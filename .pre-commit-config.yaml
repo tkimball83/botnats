@@ -1,0 +1,28 @@
+---
+default_stages:
+  - pre-commit
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        types: [file, yaml]
+        entry: yamllint --strict
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.3.0
+    hooks:
+      - id: mypy
+        args: [src, tests]
+        pass_filenames: false
+        additional_dependencies:
+          - nats-py==2.15.0
+...
