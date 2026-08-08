@@ -367,8 +367,9 @@ class Coordinator:
             if revision is None:
                 self.owns_presence = False
                 self.presence_revision = None
-                self.mark_duplicate()
+                await self.reclaim_presence()
                 self.require_unique()
+                return
             self.presence_revision = revision
 
     async def put_session(
