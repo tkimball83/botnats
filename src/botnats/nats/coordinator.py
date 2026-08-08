@@ -220,6 +220,13 @@ class Coordinator:
         nc = self.nc
         self.nc = None
         await self.cancel_watches()
+        async with self.presence_lock:
+            revision = self.presence_revision
+            if self.owns_presence and revision is not None:
+                with suppress(*PUBLISH_ERRORS):
+                    await self.presence_store.delete(self.bot_id, revision)
+            self.owns_presence = False
+            self.presence_revision = None
         for store in self.stores:
             store.reset()
         if nc is not None and not nc.is_closed:

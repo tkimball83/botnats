@@ -19,6 +19,7 @@ from botnats.nats.store import (
     ChannelStore,
     ClaimStore,
     KVStore,
+    PresenceStore,
     SessionStore,
     session_signature,
 )
@@ -259,6 +260,15 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await store.open(js) is kv
         assert await store.open(js) is kv
         js.create_key_value.assert_awaited_once()
+
+    async def test_presence_delete_uses_owned_revision(self) -> None:
+        """Delete only the case-insensitive presence revision this process owns."""
+        presence = PresenceStore("efnet", 1, 15)
+        presence.kv = AsyncMock()
+
+        await presence.delete("Alpha", LATEST_REVISION)
+
+        presence.kv.delete.assert_awaited_once_with("alpha", last=LATEST_REVISION)
 
     async def test_channel_put_keeps_highest_revision(self) -> None:
         """Prevent a delayed channel write from replacing newer durable state."""
