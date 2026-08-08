@@ -253,6 +253,11 @@ class PresenceStore(KVStore):
         except KeyWrongLastSequenceError:
             return None
 
+    async def delete(self, bot_id: str, revision: int) -> None:
+        """Delete the presence key only while its owned revision still matches."""
+        kv = await self.open()
+        await kv.delete(bot_id.casefold(), last=revision)
+
     async def update(
         self,
         bot_id: str,

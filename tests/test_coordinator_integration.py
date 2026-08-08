@@ -355,24 +355,34 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.dispatch(fail, message)
 
     async def test_close_releases_connection(self) -> None:
-        """Verify coordinator shutdown clears its connection and KV handles."""
+        """Verify shutdown releases owned presence, connection, and KV handles."""
         coordinator = build_coordinator("alpha", Fixtures())
         nc = MagicMock(is_closed=False)
         nc.close = AsyncMock()
         coordinator.nc = nc
+        coordinator.owns_presence = True
+        coordinator.presence_revision = 7
         for store in coordinator.stores:
             store.js = MagicMock()
             store.kv = MagicMock()
 
-        await coordinator.close()
-        await coordinator.close()
+        with patch.object(
+            coordinator.presence_store,
+            "delete",
+            AsyncMock(),
+        ) as delete:
+            await coordinator.close()
+            await coordinator.close()
 
         assert coordinator.nc is None
+        assert not coordinator.owns_presence
+        assert coordinator.presence_revision is None
         assert not coordinator.attempts.ready
         assert not coordinator.channels_store.ready
         assert not coordinator.claims.ready
         assert not coordinator.presence_store.ready
         assert not coordinator.sessions.ready
+        delete.assert_awaited_once_with("alpha", 7)
         nc.close.assert_awaited_once_with()
 
     async def test_disconnect_resets_stores(self) -> None:
