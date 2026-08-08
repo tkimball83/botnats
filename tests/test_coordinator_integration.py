@@ -667,12 +667,43 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 "update",
                 AsyncMock(return_value=None),
             ),
+            patch.object(
+                coordinator.presence_store,
+                "create",
+                AsyncMock(return_value=None),
+            ),
             self.assertRaisesRegex(RuntimeError, "duplicate bot ID"),
         ):
             await coordinator.put_presence(presence)
 
         assert not coordinator.owns_presence
         assert not coordinator.unique
+
+    async def test_expired_presence_owner_reclaims_id(self) -> None:
+        """Reclaim an expired owned key without reporting a duplicate."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.owns_presence = True
+        coordinator.presence_revision = 1
+        reclaimed_revision = 2
+        presence = {"bot_id": "alpha", "instance_id": coordinator.instance_id}
+
+        with (
+            patch.object(
+                coordinator.presence_store,
+                "update",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                coordinator.presence_store,
+                "create",
+                AsyncMock(return_value=reclaimed_revision),
+            ),
+        ):
+            await coordinator.put_presence(presence)
+
+        assert coordinator.owns_presence
+        assert coordinator.unique
+        assert coordinator.presence_revision == reclaimed_revision
 
     async def test_session_replay_removes_missing_cached_session(self) -> None:
         """Remove a cached session absent from a restarted watch replay."""

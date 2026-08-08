@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "botnats"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python IRC bot mesh coordinated through Core NATS and JetStream"
 license = "GPL-3.0-only"
 requires-python = ">=3.14"
