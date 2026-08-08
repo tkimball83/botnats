@@ -1,0 +1,32 @@
+---
+'on':
+  push:
+    branches:
+      - main
+    paths: &paths
+      - .pre-commit-config.yaml
+      - .yamllint
+      - '**/*.yaml'
+      - '**/*.yml'
+  pull_request:
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: yamllint --all-files
+...

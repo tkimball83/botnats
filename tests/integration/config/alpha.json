@@ -1,0 +1,30 @@
+{
+  "authorization": {
+    "session_ttl_seconds": 300
+  },
+  "bot": {
+    "id": "alpha",
+    "network": "integration",
+    "nickname": "alpha"
+  },
+  "coordination": {
+    "maintenance_interval_seconds": 1,
+    "presence_ttl_seconds": 10
+  },
+  "irc": {
+    "channel_modes": "+nt",
+    "connect_timeout_seconds": 5,
+    "servers": [
+      "irc://irc:6667"
+    ],
+    "verify_tls": false
+  },
+  "nats": {
+    "jetstream_replicas": 3,
+    "servers": [
+      "nats://nats-1:4222",
+      "nats://nats-2:4222",
+      "nats://nats-3:4222"
+    ]
+  }
+}
