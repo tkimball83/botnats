@@ -6,7 +6,7 @@
 import time
 from dataclasses import asdict, dataclass, field, fields
 
-from botnats.irc import DEFAULT_CASEMAPPING, Prefix
+from botnats.irc.protocol import DEFAULT_CASEMAPPING, Prefix
 
 
 @dataclass(frozen=True, slots=True)

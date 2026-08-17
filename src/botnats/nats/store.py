@@ -33,6 +33,7 @@ ATTEMPT_LIMIT = 3
 ATTEMPT_TTL = 120.0
 ATTEMPT_WINDOW = 60
 CLAIM_TTL = 300.0
+PRESENCE_DRIFT = 30.0
 SESSION_EXPIRY_GRACE = 60.0
 
 
@@ -241,15 +242,23 @@ class ClaimStore(KVStore):
 class PresenceStore(KVStore):
     """Bot presence heartbeats in JetStream KV with TTL expiry."""
 
-    def __init__(self, network: str, replicas: int, ttl: float) -> None:
-        """Set the bucket identity and presence TTL."""
+    def __init__(
+        self,
+        network: str,
+        replicas: int,
+        ttl: float,
+        secret: bytes,
+    ) -> None:
+        """Set the bucket identity, presence TTL, and signing secret."""
         super().__init__(f"botnats_v1_{network}_presence", replicas, ttl)
+        self.network = network
+        self.secret = secret
 
     async def create(self, bot_id: str, data: dict[str, Any]) -> int | None:
-        """Atomically create a presence key and return its revision."""
+        """Atomically create a signed presence key and return its revision."""
         kv = await self.open()
         try:
-            return await kv.create(bot_id.casefold(), json.dumps(data).encode())
+            return await kv.create(bot_id.casefold(), self.sign(data))
         except KeyWrongLastSequenceError:
             return None
 
@@ -257,6 +266,45 @@ class PresenceStore(KVStore):
         """Delete the presence key only while its owned revision still matches."""
         kv = await self.open()
         await kv.delete(bot_id.casefold(), last=revision)
+
+    async def reclaim(
+        self,
+        bot_id: str,
+        data: dict[str, Any],
+        instance_id: str,
+    ) -> int | None:
+        """Reclaim an occupied presence key from a single read.
+
+        Returns the current revision when this instance's own signed record
+        still holds the key; overwrites an unsigned or forged clobber (written
+        by a party without the coordination secret) to reclaim it; and returns
+        None when a validly signed record from another instance holds the key,
+        which is a genuine duplicate this process must yield to.
+        """
+        kv = await self.open()
+        try:
+            entry = await kv.get(bot_id.casefold())
+        except KeyDeletedError, KeyNotFoundError:
+            return None
+        try:
+            current = json.loads(entry.value) if entry.value is not None else None
+        except RecursionError, TypeError, ValueError:
+            current = None
+        if isinstance(current, dict) and self.valid(current):
+            return entry.revision if current.get("instance_id") == instance_id else None
+        try:
+            return await kv.update(
+                bot_id.casefold(), self.sign(data), last=entry.revision
+            )
+        except KeyWrongLastSequenceError:
+            return None
+
+    def sign(self, data: dict[str, Any], now: float | None = None) -> bytes:
+        """Serialize a freshly timestamped, signed presence record."""
+        current = time.time() if now is None else now
+        stamped = {**data, "timestamp": int(current)}
+        stamped["signature"] = presence_signature(self.secret, self.network, stamped)
+        return json.dumps(stamped).encode()
 
     async def update(
         self,
@@ -267,13 +315,33 @@ class PresenceStore(KVStore):
         """Refresh presence only while its last owned revision still matches."""
         kv = await self.open()
         try:
-            return await kv.update(
-                bot_id.casefold(),
-                json.dumps(data).encode(),
-                last=revision,
-            )
+            return await kv.update(bot_id.casefold(), self.sign(data), last=revision)
         except KeyWrongLastSequenceError:
             return None
+
+    def valid(self, data: dict[str, Any], now: float | None = None) -> bool:
+        """Return whether a presence record is fresh and correctly signed."""
+        signature = data.get("signature")
+        timestamp = data.get("timestamp")
+        if (
+            not isinstance(signature, str)
+            or SIGNATURE_RE.fullmatch(signature) is None
+            or not isinstance(timestamp, int)
+            or isinstance(timestamp, bool)
+        ):
+            return False
+        current = time.time() if now is None else now
+        if (
+            not current - self.ttl - PRESENCE_DRIFT
+            <= timestamp
+            <= current + PRESENCE_DRIFT
+        ):
+            return False
+        try:
+            expected = presence_signature(self.secret, self.network, data)
+        except KeyError, TypeError, UnicodeEncodeError:
+            return False
+        return hmac.compare_digest(expected, signature)
 
 
 class SessionStore(KVStore):
@@ -382,6 +450,27 @@ def session_signature(
             float(record["expires_at"]).hex(),
             str(record["version"]),
             str(int(record["revoked"])),
+        ),
+    ).encode()
+    return hmac.digest(secret, message, "sha256").hex()
+
+
+def presence_signature(
+    secret: bytes,
+    network: str,
+    record: dict[str, Any],
+) -> str:
+    """Sign the identity fields and freshness that bind a presence record."""
+    message = "\x00".join(
+        (
+            "botnats-presence-v1",
+            network,
+            record["bot_id"],
+            record["host"],
+            record["instance_id"],
+            record["nick"],
+            record["user"],
+            str(record["timestamp"]),
         ),
     ).encode()
     return hmac.digest(secret, message, "sha256").hex()

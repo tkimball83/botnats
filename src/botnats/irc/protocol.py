@@ -7,24 +7,24 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from botnats.validators import MAX_IRC_MESSAGE_BYTES
-
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-CASEMAPPINGS = frozenset({"ascii", "rfc1459", "strict-rfc1459"})
-CASEMAP_ASCII = str.maketrans(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    "abcdefghijklmnopqrstuvwxyz",
-)
-CASEMAP_RFC1459 = str.maketrans(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\^",
-    "abcdefghijklmnopqrstuvwxyz{}|~",
-)
-CASEMAP_STRICT = str.maketrans(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\",
-    "abcdefghijklmnopqrstuvwxyz{}|",
-)
+CASEMAP_TABLES = {
+    "ascii": str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "abcdefghijklmnopqrstuvwxyz",
+    ),
+    "rfc1459": str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\^",
+        "abcdefghijklmnopqrstuvwxyz{}|~",
+    ),
+    "strict-rfc1459": str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\",
+        "abcdefghijklmnopqrstuvwxyz{}|",
+    ),
+}
+CASEMAPPINGS = frozenset(CASEMAP_TABLES)
 CHANMODE_GROUP_COUNT = 4
 DEFAULT_CASEMAPPING = "rfc1459"
 DEFAULT_MEMBER_PREFIXES = {
@@ -36,9 +36,7 @@ DEFAULT_MEMBER_PREFIXES = {
 }
 ILLEGAL_PARAM_CHARS = frozenset(" \x00\r\n")
 ILLEGAL_TRAILING_CHARS = frozenset("\x00\r\n")
-TAG_ESCAPES = str.maketrans(
-    {":": ";", "\\": "\\", "n": "\n", "r": "\r", "s": " "},
-)
+MAX_IRC_MESSAGE_BYTES = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +46,6 @@ class IRCMessage:
     command: str
     params: tuple[str, ...]
     prefix: Prefix | None = None
-    tags: dict[str, str | None] = field(default_factory=dict)
 
 
 class IRCProtocol(Protocol):
@@ -204,16 +201,11 @@ class Prefix:
 
 def casefold(value: str, casemapping: str = DEFAULT_CASEMAPPING) -> str:
     """Fold an IRC identifier using a server-advertised casemapping."""
-    match casemapping:
-        case "ascii":
-            return value.translate(CASEMAP_ASCII)
-        case "rfc1459":
-            return value.translate(CASEMAP_RFC1459)
-        case "strict-rfc1459":
-            return value.translate(CASEMAP_STRICT)
-        case _:
-            msg = f"unsupported casemapping: {casemapping!r}"
-            raise ValueError(msg)
+    table = CASEMAP_TABLES.get(casemapping)
+    if table is None:
+        msg = f"unsupported casemapping: {casemapping!r}"
+        raise ValueError(msg)
+    return value.translate(table)
 
 
 def format_message(
@@ -324,25 +316,18 @@ def mask_matches(
 
 
 def parse_message(line: str) -> IRCMessage:
-    """Parse a raw IRC line into a structured message."""
-    if len(line.encode()) > MAX_IRC_MESSAGE_BYTES:
-        msg = "IRC message exceeds 512 bytes"
-        raise ValueError(msg)
+    """Parse a raw IRC line whose wire length the transport has bounded."""
     rest = line.removesuffix("\n").removesuffix("\r")
     if not ILLEGAL_TRAILING_CHARS.isdisjoint(rest):
         msg = "IRC message contains control characters"
         raise ValueError(msg)
-    tags: dict[str, str | None] = {}
     prefix: Prefix | None = None
 
     if rest.startswith("@"):
-        raw_tags, separator, rest = rest[1:].partition(" ")
+        _, separator, rest = rest.partition(" ")
         if not separator:
             msg = "IRC tags were not followed by a command"
             raise ValueError(msg)
-        for raw_tag in raw_tags.split(";"):
-            key, equals, value = raw_tag.partition("=")
-            tags[key] = unescape_tag(value) if equals else None
 
     if rest.startswith(":"):
         raw_prefix, separator, rest = rest[1:].partition(" ")
@@ -363,21 +348,4 @@ def parse_message(line: str) -> IRCMessage:
         command=words[0].upper(),
         params=tuple(params),
         prefix=prefix,
-        tags=tags,
     )
-
-
-def unescape_tag(value: str) -> str:
-    """Decode backslash escape sequences in an IRCv3 tag value."""
-    result: list[str] = []
-    index = 0
-    while index < len(value):
-        if value[index] == "\\" and index + 1 < len(value):
-            result.append(value[index + 1].translate(TAG_ESCAPES))
-            index += 2
-        elif value[index] == "\\":
-            index += 1
-        else:
-            result.append(value[index])
-            index += 1
-    return "".join(result)

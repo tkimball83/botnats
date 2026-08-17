@@ -7,11 +7,12 @@ import re
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from botnats.irc.protocol import format_message
+
 if TYPE_CHECKING:
     from collections.abc import Collection
 
 MIN_CHANNEL_LENGTH = 2
-MAX_IRC_MESSAGE_BYTES = 512
 MAX_CHANNEL_REVISION = (1 << 63) - 1
 CHANNEL_REVISION_RE = re.compile(r"^\d{20}-[0-9a-f]{32}$")
 
@@ -50,10 +51,7 @@ def validate_join(channel: str, key: str | None) -> tuple[str, str | None]:
     """Validate a channel JOIN and return its normalized parameters."""
     channel = validate_channel(channel)
     key = validate_key(key) if key is not None else None
-    components = ("JOIN", channel, key) if key is not None else ("JOIN", channel)
-    if len((" ".join(components) + "\r\n").encode()) > MAX_IRC_MESSAGE_BYTES:
-        msg = "IRC message exceeds 512 bytes"
-        raise ValueError(msg)
+    format_message("JOIN", (channel, key) if key is not None else (channel,), None)
     return channel, key
 
 

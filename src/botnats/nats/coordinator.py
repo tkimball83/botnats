@@ -44,7 +44,7 @@ DECODE_WARNING_INTERVAL = 5.0
 OFFER_TIMEOUT = 0.35
 PUBLISH_ERRORS = (*CONNECT_ERRORS, RuntimeError)
 RECONNECT_WAIT = 1
-REQUEST_ERRORS = (*CONNECT_ERRORS, *DECODE_ERRORS)
+REQUEST_ERRORS = (*CONNECT_ERRORS, *DECODE_ERRORS, RuntimeError)
 WATCH_NAMES = frozenset({"watch-channels", "watch-presence", "watch-sessions"})
 
 
@@ -178,6 +178,7 @@ class Coordinator:
             config.network,
             config.replicas,
             config.presence_ttl,
+            coordination_key,
         )
         self.sessions = SessionStore(
             config.network,
@@ -194,7 +195,10 @@ class Coordinator:
         )
         self.last_presence: dict[str, Any] = {
             "bot_id": envelope.bot_id,
+            "host": "",
             "instance_id": config.instance_id,
+            "nick": "",
+            "user": "",
         }
         self.owns_presence = False
         self.presence_lock = asyncio.Lock()
@@ -406,6 +410,16 @@ class Coordinator:
             self.bot_id,
             self.last_presence,
         )
+        if revision is None:
+            # The key is occupied: adopt this instance's own still-live record
+            # after a reconnect, or overwrite an unsigned or forged clobber; a
+            # validly signed foreign record leaves revision None (a duplicate).
+            with suppress(*PUBLISH_ERRORS):
+                revision = await self.presence_store.reclaim(
+                    self.bot_id,
+                    self.last_presence,
+                    self.instance_id,
+                )
         if revision is not None:
             if not was_unique:
                 LOGGER.info("duplicate bot ID conflict resolved: %s", self.bot_id)
@@ -655,6 +669,7 @@ class Coordinator:
         if (
             not IDENTIFIER_RE.fullmatch(presence.bot_id)
             or presence.bot_id.casefold() != key
+            or not self.presence_store.valid(data)
         ):
             return False
         self.callbacks.on_presence(presence)

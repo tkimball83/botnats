@@ -9,16 +9,23 @@ import time
 import unittest
 from unittest.mock import AsyncMock, create_autospec, patch
 
-from botnats.irc import (
+from botnats.irc.client import (
+    DESIRED_CAPS,
     IRCClient,
     IRCClientConfig,
+    IRCServer,
+    next_nickname,
+    pong_reply,
+)
+from botnats.irc.protocol import (
+    MAX_IRC_MESSAGE_BYTES,
     Prefix,
     casefold,
+    format_message,
     iter_mode_changes,
     mask_matches,
+    parse_message,
 )
-from botnats.irc.client import DESIRED_CAPS, IRCServer, next_nickname
-from botnats.irc.protocol import format_message, parse_message
 
 COLLISION_NICK_LENGTH = 9
 MASK_MATCH_BUDGET_SECONDS = 0.5
@@ -62,6 +69,24 @@ def mock_writer() -> asyncio.StreamWriter:
 class IRCProtocolTests(unittest.TestCase):
     """Tests for prefix matching, message parsing, and mode iteration."""
 
+    def test_pong_reply_echoes_raw_token(self) -> None:
+        """Verify PONG echoes raw PING token bytes and always fits the wire."""
+        assert pong_reply(b"PING :token\r\n") == b"PONG :token\r\n"
+        assert pong_reply(b"PING token\r\n") == b"PONG token\r\n"
+        assert pong_reply(b":server PING :token\r\n") == b"PONG :token\r\n"
+        assert pong_reply(b"PING server1 :token\r\n") == b"PONG :token\r\n"
+        # Tags plus a prefix: the prefix's space-colon must not be the marker.
+        assert (
+            pong_reply(b"@time=2026-01-01T00:00:00Z :srv PING :token\r\n")
+            == b"PONG :token\r\n"
+        )
+        assert pong_reply(b"@id=1 PING token\r\n") == b"PONG token\r\n"
+
+        inflating = b"PING :" + b"\xe9" * 400 + b"\r\n"
+        reply = pong_reply(inflating)
+        assert reply == b"PONG :" + b"\xe9" * 400 + b"\r\n"
+        assert len(reply) <= len(inflating) <= MAX_IRC_MESSAGE_BYTES
+
     def test_ban_mask_matching(self) -> None:
         """Verify ban mask matching against IRC prefixes."""
         prefix = Prefix("Bot[One]", "~user", "2001:db8::1")
@@ -94,6 +119,8 @@ class IRCProtocolTests(unittest.TestCase):
         assert casefold("Nick[\\]^") == "nick{|}~"
         assert casefold("Nick[\\]^", "strict-rfc1459") == "nick{|}^"
         assert casefold("Nick[\\]^", "ascii") == "nick[\\]^"
+        with self.assertRaisesRegex(ValueError, "unsupported casemapping"):
+            casefold("Nick", "utf8")
 
     def test_config_validation(self) -> None:
         """Verify IRCClientConfig rejects invalid timing and empty servers."""
@@ -191,10 +218,15 @@ class IRCProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "control characters"):
                 parse_message(line)
 
-    def test_parse_rejects_oversized_message(self) -> None:
-        """Reject inbound IRC messages larger than the protocol limit."""
-        with self.assertRaisesRegex(ValueError, "exceeds 512 bytes"):
-            parse_message("PING :" + "x" * 505 + "\r\n")
+    def test_parse_accepts_decode_inflated_message(self) -> None:
+        """Accept a wire-legal line whose replacement chars inflate re-encoding."""
+        raw = b"PRIVMSG #chan :" + b"\xe9" * 400 + b"\r\n"
+        assert len(raw) <= MAX_IRC_MESSAGE_BYTES
+
+        message = parse_message(raw.decode(errors="replace"))
+
+        assert message.command == "PRIVMSG"
+        assert message.params[0] == "#chan"
 
     def test_parse_splits_params_on_space_only(self) -> None:
         """Verify a tab inside a param does not fragment it."""
@@ -203,7 +235,7 @@ class IRCProtocolTests(unittest.TestCase):
         assert message.params == ("#a\tb", "hi")
 
     def test_parse_tagged_message(self) -> None:
-        """Verify tagged IRC message parsing extracts all fields."""
+        """Verify message tags are stripped before parsing."""
         message = parse_message(
             "@account=test;label=a\\sb :Nick!user@host PRIVMSG bot :hello world\r\n",
         )
@@ -211,7 +243,6 @@ class IRCProtocolTests(unittest.TestCase):
         assert message.command == "PRIVMSG"
         assert message.params == ("bot", "hello world")
         assert message.prefix == Prefix("Nick", "user", "host")
-        assert message.tags == {"account": "test", "label": "a b"}
 
     def test_prefix_match(self) -> None:
         """Verify prefix matching is case-insensitive on nick and host."""
@@ -247,10 +278,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(IRCClient, "nick_collision", retry):
             for numeric in numerics:
-                message = parse_message(
-                    f":server {numeric} * alpha :nickname rejected\r\n",
+                raw = f":server {numeric} * alpha :nickname rejected\r\n".encode()
+                await client.dispatch_line(
+                    parse_message(raw.decode()), raw, mock_writer(), None
                 )
-                await client.dispatch_line(message, mock_writer(), None)
 
         assert retry.await_count == len(numerics)
 
@@ -268,6 +299,39 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert "chghost" in client.cap_available
         sent = client.outbound.get_nowait()
         assert sent == b"CAP REQ :chghost multi-prefix\r\n"
+
+    async def test_dispatch_answers_inflated_ping(self) -> None:
+        """Verify dispatch_line answers a decode-inflated PING from raw bytes."""
+        client = self.cap_client()
+        raw = b"PING :" + b"\xe9" * 400 + b"\r\n"
+        message = parse_message(raw.decode(errors="replace"))
+
+        with patch.object(client, "send_immediate", AsyncMock()) as send:
+            result = await client.dispatch_line(message, raw, mock_writer(), "tok")
+
+        assert result == "tok"
+        send.assert_awaited_once()
+        assert send.await_args is not None
+        assert send.await_args.args[0] == b"PONG :" + b"\xe9" * 400 + b"\r\n"
+
+    async def test_cap_new_ack_mid_ls_does_not_end_negotiation(self) -> None:
+        """Verify a NEW-triggered ACK before LS completes keeps negotiating."""
+        client = self.cap_client()
+        assert client.outbound is not None
+
+        await client.handle_cap(parse_message(":server CAP * NEW :chghost\r\n"))
+        assert client.outbound.get_nowait() == b"CAP REQ :chghost\r\n"
+
+        await client.handle_cap(parse_message(":server CAP * ACK :chghost\r\n"))
+        assert client.cap_negotiating
+        assert client.outbound.empty()
+
+        await client.handle_cap(parse_message(":server CAP * LS :multi-prefix\r\n"))
+        assert client.outbound.get_nowait() == b"CAP REQ :chghost multi-prefix\r\n"
+
+        await client.handle_cap(parse_message(":server CAP * ACK :multi-prefix\r\n"))
+        assert not client.cap_negotiating
+        assert client.outbound.get_nowait() == b"CAP END\r\n"
 
     async def test_cap_ls_no_desired(self) -> None:
         """Verify CAP END is sent when no desired capabilities are available."""
@@ -305,6 +369,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_cap_nak_ends_negotiation(self) -> None:
         """Verify CAP NAK still sends CAP END."""
         client = self.cap_client()
+        client.cap_ls_done = True
         message = parse_message(":server CAP * NAK :chghost\r\n")
         await client.handle_cap(message)
 

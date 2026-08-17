@@ -36,6 +36,7 @@ class BotConfig:
     bot_id: str
     channel_modes: str
     coordination_secret: str = field(repr=False)
+    health_port: int
     irc_connect_timeout: float
     irc_servers: tuple[IRCServer, ...]
     irc_verify_tls: bool
@@ -59,7 +60,7 @@ class BotConfig:
             raise TypeError(msg)
 
         authorization = table(raw, "authorization", "session_ttl_seconds")
-        bot = table(raw, "bot", "id", "network", "nickname")
+        bot = table(raw, "bot", "health_port", "id", "network", "nickname")
         coordination = table(
             raw,
             "coordination",
@@ -110,6 +111,7 @@ class BotConfig:
             bot_id=bot_id,
             channel_modes=channel_modes,
             coordination_secret=coordination_secret,
+            health_port=port(bot, "health_port", 8080),
             irc_connect_timeout=positive_float(irc, "connect_timeout_seconds", 30),
             irc_servers=servers,
             irc_verify_tls=boolean(irc, "verify_tls", default=True),

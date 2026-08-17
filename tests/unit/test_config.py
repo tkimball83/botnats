@@ -45,6 +45,7 @@ CONFIG = b"""{
 """
 DEFAULT_FLOAT = 2.5
 EXPECTED_COORDINATION_KEY = "coordination-secret-used-only-for-tests"
+EXPECTED_HEALTH_PORT = 8080
 EXPECTED_MONITOR_PORT = 8222
 EXPECTED_NATS_CREDENTIAL = "nats-token"
 EXPECTED_REPLICAS = 3
@@ -74,6 +75,7 @@ class ConfigTests(unittest.TestCase):
         assert config.nats_token == EXPECTED_NATS_CREDENTIAL
         assert config.nats_monitor_port == EXPECTED_MONITOR_PORT
         assert config.jetstream_replicas == EXPECTED_REPLICAS
+        assert config.health_port == EXPECTED_HEALTH_PORT
         assert config.irc_servers == (IRCServer("irc.example.test", 6697, tls=True),)
 
     def test_config_requires_object(self) -> None:

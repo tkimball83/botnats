@@ -10,10 +10,9 @@ from nats.errors import Error as NatsError
 from botnats.bot import Bot
 from botnats.channel import ChannelRecord, ChannelRuntime
 from botnats.config import BotConfig
-from botnats.irc import casefold
 from botnats.irc.client import IRCServer
-from botnats.irc.protocol import format_message
-from botnats.nats import NATSStatus
+from botnats.irc.protocol import casefold, format_message
+from botnats.nats.status import NATSStatus
 from botnats.nats.store import ATTEMPT_LIMIT
 
 AUTH_SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
@@ -61,6 +60,7 @@ def config() -> BotConfig:
         bot_id="alpha",
         channel_modes="+npst",
         coordination_secret=COORDINATION_KEY_TEXT,
+        health_port=8080,
         irc_connect_timeout=30,
         irc_servers=(IRCServer("irc.example.test", 6697, tls=True),),
         irc_verify_tls=True,
@@ -114,7 +114,10 @@ class FakeIRC:
         *params: str,
         trailing: str | None = None,
     ) -> None:
-        """Validate and record a raw command."""
+        """Validate and record a raw command, failing when disconnected."""
+        if not self.connected:
+            msg = "IRC is not connected"
+            raise ConnectionError(msg)
         format_message(command, params, trailing)
         if command == "MODE" and params[1:]:
             self.modes.append((params[0], params[1], params[2:]))
@@ -209,14 +212,16 @@ class FakeCoordinator:
         return self.connected and self.unique
 
     async def request_auth(self, identity: str) -> bool:
-        """Record and limit authentication attempts."""
+        """Record and limit attempts, failing closed when not ready."""
+        if not self.ready:
+            return False
         self.auth_requests.append(identity)
         return len(self.auth_requests) <= ATTEMPT_LIMIT
 
     async def request_claim(self, counter: int) -> bool:
-        """Allow or deny claim requests based on claim_result."""
+        """Allow or deny claims, failing closed when not ready."""
         del counter
-        return self.claim_result
+        return self.ready and self.claim_result
 
     async def request_offer(self, base_suffix: str, payload: dict[str, object]) -> bool:
         """Record an offer request."""

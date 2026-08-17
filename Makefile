@@ -22,7 +22,7 @@ unit: install
 	venv/bin/ruff check src tests
 	venv/bin/ruff format --check src tests
 	venv/bin/mypy src tests
-	venv/bin/python -m unittest discover -s tests -v
+	venv/bin/python -m unittest discover -s tests/unit -t . -v
 
 integration: install
 	sh tests/integration/run.sh

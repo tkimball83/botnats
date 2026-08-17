@@ -12,11 +12,10 @@ from nats.errors import Error as NatsError
 
 from botnats.bot import Bot
 from botnats.channel import ChannelRuntime
-from botnats.irc import IRCMessage, Prefix, casefold
 from botnats.irc.client import DEFAULT_NICK_LENGTH
-from botnats.irc.protocol import ISupportState
+from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
 from botnats.presence import BotPresence
-from tests.helpers import (
+from tests.unit.helpers import (
     FailingPartIRC,
     FakeCoordinator,
     FakeIRC,
@@ -66,6 +65,27 @@ def fail_first_revocation(attempts: list[tuple[str, bool]]) -> AsyncMock:
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
     """Tests for IRC server message handling and mode enforcement."""
+
+    async def test_revocation_escalates_over_same_expiry_winner(self) -> None:
+        """Escalate when the store winner shares the revocation's expiry."""
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = "owner!user@host.example"
+        expires_at = time.time() + 600
+        stale = bot.authorizer.create(prefix, expires_at, "alpha", 1, revoked=True)
+        winner = bot.authorizer.create(prefix, expires_at, "alpha", 2)
+
+        with patch.object(
+            coordinator,
+            "put_session",
+            AsyncMock(return_value=winner.to_dict()),
+        ):
+            synced = await bot.events.sync_session(prefix, stale.to_dict())
+
+        assert not synced
+        pending = bot.events.pending_sessions[casefold(prefix, "ascii")]
+        assert pending["revoked"] is True
+        assert pending["version"] == winner.version + 1
+        assert not bot.authorizer.authorized(prefix)
 
     async def test_ban_list_records_mask(self) -> None:
         """Verify 367 numeric adds a ban mask to the channel."""
@@ -311,6 +331,43 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         suffixes = [suffix for suffix, _ in coordinator.offer_requests]
         assert suffixes == ["invite", "invite", "invite"]
+
+    async def test_mode_enforce_once_on_op_with_unset(self) -> None:
+        """Verify one enforcement when a single MODE ops the bot and unsets."""
+        bot, fake_irc = bot_with_irc()
+        folded = casefold("#test")
+        runtime = bot.channel_mgr.channels[folded]
+        runtime.joined = True
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "+o-n", "alpha"),
+                Prefix("someone", "user", "host"),
+            ),
+        )
+        await asyncio.sleep(0)
+        assert fake_irc.modes == [("#test", "+npst", ())]
+
+    async def test_mode_net_noop_triggers_nothing(self) -> None:
+        """Verify a deop-reop MODE line sends no enforcement or peer request."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.identity = BotPresence("alpha", "host.example", "inst", "alpha", "~alpha")
+        folded = casefold("#test")
+        runtime = bot.channel_mgr.channels[folded]
+        runtime.joined = True
+        runtime.member("alpha").modes.add("o")
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "-o+o", "alpha", "alpha"),
+                Prefix("someone", "user", "host"),
+            ),
+        )
+        await asyncio.sleep(0)
+        assert fake_irc.modes == []
+        assert coordinator.offer_requests == []
 
     async def test_mode_enforce_on_unset(self) -> None:
         """Verify channel modes are re-enforced when unset by another user."""

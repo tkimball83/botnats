@@ -10,7 +10,7 @@ import time
 from typing import TYPE_CHECKING
 
 from botnats.admin import totp
-from botnats.irc import IRCMessage, format_message, parse_message
+from botnats.irc.protocol import IRCMessage, format_message, parse_message
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -227,7 +227,7 @@ async def run() -> None:
             private_message("beta"),
             wait_seconds=COMMAND_TIMEOUT,
         )
-        assert "peers=3" in local_status.params[-1]
+        assert "peers=2" in local_status.params[-1]
         assert "channels=2" in local_status.params[-1]
         nats_fields = dict(
             field.split("=", 1) for field in nats_status.params[-1].split()[1:]
@@ -242,11 +242,27 @@ async def run() -> None:
                 f"Key for {channel}: {key}"
             )
             channel_modes = await modes(session, channel)
+            # "m" is not an ergo default, so its presence proves the bots
+            # actively enforced the configured modes rather than inheriting them.
+            assert "m" in channel_modes
             assert "n" in channel_modes
             assert "t" in channel_modes
 
         first, _ = CHANNELS[0]
         second, second_key = CHANNELS[1]
+
+        # Multiple channels with different modes: op the owner on the first
+        # channel and set an extra mode there. The mesh must keep the modes
+        # isolated per channel and not re-apply the enforced set over +i.
+        assert await command(session, "alpha", f"OP {first} owner") == (
+            f"Opped owner on {first}"
+        )
+        await wait_for_operators(session, first, present=frozenset({"owner"}))
+        await session.send("MODE", first, "+i")
+        await wait_for_modes(session, first, present="i")
+        assert "i" not in await modes(session, second)
+
+        await wait_for_operators(session, first, present=frozenset({"alpha"}))
         assert await command(session, "alpha", f"BAN {first} {TEST_BAN}") == (
             f"Banned {TEST_BAN} on {first}"
         )
@@ -299,6 +315,34 @@ async def wait_for_names(
         while True:
             current = await names(session, channel)
             if current >= present and current.isdisjoint(absent):
+                return
+            await asyncio.sleep(0.25)
+
+
+async def wait_for_modes(
+    session: IRCSession,
+    channel: str,
+    *,
+    present: str,
+) -> None:
+    """Wait until a channel's mode string contains the required flag."""
+    async with asyncio.timeout(STARTUP_TIMEOUT):
+        while True:
+            if present in await modes(session, channel):
+                return
+            await asyncio.sleep(0.25)
+
+
+async def wait_for_operators(
+    session: IRCSession,
+    channel: str,
+    *,
+    present: frozenset[str],
+) -> None:
+    """Wait until the required members hold operator status in one channel."""
+    async with asyncio.timeout(STARTUP_TIMEOUT):
+        while True:
+            if await operators(session, channel) >= present:
                 return
             await asyncio.sleep(0.25)
 

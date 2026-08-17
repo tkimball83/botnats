@@ -5,7 +5,7 @@
 
 import unittest
 
-from botnats.irc import Prefix
+from botnats.irc.protocol import Prefix
 from botnats.presence import BotPresence, PresenceRegistry
 
 

@@ -6,7 +6,7 @@
 import unittest
 
 from botnats.admin import TotpAuthorizer
-from tests.helpers import AUTH_SEED, COORDINATION_KEY
+from tests.unit.helpers import AUTH_SEED, COORDINATION_KEY
 
 
 def authorizer(issuer: str = "alpha", network: str = "efnet") -> TotpAuthorizer:
