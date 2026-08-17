@@ -12,7 +12,7 @@ using JetStream KV for shared durable state and Core NATS pub/sub for auto-coord
 | `src/botnats/`         | Package source                    |
 | `src/botnats/irc/`     | IRC client and protocol parsing   |
 | `src/botnats/nats/`    | NATS coordination and JetStream   |
-| `tests/`               | Unit tests                        |
+| `tests/unit/`          | Unit tests                        |
 | `tests/integration/`   | Docker integration tests          |
 
 ## Validation

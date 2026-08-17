@@ -21,14 +21,129 @@ from botnats.nats.store import (
     KVStore,
     PresenceStore,
     SessionStore,
+    presence_signature,
     session_signature,
 )
-from tests.helpers import COORDINATION_KEY as SECRET
+from tests.unit.helpers import COORDINATION_KEY as SECRET
 
 EXPECTED_CREATE_CALLS = 2
 EXPECTED_OPEN_CALLS = 2
 LATEST_REVISION = 8
 SHA256_HEX_LENGTH = 64
+
+
+def signed_presence(instance_id: str) -> dict[str, object]:
+    """Build a fresh, validly signed presence record for one instance."""
+    data: dict[str, object] = {
+        "bot_id": "Alpha",
+        "host": "host",
+        "instance_id": instance_id,
+        "nick": "Alpha",
+        "user": "user",
+        "timestamp": int(time.time()),
+    }
+    data["signature"] = presence_signature(SECRET, "efnet", data)
+    return data
+
+
+class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for reclaiming an occupied presence key after reconnect."""
+
+    async def test_reclaim_adopts_own_record(self) -> None:
+        """Adopt the key without a write when this instance signed it."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        owned = signed_presence("inst")
+        entry = SimpleNamespace(
+            revision=LATEST_REVISION,
+            value=json.dumps(owned).encode(),
+        )
+        kv = AsyncMock()
+        kv.get = AsyncMock(return_value=entry)
+        store.kv = kv
+
+        assert await store.reclaim("Alpha", owned, "inst") == LATEST_REVISION
+        kv.get.assert_awaited_with("alpha")
+        kv.update.assert_not_awaited()
+
+    async def test_reclaim_yields_to_valid_foreign_record(self) -> None:
+        """Never overwrite a validly signed record from another instance."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        foreign = signed_presence("other")
+        kv = AsyncMock()
+        kv.get = AsyncMock(
+            return_value=SimpleNamespace(
+                revision=5, value=json.dumps(foreign).encode()
+            ),
+        )
+        store.kv = kv
+
+        assert await store.reclaim("Alpha", signed_presence("inst"), "inst") is None
+        kv.update.assert_not_awaited()
+
+    async def test_reclaim_overwrites_forged_or_absent(self) -> None:
+        """Overwrite an unsigned clobber; yield when the key is already gone."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        data = signed_presence("inst")
+        reclaimed_revision = 6
+        kv = AsyncMock()
+        store.kv = kv
+
+        kv.get = AsyncMock(
+            return_value=SimpleNamespace(revision=5, value=b'{"garbage": true}'),
+        )
+        kv.update = AsyncMock(return_value=reclaimed_revision)
+        assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
+        kv.update.assert_awaited_once()
+
+        forged = {**data, "signature": "0" * SHA256_HEX_LENGTH}
+        kv.get = AsyncMock(
+            return_value=SimpleNamespace(revision=5, value=json.dumps(forged).encode()),
+        )
+        kv.update = AsyncMock(return_value=reclaimed_revision)
+        assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
+
+        kv.get = AsyncMock(side_effect=KeyNotFoundError())
+        assert await store.reclaim("Alpha", data, "inst") is None
+
+    def test_valid_rejects_stale_and_uncrashable(self) -> None:
+        """Reject stale replays and surrogate injection without raising."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        now = 1_000_000.0
+
+        def sign(data: dict[str, object]) -> dict[str, object]:
+            data["signature"] = presence_signature(SECRET, "efnet", data)
+            return data
+
+        fresh = sign(
+            {
+                "bot_id": "alpha",
+                "host": "host",
+                "instance_id": "inst",
+                "nick": "alpha",
+                "user": "user",
+                "timestamp": int(now),
+            },
+        )
+        assert store.valid(fresh, now=now)
+
+        stale = dict(fresh)
+        stale["timestamp"] = int(now - 1000)
+        stale["signature"] = presence_signature(SECRET, "efnet", stale)
+        assert not store.valid(stale, now=now)
+
+        surrogate = {
+            "bot_id": "alpha",
+            "host": "\ud800",
+            "instance_id": "inst",
+            "nick": "alpha",
+            "user": "user",
+            "timestamp": int(now),
+            "signature": "0" * SHA256_HEX_LENGTH,
+        }
+        assert not store.valid(surrogate, now=now)
+
+        non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
+        assert not store.valid(non_ascii_signature, now=now)
 
 
 def channel_record(revision: int) -> dict[str, object]:
@@ -263,7 +378,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_presence_delete_uses_owned_revision(self) -> None:
         """Delete only the case-insensitive presence revision this process owns."""
-        presence = PresenceStore("efnet", 1, 15)
+        presence = PresenceStore("efnet", 1, 15, SECRET)
         presence.kv = AsyncMock()
 
         await presence.delete("Alpha", LATEST_REVISION)

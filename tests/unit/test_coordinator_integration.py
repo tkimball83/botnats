@@ -21,8 +21,8 @@ from nats.aio.msg import Msg
 from nats.js.errors import KeyWrongLastSequenceError
 
 from botnats.channel import ChannelRecord
-from botnats.nats import Coordinator, Envelope, NATSConfig
-from botnats.nats.coordinator import WATCH_NAMES
+from botnats.nats.coordinator import WATCH_NAMES, Coordinator, NATSConfig
+from botnats.nats.envelope import Envelope
 from botnats.nats.store import (
     ATTEMPT_LIMIT,
     AttemptStore,
@@ -30,9 +30,10 @@ from botnats.nats.store import (
     ClaimStore,
     PresenceStore,
     SessionStore,
+    presence_signature,
     session_signature,
 )
-from tests.helpers import COORDINATION_KEY
+from tests.unit.helpers import COORDINATION_KEY
 
 if TYPE_CHECKING:
     from botnats.bot import NATSCallbackHandler
@@ -193,21 +194,23 @@ def noop_sync(value: object) -> None:
     del value
 
 
-def presence_entry() -> SimpleNamespace:
+def presence_entry(*, signed: bool = True) -> SimpleNamespace:
     """Build a conflicting alpha presence watch entry."""
+    record: dict[str, object] = {
+        "bot_id": "alpha",
+        "host": "host",
+        "instance_id": "other-instance",
+        "nick": "alpha",
+        "user": "user",
+        "timestamp": int(time.time()),
+    }
+    if signed:
+        record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
     return SimpleNamespace(
         key="alpha",
         operation="PUT",
         revision=1,
-        value=json.dumps(
-            {
-                "bot_id": "alpha",
-                "host": "host",
-                "instance_id": "other-instance",
-                "nick": "alpha",
-                "user": "user",
-            },
-        ).encode(),
+        value=json.dumps(record).encode(),
     )
 
 
@@ -288,6 +291,29 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert not selected
         coordinator.nc.publish.assert_not_awaited()
+
+    async def test_offer_grant_conflict_returns_false(self) -> None:
+        """Return False when presence uniqueness is lost during the grant."""
+        coordinator = build_coordinator("beta", Fixtures())
+        coordinator.nc = AsyncMock()
+        reply = "_INBOX.reply"
+        coordinator.nc.request.return_value = Msg(
+            MagicMock(),
+            subject=reply,
+            data=Envelope("alpha", COORDINATION_KEY).encode(reply, {}),
+        )
+        error = RuntimeError("duplicate bot ID: beta")
+
+        with (
+            patch.object(Coordinator, "ready", PropertyMock(return_value=True)),
+            patch.object(coordinator, "publish", AsyncMock(side_effect=error)),
+        ):
+            selected = await coordinator.request_offer(
+                "op",
+                {"channel": "#test", "presence": BETA_PRESENCE},
+            )
+
+        assert not selected
 
     async def test_action_rejects_mismatched_sender(self) -> None:
         """Reject action payloads whose presence does not own the envelope."""
@@ -404,6 +430,23 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.presence_store.js is None
         assert not coordinator.sessions.ready
         assert coordinator.sessions.js is None
+
+    async def test_auth_and_claim_fail_closed_when_not_ready(self) -> None:
+        """Deny attempts and claims whenever the coordinator is not ready."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        allow = AsyncMock(return_value=True)
+        claim = AsyncMock(return_value=True)
+
+        with (
+            patch.object(Coordinator, "ready", PropertyMock(return_value=False)),
+            patch.object(coordinator.attempts, "allow", allow),
+            patch.object(coordinator.claims, "claim", claim),
+        ):
+            assert not await coordinator.request_auth("host.example")
+            assert not await coordinator.request_claim(1)
+
+        allow.assert_not_awaited()
+        claim.assert_not_awaited()
 
     async def test_duplicate_bot_id_blocks_coordination(self) -> None:
         """Prevent a conflicting bot ID from publishing, offering, or granting."""
@@ -664,6 +707,37 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert create.await_count == EXPECTED_WRITE_ATTEMPTS
         update.assert_not_awaited()
 
+    async def test_reclaim_claims_occupied_key(self) -> None:
+        """Claim an occupied key via a single reclaim on the heartbeat path."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        reclaimed_revision = 7
+        presence = {
+            "bot_id": "alpha",
+            "host": "host",
+            "instance_id": coordinator.instance_id,
+            "nick": "alpha",
+            "user": "user",
+        }
+
+        with (
+            patch.object(
+                coordinator.presence_store,
+                "create",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                coordinator.presence_store,
+                "reclaim",
+                AsyncMock(return_value=reclaimed_revision),
+            ) as reclaim,
+        ):
+            await coordinator.put_presence(presence)
+
+        assert coordinator.owns_presence
+        assert coordinator.unique
+        assert coordinator.presence_revision == reclaimed_revision
+        reclaim.assert_awaited_once_with("alpha", presence, coordinator.instance_id)
+
     async def test_stale_presence_owner_cannot_overwrite_new_owner(self) -> None:
         """Fail closed when a heartbeat loses its owned KV revision."""
         coordinator = build_coordinator("alpha", Fixtures())
@@ -826,6 +900,20 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert not coordinator.unique
 
+    async def test_watch_presence_ignores_unsigned_record(self) -> None:
+        """Verify an unsigned presence record cannot demote the owner."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.owns_presence = True
+        coordinator.unique = True
+        kv, _ = watcher(presence_entry(signed=False), None)
+        coordinator.presence_store.kv = kv
+        coordinator.presence_store.js = MagicMock()
+
+        await coordinator.watch_presence()
+
+        assert coordinator.unique
+        assert coordinator.owns_presence
+
     async def test_watch_presence_reclaim_loser_stays_conflicted(self) -> None:
         """Verify the loser of atomic presence reclaim stays unique=False."""
         coordinator = build_coordinator("alpha", Fixtures())
@@ -837,6 +925,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         kv, _ = watcher(presence_entry(), None, delete_entry)
         kv.create = AsyncMock(
             side_effect=KeyWrongLastSequenceError,
+        )
+        # A valid signed record from another instance holds the key, so the
+        # reclaim finds a genuine duplicate and must not overwrite it.
+        kv.get = AsyncMock(
+            return_value=SimpleNamespace(revision=1, value=presence_entry().value),
         )
         coordinator.presence_store.kv = kv
         coordinator.presence_store.js = MagicMock()

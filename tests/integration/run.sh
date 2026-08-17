@@ -44,14 +44,19 @@ compose down --volumes --remove-orphans
 compose build alpha
 compose up --detach --no-build --wait --wait-timeout 120
 
+# Assign before export so a failed command substitution aborts under set -e
+# instead of being masked by export's own zero exit status.
 nats_address=$(compose port nats-1 4222)
-export BOTNATS_TEST_IRC_ADDRESS="$(compose port irc 6667)"
+irc_address=$(compose port irc 6667)
+nats_2_address=$(compose port nats-2 4222)
+nats_3_address=$(compose port nats-3 4222)
+export BOTNATS_TEST_IRC_ADDRESS="$irc_address"
 export BOTNATS_TEST_JETSTREAM_REPLICAS=3
 export BOTNATS_TEST_NATS_TOKEN=integration-token
 export BOTNATS_TEST_NATS_URL="nats://$nats_address"
-export BOTNATS_TEST_NATS_URLS="nats://$(compose port nats-1 4222),nats://$(compose port nats-2 4222),nats://$(compose port nats-3 4222)"
+export BOTNATS_TEST_NATS_URLS="nats://$nats_address,nats://$nats_2_address,nats://$nats_3_address"
 
-venv/bin/python -m unittest tests.test_coordinator_integration.CoordinatorIntegrationTests -v
+venv/bin/python -m unittest tests.unit.test_coordinator_integration.CoordinatorIntegrationTests -v
 
 leader=$(venv/bin/python tests/integration/test_failover.py leader)
 case "$leader" in
@@ -73,12 +78,14 @@ export BOTNATS_TEST_NATS_URL="nats://$nats_address"
 venv/bin/python tests/integration/test_restart.py mark
 compose kill nats-1 nats-2 nats-3
 compose up --detach --no-build --wait --wait-timeout 120
+nats_address=$(compose port nats-1 4222)
+export BOTNATS_TEST_NATS_URL="nats://$nats_address"
+# Check durable state before waiting on bot readiness so the TTL'd claim is
+# read well inside CLAIM_TTL; the bots' own recovery is verified afterwards.
+venv/bin/python tests/integration/test_restart.py check
 for service in alpha beta gamma; do
   wait_ready "$service"
 done
-nats_address=$(compose port nats-1 4222)
-export BOTNATS_TEST_NATS_URL="nats://$nats_address"
-venv/bin/python tests/integration/test_restart.py check
 
 BOTNATS_TEST_TOTP_SECRET=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ \
   venv/bin/python tests/integration/test_mesh.py

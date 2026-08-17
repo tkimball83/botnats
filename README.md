@@ -49,6 +49,7 @@ Example `bot.json`:
     "session_ttl_seconds": 3600
   },
   "bot": {
+    "health_port": 8080,
     "id": "mybot",
     "network": "undernet",
     "nickname": "mybot"
@@ -78,6 +79,7 @@ Example `bot.json`:
 | Setting                                     | Behavior                                                    |
 | ------------------------------------------- | ----------------------------------------------------------- |
 | `authorization.session_ttl_seconds`         | Authorized session lifetime; maximum 86,400 seconds         |
+| `bot.health_port`                           | HTTP liveness and readiness port; 8080 by default           |
 | `bot.id`                                    | Unique mesh ID; compared case-insensitively                 |
 | `bot.network`                               | One IRC network per process; namespaces shared NATS state   |
 | `bot.nickname`                              | IRC nickname and connection identity                        |
@@ -94,9 +96,22 @@ Example `bot.json`:
 Plain IRC exposes commands and responses, so use a trusted network when IRCS is
 unavailable. JetStream requires file storage; persist each peer's directory.
 
+Give the NATS token only to bot processes. Signatures on channel, session, and
+presence records mean a holder of the token but not the coordination secret
+cannot forge state a bot will accept, and the attempt and claim buckets use
+secret-derived keys such a holder cannot compute. None of that stops a writer
+from deleting or overwriting existing bucket entries, so a hostile token holder
+can still churn state (for example, repeatedly clobbering a presence key to
+stall a bot's readiness). NATS wildcards match whole subject tokens and each
+bucket name is one token, so when the token is shared more widely, restrict the
+buckets by their concrete names via server permissions — for a network named
+`efnet`, `$KV.botnats_v1_efnet_presence.>`, and ideally the other four buckets
+too (`auth_attempts`, `channels`, `sessions`, and `used_totp` under the same
+`botnats_v1_efnet_` prefix).
+
 ## Health
 
-The HTTP server listens on port 8080:
+The HTTP server listens on `bot.health_port` (8080 by default):
 
 | Path     | Success requires                                            |
 | -------- | ----------------------------------------------------------- |

@@ -16,12 +16,13 @@ from botnats import error_label
 from botnats.irc.protocol import (
     CASEMAPPINGS,
     DEFAULT_CASEMAPPING,
+    MAX_IRC_MESSAGE_BYTES,
     IRCMessage,
     casefold,
     format_message,
     parse_message,
 )
-from botnats.validators import MAX_IRC_MESSAGE_BYTES, validate_server_url
+from botnats.validators import validate_server_url
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -106,6 +107,7 @@ class IRCClient:
         """Configure the client with connection and rate-limit settings."""
         self.cap_available: set[str] = set()
         self.cap_negotiating = False
+        self.cap_ls_done = False
         self.casemapping = DEFAULT_CASEMAPPING
         self.config = config
         self.current_nick = config.nickname
@@ -147,15 +149,15 @@ class IRCClient:
     async def dispatch_line(
         self,
         message: IRCMessage,
+        raw: bytes,
         writer: asyncio.StreamWriter,
         ping_token: str | None,
     ) -> str | None:
         """Handle one parsed message and return the updated PING token."""
         if message.command == "PING" and message.params:
-            await self.send_immediate(
-                format_message("PONG", (), message.params[-1]),
-                writer,
-            )
+            # Echo the server's raw token bytes: lossy decoding can inflate
+            # them past 512, and a re-encoded token would not byte-match.
+            await self.send_immediate(pong_reply(raw), writer)
             return ping_token
         if (
             message.command == "PONG"
@@ -204,6 +206,7 @@ class IRCClient:
         self.sender_task.add_done_callback(self.sender_done)
         self.cap_available = set()
         self.cap_negotiating = True
+        self.cap_ls_done = False
         self.current_nick = self.desired_nick
         self.nickname_attempts = 0
         self.registered_with_server = False
@@ -234,6 +237,7 @@ class IRCClient:
                 and message.params[2] == "*"
             ):
                 return
+            self.cap_ls_done = True
             wanted = DESIRED_CAPS & self.cap_available
             if wanted:
                 await self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
@@ -247,7 +251,9 @@ class IRCClient:
                 await self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
         elif subcommand == "DEL":
             self.cap_available.difference_update(caps)
-        elif subcommand in {"ACK", "NAK"} and self.cap_negotiating:
+        elif subcommand in {"ACK", "NAK"} and self.cap_negotiating and self.cap_ls_done:
+            # End only once the LS phase has issued its REQ; a NEW-triggered
+            # ACK arriving mid-LS must not cut the initial exchange short.
             await self.send("CAP", "END")
             self.cap_negotiating = False
 
@@ -323,7 +329,7 @@ class IRCClient:
                 message = parse_message(raw.decode(errors="replace"))
             except ValueError:
                 continue
-            ping_token = await self.dispatch_line(message, writer, ping_token)
+            ping_token = await self.dispatch_line(message, raw, writer, ping_token)
 
     async def run_forever(self) -> None:
         """Maintain a persistent connection with automatic reconnection."""
@@ -484,6 +490,25 @@ class IRCClient:
             == casefold(self.current_nick, self.casemapping)
         ):
             self.current_nick = message.params[-1]
+
+
+def pong_reply(line: bytes) -> bytes:
+    """Build a PONG that echoes a PING's raw token bytes.
+
+    Tags and prefix are dropped first, mirroring parse_message, so a leading
+    prefix's space-colon is not mistaken for the trailing-parameter marker.
+    The token is kept verbatim, so the reply never exceeds the wire length of
+    the PING that parse_message already accepted.
+    """
+    rest = line.rstrip(b"\r\n")
+    if rest.startswith(b"@"):
+        _, _, rest = rest.partition(b" ")
+    if rest.startswith(b":"):
+        _, _, rest = rest.partition(b" ")
+    _, trailing_sep, trailing = rest.partition(b" :")
+    if trailing_sep:
+        return b"PONG :" + trailing + b"\r\n"
+    return b"PONG " + rest.rsplit(b" ", 1)[-1] + b"\r\n"
 
 
 def next_nickname(length: int) -> str:

@@ -92,10 +92,31 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_route_count(self) -> None:
-        """Parse the route count from a successful monitoring response."""
+        """Parse the route count and connect to the given host and port."""
+        for host in ("nats-1", "::1"):
+            with self.subTest(host=host):
+                reader = AsyncMock()
+                reader.read.side_effect = [
+                    b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n",
+                    b'{"num_routes":2}',
+                    b"",
+                ]
+                writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+                connect = AsyncMock(return_value=(reader, writer))
+
+                with patch("botnats.nats.status.asyncio.open_connection", connect):
+                    routes = await route_count(host, 8222)
+
+                assert routes == EXPECTED_ROUTES
+                assert connect.await_args is not None
+                assert connect.await_args.args == (host, 8222)
+                writer.close.assert_called_once_with()
+
+    async def test_route_count_refuses_redirects(self) -> None:
+        """Reject a redirect response instead of following it."""
         reader = AsyncMock()
         reader.read.side_effect = [
-            b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n",
+            b"HTTP/1.0 302 Found\r\nLocation: http://evil.example/\r\n\r\n",
             b'{"num_routes":2}',
             b"",
         ]
@@ -107,8 +128,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         ):
             routes = await route_count("nats-1", 8222)
 
-        assert routes == EXPECTED_ROUTES
-        writer.close.assert_called_once_with()
+        assert routes is None
 
     async def test_route_count_rejects_invalid_payloads(self) -> None:
         """Reject malformed monitoring payloads and impossible route counts."""
@@ -121,11 +141,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(body=body):
                 reader = AsyncMock()
-                reader.read.side_effect = [
-                    b"HTTP/1.0 200 OK\r\n\r\n",
-                    body,
-                    b"",
-                ]
+                reader.read.side_effect = [b"HTTP/1.0 200 OK\r\n\r\n", body, b""]
                 writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
 
                 with patch(

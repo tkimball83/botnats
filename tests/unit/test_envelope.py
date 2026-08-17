@@ -7,8 +7,8 @@ import json
 import time
 import unittest
 
-from botnats.nats import Envelope
-from tests.helpers import COORDINATION_KEY
+from botnats.nats.envelope import Envelope
+from tests.unit.helpers import COORDINATION_KEY
 
 JSON_NESTING_DEPTH = 100_000
 OVERSIZED_TIMESTAMP = 10**400

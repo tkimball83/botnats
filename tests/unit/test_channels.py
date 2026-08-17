@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, patch
 
 from botnats.bot import Bot
 from botnats.channel import ChannelRecord, ChannelRuntime
-from botnats.irc import IRCMessage, Prefix, casefold
+from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
-from tests.helpers import (
+from tests.unit.helpers import (
     FailingPartIRC,
     FailingPublishCoordinator,
     FakeCoordinator,
@@ -130,6 +130,28 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.set_casemapping("rfc1459")
         bot.channel_mgr.set_casemapping("ascii")
         assert len(bot.channel_mgr.channel_records) == EXPECTED_SPLIT_RECORDS
+
+    async def test_casemapping_change_parts_tombstoned_channel(self) -> None:
+        """Queue a PART when a rekeyed joined channel folds onto a tombstone."""
+        bot = Bot(config())
+        fake_irc = FakeIRC()
+        bot.irc = fake_irc
+        bot.channel_mgr.set_casemapping("ascii")
+        joined = ChannelRecord.new("#room[", None, present=True)
+        await bot.channel_mgr.apply_record(joined)
+        bot.channel_mgr.channels[casefold("#room[", "ascii")].joined = True
+        tombstone = ChannelRecord.new("#room{", None, present=False)
+        await bot.channel_mgr.apply_record(tombstone)
+
+        bot.channel_mgr.set_casemapping("rfc1459")
+
+        folded = casefold("#room{")
+        assert folded not in bot.channel_mgr.channels
+        assert bot.channel_mgr.pending_parts == {folded: "#room{"}
+
+        await bot.channel_mgr.retry_pending_parts()
+        assert ("PART", ("#room{",)) in fake_irc.sent
+        assert bot.channel_mgr.pending_parts == {}
 
     async def test_flush_cancellation_does_not_respawn(self) -> None:
         """Verify a cancelled op-flush does not resurrect a background task."""

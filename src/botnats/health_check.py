@@ -44,7 +44,7 @@ class HealthCheck:
     def __init__(
         self,
         ready: Callable[[], bool],
-        port: int = 8080,
+        port: int,
     ) -> None:
         """Initialize the server with a readiness callback."""
         self.port = port

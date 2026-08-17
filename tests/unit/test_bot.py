@@ -11,9 +11,10 @@ from unittest.mock import patch
 from botnats import error_label
 from botnats.bot import Bot
 from botnats.channel import ChannelRecord
-from botnats.irc import IRCClient, IRCMessage, Prefix, casefold
+from botnats.irc.client import IRCClient
+from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
-from tests.helpers import (
+from tests.unit.helpers import (
     FakeCoordinator,
     FakeIRC,
     bot_with_channel,

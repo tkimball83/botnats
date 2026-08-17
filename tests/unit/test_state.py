@@ -6,7 +6,7 @@
 import unittest
 
 from botnats.channel import ChannelRecord, ChannelRuntime
-from botnats.irc import Prefix
+from botnats.irc.protocol import Prefix
 
 PRE_MERGE_MEMBER_COUNT = 2
 

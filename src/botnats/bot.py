@@ -12,25 +12,24 @@ from typing import TYPE_CHECKING, Any
 from botnats.admin import AuthFlow, CommandHandler, TotpAuthorizer
 from botnats.channel import ChannelManager, ChannelRecord, ChannelRuntime
 from botnats.health_check import HealthCheck
-from botnats.irc import (
+from botnats.irc.client import IRCClient, IRCClientConfig
+from botnats.irc.events import IRCEventHandler
+from botnats.irc.protocol import (
     DEFAULT_CASEMAPPING,
-    IRCClient,
-    IRCClientConfig,
     IRCProtocol,
+    ISupportState,
     Prefix,
     casefold,
     format_message,
     mask_matches,
 )
-from botnats.irc.events import IRCEventHandler
-from botnats.irc.protocol import ISupportState
-from botnats.nats import (
+from botnats.nats.coordinator import (
     PUBLISH_ERRORS,
     Coordinator,
     CoordinatorProtocol,
-    Envelope,
     NATSConfig,
 )
+from botnats.nats.envelope import Envelope
 from botnats.presence import BotPresence, PresenceRegistry
 
 if TYPE_CHECKING:
@@ -64,7 +63,7 @@ class Bot:
         self.identity_retry_attempts = 5
         self.identity_retry_delay = 5.0
         self.instance_id = uuid.uuid4().hex
-        self.health_check = HealthCheck(ready=self.ready)
+        self.health_check = HealthCheck(ready=self.ready, port=config.health_port)
         self.events = IRCEventHandler(self)
         self.irc: IRCProtocol = IRCClient(
             config=IRCClientConfig(

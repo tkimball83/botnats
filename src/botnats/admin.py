@@ -7,7 +7,6 @@ import asyncio
 import base64
 import binascii
 import hmac
-import struct
 import time
 from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass
@@ -16,7 +15,7 @@ from typing import TYPE_CHECKING
 from botnats.channel import ChannelRecord
 from botnats.config import MIN_COORDINATION_KEY_BYTES
 from botnats.irc.protocol import casefold, format_message
-from botnats.nats import PUBLISH_ERRORS
+from botnats.nats.coordinator import PUBLISH_ERRORS
 from botnats.nats.store import (
     SESSION_EXPIRY_GRACE,
     parse_session_record,
@@ -29,7 +28,7 @@ if TYPE_CHECKING:
 
     from botnats.bot import Bot
     from botnats.channel import ChannelRuntime
-    from botnats.irc import Prefix
+    from botnats.irc.protocol import Prefix
 
 ADMIN_COMMAND_ARGS = 2
 MAX_JOIN_ARGS = 2
@@ -130,6 +129,8 @@ class CommandHandler:
     ) -> None:
         """Publish a channel record update and apply it locally."""
         if present and self.bot.config.channel_modes:
+            # Validation only: reject the join before the durable write when
+            # the enforced MODE line cannot fit this channel name in 512 bytes.
             format_message(
                 "MODE",
                 (channel, self.bot.config.channel_modes),
@@ -295,10 +296,14 @@ class CommandHandler:
         joined = sum(
             runtime.joined for runtime in self.bot.channel_mgr.channels.values()
         )
+        own_id = self.bot.config.bot_id.casefold()
+        peers = sum(
+            peer.bot_id.casefold() != own_id for peer in self.bot.presence.active()
+        )
         await self.bot.safe_privmsg(
             prefix.nick,
             f"bot id={self.bot.config.bot_id} nick={self.bot.irc.current_nick} "
-            f"peers={len(self.bot.presence.active())} channels={joined}",
+            f"peers={peers} channels={joined}",
         )
         status = await self.bot.coordinator.status()
         await self.bot.safe_privmsg(prefix.nick, status.render())
@@ -659,7 +664,7 @@ def parse_command(value: str) -> tuple[str, tuple[str, ...]]:
 
 def totp(secret: bytes, counter: int) -> str:
     """Generate a six-digit TOTP code for the given counter value."""
-    digest = hmac.digest(secret, struct.pack(">Q", counter), "sha1")
+    digest = hmac.digest(secret, counter.to_bytes(8), "sha1")
     offset = digest[-1] & 0x0F
-    value = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    value = int.from_bytes(digest[offset : offset + 4]) & 0x7FFFFFFF
     return f"{value % 1_000_000:06d}"

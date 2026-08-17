@@ -10,10 +10,16 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from botnats.config import mode_intent
-from botnats.irc import IRCMessage, Prefix, casefold, iter_mode_changes, mask_matches
 from botnats.irc.client import DEFAULT_NICK_LENGTH
-from botnats.irc.protocol import ISupportState
-from botnats.nats import PUBLISH_ERRORS
+from botnats.irc.protocol import (
+    IRCMessage,
+    ISupportState,
+    Prefix,
+    casefold,
+    iter_mode_changes,
+    mask_matches,
+)
+from botnats.nats.coordinator import PUBLISH_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -96,7 +102,7 @@ class IRCEventHandler:
             elif mode == "k":
                 self.process_key(runtime, channel, argument, adding=adding)
             elif mode in self.caps.operator_modes:
-                self.process_op(runtime, channel, mode, argument, adding=adding)
+                self.process_op(runtime, mode, argument, adding=adding)
                 if adding:
                     saw_new_op = True
         return lost_enforced, saw_new_op
@@ -287,21 +293,23 @@ class IRCEventHandler:
         runtime = self.bot.runtime(channel)
         if runtime is None:
             return
+        was_opped = self.bot.is_self_opped(runtime)
         lost_enforced, saw_new_op = self.apply_mode_changes(
             runtime,
             channel,
             modes,
             arguments,
         )
-        if lost_enforced and self.bot.is_self_opped(runtime):
+        opped = self.bot.is_self_opped(runtime)
+        if opped and (lost_enforced or not was_opped):
             self.bot.spawn(
                 self.bot.channel_mgr.enforce_modes(channel),
                 "enforce-modes",
             )
-        if saw_new_op and not self.bot.is_self_opped(runtime):
+        elif not opped and (saw_new_op or was_opped):
             self.bot.spawn(
                 self.bot.channel_mgr.request_peer("op", channel),
-                "new-op-request",
+                "op-request",
             )
 
     async def handle_names(self, message: IRCMessage) -> None:
@@ -483,29 +491,17 @@ class IRCEventHandler:
     def process_op(
         self,
         runtime: ChannelRuntime,
-        channel: str,
         mode: str,
         nick: str,
         *,
         adding: bool,
     ) -> None:
-        """Grant or revoke operator status and trigger mode enforcement."""
+        """Grant or revoke a member's operator status."""
         member = runtime.member(nick)
         if adding:
             member.modes.add(mode)
         else:
             member.modes.discard(mode)
-        if self.bot.is_self(nick):
-            if adding:
-                self.bot.spawn(
-                    self.bot.channel_mgr.enforce_modes(channel),
-                    "enforce-modes",
-                )
-            elif not self.bot.is_self_opped(runtime):
-                self.bot.spawn(
-                    self.bot.channel_mgr.request_peer("op", channel),
-                    "deop-request",
-                )
 
     async def revoke_session(self, prefix: Prefix) -> None:
         """Revoke authorization and propagate the deletion to peers."""

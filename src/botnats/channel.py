@@ -11,9 +11,14 @@ from typing import TYPE_CHECKING, ClassVar
 
 from botnats import error_label
 from botnats.config import mode_intent
-from botnats.irc import CASEMAPPINGS, DEFAULT_CASEMAPPING, Prefix, casefold
-from botnats.irc.protocol import mode_requires_argument
-from botnats.nats import PUBLISH_ERRORS
+from botnats.irc.protocol import (
+    CASEMAPPINGS,
+    DEFAULT_CASEMAPPING,
+    Prefix,
+    casefold,
+    mode_requires_argument,
+)
+from botnats.nats.coordinator import PUBLISH_ERRORS
 from botnats.validators import (
     MAX_CHANNEL_REVISION,
     parse_channel_record,
@@ -327,6 +332,13 @@ class ChannelManager:
                 continue
             runtime.set_casemapping(casemapping)
             channels[folded] = runtime
+        parted = {
+            folded: records[folded].channel
+            for folded, runtime in channels.items()
+            if folded not in self.desired_channels
+            and runtime.joined
+            and folded in records
+        }
         channels = {
             folded: runtime
             for folded, runtime in channels.items()
@@ -343,6 +355,7 @@ class ChannelManager:
         self.pending_parts = {
             self.bot.fold(channel): channel for channel in self.pending_parts.values()
         }
+        self.pending_parts.update(parted)
         self.cooldowns.clear()
         self.pending_op_flushes.clear()
         self.pending_ops.clear()

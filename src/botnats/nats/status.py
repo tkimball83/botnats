@@ -106,11 +106,10 @@ async def collect(
 
 
 async def read_response(reader: asyncio.StreamReader) -> bytes:
-    """Read a complete monitoring response without exceeding its size limit."""
+    """Read a monitoring response without exceeding its size limit."""
     response = bytearray()
     while len(response) <= MAX_RESPONSE_BYTES:
-        remaining = MAX_RESPONSE_BYTES + 1 - len(response)
-        chunk = await reader.read(min(65_536, remaining))
+        chunk = await reader.read(min(65_536, MAX_RESPONSE_BYTES + 1 - len(response)))
         if not chunk:
             break
         response.extend(chunk)
@@ -118,9 +117,15 @@ async def read_response(reader: asyncio.StreamReader) -> bytes:
 
 
 async def route_count(host: str | None, port: int) -> int | None:
-    """Return the connected server's route count from its monitoring endpoint."""
+    """Return the connected server's route count from its monitoring endpoint.
+
+    Uses non-blocking socket I/O so the timeout genuinely cancels a slow read
+    and the connection is closed; a bare HTTP/1.0 request with an explicit 200
+    status check refuses redirects without following them.
+    """
     if host is None:
         return None
+    location = f"[{host}]" if ":" in host else host
     writer: asyncio.StreamWriter | None = None
     try:
         async with asyncio.timeout(STATUS_TIMEOUT):
@@ -128,7 +133,7 @@ async def route_count(host: str | None, port: int) -> int | None:
             writer.write(
                 (
                     f"GET /routez?subs=0 HTTP/1.0\r\n"
-                    f"Host: {host}\r\n"
+                    f"Host: {location}\r\n"
                     f"Connection: close\r\n\r\n"
                 ).encode(),
             )

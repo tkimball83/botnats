@@ -40,6 +40,6 @@ select = ["ALL"]
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = [
+"tests/**" = [
   "S101",
 ]

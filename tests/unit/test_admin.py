@@ -8,9 +8,9 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from botnats.admin import totp
-from botnats.irc import IRCMessage, Prefix, casefold
+from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
-from tests.helpers import (
+from tests.unit.helpers import (
     FailingIRC,
     FailingPublishCoordinator,
     bot_with_coordinator,
@@ -339,6 +339,21 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "Authorized")]
         assert len(coordinator.session_puts) == 1
 
+    async def test_auth_fails_closed_when_coordinator_unready(self) -> None:
+        """Deny authentication when the coordinator cannot enforce mesh limits."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        coordinator.claim_result = True
+        coordinator.connected = False
+        prefix = Prefix("owner", "user", "host.example")
+        counter = int(time.time() // 30)
+        valid_code = totp(bot.authorizer.secret, counter)
+
+        await bot.auth_flow.authenticate(prefix, (valid_code,))
+
+        assert not bot.authorizer.authorized(prefix.render())
+        assert fake_irc.privmsgs == []
+        assert coordinator.session_puts == []
+
     async def test_auth_denies_when_durable_revocation_wins(self) -> None:
         """Do not report success when newer durable state revokes the session."""
         bot, fake_irc, coordinator = bot_with_coordinator()
@@ -405,12 +420,18 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
         bot.channel_mgr.channels[casefold("#test")].joined = True
+        bot.presence.update(
+            BotPresence("Alpha", "host.example", "inst", "alpha", "~alpha"),
+        )
+        bot.presence.update(
+            BotPresence("beta", "peer.example", "inst2", "beta", "~beta"),
+        )
 
         await bot.events.handle_command(
             IRCMessage("PRIVMSG", ("alpha", "STATUS"), OWNER),
         )
         assert fake_irc.privmsgs == [
-            ("owner", "bot id=alpha nick=alpha peers=0 channels=1"),
+            ("owner", "bot id=alpha nick=alpha peers=1 channels=1"),
             (
                 "owner",
                 (
