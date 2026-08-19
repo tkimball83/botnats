@@ -7,18 +7,34 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 import nats
 from nats.errors import Error as NatsError
 
 from botnats.channel import ChannelRecord
-from botnats.nats.store import ChannelStore, ClaimStore
+from botnats.nats.store import ChannelStore, ClaimStore, SessionStore, session_signature
+from tests.unit.helpers import COORDINATION_KEY as SECRET
 
 CHANNEL = "#botnats-restart"
 CHANNEL_KEY = "restart-key"
 CONNECT_TIMEOUT = 30.0
 COUNTER = 987_654_321
-SECRET = b"coordination-secret-used-only-for-tests"
+SESSION_IDENTITY = "restart!user@host.example"
+SESSION_TTL = 3600.0
+
+
+def session_record() -> dict[str, object]:
+    """Build a signed session record that outlives the cluster restart."""
+    record: dict[str, object] = {
+        "expires_at": time.time() + SESSION_TTL / 2,
+        "issuer": "restart-test",
+        "prefix": SESSION_IDENTITY,
+        "revoked": False,
+        "version": 1,
+    }
+    record["signature"] = session_signature(SECRET, "efnet", record)
+    return record
 
 
 async def connect() -> nats.NATS:
@@ -48,6 +64,7 @@ async def run(phase: str) -> None:
     try:
         claims = ClaimStore("efnet", 3, SECRET)
         channels = ChannelStore("efnet", 3, SECRET)
+        sessions = SessionStore("efnet", 3, SECRET, SESSION_TTL)
         if phase == "mark":
             await claims.open(nc.jetstream())
             assert await claims.claim(COUNTER)
@@ -55,6 +72,9 @@ async def run(phase: str) -> None:
             record = ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True).to_dict()
             stored = await channels.put(CHANNEL, record)
             assert stored["key"] == CHANNEL_KEY
+            await sessions.open(nc.jetstream())
+            session = await sessions.put(SESSION_IDENTITY, session_record())
+            assert session["prefix"] == SESSION_IDENTITY
         elif phase == "check":
             # A missing key here can be transient while JetStream replays after
             # the restart, so keep retrying; only a genuine loss (or an elapsed
@@ -68,6 +88,10 @@ async def run(phase: str) -> None:
                             entry = await kv.get(claims.key(COUNTER))
                             channel_kv = await channels.open(nc.jetstream())
                             channel_entry = await channel_kv.get(channels.key(CHANNEL))
+                            session_kv = await sessions.open(nc.jetstream())
+                            session_entry = await session_kv.get(
+                                sessions.key(SESSION_IDENTITY),
+                            )
                         except NatsError:
                             await asyncio.sleep(0.5)
                             continue
@@ -76,6 +100,10 @@ async def run(phase: str) -> None:
                         channel_record = json.loads(channel_entry.value)
                         assert channel_record["key"] == CHANNEL_KEY
                         assert channel_record["present"] is True
+                        assert session_entry.value is not None
+                        stored_session = json.loads(session_entry.value)
+                        assert stored_session["prefix"] == SESSION_IDENTITY
+                        assert stored_session["issuer"] == "restart-test"
                         break
             except TimeoutError:
                 msg = "durable state missing after NATS restart"

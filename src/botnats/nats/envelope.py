@@ -104,10 +104,7 @@ class Envelope:
         if bound_subject is None:
             msg = "NATS envelope is not bound to a subject"
             raise ValueError(msg)
-        if not isinstance(bound_subject, str) or not hmac.compare_digest(
-            bound_subject,
-            subject,
-        ):
+        if bound_subject != subject:
             msg = "NATS envelope subject is invalid"
             raise ValueError(msg)
         payload.pop(SUBJECT_FIELD, None)

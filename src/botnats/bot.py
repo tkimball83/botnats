@@ -9,6 +9,7 @@ import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from botnats import error_label
 from botnats.admin import AuthFlow, CommandHandler, TotpAuthorizer
 from botnats.channel import ChannelManager, ChannelRecord, ChannelRuntime
 from botnats.health_check import HealthCheck
@@ -136,9 +137,13 @@ class Bot:
                     break
             if end == index:
                 LOGGER.warning(
-                    "cannot apply %s on %s: IRC MODE exceeds 512 bytes", label, channel
+                    "cannot apply %s to %s on %s: IRC MODE exceeds 512 bytes",
+                    label,
+                    targets[index],
+                    channel,
                 )
-                return
+                index += 1
+                continue
             try:
                 await self.irc.send(
                     "MODE",
@@ -153,14 +158,27 @@ class Bot:
 
     async def close(self) -> None:
         """Cancel background tasks and shut down all connections."""
-        tasks = tuple(self.tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
+        # Cancel tracked tasks first: a task holding presence_lock would
+        # otherwise stall coordinator.close(), which also takes that lock.
+        # Then stop the coordinator's callbacks and drain once more to reap any
+        # task a subscription spawned before delivery stopped. The finally keeps
+        # teardown atomic so a coordinator.close() error cannot leak the IRC
+        # socket or the health port.
+        await self.drain_tasks()
+        try:
+            await self.coordinator.close()
+        finally:
+            await self.drain_tasks()
+            await self.health_check.close()
+            await self.irc.close()
+
+    async def drain_tasks(self) -> None:
+        """Cancel and await every tracked background task."""
+        while self.tasks:
+            tasks = tuple(self.tasks)
+            for task in tasks:
+                task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        await self.health_check.close()
-        await self.irc.close()
-        await self.coordinator.close()
 
     async def discover_identity(self, generation: int) -> None:
         """Query the IRC server to resolve the bot's host and user prefix."""
@@ -275,9 +293,13 @@ class Bot:
         return self.channel_mgr.channels.get(self.fold(channel))
 
     async def safe_privmsg(self, nickname: str, message: str) -> None:
-        """Send a private message, silently ignoring connection failures."""
-        with suppress(ConnectionError):
+        """Send a private message, dropping unsendable or undeliverable lines."""
+        try:
             await self.irc.send("PRIVMSG", nickname, trailing=message)
+        except ConnectionError:
+            pass
+        except ValueError as error:
+            LOGGER.warning("dropped PRIVMSG to %s: %s", nickname, error_label(error))
 
     async def set_identity(self, prefix: Prefix) -> None:
         """Store the bot's resolved identity and announce presence to peers."""
@@ -405,13 +427,7 @@ class NATSCallbackHandler:
 
     def on_session_delete(self, prefix: str) -> None:
         """Remove a revoked session from local cache via KV watch."""
-        key = self.bot.authorizer.identity_fold(prefix)
-        session = self.bot.authorizer.sessions.get(key)
-        if session is not None and casefold(session.prefix, "ascii") == casefold(
-            prefix,
-            "ascii",
-        ):
-            self.bot.authorizer.sessions.pop(key, None)
+        self.bot.authorizer.drop_session(prefix)
 
     def on_session_update(self, payload: dict[str, Any]) -> None:
         """Import a session from a KV watch update into local cache."""
@@ -426,7 +442,7 @@ class NATSCallbackHandler:
         prefix = presence.to_prefix()
         masks = sorted(
             mask
-            for mask in runtime.bans
+            for mask in runtime.bans.values()
             if mask_matches(mask, prefix, self.bot.caps.casemapping)
         )
         await self.bot.batch_mode(channel, "-", "b", masks, "removed bot ban(s)")
@@ -440,5 +456,5 @@ class NATSCallbackHandler:
         prefix = presence.to_prefix()
         return any(
             mask_matches(mask, prefix, self.bot.caps.casemapping)
-            for mask in runtime.bans
+            for mask in runtime.bans.values()
         )

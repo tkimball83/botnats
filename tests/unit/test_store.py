@@ -21,6 +21,7 @@ from botnats.nats.store import (
     KVStore,
     PresenceStore,
     SessionStore,
+    channel_signature,
     presence_signature,
     session_signature,
 )
@@ -81,7 +82,7 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         kv.update.assert_not_awaited()
 
     async def test_reclaim_overwrites_forged_or_absent(self) -> None:
-        """Overwrite an unsigned clobber; yield when the key is already gone."""
+        """Overwrite an unsigned clobber; claim when the key is already gone."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
         data = signed_presence("inst")
         reclaimed_revision = 6
@@ -103,7 +104,38 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
 
         kv.get = AsyncMock(side_effect=KeyNotFoundError())
-        assert await store.reclaim("Alpha", data, "inst") is None
+        kv.create = AsyncMock(return_value=reclaimed_revision)
+        assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
+        kv.create.assert_awaited_once()
+
+        # A lost create race against a forged occupant re-reads and overwrites
+        # instead of misreporting a duplicate.
+        kv.get = AsyncMock(
+            side_effect=[
+                KeyNotFoundError(),
+                SimpleNamespace(revision=9, value=b'{"garbage": true}'),
+            ],
+        )
+        kv.create = AsyncMock(side_effect=KeyWrongLastSequenceError())
+        kv.update = AsyncMock(return_value=reclaimed_revision)
+        assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
+        kv.update.assert_awaited_once()
+
+        # A lost overwrite race against a forged occupant re-reads and retries
+        # instead of misreporting a duplicate.
+        forged_entry = SimpleNamespace(revision=5, value=b'{"garbage": true}')
+        kv.get = AsyncMock(side_effect=[forged_entry, forged_entry])
+        kv.update = AsyncMock(
+            side_effect=[KeyWrongLastSequenceError(), reclaimed_revision],
+        )
+        assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
+
+        # Exhausting the retries proves contention, not a duplicate: raise
+        # into the caller's transient retry path instead of yielding None.
+        kv.get = AsyncMock(side_effect=[forged_entry, forged_entry])
+        kv.update = AsyncMock(side_effect=KeyWrongLastSequenceError())
+        with self.assertRaisesRegex(NatsError, "repeated update races"):
+            await store.reclaim("Alpha", data, "inst")
 
     def test_valid_rejects_stale_and_uncrashable(self) -> None:
         """Reject stale replays and surrogate injection without raising."""
@@ -147,13 +179,15 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
 
 
 def channel_record(revision: int) -> dict[str, object]:
-    """Build a valid durable channel record with a sortable revision."""
-    return {
+    """Build a valid, signed durable channel record with a sortable revision."""
+    record: dict[str, object] = {
         "channel": "#test",
         "key": None,
         "present": True,
         "revision": f"{revision:020d}-{'0' * 32}",
     }
+    record["signature"] = channel_signature(SECRET, "efnet", record)
+    return record
 
 
 def session_record(
@@ -407,6 +441,48 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert channels.order(channels.key("#test"), record) is not None
         assert channels.order(channels.key("#other"), record) is None
+
+    async def test_channel_order_rejects_forged_and_unsigned(self) -> None:
+        """Reject channel records lacking a valid coordination-secret signature."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        key = channels.key("#test")
+        record = channel_record(1)
+
+        unsigned = {k: v for k, v in record.items() if k != "signature"}
+        assert channels.order(key, unsigned) is None
+
+        forged = {**record, "signature": "0" * SHA256_HEX_LENGTH}
+        assert channels.order(key, forged) is None
+
+        # A record signed with a different coordination secret is rejected.
+        attacker_record: dict[str, object] = {
+            "channel": "#test",
+            "key": "hijacked",
+            "present": True,
+            "revision": f"{9:020d}-{'0' * 32}",
+        }
+        attacker_record["signature"] = channel_signature(
+            b"a-different-coordination-secret!",
+            "efnet",
+            attacker_record,
+        )
+        assert channels.order(key, attacker_record) is None
+
+    async def test_channel_signature_covers_key_and_present(self) -> None:
+        """Detect tampering with the key or presence flag after signing."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        key = channels.key("#test")
+        signed = channels.sign(
+            {
+                "channel": "#test",
+                "key": "secret",
+                "present": True,
+                "revision": f"{1:020d}-{'0' * 32}",
+            },
+        )
+        assert channels.order(key, signed) is not None
+        assert channels.order(key, {**signed, "key": "swapped"}) is None
+        assert channels.order(key, {**signed, "present": False}) is None
 
     async def test_channel_put_retries_cas_conflict(self) -> None:
         """Retry a newer channel write after another writer wins the CAS."""

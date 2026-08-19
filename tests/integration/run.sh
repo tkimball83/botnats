@@ -58,7 +58,7 @@ export BOTNATS_TEST_NATS_URLS="nats://$nats_address,nats://$nats_2_address,nats:
 
 venv/bin/python -m unittest tests.unit.test_coordinator_integration.CoordinatorIntegrationTests -v
 
-leader=$(venv/bin/python tests/integration/test_failover.py leader)
+leader=$(venv/bin/python -m tests.integration.test_failover leader)
 case "$leader" in
   nats-1|nats-2|nats-3) ;;
   *)
@@ -70,19 +70,19 @@ compose kill "$leader"
 for service in alpha beta gamma; do
   wait_ready "$service"
 done
-venv/bin/python tests/integration/test_failover.py claim "$leader"
+venv/bin/python -m tests.integration.test_failover claim "$leader"
 compose up --detach --no-build --wait --wait-timeout 120 "$leader"
 nats_address=$(compose port nats-1 4222)
 export BOTNATS_TEST_NATS_URL="nats://$nats_address"
 
-venv/bin/python tests/integration/test_restart.py mark
+venv/bin/python -m tests.integration.test_restart mark
 compose kill nats-1 nats-2 nats-3
 compose up --detach --no-build --wait --wait-timeout 120
 nats_address=$(compose port nats-1 4222)
 export BOTNATS_TEST_NATS_URL="nats://$nats_address"
 # Check durable state before waiting on bot readiness so the TTL'd claim is
 # read well inside CLAIM_TTL; the bots' own recovery is verified afterwards.
-venv/bin/python tests/integration/test_restart.py check
+venv/bin/python -m tests.integration.test_restart check
 for service in alpha beta gamma; do
   wait_ready "$service"
 done

@@ -12,13 +12,13 @@ import nats
 from nats.errors import Error as NatsError
 
 from botnats.nats.store import ClaimStore
+from tests.unit.helpers import COORDINATION_KEY as SECRET
 
 if TYPE_CHECKING:
     from nats.js.kv import KeyValue
 
 COUNTER = 987_654_320
 LEADER_TIMEOUT = 30.0
-SECRET = b"coordination-secret-used-only-for-tests"
 
 
 async def ignore_error(error: Exception) -> None:

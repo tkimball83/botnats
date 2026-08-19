@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 ADMIN_COMMAND_ARGS = 2
 MAX_JOIN_ARGS = 2
+MAX_RATE_BUCKETS = 8192
 MIN_TOTP_SECRET_BYTES = 20
 TOTP_CODE_LENGTH = 6
 
@@ -53,7 +54,7 @@ class AuthFlow:
             await bot.safe_privmsg(prefix.nick, "AUTH <totp-code>")
             return
         rendered = prefix.render()
-        identity = casefold(prefix.host or rendered, "ascii")
+        identity = limit_identity(prefix)
         if not await coordinator.request_auth(identity):
             return
         counter = bot.authorizer.match(arguments[0])
@@ -180,7 +181,7 @@ class CommandHandler:
         if runtime is None:
             await self.bot.safe_privmsg(prefix.nick, f"No record for {channel}")
         elif runtime.bans:
-            for mask in sorted(runtime.bans):
+            for mask in sorted(runtime.bans.values()):
                 await self.bot.safe_privmsg(prefix.nick, f"{channel} +b {mask}")
         else:
             await self.bot.safe_privmsg(prefix.nick, f"No bans tracked for {channel}")
@@ -316,11 +317,7 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         mask = validate_target(arguments[1])
         runtime = self.opped_channel(channel)
-        folded = self.bot.fold(mask)
-        stored = next(
-            (ban for ban in runtime.bans if self.bot.fold(ban) == folded),
-            None,
-        )
+        stored = runtime.bans.get(self.bot.fold(mask))
         if stored is None:
             await self.bot.safe_privmsg(
                 prefix.nick,
@@ -332,7 +329,7 @@ class CommandHandler:
 
     async def dispatch(self, prefix: Prefix, text: str) -> None:
         """Route an incoming private message to the appropriate command handler."""
-        identity = casefold(prefix.host or prefix.render(), "ascii")
+        identity = limit_identity(prefix)
         if not self.command_limiter.check(identity, limit=8, window=10.0):
             return
         try:
@@ -368,10 +365,9 @@ class CommandHandler:
 class RateLimiter:
     """Sliding-window rate limiter keyed by identity string."""
 
-    def __init__(self, *, max_buckets: int = 8192) -> None:
-        """Initialize with an upper bound on tracked bucket count."""
+    def __init__(self) -> None:
+        """Initialize empty rate-limit buckets."""
         self.buckets: OrderedDict[str, deque[float]] = OrderedDict()
-        self.max_buckets = max(1, max_buckets)
 
     def check(self, key: str, *, limit: int, window: float) -> bool:
         """Record an event and return whether the key is within its rate limit."""
@@ -379,7 +375,7 @@ class RateLimiter:
         cutoff = now - window
         bucket = self.buckets.get(key)
         if bucket is None:
-            if len(self.buckets) >= self.max_buckets:
+            if len(self.buckets) >= MAX_RATE_BUCKETS:
                 self.buckets.popitem(last=False)
             bucket = deque()
             self.buckets[key] = bucket
@@ -425,7 +421,7 @@ class TotpAuthorizer:
         secret: str,
         *,
         coordination_secret: bytes,
-        identity_fold: Callable[[str], str] | None = None,
+        identity_fold: Callable[[str], str],
         scope: tuple[str, str],
         session_ttl: float,
     ) -> None:
@@ -451,7 +447,7 @@ class TotpAuthorizer:
             msg = "authorization network must not be empty"
             raise ValueError(msg)
         self.coordination_key = coordination_secret
-        self.identity_fold = identity_fold or (lambda value: casefold(value, "ascii"))
+        self.identity_fold = identity_fold
         self.issuer = issuer
         self.network = network
         self.secret = decoded
@@ -488,6 +484,16 @@ class TotpAuthorizer:
             version=version,
             signature=session_signature(self.coordination_key, self.network, record),
         )
+
+    def drop_session(self, prefix: str) -> None:
+        """Remove a cached session whose durable record was deleted."""
+        key = self.identity_fold(prefix)
+        session = self.sessions.get(key)
+        if session is not None and casefold(session.prefix, "ascii") == casefold(
+            prefix,
+            "ascii",
+        ):
+            self.sessions.pop(key, None)
 
     def get(self, prefix: str, now: float | None = None) -> Session | None:
         """Return an active session, pruning it when expired."""
@@ -614,24 +620,21 @@ class TotpAuthorizer:
             k: s for k, s in self.revocations.items() if s.expires_at > cutoff
         }
 
+    def _refold(self, records: dict[str, Session]) -> dict[str, Session]:
+        """Collapse records onto the current identity fold, keeping the newest."""
+        folded: dict[str, Session] = {}
+        for session in records.values():
+            key = self.identity_fold(session.prefix)
+            existing = folded.get(key)
+            if existing is None or session.order > existing.order:
+                folded[key] = session
+        return folded
+
     def rekey(self, *, now: float | None = None) -> None:
         """Deduplicate sessions after an identity folding change."""
         self.prune(time.time() if now is None else now)
-        sessions: dict[str, Session] = {}
-        for session in self.sessions.values():
-            key = self.identity_fold(session.prefix)
-            existing = sessions.get(key)
-            if existing is None or session.order > existing.order:
-                sessions[key] = session
-        self.sessions = sessions
-
-        revocations: dict[str, Session] = {}
-        for session in self.revocations.values():
-            key = self.identity_fold(session.prefix)
-            existing = revocations.get(key)
-            if existing is None or session.order > existing.order:
-                revocations[key] = session
-        self.revocations = revocations
+        self.sessions = self._refold(self.sessions)
+        self.revocations = self._refold(self.revocations)
         for key, session in tuple(self.sessions.items()):
             revoked = self.revocations.get(key)
             if revoked is not None and revoked.order >= session.order:
@@ -651,6 +654,11 @@ class TotpAuthorizer:
             )
             self.revocations[key] = session
         return session
+
+
+def limit_identity(prefix: Prefix) -> str:
+    """Return the rate-limit key for a prefix, shared by both limiters."""
+    return casefold(prefix.host or prefix.render(), "ascii")
 
 
 def parse_command(value: str) -> tuple[str, tuple[str, ...]]:

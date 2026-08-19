@@ -245,12 +245,9 @@ class IRCClient:
                 await self.send("CAP", "END")
                 self.cap_negotiating = False
         elif subcommand == "NEW":
-            self.cap_available.update(caps)
             wanted = DESIRED_CAPS & caps
             if wanted:
                 await self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
-        elif subcommand == "DEL":
-            self.cap_available.difference_update(caps)
         elif subcommand in {"ACK", "NAK"} and self.cap_negotiating and self.cap_ls_done:
             # End only once the LS phase has issued its REQ; a NEW-triggered
             # ACK arriving mid-LS must not cut the initial exchange short.
@@ -266,7 +263,6 @@ class IRCClient:
         self.current_nick = next_nickname(
             min(len(self.desired_nick), self.nickname_length),
         )
-        await asyncio.sleep(min(2.0, self.nickname_attempts * 0.1))
         await self.send("NICK", self.current_nick)
 
     async def reconnect(self) -> None:
@@ -276,7 +272,6 @@ class IRCClient:
 
     def reset_caps(self) -> None:
         """Reset capabilities learned from the previous server connection."""
-        self.casemapping = DEFAULT_CASEMAPPING
         self.nickname_length = DEFAULT_NICK_LENGTH
 
     async def run_connection(self, server: IRCServer) -> None:
@@ -448,7 +443,7 @@ class IRCClient:
             return
         error = task.exception()
         if error is not None:
-            LOGGER.error("IRC sender failed: %s", error)
+            LOGGER.error("IRC sender failed", exc_info=error)
 
     def set_casemapping(self, casemapping: str) -> None:
         """Apply the server-advertised case-folding rule."""
@@ -508,7 +503,8 @@ def pong_reply(line: bytes) -> bytes:
     _, trailing_sep, trailing = rest.partition(b" :")
     if trailing_sep:
         return b"PONG :" + trailing + b"\r\n"
-    return b"PONG " + rest.rsplit(b" ", 1)[-1] + b"\r\n"
+    tokens = [token for token in rest.split(b" ")[1:] if token]
+    return b"PONG " + b" ".join(tokens) + b"\r\n"
 
 
 def next_nickname(length: int) -> str:

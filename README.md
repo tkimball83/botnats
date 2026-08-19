@@ -9,7 +9,7 @@ stores shared durable state and atomic authentication controls.
 
 - Each bot connects independently to IRC and NATS.
 - Peers converge through JetStream KV watches after startup and reconnecting.
-- Versioned channel records and part tombstones reject stale state.
+- Signed, versioned channel records and part tombstones reject stale and forged state.
 - Signed, versioned session records make authorization and revocation converge across restarts.
 - Signed NATS messages bind a nonce and timestamp to the exact subject.
 - Automatic op, invite, and unban recovery uses request, offer, and targeted grant flows; admin

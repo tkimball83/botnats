@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, create_autospec, patch
 
 from botnats.irc.client import (
     DESIRED_CAPS,
+    SEND_BURST,
+    SEND_RATE,
     IRCClient,
     IRCClientConfig,
     IRCServer,
@@ -27,7 +29,13 @@ from botnats.irc.protocol import (
     parse_message,
 )
 
+BACKOFF_BASE = 1.5
+BACKOFF_JITTER = 1.0
 COLLISION_NICK_LENGTH = 9
+FAILOVER_ATTEMPTS = 4
+RATE_TEST_MESSAGES = 6
+RESET_ATTEMPTS = 3
+STABLE_ATTEMPT = 2
 MASK_MATCH_BUDGET_SECONDS = 0.5
 
 
@@ -75,6 +83,9 @@ class IRCProtocolTests(unittest.TestCase):
         assert pong_reply(b"PING token\r\n") == b"PONG token\r\n"
         assert pong_reply(b":server PING :token\r\n") == b"PONG :token\r\n"
         assert pong_reply(b"PING server1 :token\r\n") == b"PONG :token\r\n"
+        assert pong_reply(b"PING srv1 srv2\r\n") == b"PONG srv1 srv2\r\n"
+        assert pong_reply(b"PING  token\r\n") == b"PONG token\r\n"
+        assert pong_reply(b"PING a\tb\r\n") == b"PONG a\tb\r\n"
         # Tags plus a prefix: the prefix's space-colon must not be the marker.
         assert (
             pong_reply(b"@time=2026-01-01T00:00:00Z :srv PING :token\r\n")
@@ -186,6 +197,18 @@ class IRCProtocolTests(unittest.TestCase):
             (False, "v", "voice"),
         ]
 
+    def test_mode_parser_bare_unset_key_keeps_pairing(self) -> None:
+        """Verify a stripped -k argument does not steal later arguments."""
+        assert list(iter_mode_changes("-k+o", ("alpha",))) == [
+            (False, "k", None),
+            (True, "o", "alpha"),
+        ]
+        # A conforming batch with the key present pairs exactly as before.
+        assert list(iter_mode_changes("-k+o", ("key", "alpha"))) == [
+            (False, "k", "key"),
+            (True, "o", "alpha"),
+        ]
+
     def test_mode_parser_custom_modes(self) -> None:
         """Verify mode parser handles custom channel modes and prefixes."""
         changes = list(
@@ -244,6 +267,15 @@ class IRCProtocolTests(unittest.TestCase):
         assert message.params == ("bot", "hello world")
         assert message.prefix == Prefix("Nick", "user", "host")
 
+    def test_prefix_parse_host_without_user(self) -> None:
+        """Parse the RFC 2812 nick@host prefix form without a user part."""
+        prefix = Prefix.parse("owner@static.example")
+
+        assert prefix.nick == "owner"
+        assert prefix.user is None
+        assert prefix.host == "static.example"
+        assert not prefix.complete
+
     def test_prefix_match(self) -> None:
         """Verify prefix matching is case-insensitive on nick and host."""
         prefix = Prefix("Owner", "user", "Host.Example")
@@ -269,6 +301,109 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.writer = mock_writer()
         self.addAsyncCleanup(client.stop_sender)
         return client
+
+    def failover_client(self) -> IRCClient:
+        """Build a client with two failover servers for run_forever tests."""
+        return IRCClient(
+            config=IRCClientConfig(
+                connect_timeout=1,
+                nickname="alpha",
+                servers=(
+                    IRCServer("127.0.0.1", 6667, tls=False),
+                    IRCServer("127.0.0.1", 6668, tls=False),
+                ),
+                verify_tls=False,
+            ),
+            on_disconnect=lambda: None,
+            on_message=ignore_message,
+        )
+
+    async def test_run_forever_rotates_servers_with_backoff(self) -> None:
+        """Rotate failover servers on failure with growing bounded backoff."""
+        client = self.failover_client()
+        delays: list[float] = []
+        ports: list[int] = []
+
+        async def failing_connection(server: IRCServer) -> None:
+            ports.append(server.port)
+            if len(ports) >= FAILOVER_ATTEMPTS:
+                client.stopping = True
+            msg = "connection refused"
+            raise OSError(msg)
+
+        async def record_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        with (
+            patch.object(client, "run_connection", failing_connection),
+            patch("botnats.irc.client.asyncio.sleep", record_sleep),
+            self.assertLogs("botnats.irc.client", level="WARNING"),
+        ):
+            await client.run_forever()
+
+        assert ports == [6667, 6668, 6667, 6668]
+        assert len(delays) == len(ports) - 1
+        for attempt, delay in enumerate(delays, start=1):
+            base = BACKOFF_BASE**attempt
+            assert base <= delay < base + BACKOFF_JITTER
+
+    async def test_run_forever_resets_backoff_after_stable_session(self) -> None:
+        """Reset backoff and keep the server after a stable registered session."""
+        client = self.failover_client()
+        delays: list[float] = []
+        ports: list[int] = []
+
+        async def connection(server: IRCServer) -> None:
+            ports.append(server.port)
+            client.registered_with_server = len(ports) == STABLE_ATTEMPT
+            if len(ports) >= RESET_ATTEMPTS:
+                client.stopping = True
+            msg = "connection lost"
+            raise OSError(msg)
+
+        async def record_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        with (
+            patch.object(client, "run_connection", connection),
+            patch("botnats.irc.client.asyncio.sleep", record_sleep),
+            patch("botnats.irc.client.STABLE_SESSION_SECONDS", 0.0),
+            self.assertLogs("botnats.irc.client", level="WARNING"),
+        ):
+            await client.run_forever()
+
+        # Failure rotates away; the stable session keeps its server and
+        # resets the backoff to the base delay.
+        assert ports == [6667, 6668, 6668]
+        assert delays[0] >= BACKOFF_BASE
+        assert 1.0 <= delays[1] < 1.0 + BACKOFF_JITTER
+
+    async def test_send_loop_rate_limits_after_burst(self) -> None:
+        """Delay sends once the token-bucket burst allowance is spent."""
+        client = irc_client()
+        writer = mock_writer()
+        client.writer = writer
+        outbound: asyncio.Queue[bytes] = asyncio.Queue()
+        for index in range(RATE_TEST_MESSAGES):
+            outbound.put_nowait(b"PRIVMSG nick :%d\r\n" % index)
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def record_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with (
+            patch("botnats.irc.client.asyncio.sleep", record_sleep),
+            patch.object(client, "send_immediate", AsyncMock()) as send,
+        ):
+            task = asyncio.create_task(client.send_loop(writer, outbound))
+            while send.await_count < RATE_TEST_MESSAGES:
+                await real_sleep(0)
+            task.cancel()
+
+        # The burst allowance goes out untouched; the rest wait ~1s each.
+        assert len(sleeps) == RATE_TEST_MESSAGES - int(SEND_BURST)
+        assert all(delay > 1.0 / (2 * SEND_RATE) for delay in sleeps)
 
     async def test_registration_nick_rejections_retry(self) -> None:
         """Verify registration retries every nickname rejection numeric."""
@@ -327,7 +462,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.outbound.empty()
 
         await client.handle_cap(parse_message(":server CAP * LS :multi-prefix\r\n"))
-        assert client.outbound.get_nowait() == b"CAP REQ :chghost multi-prefix\r\n"
+        assert client.outbound.get_nowait() == b"CAP REQ :multi-prefix\r\n"
 
         await client.handle_cap(parse_message(":server CAP * ACK :multi-prefix\r\n"))
         assert not client.cap_negotiating
@@ -379,13 +514,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert sent == b"CAP END\r\n"
 
     async def test_cap_new_and_del_after_registration(self) -> None:
-        """Verify post-registration capability availability stays current."""
+        """Verify NEW requests desired capabilities and DEL is ignored."""
         client = self.cap_client(negotiating=False)
-        client.cap_available = {"chghost"}
         await client.handle_cap(
             parse_message(":server CAP alpha NEW :multi-prefix sasl\r\n"),
         )
-        assert client.cap_available == {"chghost", "multi-prefix", "sasl"}
         assert client.outbound is not None
         assert client.outbound.get_nowait() == b"CAP REQ :multi-prefix\r\n"
 
@@ -395,7 +528,6 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         await client.handle_cap(
             parse_message(":server CAP alpha DEL :chghost\r\n"),
         )
-        assert client.cap_available == {"multi-prefix", "sasl"}
         assert client.outbound.empty()
 
     async def test_close_releases_writer(self) -> None:
@@ -425,14 +557,14 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             ping = await reader.readline()
             if ping.startswith(b"PING :"):
                 ping_seen.set()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5)
             writer.close()
             await writer.wait_closed()
 
         server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
 
-        client = irc_client(idle_timeout=0.02, pong_timeout=0.02, port=port)
+        client = irc_client(idle_timeout=0.05, pong_timeout=0.05, port=port)
         try:
             with self.assertRaisesRegex(ConnectionError, "did not answer"):
                 await client.run_connection(client.config.servers[0])

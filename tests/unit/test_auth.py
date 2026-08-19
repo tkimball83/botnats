@@ -6,6 +6,7 @@
 import unittest
 
 from botnats.admin import TotpAuthorizer
+from botnats.irc.protocol import casefold
 from tests.unit.helpers import AUTH_SEED, COORDINATION_KEY
 
 
@@ -14,6 +15,7 @@ def authorizer(issuer: str = "alpha", network: str = "efnet") -> TotpAuthorizer:
     return TotpAuthorizer(
         AUTH_SEED,
         coordination_secret=COORDINATION_KEY,
+        identity_fold=lambda value: casefold(value, "ascii"),
         scope=(issuer, network),
         session_ttl=30,
     )
