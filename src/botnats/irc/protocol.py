@@ -27,6 +27,8 @@ CASEMAP_TABLES = {
 CASEMAPPINGS = frozenset(CASEMAP_TABLES)
 CHANMODE_GROUP_COUNT = 4
 DEFAULT_CASEMAPPING = "rfc1459"
+DEFAULT_CHANMODES = ("beI", "k", "l", "imnst")
+DEFAULT_MEMBERSHIP_MODES = "qaohv"
 DEFAULT_MEMBER_PREFIXES = {
     "%": "h",
     "&": "a",
@@ -41,7 +43,7 @@ MAX_IRC_MESSAGE_BYTES = 512
 
 @dataclass(frozen=True, slots=True)
 class IRCMessage:
-    """Parsed IRC message with command, parameters, prefix, and tags."""
+    """Parsed IRC message with command, parameters, and prefix."""
 
     command: str
     params: tuple[str, ...]
@@ -98,11 +100,11 @@ class ISupportState:
     """Tracks server capabilities advertised via ISUPPORT tokens."""
 
     casemapping: str = DEFAULT_CASEMAPPING
-    chanmodes: tuple[str, str, str, str] = ("beI", "k", "l", "imnst")
+    chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES
     member_prefixes: dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_MEMBER_PREFIXES),
     )
-    membership_modes: str = "qaohv"
+    membership_modes: str = DEFAULT_MEMBERSHIP_MODES
     mode_limit: int = 1
     op_mode: str = "o"
 
@@ -149,9 +151,9 @@ class ISupportState:
     def reset(self) -> None:
         """Reset capabilities learned from the previous server connection."""
         self.casemapping = DEFAULT_CASEMAPPING
-        self.chanmodes = ("beI", "k", "l", "imnst")
+        self.chanmodes = DEFAULT_CHANMODES
         self.member_prefixes = dict(DEFAULT_MEMBER_PREFIXES)
-        self.membership_modes = "qaohv"
+        self.membership_modes = DEFAULT_MEMBERSHIP_MODES
         self.mode_limit = 1
         self.op_mode = "o"
 
@@ -188,7 +190,8 @@ class Prefix:
         """Construct a Prefix from a nick!user@host string."""
         nick, bang, remainder = value.partition("!")
         if not bang:
-            return cls(nick=nick)
+            nick, at, host = value.partition("@")
+            return cls(nick=nick, host=(host or None) if at else None)
         user, at, host = remainder.partition("@")
         return cls(nick=nick, user=user or None, host=(host or None) if at else None)
 
@@ -265,12 +268,12 @@ def glob_matches(pattern: str, value: str) -> bool:
 def iter_mode_changes(
     modes: str,
     arguments: tuple[str, ...],
-    chanmodes: tuple[str, str, str, str] = ("beI", "k", "l", "imnst"),
-    membership: str = "qaohv",
+    chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES,
+    membership: str = DEFAULT_MEMBERSHIP_MODES,
 ) -> Iterator[tuple[bool, str, str | None]]:
     """Yield channel mode changes with their consumed arguments."""
     adding = True
-    argument_index = 0
+    changes: list[tuple[bool, str]] = []
     for mode in modes:
         if mode == "+":
             adding = True
@@ -278,13 +281,28 @@ def iter_mode_changes(
         if mode == "-":
             adding = False
             continue
-        argument = None
-        if mode_requires_argument(
+        changes.append((adding, mode))
+    consumes = [
+        mode_requires_argument(
             mode,
             adding=adding,
             chanmodes=chanmodes,
             membership=membership,
-        ) and argument_index < len(arguments):
+        )
+        for adding, mode in changes
+    ]
+    # A server that strips the key argument from -k leaves the batch exactly
+    # one argument short; letting that -k consume nothing keeps the remaining
+    # arguments paired with their modes.
+    if sum(consumes) == len(arguments) + 1:
+        for position, (adding, mode) in enumerate(changes):
+            if mode == "k" and not adding and consumes[position]:
+                consumes[position] = False
+                break
+    argument_index = 0
+    for (adding, mode), consume in zip(changes, consumes, strict=True):
+        argument = None
+        if consume and argument_index < len(arguments):
             argument = arguments[argument_index]
             argument_index += 1
         yield adding, mode, argument
@@ -294,8 +312,8 @@ def mode_requires_argument(
     mode: str,
     *,
     adding: bool,
-    chanmodes: tuple[str, str, str, str] = ("beI", "k", "l", "imnst"),
-    membership: str = "qaohv",
+    chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES,
+    membership: str = DEFAULT_MEMBERSHIP_MODES,
 ) -> bool:
     """Return whether a channel mode change consumes an argument."""
     return mode in chanmodes[0] + chanmodes[1] + membership or (

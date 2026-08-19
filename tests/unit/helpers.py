@@ -86,7 +86,7 @@ class FakeIRC:
         self.current_nick = "alpha"
         self.desired_nick = "alpha"
         self.modes: list[tuple[str, str, tuple[str, ...]]] = []
-        self.nickname_length = 30
+        self.nickname_length = 9
         self.privmsgs: list[tuple[str, str]] = []
         self.reconnects = 0
         self.sent: list[tuple[str, tuple[str, ...]]] = []
@@ -101,7 +101,6 @@ class FakeIRC:
 
     def reset_caps(self) -> None:
         """Reset server-advertised capabilities."""
-        self.casemapping = "rfc1459"
         self.nickname_length = 9
 
     async def run_forever(self) -> None:
@@ -172,13 +171,22 @@ class FakeCoordinator:
     def __init__(self, *, claim_result: bool = False) -> None:
         """Initialize empty recording buffers."""
         self.auth_requests: list[str] = []
+        self.bot_id = "alpha"
         self.channel_puts: list[tuple[str, dict[str, Any]]] = []
         self.claim_result = claim_result
         self.connected = True
         self.offer_requests: list[tuple[str, dict[str, object]]] = []
+        self.owns_presence = True
         self.presence_puts: list[dict[str, Any]] = []
         self.session_puts: list[tuple[str, dict[str, Any]]] = []
+        self.synced = True
         self.unique = True
+
+    def require_unique(self) -> None:
+        """Mirror the real duplicate-ID write gate."""
+        if not self.unique or not self.owns_presence:
+            msg = f"duplicate bot ID: {self.bot_id}"
+            raise RuntimeError(msg)
 
     async def close(self) -> None:
         """No-op close."""
@@ -190,11 +198,16 @@ class FakeCoordinator:
         record: dict[str, Any],
     ) -> dict[str, Any]:
         """Record a channel KV put."""
+        self.require_unique()
         self.channel_puts.append((channel, record))
         return record
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
         """Record a presence KV put."""
+        if presence.get("bot_id") != self.bot_id:
+            msg = "presence does not match coordinator bot ID"
+            raise ValueError(msg)
+        self.require_unique()
         self.presence_puts.append(presence)
 
     async def put_session(
@@ -203,20 +216,21 @@ class FakeCoordinator:
         session: dict[str, Any],
     ) -> dict[str, Any]:
         """Record a session KV put."""
+        self.require_unique()
         self.session_puts.append((identity, session))
         return session
 
     @property
     def ready(self) -> bool:
-        """Mirror real readiness: connected and unique."""
-        return self.connected and self.unique
+        """Mirror real readiness: connection, replay, presence, uniqueness."""
+        return self.connected and self.unique and self.synced and self.owns_presence
 
     async def request_auth(self, identity: str) -> bool:
-        """Record and limit attempts, failing closed when not ready."""
+        """Record and limit attempts per identity, failing closed if not ready."""
         if not self.ready:
             return False
         self.auth_requests.append(identity)
-        return len(self.auth_requests) <= ATTEMPT_LIMIT
+        return self.auth_requests.count(identity) <= ATTEMPT_LIMIT
 
     async def request_claim(self, counter: int) -> bool:
         """Allow or deny claims, failing closed when not ready."""
@@ -224,7 +238,9 @@ class FakeCoordinator:
         return self.ready and self.claim_result
 
     async def request_offer(self, base_suffix: str, payload: dict[str, object]) -> bool:
-        """Record an offer request."""
+        """Record an offer request, refusing when not ready."""
+        if not self.ready:
+            return False
         self.offer_requests.append((base_suffix, payload))
         return True
 

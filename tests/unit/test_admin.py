@@ -63,7 +63,8 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "No bans tracked for #test")]
 
         fake_irc.privmsgs.clear()
-        runtime.bans.update({"*!*@bad.host", "*!*@evil.host"})
+        for _mask in ("*!*@bad.host", "*!*@evil.host"):
+            runtime.add_ban(_mask)
         await bot.events.handle_command(
             IRCMessage("PRIVMSG", ("alpha", "BANS #test"), OWNER),
         )
@@ -89,10 +90,10 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         action = {"channel": "#test", "presence": peer.to_dict()}
         await bot.callbacks.on_invite_grant(action)
         runtime.member("beta").prefix = Prefix("beta", "~beta", "beta.host")
-        runtime.bans.add("*!~beta@beta.host")
+        runtime.add_ban("*!~beta@beta.host")
         await bot.callbacks.on_unban_grant(action)
 
-        assert "*!~beta@beta.host" in runtime.bans
+        assert "*!~beta@beta.host" in runtime.bans.values()
 
         bot.channel_mgr.pending_ops[casefold("#test")] = {"beta": peer}
         await bot.channel_mgr.flush_pending_ops(casefold("#test"))
@@ -212,7 +213,7 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.member("alpha").modes.add("o")
-        runtime.bans.add("*!*@bad.host")
+        runtime.add_ban("*!*@bad.host")
         bot.authorizer.grant(OWNER.render())
 
         await bot.events.handle_command(
@@ -229,7 +230,7 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.member("alpha").modes.add("o")
-        runtime.bans.add("*!*@Bad.Host")
+        runtime.add_ban("*!*@Bad.Host")
         bot.authorizer.grant(OWNER.render())
 
         await bot.events.handle_command(

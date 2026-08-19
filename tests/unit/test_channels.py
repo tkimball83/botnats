@@ -488,16 +488,5 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """Verify safe join handles unsendable channel keys gracefully."""
         bot = bot_with_channel()
 
-        class RejectingIRC(FakeIRC):
-            """IRC stub that rejects join with invalid key characters."""
-
-            async def join(self, channel: str, key: str | None = None) -> None:
-                """Raise ValueError to simulate unsendable parameters."""
-                del channel, key
-                msg = "IRC parameter contains unsupported characters"
-                raise ValueError(msg)
-
-        bot.irc = RejectingIRC()
-
         with self.assertLogs("botnats.channel", level="WARNING"):
             await bot.channel_mgr.safe_join("#test", "bad key")

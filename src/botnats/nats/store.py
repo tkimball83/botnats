@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from nats.errors import Error as NatsError
 from nats.js.api import KeyValueConfig, StorageType
-from nats.js.errors import KeyDeletedError, KeyNotFoundError, KeyWrongLastSequenceError
+from nats.js.errors import KeyNotFoundError, KeyWrongLastSequenceError
 from nats.js.kv import KV_DEL, KV_PURGE
 
 from botnats import error_label
@@ -98,7 +98,7 @@ class KVStore:
         while True:
             try:
                 entry = await kv.get(key)
-            except KeyDeletedError, KeyNotFoundError:
+            except KeyNotFoundError:
                 try:
                     await kv.create(key, encoded)
                 except KeyWrongLastSequenceError:
@@ -138,7 +138,7 @@ class AttemptStore(KVStore):
                 key = self.key(identity, slot)
                 try:
                     entry = await kv.get(key)
-                except KeyDeletedError, KeyNotFoundError:
+                except KeyNotFoundError:
                     try:
                         await kv.create(key, encoded)
                     except KeyWrongLastSequenceError:
@@ -177,6 +177,7 @@ class ChannelStore(KVStore):
     def __init__(self, network: str, replicas: int, secret: bytes) -> None:
         """Set the bucket identity and key derivation secret."""
         super().__init__(f"botnats_v1_{network}_channels", replicas, 0)
+        self.network = network
         self.secret = secret
 
     def key(self, channel: str) -> str:
@@ -184,18 +185,56 @@ class ChannelStore(KVStore):
         message = f"botnats-channel-v1\x00{casefold(channel, 'ascii')}".encode()
         return hmac.digest(self.secret, message, "sha256").hex()
 
+    def sign(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Return a canonical, signed copy of a valid channel record."""
+        channel, channel_key, present, revision = parse_channel_record(data)
+        record: dict[str, Any] = {
+            "channel": channel,
+            "key": channel_key,
+            "present": present,
+            "revision": revision,
+        }
+        record["signature"] = channel_signature(self.secret, self.network, record)
+        return record
+
     def order(self, key: str, record: dict[str, Any]) -> str | None:
-        """Validate a key-bound channel record and return its revision."""
+        """Validate a signed, key-bound channel record and return its revision.
+
+        Unsigned or wrong-signature records are untrusted and treated as
+        replaceable (revision ignored), like sessions and presence: honoring an
+        unsigned record's revision would let a coordination-secret-less writer
+        plant a high revision and wedge legitimate writes.
+        """
         try:
-            channel, _, _, revision = parse_channel_record(record)
+            channel, channel_key, present, revision = parse_channel_record(record)
         except TypeError, ValueError:
             return None
-        return revision if self.key(channel) == key else None
+        signature = record.get("signature")
+        if (
+            self.key(channel) != key
+            or not isinstance(signature, str)
+            or SIGNATURE_RE.fullmatch(signature) is None
+        ):
+            return None
+        expected = channel_signature(
+            self.secret,
+            self.network,
+            {
+                "channel": channel,
+                "key": channel_key,
+                "present": present,
+                "revision": revision,
+            },
+        )
+        if not hmac.compare_digest(expected, signature):
+            return None
+        return revision
 
     async def put(self, channel: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Store a channel record and return the authoritative record."""
+        """Store a signed channel record and return the authoritative record."""
+        signed = self.sign(data)
         key = self.key(channel)
-        revision = self.order(key, data)
+        revision = self.order(key, signed)
         if revision is None:
             msg = "channel record is invalid"
             raise ValueError(msg)
@@ -204,7 +243,7 @@ class ChannelStore(KVStore):
             current_revision = self.order(key, current)
             return current_revision is None or revision > current_revision
 
-        return await self.put_newer(key, data, newer)
+        return await self.put_newer(key, signed, newer)
 
 
 class ClaimStore(KVStore):
@@ -278,26 +317,45 @@ class PresenceStore(KVStore):
         Returns the current revision when this instance's own signed record
         still holds the key; overwrites an unsigned or forged clobber (written
         by a party without the coordination secret) to reclaim it; and returns
-        None when a validly signed record from another instance holds the key,
-        which is a genuine duplicate this process must yield to.
+        None only when a validly signed record from another instance holds the
+        key, which is a genuine duplicate this process must yield to. Repeated
+        lost races prove nothing about ownership, so exhaustion raises for the
+        caller's transient retry path instead of reporting a duplicate.
         """
         kv = await self.open()
-        try:
-            entry = await kv.get(bot_id.casefold())
-        except KeyDeletedError, KeyNotFoundError:
-            return None
-        try:
-            current = json.loads(entry.value) if entry.value is not None else None
-        except RecursionError, TypeError, ValueError:
-            current = None
-        if isinstance(current, dict) and self.valid(current):
-            return entry.revision if current.get("instance_id") == instance_id else None
-        try:
-            return await kv.update(
-                bot_id.casefold(), self.sign(data), last=entry.revision
-            )
-        except KeyWrongLastSequenceError:
-            return None
+        for _ in range(2):
+            try:
+                entry = await kv.get(bot_id.casefold())
+            except KeyNotFoundError:
+                # The occupant expired between the failed create and this
+                # read; the key is unowned, so claim it. On a lost create
+                # race, re-read to evaluate the racing writer instead of
+                # misreporting a forged occupant as a genuine duplicate.
+                revision = await self.create(bot_id, data)
+                if revision is not None:
+                    return revision
+                continue
+            try:
+                current = json.loads(entry.value) if entry.value is not None else None
+            except RecursionError, TypeError, ValueError:
+                current = None
+            if isinstance(current, dict) and self.valid(current):
+                return (
+                    entry.revision
+                    if current.get("instance_id") == instance_id
+                    else None
+                )
+            try:
+                return await kv.update(
+                    bot_id.casefold(), self.sign(data), last=entry.revision
+                )
+            except KeyWrongLastSequenceError:
+                # Lost the overwrite race; re-read to evaluate the racing
+                # writer instead of misreporting a forged clobber as a
+                # genuine duplicate.
+                continue
+        msg = "presence reclaim lost repeated update races"
+        raise NatsError(msg)
 
     def sign(self, data: dict[str, Any], now: float | None = None) -> bytes:
         """Serialize a freshly timestamped, signed presence record."""
@@ -433,6 +491,27 @@ def parse_session_record(
     ):
         return None
     return expiry, issuer, prefix, revoked, version, signature
+
+
+def channel_signature(
+    secret: bytes,
+    network: str,
+    record: dict[str, Any],
+) -> str:
+    """Sign the durable fields that authorize a channel configuration record."""
+    channel_key = record["key"]
+    message = "\x00".join(
+        (
+            "botnats-channel-record-v1",
+            network,
+            record["channel"],
+            str(int(channel_key is not None)),
+            channel_key or "",
+            str(int(record["present"])),
+            record["revision"],
+        ),
+    ).encode()
+    return hmac.digest(secret, message, "sha256").hex()
 
 
 def session_signature(

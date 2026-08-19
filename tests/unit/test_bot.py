@@ -12,7 +12,7 @@ from botnats import error_label
 from botnats.bot import Bot
 from botnats.channel import ChannelRecord
 from botnats.irc.client import IRCClient
-from botnats.irc.protocol import IRCMessage, Prefix, casefold
+from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     FakeCoordinator,
@@ -33,6 +33,17 @@ EXPECTED_TICK_COUNT = 2
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
     """Tests for bot identity, op grants, rate limiting, and channel keys."""
+
+    async def test_safe_privmsg_drops_unsendable_message(self) -> None:
+        """Drop an oversized PRIVMSG instead of raising into the handler."""
+        bot, _ = bot_with_irc()
+        error = ValueError("message exceeds 512 bytes")
+
+        with (
+            patch.object(bot.irc, "send", side_effect=error),
+            self.assertLogs("botnats.bot", level="WARNING"),
+        ):
+            await bot.safe_privmsg("nick", "x" * 600)
 
     async def test_channel_record_key_validation(self) -> None:
         """Verify channel records reject invalid keys."""
@@ -209,7 +220,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 {"channel": "#test", "presence": peer.to_dict()},
             )
 
-        await asyncio.sleep(0.1)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
         assert fake_irc.modes == [("#test", "+oo", ("beta", "gamma"))]
 
     async def test_mode_batching_respects_message_bytes(self) -> None:
@@ -221,6 +233,86 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.batch_mode("#test", "+", "o", targets, "opped")
 
         assert [len(arguments) for _, _, arguments in fake_irc.modes] == [15, 1]
+
+    async def test_batch_mode_skips_single_oversized_target(self) -> None:
+        """Skip one un-encodable target and still apply the rest of the batch."""
+        bot, fake_irc = bot_with_irc()
+        bot.caps.mode_limit = 4
+        oversized = "n" * (MAX_IRC_MESSAGE_BYTES + 1)
+        targets = ["alpha", oversized, "gamma"]
+
+        with self.assertLogs("botnats.bot", level="WARNING"):
+            await bot.batch_mode("#test", "+", "o", targets, "opped")
+
+        applied = [arg for _, _, arguments in fake_irc.modes for arg in arguments]
+        assert applied == ["alpha", "gamma"]
+
+    async def test_close_reaps_task_spawned_during_shutdown(self) -> None:
+        """Drain a task a coordinator callback spawns mid-shutdown."""
+        bot, _ = bot_with_irc()
+        started = asyncio.Event()
+
+        async def slow_task() -> None:
+            started.set()
+            await asyncio.sleep(0)
+
+        class SpawningCoordinator(FakeCoordinator):
+            async def close(self) -> None:
+                bot.spawn(slow_task(), "late-spawn")
+                await started.wait()
+
+        bot.coordinator = SpawningCoordinator()
+
+        await bot.close()
+
+        assert not bot.tasks
+
+    async def test_close_cancels_tasks_before_closing_coordinator(self) -> None:
+        """Cancel tracked tasks before coordinator.close so a lock cannot stall."""
+        bot, _ = bot_with_irc()
+        order: list[str] = []
+        running = asyncio.Event()
+
+        async def long_task() -> None:
+            running.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                order.append("task-cancelled")
+                raise
+
+        class OrderingCoordinator(FakeCoordinator):
+            async def close(self) -> None:
+                order.append("coordinator-closed")
+
+        bot.coordinator = OrderingCoordinator()
+        bot.spawn(long_task(), "long")
+        await running.wait()
+
+        await bot.close()
+
+        assert order == ["task-cancelled", "coordinator-closed"]
+        assert not bot.tasks
+
+    async def test_close_is_atomic_when_coordinator_close_raises(self) -> None:
+        """Close IRC and health even if coordinator.close raises."""
+        bot, _ = bot_with_irc()
+
+        class RaisingCoordinator(FakeCoordinator):
+            async def close(self) -> None:
+                msg = "connection reset"
+                raise OSError(msg)
+
+        bot.coordinator = RaisingCoordinator()
+        with (
+            patch.object(bot.irc, "close") as irc_close,
+            patch.object(bot.health_check, "close") as health_close,
+            self.assertRaises(OSError),
+        ):
+            await bot.close()
+
+        irc_close.assert_awaited_once()
+        health_close.assert_awaited_once()
 
     async def test_op_requires_matching_host(self) -> None:
         """Verify op request is rejected when peer host does not match."""
@@ -346,7 +438,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.caps.mode_limit = 4
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.member("alpha").modes.add("o")
-        runtime.bans.update({"*!~beta@bot.host", "*!other@*"})
+        for _mask in ("*!~beta@bot.host", "*!other@*"):
+            runtime.add_ban(_mask)
         peer = BotPresence("beta", "bot.host", "one", "beta", "~beta")
         bot.presence.update(peer)
         payload = {"channel": "#test", "presence": peer.to_dict()}

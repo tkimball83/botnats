@@ -22,9 +22,10 @@ def main() -> None:
         default=os.environ.get("BOTNATS_CONFIG", "/etc/botnats/bot.json"),
     )
     arguments = parser.parse_args()
+    level = os.environ.get("BOTNATS_LOG_LEVEL", "INFO").strip().upper()
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        level=os.environ.get("BOTNATS_LOG_LEVEL", "INFO").upper(),
+        level=logging.getLevelNamesMapping().get(level, logging.INFO),
     )
     config = BotConfig.load(arguments.config)
 

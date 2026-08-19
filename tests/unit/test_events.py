@@ -99,7 +99,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        assert "*!*@banned.host" in runtime.bans
+        assert "*!*@banned.host" in runtime.bans.values()
 
     async def test_banned_requests_unban(self) -> None:
         """Verify 474 numeric triggers an unban request."""
@@ -189,6 +189,37 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert ("WHO", ("#test",)) in fake_irc.sent
         assert ("MODE", ("#test", "+b")) in fake_irc.sent
+
+    async def test_names_and_who_record_only_operator_modes(self) -> None:
+        """Track operator prefixes only; sub-op modes are never applied."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+
+        await bot.events.on_irc_message(
+            IRCMessage("353", ("alpha", "=", "#test", "+bob @carol")),
+        )
+        assert runtime.member("bob").modes == set()
+        assert runtime.member("carol").modes == {"o"}
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "352",
+                ("alpha", "#test", "user", "host", "srv", "bob", "H+"),
+            ),
+        )
+        assert runtime.member("bob").modes == set()
+
+    async def test_quit_with_host_only_prefix_removes_member(self) -> None:
+        """Remove a member whose QUIT prefix omits the user part."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.member("owner")
+
+        await bot.events.on_irc_message(
+            IRCMessage("QUIT", (), Prefix.parse("owner@static.example")),
+        )
+
+        assert casefold("owner") not in runtime.members
 
     async def test_invite_ignores_joined_channel(self) -> None:
         """Verify an INVITE to an already-joined channel is ignored."""
@@ -428,6 +459,50 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert runtime.key is None
 
+    async def test_mode_key_unset_without_argument(self) -> None:
+        """Clear the channel key when a server strips the -k argument."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.joined = True
+        runtime.key = "secret"
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "-k"),
+                Prefix("chanserv", "service", "services.host"),
+            ),
+        )
+
+        assert runtime.key is None
+
+        runtime.key = "secret"
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "-k+o", "bob"),
+                Prefix("chanserv", "service", "services.host"),
+            ),
+        )
+
+        assert runtime.key is None
+        assert runtime.member("bob").modes == {"o"}
+
+    async def test_nick_only_prefix_moves_bot_identity(self) -> None:
+        """Advertise the new nick when a NICK prefix omits user@host."""
+        bot, fake_irc = bot_with_irc()
+        bot.registered = True
+        bot.identity = BotPresence("alpha", "host.example", "inst", "alpha", "~alpha")
+        fake_irc.current_nick = "newalpha"
+
+        await bot.events.on_irc_message(
+            IRCMessage("NICK", ("newalpha",), Prefix.parse("alpha")),
+        )
+
+        assert bot.identity is not None
+        assert bot.identity.nick == "newalpha"
+        assert bot.identity.host == "host.example"
+
     async def test_mode_key_unusable(self) -> None:
         """Verify unusable channel key is ignored and not republished."""
         bot, _ = bot_with_irc()
@@ -472,7 +547,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         first.member("Target").prefix = Prefix("Target", "user", "first.host")
 
         second = ChannelRuntime(joined=True, key="second-key")
-        second.bans.add("*!*@second.host")
+        second.add_ban("*!*@second.host")
         second.member("alpha").modes.add("o")
         second.member("Target").modes.add("v")
         bot.channel_mgr.channels[casefold("#other")] = second
@@ -487,10 +562,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         assert first.member("Target").modes == {"o"}
-        assert first.bans == {"*!*@first.host"}
+        assert set(first.bans.values()) == {"*!*@first.host"}
         assert first.key == "first-key"
         assert second.member("Target").modes == {"v"}
-        assert second.bans == {"*!*@second.host"}
+        assert set(second.bans.values()) == {"*!*@second.host"}
         assert second.key == "second-key"
         assert len(coordinator.channel_puts) == 1
         _, payload = coordinator.channel_puts[0]
@@ -617,7 +692,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.joined = True
-        runtime.bans.add("*!*@old.ban")
+        runtime.add_ban("*!*@old.ban")
         runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "host.example")
         runtime.member("victim").prefix = Prefix("victim", "user", "host")
 
@@ -630,7 +705,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert runtime.joined
-        assert "*!*@old.ban" in runtime.bans
+        assert "*!*@old.ban" in runtime.bans.values()
         assert casefold("alpha") in runtime.members
         assert casefold("victim") not in runtime.members
 
@@ -702,6 +777,104 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.events.pending_sessions
         assert put.await_count == EXPECTED_WRITE_ATTEMPTS
 
+    async def test_duplicate_coordinator_queues_session_writes(self) -> None:
+        """Queue session writes while the coordinator reports a duplicate ID."""
+        bot, _, coordinator = bot_with_coordinator()
+        coordinator.unique = False
+
+        assert not await bot.events.sync_session("a!u@h", {"revoked": False})
+
+        assert bot.events.pending_sessions
+        assert not coordinator.session_puts
+
+    async def test_requeued_identity_moves_to_queue_tail(self) -> None:
+        """Keep the pending queue in causal order when an identity re-queues."""
+        bot, _, coordinator = bot_with_coordinator()
+
+        with patch.object(
+            coordinator,
+            "put_session",
+            AsyncMock(side_effect=NatsError("unavailable")),
+        ):
+            assert not await bot.events.sync_session("b!u@h", {"revoked": False})
+            assert not await bot.events.sync_session("a!u@h", {"revoked": True})
+            assert not await bot.events.sync_session("b!u@h", {"revoked": False})
+
+        assert list(bot.events.pending_sessions) == ["a!u@h", "b!u@h"]
+
+    async def test_pending_revocation_blocks_later_session_writes(self) -> None:
+        """Never write a queued grant past an earlier still-pending revocation."""
+        bot, _, coordinator = bot_with_coordinator()
+        blocked = bot.authorizer.create(
+            "old!user@host.example",
+            time.time() + 100,
+            bot.authorizer.issuer,
+            1,
+            revoked=True,
+        ).to_dict()
+        identity = "new!user@host.example"
+        session = bot.authorizer.create(
+            identity,
+            time.time() + 100,
+            bot.authorizer.issuer,
+            1,
+        ).to_dict()
+
+        async def put_session(
+            stored_identity: str,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            del stored_identity
+            if payload is blocked:
+                msg = "unavailable"
+                raise NatsError(msg)
+            return payload
+
+        with patch.object(
+            coordinator,
+            "put_session",
+            AsyncMock(side_effect=put_session),
+        ) as put:
+            assert not await bot.events.sync_session("old!user@host.example", blocked)
+            assert not await bot.events.sync_session(identity, session)
+
+        assert put.await_count == EXPECTED_WRITE_ATTEMPTS
+        assert all(call.args[1] is blocked for call in put.await_args_list)
+        assert casefold(identity, "ascii") in bot.events.pending_sessions
+
+    async def test_expired_revocation_drains_from_pending_queue(self) -> None:
+        """Drop a pending revocation once its durable record has expired."""
+        bot, _, coordinator = bot_with_coordinator()
+        revocation = bot.authorizer.create(
+            "old!user@host.example",
+            time.time() - 1,
+            bot.authorizer.issuer,
+            1,
+            revoked=True,
+        ).to_dict()
+        identity = "new!user@host.example"
+        session = bot.authorizer.create(
+            identity,
+            time.time() + 100,
+            bot.authorizer.issuer,
+            1,
+        ).to_dict()
+
+        with patch.object(
+            coordinator,
+            "put_session",
+            AsyncMock(side_effect=[NatsError("unavailable"), revocation, session]),
+        ):
+            assert not await bot.events.sync_session(
+                "old!user@host.example",
+                revocation,
+            )
+            assert bot.events.pending_sessions
+            assert await bot.events.sync_session(identity, session)
+
+        assert not bot.events.pending_sessions
+        assert bot.authorizer.authorized(identity)
+
     async def test_new_session_replaces_pending_revocation(self) -> None:
         """Never retry an old revocation after a newer session write succeeds."""
         bot, _, coordinator = bot_with_coordinator()
@@ -770,7 +943,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.joined = True
-        runtime.bans.add("*!*@old.ban")
+        runtime.add_ban("*!*@old.ban")
         runtime.member("stale").prefix = Prefix("stale", "user", "host")
 
         await bot.events.on_irc_message(
@@ -778,7 +951,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert runtime.joined
-        assert runtime.bans == set()
+        assert runtime.bans == {}
         assert casefold("stale") not in runtime.members
         assert casefold("alpha") in runtime.members
 
@@ -811,7 +984,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.joined = True
-        runtime.bans.add("*!*@old.ban")
+        runtime.add_ban("*!*@old.ban")
         runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "host.example")
         runtime.member("other").prefix = Prefix("other", "user", "host")
 
@@ -824,7 +997,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert not runtime.joined
-        assert runtime.bans == set()
+        assert runtime.bans == {}
         assert runtime.members == {}
 
     async def test_self_part_clears_state(self) -> None:
@@ -832,7 +1005,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.joined = True
-        runtime.bans.add("*!*@old.ban")
+        runtime.add_ban("*!*@old.ban")
         runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "host.example")
         runtime.member("other").prefix = Prefix("other", "user", "host")
 
@@ -841,7 +1014,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert not runtime.joined
-        assert runtime.bans == set()
+        assert runtime.bans == {}
         assert runtime.members == {}
 
     async def test_userhost_identity(self) -> None:

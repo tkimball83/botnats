@@ -136,6 +136,9 @@ class ChannelManager:
             await asyncio.sleep(0.05)
             channel = self.desired_channels.get(folded_channel)
             runtime = self.channels.get(folded_channel)
+            # Drop the batch if we lost op during the coalescing window rather
+            # than re-queue: retrying here would busy-spin while unopped, and
+            # the requesting peer re-asks on its own maintenance tick.
             queued = self.pending_ops.pop(folded_channel, {})
             if (
                 channel is not None
@@ -259,6 +262,10 @@ class ChannelManager:
         self.pending_op_flushes.clear()
         self.pending_ops.clear()
         self.pending_parts.clear()
+
+    def schedule_part(self, channel: str) -> None:
+        """Queue a channel part for retry after a failed PART send."""
+        self.pending_parts[self.bot.fold(channel)] = channel
 
     async def retry_pending_parts(self) -> None:
         """Reattempt PART for channels that failed to leave previously."""
@@ -420,11 +427,15 @@ class ChannelRecord:
 class ChannelRuntime:
     """Maintain live channel state including members, bans, and keys."""
 
-    bans: set[str] = field(default_factory=set)
+    bans: dict[str, str] = field(default_factory=dict)
     casemapping: str = DEFAULT_CASEMAPPING
     joined: bool = False
     key: str | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
+
+    def add_ban(self, mask: str) -> None:
+        """Track a ban mask keyed by its folded form for O(1) lookup."""
+        self.bans[casefold(mask, self.casemapping)] = mask
 
     def member(self, nickname: str) -> ChannelMember:
         """Return the member for a nickname, creating one if absent."""
@@ -442,10 +453,7 @@ class ChannelRuntime:
 
     def remove_ban(self, mask: str) -> None:
         """Delete a ban mask from the channel ban list."""
-        folded = casefold(mask, self.casemapping)
-        self.bans = {
-            ban for ban in self.bans if casefold(ban, self.casemapping) != folded
-        }
+        self.bans.pop(casefold(mask, self.casemapping), None)
 
     def reset(self) -> None:
         """Clear connection-specific channel state."""
@@ -463,16 +471,17 @@ class ChannelRuntime:
             folded = casefold(member.nick, casemapping)
             members.setdefault(folded, member)
         self.members = members
-        seen: dict[str, str] = {}
-        for ban in self.bans:
-            seen.setdefault(casefold(ban, casemapping), ban)
-        self.bans = set(seen.values())
+        rekeyed: dict[str, str] = {}
+        for mask in self.bans.values():
+            rekeyed.setdefault(casefold(mask, casemapping), mask)
+        self.bans = rekeyed
 
     def set_key(self, key: str | None) -> bool:
         """Set the channel key, validating a non-None key.
 
         Returns False without changing the current key when a key is present
-        but unusable, so the IRC and NATS ingress paths reject it identically.
+        but unusable, so the IRC MODE path can reject it the same way the
+        durable path rejects it through ChannelRecord.new's validation.
         """
         if key is not None:
             try:

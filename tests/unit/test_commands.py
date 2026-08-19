@@ -4,6 +4,7 @@
 """Tests for command parsing, input validation, and rate limiting."""
 
 import unittest
+from unittest.mock import patch
 
 from botnats.admin import RateLimiter, parse_command
 from botnats.validators import (
@@ -83,11 +84,12 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bucket_eviction(self) -> None:
         """Verify the least recently used bucket is evicted at capacity."""
-        limiter = RateLimiter(max_buckets=2)
-        limiter.check("a", limit=10, window=60)
-        limiter.check("b", limit=10, window=60)
-        limiter.check("a", limit=10, window=60)
-        limiter.check("c", limit=10, window=60)
+        limiter = RateLimiter()
+        with patch("botnats.admin.MAX_RATE_BUCKETS", 2):
+            limiter.check("a", limit=10, window=60)
+            limiter.check("b", limit=10, window=60)
+            limiter.check("a", limit=10, window=60)
+            limiter.check("c", limit=10, window=60)
         assert "a" in limiter.buckets
         assert "b" not in limiter.buckets
         assert "c" in limiter.buckets

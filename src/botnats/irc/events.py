@@ -96,6 +96,10 @@ class IRCEventHandler:
             ):
                 lost_enforced = True
             if argument is None:
+                if mode == "k" and not adding and runtime.key is not None:
+                    # Some servers strip the key argument from -k; unsetting
+                    # never needs it, and skipping would keep a stale key.
+                    self.process_key(runtime, channel, "", adding=False)
                 continue
             if mode == "b":
                 self.process_ban(runtime, channel, argument, adding=adding)
@@ -115,7 +119,7 @@ class IRCEventHandler:
         mask = message.params[2]
         runtime = self.bot.runtime(channel)
         if runtime is not None:
-            runtime.bans.add(mask)
+            runtime.add_ban(mask)
 
     async def handle_banned(self, message: IRCMessage) -> None:
         """Request an unban when the bot is banned from a channel."""
@@ -245,7 +249,7 @@ class IRCEventHandler:
                 try:
                     await self.bot.irc.send("PART", channel)
                 except ConnectionError:
-                    self.bot.channel_mgr.pending_parts[self.bot.fold(channel)] = channel
+                    self.bot.channel_mgr.schedule_part(channel)
             return
         if is_self:
             runtime.reset()
@@ -324,7 +328,9 @@ class IRCEventHandler:
             modes: set[str] = set()
             nick = decorated_nick
             while nick and nick[0] in self.caps.member_prefixes:
-                modes.add(self.caps.member_prefixes[nick[0]])
+                mode = self.caps.member_prefixes[nick[0]]
+                if mode in self.caps.operator_modes:
+                    modes.add(mode)
                 nick = nick[1:]
             if nick:
                 runtime.member(nick).modes.update(modes)
@@ -359,13 +365,20 @@ class IRCEventHandler:
                     await self.sync_session(new_identity, session.to_dict())
                 else:
                     async with self.session_lock:
-                        self.pending_sessions[casefold(new_identity, "ascii")] = (
-                            session.to_dict()
-                        )
-        if self.bot.identity is not None and old_folded == self.bot.fold(
-            self.bot.identity.nick,
-        ):
-            await self.bot.set_identity(new_prefix)
+                        key = casefold(new_identity, "ascii")
+                        self.pending_sessions.pop(key, None)
+                        self.pending_sessions[key] = session.to_dict()
+        identity = self.bot.identity
+        if identity is not None and old_folded == self.bot.fold(identity.nick):
+            # Fall back to the known identity when the NICK prefix omits
+            # user@host, so the advertised presence nick still moves.
+            await self.bot.set_identity(
+                Prefix(
+                    new_nick,
+                    new_prefix.user or identity.user or None,
+                    new_prefix.host or identity.host or None,
+                ),
+            )
 
     async def handle_part(self, message: IRCMessage) -> None:
         """Remove a member on PART or reset channel state for self-parts."""
@@ -428,7 +441,7 @@ class IRCEventHandler:
         member.modes = {
             mode
             for prefix, mode in self.caps.member_prefixes.items()
-            if prefix in flags
+            if prefix in flags and mode in self.caps.operator_modes
         }
         if self.bot.is_self(nick):
             await self.bot.set_identity(member.prefix)
@@ -458,7 +471,7 @@ class IRCEventHandler:
     ) -> None:
         """Add or remove a ban mask and request unban when the bot is affected."""
         if adding:
-            runtime.bans.add(mask)
+            runtime.add_ban(mask)
             if self.bot.identity is not None and mask_matches(
                 mask,
                 self.bot.identity.to_prefix(),
@@ -504,7 +517,7 @@ class IRCEventHandler:
             member.modes.discard(mode)
 
     async def revoke_session(self, prefix: Prefix) -> None:
-        """Revoke authorization and propagate the deletion to peers."""
+        """Revoke authorization and propagate the signed revocation to peers."""
         revoked = self.bot.authorizer.revoke(prefix.render())
         if revoked is not None:
             await self.sync_session(
@@ -522,20 +535,26 @@ class IRCEventHandler:
         identity: str,
         session: dict[str, object],
     ) -> bool:
-        """Apply or queue one session update."""
+        """Apply or queue one session update; report this update's outcome."""
         identity = casefold(identity, "ascii")
         async with self.session_lock:
+            # Pop before inserting so a re-queued identity moves to the tail;
+            # dict assignment alone would keep its stale causal position.
+            self.pending_sessions.pop(identity, None)
             self.pending_sessions[identity] = session
-            return await self._drain_sessions()
+            await self._drain_sessions()
+            return identity not in self.pending_sessions
 
-    async def _drain_sessions(self) -> bool:
-        """Apply queued session mutations in insertion order."""
+    async def _drain_sessions(self) -> None:
+        """Apply queued session mutations in insertion order.
+
+        Stop at the first failure: insertion order carries causality (a nick
+        move queues revoke-old before grant-new), so later entries must not
+        leapfrog an earlier one that is still pending.
+        """
         for identity, session in tuple(self.pending_sessions.items()):
-            if self.pending_sessions.get(identity, self) is not session:
-                continue
             if not await self._apply_session(identity, session):
-                return False
-        return True
+                return
 
     async def _apply_session(
         self,
@@ -550,9 +569,7 @@ class IRCEventHandler:
         self.bot.authorizer.import_session(stored)
         if session.get("revoked") is True:
             winner = self.bot.authorizer.parse(stored, time.time())
-            if winner is None:
-                return False
-            if not winner.revoked:
+            if winner is not None and not winner.revoked:
                 replacement = self.bot.authorizer.create(
                     winner.prefix,
                     winner.expires_at,
@@ -561,9 +578,7 @@ class IRCEventHandler:
                     revoked=True,
                 ).to_dict()
                 self.bot.authorizer.import_session(replacement)
-                if self.pending_sessions.get(identity) is session:
-                    self.pending_sessions[identity] = replacement
+                self.pending_sessions[identity] = replacement
                 return False
-        if self.pending_sessions.get(identity) is session:
-            self.pending_sessions.pop(identity, None)
+        self.pending_sessions.pop(identity, None)
         return True

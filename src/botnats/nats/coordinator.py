@@ -9,6 +9,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
@@ -42,10 +43,17 @@ CONNECT_ERRORS = (NatsError, OSError)
 DECODE_ERRORS = (RecursionError, TypeError, ValueError)
 DECODE_WARNING_INTERVAL = 5.0
 OFFER_TIMEOUT = 0.35
+TRANSIENT_WARNING_INTERVAL = 60.0
 PUBLISH_ERRORS = (*CONNECT_ERRORS, RuntimeError)
 RECONNECT_WAIT = 1
 REQUEST_ERRORS = (*CONNECT_ERRORS, *DECODE_ERRORS, RuntimeError)
 WATCH_NAMES = frozenset({"watch-channels", "watch-presence", "watch-sessions"})
+
+# Task-local generation of the running watch, None outside watch tasks.
+WATCH_GENERATION: ContextVar[int | None] = ContextVar(
+    "WATCH_GENERATION",
+    default=None,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +182,7 @@ class Coordinator:
         self.nc: nats.NATS | None = None
         self.ns = f"botnats.v1.{config.network}"
         self.last_decode_warning = float("-inf")
+        self.transient_warnings: dict[str, tuple[float, int]] = {}
         self.presence_store = PresenceStore(
             config.network,
             config.replicas,
@@ -208,6 +217,7 @@ class Coordinator:
         self.suppressed_warnings = 0
         self.synced_watches: set[str] = set()
         self.unique = True
+        self.watch_generation = 0
         self.watch_tasks: list[asyncio.Task[None]] = []
 
     async def cancel_watches(self) -> None:
@@ -279,7 +289,7 @@ class Coordinator:
 
     async def grant(self, callback: JsonCallback, message: Msg) -> None:
         """Dispatch a targeted grant unless this bot ID conflicts with a peer."""
-        if self.ready:
+        if self.unique and self.owns_presence:
             await self.dispatch(callback, message)
 
     async def init_stores(self) -> None:
@@ -295,9 +305,9 @@ class Coordinator:
                 for store in self.stores:
                     await store.open(js)
             except PUBLISH_ERRORS as error:
-                LOGGER.warning(
-                    "JetStream reinitialization failed; retrying: %s",
-                    error_label(error),
+                self.warn_transient(
+                    "JetStream reinitialization failed; retrying",
+                    error,
                 )
                 await asyncio.sleep(RECONNECT_WAIT)
             else:
@@ -361,8 +371,8 @@ class Coordinator:
         if presence.get("bot_id") != self.bot_id:
             msg = "presence does not match coordinator bot ID"
             raise ValueError(msg)
-        self.last_presence = presence
         async with self.presence_lock:
+            self.last_presence = presence
             if not self.owns_presence:
                 await self.reclaim_presence()
                 self.require_unique()
@@ -414,12 +424,13 @@ class Coordinator:
             # The key is occupied: adopt this instance's own still-live record
             # after a reconnect, or overwrite an unsigned or forged clobber; a
             # validly signed foreign record leaves revision None (a duplicate).
-            with suppress(*PUBLISH_ERRORS):
-                revision = await self.presence_store.reclaim(
-                    self.bot_id,
-                    self.last_presence,
-                    self.instance_id,
-                )
+            # A transient store error propagates to the caller's retry path
+            # instead of being misread as a duplicate bot ID.
+            revision = await self.presence_store.reclaim(
+                self.bot_id,
+                self.last_presence,
+                self.instance_id,
+            )
         if revision is not None:
             if not was_unique:
                 LOGGER.info("duplicate bot ID conflict resolved: %s", self.bot_id)
@@ -476,14 +487,26 @@ class Coordinator:
             msg = f"duplicate bot ID: {self.bot_id}"
             raise RuntimeError(msg)
 
+    def discard_watch_synced(self, name: str, generation: int) -> None:
+        """Invalidate one watch's replay marker unless it was superseded."""
+        if generation == self.watch_generation:
+            self.synced_watches.discard(name)
+
     async def run_watch(
         self,
         name: str,
         watch_fn: Callable[[], Awaitable[None]],
+        generation: int,
     ) -> None:
-        """Run a watch coroutine, retrying on errors with backoff."""
-        while self.connected:
-            self.synced_watches.discard(name)
+        """Run a watch coroutine, retrying on errors with backoff.
+
+        The generation check ejects a superseded task that survived
+        cancellation because a CancelledError was replaced by a transport
+        error raised from the watch body's cleanup.
+        """
+        WATCH_GENERATION.set(generation)
+        while self.connected and generation == self.watch_generation:
+            self.discard_watch_synced(name, generation)
             try:
                 await watch_fn()
             except asyncio.CancelledError:
@@ -491,13 +514,13 @@ class Coordinator:
             except CONNECT_ERRORS as error:
                 if not self.connected:
                     return
-                LOGGER.warning("watch %s failed: %s", name, error_label(error))
+                self.warn_transient(f"watch {name} failed", error)
             except Exception:
                 if not self.connected:
                     return
                 LOGGER.exception("watch %s crashed", name)
             finally:
-                self.synced_watches.discard(name)
+                self.discard_watch_synced(name, generation)
             await asyncio.sleep(RECONNECT_WAIT)
 
     async def start(self) -> None:
@@ -533,20 +556,29 @@ class Coordinator:
 
     async def start_watches(self) -> None:
         """Launch KV watch background tasks for all state buckets."""
+        self.watch_generation += 1
+        generation = self.watch_generation
         self.synced_watches.clear()
         await self.cancel_watches()
+        if self.watch_generation != generation:
+            return
         watches = (
             ("watch-channels", self.watch_channels),
             ("watch-presence", self.watch_presence),
             ("watch-sessions", self.watch_sessions),
         )
         for name, watch_fn in watches:
-            task = asyncio.create_task(self.run_watch(name, watch_fn), name=name)
+            task = asyncio.create_task(
+                self.run_watch(name, watch_fn, generation),
+                name=name,
+            )
             self.watch_tasks.append(task)
 
     def mark_watch_synced(self, name: str) -> None:
-        """Record one completed watch replay."""
-        self.synced_watches.add(name)
+        """Record one completed watch replay unless the watch is superseded."""
+        generation = WATCH_GENERATION.get()
+        if generation is None or generation == self.watch_generation:
+            self.synced_watches.add(name)
 
     async def status(self) -> NATSStatus:
         """Return Core NATS and JetStream cluster status."""
@@ -582,6 +614,17 @@ class Coordinator:
                 f"{self.ns}.{suffix}",
                 cb=partial(self.offer, offer_callback),
             )
+
+    def warn_transient(self, context: str, error: Exception) -> None:
+        """Rate-limit warnings per context for repeating transient failures."""
+        now = time.monotonic()
+        last, suppressed = self.transient_warnings.get(context, (float("-inf"), 0))
+        if now - last < TRANSIENT_WARNING_INTERVAL:
+            self.transient_warnings[context] = (last, suppressed + 1)
+            return
+        suffix = f"; suppressed {suppressed} similar warning(s)" if suppressed else ""
+        LOGGER.warning("%s: %s%s", context, error_label(error), suffix)
+        self.transient_warnings[context] = (now, 0)
 
     def warn_decode(self, kind: str, subject: str, error: Exception) -> None:
         """Rate-limit warnings for malformed NATS messages."""
