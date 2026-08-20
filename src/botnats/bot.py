@@ -7,6 +7,7 @@ import asyncio
 import logging
 import uuid
 from contextlib import suppress
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from botnats import error_label
@@ -236,7 +237,7 @@ class Bot:
             await self.channel_mgr.retry_pending_parts()
             if self.identity is not None:
                 with suppress(*PUBLISH_ERRORS):
-                    await self.coordinator.put_presence(self.identity.to_dict())
+                    await self.coordinator.put_presence(asdict(self.identity))
                 await self.channel_mgr.join_desired()
         if self.coordinator.ready:
             await self.events.retry_pending_sessions()
@@ -263,7 +264,7 @@ class Bot:
         self.identity_generation += 1
         self.registered = False
 
-    async def on_registered(self) -> None:
+    def on_registered(self) -> None:
         """Handle successful IRC registration and begin identity discovery."""
         self.registered = True
         self.identity = None
@@ -323,7 +324,7 @@ class Bot:
             return
         self.identity = identity
         with suppress(*PUBLISH_ERRORS):
-            await self.coordinator.put_presence(identity.to_dict())
+            await self.coordinator.put_presence(asdict(identity))
         await self.channel_mgr.join_desired()
 
     def spawn(self, coroutine: Coroutine[Any, Any, None], name: str) -> None:

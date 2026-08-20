@@ -5,6 +5,7 @@
 
 import time
 import unittest
+from dataclasses import asdict
 from unittest.mock import AsyncMock, patch
 
 from botnats.admin import totp
@@ -87,7 +88,7 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
 
         peer = BotPresence("beta", "beta.host", "one", "beta", "~beta")
         bot.presence.update(peer)
-        action = {"channel": "#test", "presence": peer.to_dict()}
+        action = {"channel": "#test", "presence": asdict(peer)}
         await bot.callbacks.on_invite_grant(action)
         runtime.member("beta").prefix = Prefix("beta", "~beta", "beta.host")
         runtime.add_ban("*!~beta@beta.host")
@@ -377,7 +378,7 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
                 incoming.version + 1,
                 revoked=True,
             )
-            return winner.to_dict()
+            return asdict(winner)
 
         with patch.object(
             coordinator,

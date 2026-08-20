@@ -5,11 +5,12 @@
 
 import asyncio
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from unittest.mock import AsyncMock, patch
 
 from botnats.bot import Bot
 from botnats.channel import ChannelRecord, ChannelRuntime
+from botnats.config import mode_intent
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
@@ -22,9 +23,6 @@ from tests.unit.helpers import (
     bot_with_irc,
     config,
 )
-
-EXPECTED_NATS_FAILURE_PRIVMSGS = 2
-EXPECTED_SPLIT_RECORDS = 2
 
 
 class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -67,6 +65,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """Skip a configured mode reclassified by the active IRC server."""
         bot, fake_irc = bot_with_irc()
         bot.config = replace(bot.config, channel_modes="+x")
+        bot.channel_mgr.mode_intent = mode_intent(bot.config.channel_modes)
         bot.caps.chanmodes = ("beI", "kx", "l", "imnst")
 
         with self.assertLogs("botnats.channel", level="WARNING"):
@@ -125,7 +124,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert len(bot.channel_mgr.channel_records) == 1
 
         bot.channel_mgr.set_casemapping("ascii")
-        assert len(bot.channel_mgr.channel_records) == EXPECTED_SPLIT_RECORDS
+        assert len(bot.channel_mgr.channel_records) == 2
         assert {record.key for record in bot.channel_mgr.channel_records.values()} == {
             "first",
             "second",
@@ -133,7 +132,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.channel_mgr.set_casemapping("rfc1459")
         bot.channel_mgr.set_casemapping("ascii")
-        assert len(bot.channel_mgr.channel_records) == EXPECTED_SPLIT_RECORDS
+        assert len(bot.channel_mgr.channel_records) == 2
 
     async def test_casemapping_change_parts_tombstoned_channel(self) -> None:
         """Queue a PART when a rekeyed joined channel folds onto a tombstone."""
@@ -202,7 +201,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert casefold("#new") not in bot.channel_mgr.desired_channels
         assert casefold("#test") in bot.channel_mgr.desired_channels
-        assert len(fake_irc.privmsgs) == EXPECTED_NATS_FAILURE_PRIVMSGS
+        assert len(fake_irc.privmsgs) == 2
 
     async def test_join_preserves_live_key(self) -> None:
         """Verify a repeated keyless JOIN retains a key learned from IRC."""
@@ -373,7 +372,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key == "recordkey"
         record = bot.channel_mgr.channel_records[casefold("#test")]
         assert record.key == "recordkey"
-        assert coordinator.channel_puts == [("#test", record.to_dict())]
+        assert coordinator.channel_puts == [("#test", asdict(record))]
 
     async def test_record_key_skips_unchanged_value(self) -> None:
         """Avoid a new durable revision when the key is unchanged."""
@@ -504,7 +503,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 present=True,
                 after=incoming.revision,
             )
-            return winner.to_dict()
+            return asdict(winner)
 
         with patch.object(
             coordinator,

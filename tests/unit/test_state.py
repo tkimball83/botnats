@@ -4,11 +4,10 @@
 """Tests for channel record ordering and runtime state."""
 
 import unittest
+from dataclasses import asdict
 
 from botnats.channel import ChannelRecord, ChannelRuntime
 from botnats.irc.protocol import Prefix
-
-PRE_MERGE_MEMBER_COUNT = 2
 
 
 class StateTests(unittest.TestCase):
@@ -41,7 +40,7 @@ class StateTests(unittest.TestCase):
         )
 
         assert tombstone.revision > update.revision
-        assert ChannelRecord.from_dict(tombstone.to_dict()) == tombstone
+        assert ChannelRecord.from_dict(asdict(tombstone)) == tombstone
 
     def test_channel_revision_validation(self) -> None:
         """Verify malformed revisions cannot permanently outrank valid updates."""
@@ -74,7 +73,7 @@ class StateTests(unittest.TestCase):
 
         runtime.member("user[").prefix = Prefix("user[", "u", "host")
         runtime.member("user{").prefix = Prefix("user{", "u", "host")
-        assert len(runtime.members) == PRE_MERGE_MEMBER_COUNT
+        assert len(runtime.members) == 2
 
         runtime.set_casemapping("rfc1459")
         assert len(runtime.members) == 1

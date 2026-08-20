@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+")
 MODE_STRING_RE = re.compile(r"(?:[+-][A-Za-z]+)+")
-MAX_JETSTREAM_REPLICAS = 5
-MAX_PORT = 65535
 MAX_SESSION_TTL = 86400
 MIN_COORDINATION_KEY_BYTES = 32
 NATS_SCHEMES = frozenset({"nats", "tls"})
@@ -234,11 +232,7 @@ def nick(section: dict[str, Any], key: str, label: str) -> str:
 def port(section: dict[str, Any], key: str, default: int) -> int:
     """Extract a valid TCP port number."""
     value = section.get(key, default)
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 1 <= value <= MAX_PORT
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         msg = f"{key} must be an integer between 1 and 65535"
         raise ValueError(msg)
     return value
@@ -264,11 +258,7 @@ def positive_float(section: dict[str, Any], key: str, default: float) -> float:
 def replica_count(section: dict[str, Any]) -> int:
     """Extract a valid JetStream replica count."""
     value = section.get("jetstream_replicas", 1)
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 1 <= value <= MAX_JETSTREAM_REPLICAS
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
         msg = "jetstream_replicas must be an integer between 1 and 5"
         raise ValueError(msg)
     return value

@@ -47,6 +47,7 @@ class ChannelManager:
         self.channels: dict[str, ChannelRuntime] = {}
         self.cooldowns: dict[tuple[str, str], float] = {}
         self.desired_channels: dict[str, str] = {}
+        self.mode_intent = mode_intent(bot.config.channel_modes)
         self.pending_op_flushes: set[str] = set()
         self.pending_ops: dict[str, dict[str, BotPresence]] = {}
         self.pending_parts: dict[str, str] = {}
@@ -93,7 +94,7 @@ class ChannelManager:
         """Set the configured channel modes when the bot has operator status."""
         if not self.bot.config.channel_modes:
             return
-        required, forbidden = mode_intent(self.bot.config.channel_modes)
+        required, forbidden = self.mode_intent
         if any(
             mode_requires_argument(
                 mode,
@@ -145,7 +146,14 @@ class ChannelManager:
                 and runtime is not None
                 and self.bot.is_self_opped(runtime)
             ):
-                targets = self.grantable_targets(runtime, queued)
+                targets = [
+                    p.nick
+                    for p in queued.values()
+                    if (m := runtime.members.get(self.bot.fold(p.nick))) is not None
+                    and not self.bot.caps.is_opped(m.modes)
+                    and m.prefix is not None
+                    and p.matches(m.prefix, self.bot.caps.casemapping)
+                ]
                 await self.bot.batch_mode(
                     channel,
                     "+",
@@ -161,24 +169,6 @@ class ChannelManager:
             if not cancelled and self.pending_ops.get(folded_channel):
                 self.pending_op_flushes.add(folded_channel)
                 self.bot.spawn(self.flush_pending_ops(folded_channel), "op-batch")
-
-    def grantable_targets(
-        self,
-        runtime: ChannelRuntime,
-        queued: dict[str, BotPresence],
-    ) -> list[str]:
-        """Return queued peers that are present, unopped, and identity-matched."""
-        targets: list[str] = []
-        for presence in queued.values():
-            member = runtime.members.get(self.bot.fold(presence.nick))
-            if (
-                member is not None
-                and not self.bot.caps.is_opped(member.modes)
-                and member.prefix is not None
-                and presence.matches(member.prefix, self.bot.caps.casemapping)
-            ):
-                targets.append(presence.nick)
-        return targets
 
     async def join_desired(self) -> None:
         """Attempt to join all desired channels not yet entered."""
@@ -211,7 +201,7 @@ class ChannelManager:
         try:
             stored = await self.bot.coordinator.put_channel(
                 channel,
-                record.to_dict(),
+                asdict(record),
             )
         except PUBLISH_ERRORS:
             # Keep the observed IRC key locally and queue the durable write;
@@ -236,7 +226,7 @@ class ChannelManager:
         self.cooldowns[key] = loop_time
         await self.bot.coordinator.request_offer(
             kind,
-            {"channel": channel, "presence": self.bot.identity.to_dict()},
+            {"channel": channel, "presence": asdict(self.bot.identity)},
         )
 
     async def retry_pending_records(self) -> None:
@@ -248,7 +238,7 @@ class ChannelManager:
             try:
                 stored = await self.bot.coordinator.put_channel(
                     record.channel,
-                    record.to_dict(),
+                    asdict(record),
                 )
             except PUBLISH_ERRORS:
                 return
@@ -264,10 +254,6 @@ class ChannelManager:
         self.pending_op_flushes.clear()
         self.pending_ops.clear()
         self.pending_parts.clear()
-
-    def schedule_part(self, channel: str) -> None:
-        """Queue a channel part for retry after a failed PART send."""
-        self.pending_parts[self.bot.fold(channel)] = channel
 
     async def retry_pending_parts(self) -> None:
         """Reattempt PART for channels that failed to leave previously."""
@@ -434,10 +420,6 @@ class ChannelRecord:
             present=present,
             revision=f"{cls.last_revision:020d}-{uuid.uuid4().hex}",
         )
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize the channel record to a dictionary."""
-        return asdict(self)
 
 
 @dataclass(slots=True)

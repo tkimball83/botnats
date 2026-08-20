@@ -11,7 +11,7 @@ import unittest
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -49,11 +49,6 @@ BETA_PRESENCE = {
     "nick": "beta",
     "user": "user",
 }
-EXPECTED_WARNING_COUNT = 2
-EXPECTED_WATCH_RESTARTS = 3
-EXPECTED_WRITE_ATTEMPTS = 2
-OLD_INIT_RETRY_LIMIT = 10
-RUNTIME_ERROR_CALL = 2
 GRANT_TIMEOUT = 5
 JETSTREAM_REPLICAS = int(os.environ.get("BOTNATS_TEST_JETSTREAM_REPLICAS", "1"))
 NATS_TOKEN = os.environ.get("BOTNATS_TEST_NATS_TOKEN", "integration-token")
@@ -535,7 +530,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             coordinator.warn_transient("watch watch-presence failed", OSError("c"))
         # watch-channels logs once (second suppressed); watch-presence's first
         # failure is not starved by the channels throttle.
-        assert len(logs.output) == EXPECTED_WARNING_COUNT
+        assert len(logs.output) == 2
         assert any("watch-channels" in line for line in logs.output)
         assert any("watch-presence" in line for line in logs.output)
 
@@ -610,7 +605,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha", Fixtures())
         coordinator.nc = MagicMock(is_connected=True)
         coordinator.nc.jetstream.return_value = MagicMock()
-        failures = [OSError("unavailable")] * (OLD_INIT_RETRY_LIMIT + 1)
+        failures = [OSError("unavailable")] * 11
         open_attempt = AsyncMock(side_effect=[*failures, None])
         open_store = AsyncMock()
 
@@ -625,8 +620,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         ):
             await coordinator.init_stores()
 
-        assert open_attempt.await_count == OLD_INIT_RETRY_LIMIT + 2
-        assert sleep.await_count == OLD_INIT_RETRY_LIMIT + 1
+        assert open_attempt.await_count == 12
+        assert sleep.await_count == 11
 
     async def test_init_stores_surfaces_programming_errors(self) -> None:
         """Do not retry a programming error as though it were an outage."""
@@ -670,7 +665,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             coordinator.warn_decode("message", SUBJECT, ValueError("bad"))
             coordinator.warn_decode("message", SUBJECT, ValueError("bad"))
 
-        assert len(logs.output) == EXPECTED_WARNING_COUNT
+        assert len(logs.output) == 2
         assert "suppressed 1 similar warning(s)" in logs.output[-1]
 
     async def test_network_namespaces(self) -> None:
@@ -760,7 +755,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             del arguments
             nonlocal calls
             calls += 1
-            if calls <= RUNTIME_ERROR_CALL:
+            if calls <= 2:
                 msg = "boom"
                 raise ValueError(msg)
             await asyncio.Event().wait()
@@ -779,7 +774,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
             async with asyncio.timeout(5):
-                while calls <= RUNTIME_ERROR_CALL:
+                while calls <= 2:
                     await real_sleep(0.001)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -850,7 +845,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         entry = SimpleNamespace(
             key=coordinator.channels_store.key("#other"),
             operation="PUT",
-            value=json.dumps(record.to_dict()).encode(),
+            value=json.dumps(asdict(record)).encode(),
         )
         kv, _ = watcher(entry, None)
         coordinator.channels_store.kv = kv
@@ -927,7 +922,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.put_presence(presence)
 
         assert coordinator.unique
-        assert create.await_count == EXPECTED_WRITE_ATTEMPTS
+        assert create.await_count == 2
         update.assert_not_awaited()
 
     async def test_reclaim_claims_occupied_key(self) -> None:
@@ -1288,7 +1283,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             if calls == 1:
                 msg = "transient"
                 raise OSError(msg)
-            if calls == RUNTIME_ERROR_CALL:
+            if calls == 2:
                 # KVStore.open raises this while JetStream handles are
                 # reset; a watch must treat it as transient, not a crash.
                 msg = "JetStream is unavailable"
@@ -1304,12 +1299,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         ):
             await coordinator.start_watches()
             async with asyncio.timeout(5):
-                while calls <= EXPECTED_WATCH_RESTARTS:
+                while calls <= 3:
                     await real_sleep(0.001)
             assert not coordinator.synced_watches
             await coordinator.cancel_watches()
 
-        assert calls > EXPECTED_WATCH_RESTARTS
+        assert calls > 3
 
     async def test_concurrent_start_watches_keeps_single_watcher_set(self) -> None:
         """Verify overlapping start_watches calls leave exactly one watcher set."""
@@ -1456,7 +1451,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             del arguments
             nonlocal calls
             calls += 1
-            if calls <= EXPECTED_WATCH_RESTARTS:
+            if calls <= 3:
                 # A bare RuntimeError is a programming failure, unlike the
                 # StoreUnavailableError subclass watches treat as transient.
                 msg = "missing attribute"
@@ -1472,12 +1467,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         ):
             await coordinator.start_watches()
             async with asyncio.timeout(5):
-                while calls <= EXPECTED_WATCH_RESTARTS:
+                while calls <= 3:
                     await real_sleep(0.001)
             await coordinator.cancel_watches()
 
         assert any("crashed" in line for line in logs.output)
-        assert calls > EXPECTED_WATCH_RESTARTS
+        assert calls > 3
 
 
 @unittest.skipUnless(NATS_URL, "BOTNATS_TEST_NATS_URL is not configured")

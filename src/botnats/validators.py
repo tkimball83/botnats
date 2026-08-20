@@ -11,22 +11,20 @@ from botnats.irc.protocol import format_message
 
 if TYPE_CHECKING:
     from collections.abc import Collection
-
-MIN_CHANNEL_LENGTH = 2
 MAX_CHANNEL_REVISION = (1 << 63) - 1
 CHANNEL_REVISION_RE = re.compile(r"\d{20}-[0-9a-f]{32}")
 
 
+def _has_control_chars(value: str) -> bool:
+    return any(c.isspace() or c == "\x00" for c in value)
+
+
 def validate_channel(value: str) -> str:
     """Verify an IRC channel name is well-formed and return it."""
-    if len(value) < MIN_CHANNEL_LENGTH or not value.startswith(("#", "&", "+", "!")):
+    if len(value) < 2 or not value.startswith(("#", "&", "+", "!")):
         msg = "channel must start with #, &, +, or !"
         raise ValueError(msg)
-    if (
-        "," in value
-        or "\x07" in value
-        or any(character.isspace() or character == "\x00" for character in value)
-    ):
+    if "," in value or "\x07" in value or _has_control_chars(value):
         msg = "channel contains unsupported characters"
         raise ValueError(msg)
     return value
@@ -37,11 +35,7 @@ def validate_key(value: str) -> str:
     if not value:
         msg = "channel key must not be empty"
         raise ValueError(msg)
-    if (
-        value.startswith(":")
-        or "," in value
-        or any(character.isspace() or character == "\x00" for character in value)
-    ):
+    if value.startswith(":") or "," in value or _has_control_chars(value):
         msg = "channel key contains unsupported characters"
         raise ValueError(msg)
     return value
@@ -128,9 +122,7 @@ def validate_target(value: str) -> str:
     if not value:
         msg = "target must not be empty"
         raise ValueError(msg)
-    if value.startswith(":") or any(
-        character.isspace() or character == "\x00" for character in value
-    ):
+    if value.startswith(":") or _has_control_chars(value):
         msg = "target contains unsupported characters"
         raise ValueError(msg)
     return value

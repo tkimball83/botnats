@@ -43,20 +43,15 @@ CONFIG = b"""{
   }
 }
 """
-DEFAULT_FLOAT = 2.5
-DEFAULT_PRESENCE_TTL = 15
-DEFAULT_SESSION_TTL = 3600
-EXPECTED_COORDINATION_KEY = "coordination-secret-used-only-for-tests"
-EXPECTED_HEALTH_PORT = 8080
-EXPECTED_MONITOR_PORT = 8222
-EXPECTED_NATS_CREDENTIAL = "nats-token"
-EXPECTED_REPLICAS = 3
-OVERSIZED_NUMBER = 10**400
 SECRETS = {
     "BOTNATS_COORDINATION_SECRET": "coordination-secret-used-only-for-tests",
     "BOTNATS_NATS_TOKEN": "nats-token",
     "BOTNATS_TOTP_SECRET": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
 }
+
+
+EXPECTED_COORDINATION_KEY = "coordination-secret-used-only-for-tests"
+EXPECTED_NATS_CREDENTIAL = "nats-token"
 
 
 class ConfigTests(unittest.TestCase):
@@ -75,9 +70,9 @@ class ConfigTests(unittest.TestCase):
         assert config.nickname == "botnats"
         assert not config.irc_verify_tls
         assert config.nats_token == EXPECTED_NATS_CREDENTIAL
-        assert config.nats_monitor_port == EXPECTED_MONITOR_PORT
-        assert config.jetstream_replicas == EXPECTED_REPLICAS
-        assert config.health_port == EXPECTED_HEALTH_PORT
+        assert config.nats_monitor_port == 8222
+        assert config.jetstream_replicas == 3
+        assert config.health_port == 8080
         assert config.irc_servers == (IRCServer("irc.example.test", 6697, tls=True),)
 
     def test_optional_tables_may_be_omitted(self) -> None:
@@ -91,8 +86,8 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(os.environ, SECRETS):
                 config = BotConfig.load(path)
 
-        assert config.auth_session_ttl == DEFAULT_SESSION_TTL
-        assert config.presence_ttl == DEFAULT_PRESENCE_TTL
+        assert config.auth_session_ttl == 3600
+        assert config.presence_ttl == 15
 
     def test_required_key_errors_name_their_section(self) -> None:
         """Qualify required-key errors with their configuration table."""
@@ -160,10 +155,10 @@ class ConfigTests(unittest.TestCase):
 
     def test_port_validation(self) -> None:
         """Verify monitoring ports default and stay in the TCP port range."""
-        assert port({}, "monitor_port", EXPECTED_MONITOR_PORT) == EXPECTED_MONITOR_PORT
+        assert port({}, "monitor_port", 8222) == 8222
         for bad in (True, 0, 65536, 8222.0, "8222"):
             with self.assertRaisesRegex(ValueError, "integer between 1 and 65535"):
-                port({"monitor_port": bad}, "monitor_port", EXPECTED_MONITOR_PORT)
+                port({"monitor_port": bad}, "monitor_port", 8222)
 
     def test_positive_float_rejects_non_finite(self) -> None:
         """Verify positive_float rejects NaN, infinities, and non-positive values."""
@@ -171,13 +166,13 @@ class ConfigTests(unittest.TestCase):
             float("nan"),
             float("inf"),
             float("-inf"),
-            OVERSIZED_NUMBER,
+            10**400,
             0,
             -1,
         ):
             with self.assertRaisesRegex(ValueError, "positive number"):
                 positive_float({"value": bad}, "value", 1.0)
-        assert positive_float({}, "value", DEFAULT_FLOAT) == DEFAULT_FLOAT
+        assert positive_float({}, "value", 2.5) == 2.5
 
     def test_presence_ttl_exceeds_maintenance_interval(self) -> None:
         """Reject presence expiry that is no longer than its heartbeat interval."""

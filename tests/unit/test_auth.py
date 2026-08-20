@@ -4,6 +4,7 @@
 """Tests for TOTP authorization and session management."""
 
 import unittest
+from dataclasses import asdict
 
 from botnats.admin import TotpAuthorizer
 from botnats.irc.protocol import casefold
@@ -70,7 +71,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         session = auth.sessions[auth.identity_fold(prefix)]
 
         auth.revoke(prefix)
-        auth.import_session(session.to_dict(), now=20)
+        auth.import_session(asdict(session), now=20)
 
         assert not auth.authorized(prefix, now=21)
 
@@ -82,10 +83,10 @@ class TotpAuthorizerTests(unittest.TestCase):
         session = source.grant(prefix, now=10)
         revoked = source.revoke(prefix)
         assert revoked is not None
-        revocation = revoked.to_dict()
+        revocation = asdict(revoked)
 
         target.import_session(revocation, now=20)
-        target.import_session(session.to_dict(), now=20)
+        target.import_session(asdict(session), now=20)
 
         assert not target.authorized(prefix, now=21)
 
@@ -97,9 +98,9 @@ class TotpAuthorizerTests(unittest.TestCase):
         revoked = source.revoke(prefix)
         assert revoked is not None
 
-        missing = revoked.to_dict()
+        missing = asdict(revoked)
         missing.pop("revoked")
-        changed = {**revoked.to_dict(), "revoked": False}
+        changed = {**asdict(revoked), "revoked": False}
         for payload in (missing, changed):
             target = authorizer("beta")
             target.import_session(payload, now=20)
@@ -133,7 +134,7 @@ class TotpAuthorizerTests(unittest.TestCase):
 
         first.grant(prefix, now=10)
         session = next(iter(first.sessions.values()))
-        second.import_session(session.to_dict(), now=20)
+        second.import_session(asdict(session), now=20)
 
         assert second.authorized(prefix, now=39.9)
         assert not second.authorized(prefix, now=40)
@@ -184,16 +185,16 @@ class TotpAuthorizerTests(unittest.TestCase):
         first_revoked, moved = source.move(first, second, now=11) or (None, None)
         assert first_revoked is not None
         assert moved is not None
-        target.import_session(first_revoked.to_dict(), now=12)
-        target.import_session(moved.to_dict(), now=12)
+        target.import_session(asdict(first_revoked), now=12)
+        target.import_session(asdict(moved), now=12)
         second_revoked, moved_back = source.move(second, first, now=13) or (
             None,
             None,
         )
         assert second_revoked is not None
         assert moved_back is not None
-        target.import_session(second_revoked.to_dict(), now=14)
-        target.import_session(moved_back.to_dict(), now=14)
+        target.import_session(asdict(second_revoked), now=14)
+        target.import_session(asdict(moved_back), now=14)
 
         assert source.authorized(first, now=15)
         assert target.authorized(first, now=15)
@@ -206,7 +207,7 @@ class TotpAuthorizerTests(unittest.TestCase):
 
         first.grant(prefix, now=10)
         session = next(iter(first.sessions.values()))
-        second.import_session(session.to_dict(), now=20)
+        second.import_session(asdict(session), now=20)
 
         assert not second.authorized(prefix, now=21)
 
@@ -226,11 +227,13 @@ class TotpAuthorizerTests(unittest.TestCase):
             **forged,
             "signature": "é" * 64,
         }
-        non_finite = receiver.create(
-            "attacker!user@example.test",
-            float("nan"),
-            "alpha",
-        ).to_dict()
+        non_finite = asdict(
+            receiver.create(
+                "attacker!user@example.test",
+                float("nan"),
+                "alpha",
+            ),
+        )
 
         for bad in (unsigned, forged, non_ascii, non_finite):
             receiver.import_session(bad, now=20)

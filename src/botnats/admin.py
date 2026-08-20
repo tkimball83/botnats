@@ -30,9 +30,6 @@ if TYPE_CHECKING:
     from botnats.channel import ChannelRuntime
     from botnats.irc.protocol import Prefix
 
-ADMIN_COMMAND_ARGS = 2
-INVALID_CLAIM_COUNTER = -1
-MAX_JOIN_ARGS = 2
 MAX_RATE_BUCKETS = 8192
 MIN_TOTP_SECRET_BYTES = 20
 TOTP_CODE_LENGTH = 6
@@ -63,17 +60,17 @@ class AuthFlow:
         # A wrong code still performs the claim round trip so response
         # timing cannot distinguish it from a valid-but-replayed code.
         claimed = await coordinator.request_claim(
-            counter if counter is not None else INVALID_CLAIM_COUNTER,
+            counter if counter is not None else -1,
         )
         if counter is not None and claimed:
             session = bot.authorizer.grant(rendered)
             if not await bot.events.sync_session(
                 rendered,
-                session.to_dict(),
+                asdict(session),
             ) or not bot.authorizer.authorized(rendered):
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
-                    await bot.events.sync_session(rendered, revoked.to_dict())
+                    await bot.events.sync_session(rendered, asdict(revoked))
                 await bot.safe_privmsg(prefix.nick, "Authorization failed")
                 return
             await bot.safe_privmsg(prefix.nick, "Authorized")
@@ -156,7 +153,7 @@ class CommandHandler:
         )
         stored = await self.bot.coordinator.put_channel(
             channel,
-            record.to_dict(),
+            asdict(record),
         )
         authoritative = ChannelRecord.from_dict(stored)
         await self.bot.channel_mgr.apply_record(authoritative)
@@ -168,7 +165,7 @@ class CommandHandler:
 
     async def cmd_ban(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Set a ban mask on a channel."""
-        if len(arguments) != ADMIN_COMMAND_ARGS:
+        if len(arguments) != 2:
             msg = "BAN <channel> <mask>"
             raise ValueError(msg)
         channel = validate_channel(arguments[0])
@@ -194,7 +191,7 @@ class CommandHandler:
 
     async def cmd_deop(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Remove operator status from a user on a channel."""
-        if len(arguments) != ADMIN_COMMAND_ARGS:
+        if len(arguments) != 2:
             msg = "DEOP <channel> <nick>"
             raise ValueError(msg)
         channel = validate_channel(arguments[0])
@@ -220,7 +217,7 @@ class CommandHandler:
 
     async def cmd_invite(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Invite a user to a channel."""
-        if len(arguments) != ADMIN_COMMAND_ARGS:
+        if len(arguments) != 2:
             msg = "INVITE <channel> <nick>"
             raise ValueError(msg)
         channel = validate_channel(arguments[0])
@@ -231,11 +228,11 @@ class CommandHandler:
 
     async def cmd_join(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Add a channel to the desired set and begin joining it."""
-        if not 1 <= len(arguments) <= MAX_JOIN_ARGS:
+        if not 1 <= len(arguments) <= 2:
             msg = "JOIN <channel> [key]"
             raise ValueError(msg)
         channel = validate_channel(arguments[0])
-        key = validate_key(arguments[1]) if len(arguments) == MAX_JOIN_ARGS else None
+        key = validate_key(arguments[1]) if len(arguments) == 2 else None
         await self.channel_update(prefix, channel, key, present=True)
 
     async def cmd_key(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
@@ -257,7 +254,7 @@ class CommandHandler:
 
     async def cmd_op(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Grant operator status to a user on a channel."""
-        if len(arguments) != ADMIN_COMMAND_ARGS:
+        if len(arguments) != 2:
             msg = "OP <channel> <nick>"
             raise ValueError(msg)
         channel = validate_channel(arguments[0])
@@ -317,7 +314,7 @@ class CommandHandler:
 
     async def cmd_unban(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Remove a ban mask from a channel."""
-        if len(arguments) != ADMIN_COMMAND_ARGS:
+        if len(arguments) != 2:
             msg = "UNBAN <channel> <mask>"
             raise ValueError(msg)
         channel = validate_channel(arguments[0])
@@ -343,7 +340,8 @@ class CommandHandler:
         except ValueError as error:
             # Unauthenticated senders get silence, not a parse-error reply
             # that would confirm a bot is listening.
-            if self.bot.authorizer.authorized(prefix.render()):
+            rendered = prefix.render()
+            if self.bot.authorizer.authorized(rendered):
                 await self.bot.safe_privmsg(
                     prefix.nick,
                     str(error) or "Command failed",
@@ -353,7 +351,8 @@ class CommandHandler:
         if name == "AUTH":
             await self.bot.auth_flow.authenticate(prefix, arguments)
             return
-        if not self.bot.authorizer.authorized(prefix.render()):
+        rendered = prefix.render()
+        if not self.bot.authorizer.authorized(rendered):
             return
 
         handler = self.handlers.get(name)
@@ -427,10 +426,6 @@ class Session:
     def order(self) -> tuple[float, int, bool]:
         """Return the durable mutation order for this session."""
         return self.expires_at, self.version, self.revoked
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a serializable dictionary of session fields."""
-        return asdict(self)
 
 
 class TotpAuthorizer:

@@ -25,7 +25,6 @@ CASEMAP_TABLES = {
     ),
 }
 CASEMAPPINGS = frozenset(CASEMAP_TABLES)
-CHANMODE_GROUP_COUNT = 4
 DEFAULT_CASEMAPPING = "rfc1459"
 DEFAULT_CHANMODES = ("beI", "k", "l", "imnst")
 DEFAULT_MEMBERSHIP_MODES = "qaohv"
@@ -121,7 +120,7 @@ class ISupportState:
     def parse_chanmodes(self, value: str) -> None:
         """Extract the four CHANMODES categories from an ISUPPORT value."""
         groups = value.split(",")
-        if len(groups) >= CHANMODE_GROUP_COUNT:
+        if len(groups) >= 4:
             self.chanmodes = (groups[0], groups[1], groups[2], groups[3])
 
     def parse_modes(self, value: str) -> None:
@@ -238,7 +237,7 @@ def format_message(
     return encoded
 
 
-def glob_matches(pattern: str, value: str) -> bool:
+def _glob_matches(pattern: str, value: str) -> bool:
     """Match a glob pattern with * and ? wildcards without backtracking blowup."""
     pattern_index = 0
     value_index = 0
@@ -336,9 +335,9 @@ def mask_matches(
     host = casefold(prefix.host or "", "ascii")
     mask_host = casefold(mask_prefix.host or "*", "ascii")
     return (
-        glob_matches(mask_nick, nick)
-        and glob_matches(mask_user, user)
-        and glob_matches(mask_host, host)
+        _glob_matches(mask_nick, nick)
+        and _glob_matches(mask_user, user)
+        and _glob_matches(mask_host, host)
     )
 
 

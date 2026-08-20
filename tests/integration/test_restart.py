@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import asdict
 
 import nats
 from nats.errors import Error as NatsError
@@ -69,7 +70,7 @@ async def run(phase: str) -> None:
             await claims.open(nc.jetstream())
             assert await claims.claim(COUNTER)
             await channels.open(nc.jetstream())
-            record = ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True).to_dict()
+            record = asdict(ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True))
             stored = await channels.put(CHANNEL, record)
             assert stored["key"] == CHANNEL_KEY
             await sessions.open(nc.jetstream())

@@ -21,10 +21,6 @@ CHANNELS = (
     ("#botnats-second", "second-key"),
 )
 COMMAND_TIMEOUT = 15.0
-MIN_CHANNEL_MODE_PARAMS = 3
-MIN_NAMES_REPLY_PARAMS = 2
-MIN_NATS_ROUTES = 2
-MIN_PRIVMSG_PARAMS = 2
 STARTUP_TIMEOUT = 45.0
 TEST_BAN = "*!*@blocked.example"
 
@@ -118,7 +114,7 @@ async def modes(session: IRCSession, channel: str) -> str:
     response = await session.read_until(
         lambda message: (
             message.command == "324"
-            and len(message.params) >= MIN_CHANNEL_MODE_PARAMS
+            and len(message.params) >= 3
             and message.params[1].casefold() == channel.casefold()
         ),
         wait_seconds=COMMAND_TIMEOUT,
@@ -152,11 +148,11 @@ def names_reply(channel: str) -> Callable[[IRCMessage], bool]:
     """Return a predicate for NAMES replies belonging to one channel."""
 
     def matches(message: IRCMessage) -> bool:
-        if message.command == "353" and len(message.params) >= MIN_NAMES_REPLY_PARAMS:
+        if message.command == "353" and len(message.params) >= 2:
             return message.params[-2].casefold() == channel.casefold()
         return (
             message.command == "366"
-            and len(message.params) >= MIN_NAMES_REPLY_PARAMS
+            and len(message.params) >= 2
             and message.params[1].casefold() == channel.casefold()
         )
 
@@ -183,7 +179,7 @@ def private_message(
             message.command == "PRIVMSG"
             and message.prefix is not None
             and message.prefix.nick.casefold() == source.casefold()
-            and len(message.params) >= MIN_PRIVMSG_PARAMS
+            and len(message.params) >= 2
             and message.params[0].casefold() == "owner"
             and (text is None or message.params[-1] == text)
         )
@@ -351,7 +347,7 @@ async def wait_for_status(session: IRCSession, bot: str) -> None:
             )
             if (
                 nats_fields.get("connection") == "up"
-                and int(nats_fields.get("routes", "0")) >= MIN_NATS_ROUTES
+                and int(nats_fields.get("routes", "0")) >= 2
                 and nats_fields.get("jetstream") == "up"
                 and nats_fields.get("replicas") == "3/3"
             ):

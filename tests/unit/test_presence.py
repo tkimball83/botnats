@@ -4,6 +4,7 @@
 """Tests for bot presence matching and registry expiry."""
 
 import unittest
+from dataclasses import asdict
 
 from botnats.irc.protocol import Prefix
 from botnats.presence import BotPresence, PresenceRegistry
@@ -33,7 +34,7 @@ class PresenceTests(unittest.TestCase):
     def test_from_dict_round_trip(self) -> None:
         """Verify from_dict and to_dict produce equivalent presences."""
         original = BotPresence("alpha", "host", "instance", "Alpha", "user")
-        restored = BotPresence.from_dict(original.to_dict())
+        restored = BotPresence.from_dict(asdict(original))
         assert original == restored
 
     def test_presence_expiry(self) -> None:

@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -33,6 +32,8 @@ from botnats.nats.store import (
 from botnats.presence import BotPresence
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from nats.aio.msg import Msg
 
     from botnats.bot import NATSCallbackHandler
@@ -126,10 +127,6 @@ class CoordinatorProtocol(Protocol):
     async def status(self) -> NATSStatus:
         """Return Core NATS and JetStream cluster status."""
         ...
-
-
-JsonCallback = Callable[[dict[str, Any]], Awaitable[None]]
-OfferCallback = Callable[[dict[str, Any]], bool]
 
 
 def sender_owns_presence(sender: str, payload: dict[str, Any]) -> bool:
@@ -282,12 +279,20 @@ class Coordinator:
             return None
         return payload
 
-    async def dispatch(self, callback: JsonCallback, message: Msg) -> None:
+    async def dispatch(
+        self,
+        callback: Callable[[dict[str, Any]], Awaitable[None]],
+        message: Msg,
+    ) -> None:
         """Decode a NATS message and invoke the callback with its payload."""
         if (payload := self.decode_action(message)) is not None:
             await callback(payload)
 
-    async def grant(self, callback: JsonCallback, message: Msg) -> None:
+    async def grant(
+        self,
+        callback: Callable[[dict[str, Any]], Awaitable[None]],
+        message: Msg,
+    ) -> None:
         """Dispatch a targeted grant unless this bot ID conflicts with a peer."""
         if self.unique and self.owns_presence:
             await self.dispatch(callback, message)
@@ -319,7 +324,11 @@ class Coordinator:
             LOGGER.error("duplicate bot ID detected: %s", self.bot_id)
         self.unique = False
 
-    async def offer(self, callback: OfferCallback, message: Msg) -> None:
+    async def offer(
+        self,
+        callback: Callable[[dict[str, Any]], bool],
+        message: Msg,
+    ) -> None:
         """Evaluate an offer request and respond if eligible."""
         # The reply subject is an unsigned NATS header; accepting only inbox
         # replies keeps a replayed request from minting a signed envelope

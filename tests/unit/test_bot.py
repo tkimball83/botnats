@@ -6,10 +6,10 @@
 import asyncio
 import ssl
 import unittest
+from dataclasses import asdict
 from unittest.mock import AsyncMock, patch
 
 from botnats import error_label
-from botnats.admin import INVALID_CLAIM_COUNTER
 from botnats.bot import Bot
 from botnats.channel import ChannelRecord
 from botnats.irc.client import IRCClient
@@ -23,13 +23,6 @@ from tests.unit.helpers import (
     bot_with_irc,
     config,
 )
-
-AUTH_RATE_LIMIT_REPLIES = 3
-COMMAND_RATE_LIMIT_REPLIES = 8
-EXPECTED_JOIN_COUNT = 2
-EXPECTED_NICK_LENGTH = 9
-EXPECTED_PRESENCE_COUNT = 2
-EXPECTED_TICK_COUNT = 2
 
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
@@ -56,12 +49,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test")]
         current = bot.channel_mgr.channel_records[casefold("#test")]
 
-        invalid = ChannelRecord.new(
-            "#test",
-            None,
-            present=True,
-            after=current.revision,
-        ).to_dict()
+        invalid = asdict(
+            ChannelRecord.new(
+                "#test",
+                None,
+                present=True,
+                after=current.revision,
+            ),
+        )
         invalid["key"] = "bad key"
         await bot.callbacks.on_channel(invalid)
         assert runtime.key is None
@@ -72,7 +67,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             present=True,
             after=current.revision,
         )
-        await bot.callbacks.on_channel(record.to_dict())
+        await bot.callbacks.on_channel(asdict(record))
         assert runtime.key == "good-key"
 
     async def test_disconnect_clears_runtime(self) -> None:
@@ -109,7 +104,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert bot.caps.mode_limit == 1
         assert bot.caps.op_mode == "o"
         assert bot.irc.casemapping == "rfc1459"
-        assert bot.irc.nickname_length == EXPECTED_NICK_LENGTH
+        assert bot.irc.nickname_length == 9
         assert runtime.casemapping == "rfc1459"
         assert not runtime.joined
         assert not runtime.members
@@ -125,7 +120,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.connected = False
 
         offered = bot.callbacks.on_op_request(
-            {"channel": "#test", "presence": peer.to_dict()},
+            {"channel": "#test", "presence": asdict(peer)},
         )
 
         assert not offered
@@ -157,7 +152,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.bot.IDENTITY_RETRY_ATTEMPTS", 1),
             patch("botnats.bot.IDENTITY_RETRY_DELAY", 0),
         ):
-            await bot.on_registered()
+            bot.on_registered()
             tasks = tuple(bot.tasks)
             await asyncio.gather(*tasks)
 
@@ -190,7 +185,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.presence.update(peer)
 
         await bot.callbacks.on_invite_grant(
-            {"channel": "#test", "presence": peer.to_dict()},
+            {"channel": "#test", "presence": asdict(peer)},
         )
 
         assert fake_irc.sent == [("INVITE", ("beta", "#test"))]
@@ -222,10 +217,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             bot.presence.update(peer)
             runtime.member(peer.nick).prefix = Prefix(peer.nick, peer.user, peer.host)
             assert bot.callbacks.on_op_request(
-                {"channel": "#test", "presence": peer.to_dict()},
+                {"channel": "#test", "presence": asdict(peer)},
             )
             await bot.callbacks.on_op_grant(
-                {"channel": "#test", "presence": peer.to_dict()},
+                {"channel": "#test", "presence": asdict(peer)},
             )
 
         async with asyncio.timeout(5):
@@ -332,7 +327,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("beta").prefix = Prefix("beta", "~beta", "stolen.host")
 
         offered = bot.callbacks.on_op_request(
-            {"channel": "#test", "presence": peer.to_dict()},
+            {"channel": "#test", "presence": asdict(peer)},
         )
 
         assert not offered
@@ -350,7 +345,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 IRCMessage("PRIVMSG", ("alpha", "AUTH 000000"), prefix),
             )
 
-        assert len(fake_irc.privmsgs) == AUTH_RATE_LIMIT_REPLIES
+        assert len(fake_irc.privmsgs) == 3
 
         another = Bot(config())
         another_irc = FakeIRC()
@@ -359,7 +354,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await another.events.handle_command(
                 IRCMessage("PRIVMSG", ("alpha", "AUTH"), prefix),
             )
-        assert len(another_irc.privmsgs) == COMMAND_RATE_LIMIT_REPLIES
+        assert len(another_irc.privmsgs) == 8
 
     async def test_wrong_auth_code_with_available_claim_fails(self) -> None:
         """Deny a wrong code even when the equalizing claim succeeds."""
@@ -399,7 +394,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 IRCMessage("PRIVMSG", ("alpha", "AUTH 000000"), prefix),
             )
 
-        assert coordinator.claim_requests == [INVALID_CLAIM_COUNTER]
+        assert coordinator.claim_requests == [-1]
 
     async def test_rate_limited_admin_is_silent(self) -> None:
         """Silently drop an authenticated admin's commands over the limit."""
@@ -413,7 +408,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 IRCMessage("PRIVMSG", ("alpha", "BOGUS"), prefix),
             )
 
-        assert len(bot.irc.privmsgs) == COMMAND_RATE_LIMIT_REPLIES
+        assert len(bot.irc.privmsgs) == 8
         assert all(text == "Unknown command" for _, text in bot.irc.privmsgs)
 
     async def test_maintenance_tick_before_coordinator_connects(self) -> None:
@@ -457,7 +452,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 IRCMessage("PRIVMSG", ("alpha", "AUTH"), prefix),
             )
 
-        assert len(bot.irc.privmsgs) == COMMAND_RATE_LIMIT_REPLIES
+        assert len(bot.irc.privmsgs) == 8
 
     async def test_run_does_not_wait_for_coordinator(self) -> None:
         """Serve IRC while coordinator startup blocks on an outage."""
@@ -515,7 +510,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.set_identity(Prefix("alpha", "~alpha", "new.host"))
         assert bot.identity.host == "new.host"
         joins = [cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]
-        assert len(joins) == EXPECTED_JOIN_COUNT
+        assert len(joins) == 2
 
     async def test_session_delete_keeps_colliding_live_identity(self) -> None:
         """Delete only the ASCII durable identity represented by a KV key."""
@@ -547,7 +542,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.set_identity(Prefix("alpha", "~alpha", "new.host"))
         assert bot.identity is not None
         assert bot.identity.host == "new.host"
-        assert len(coordinator.presence_puts) == EXPECTED_PRESENCE_COUNT
+        assert len(coordinator.presence_puts) == 2
 
     async def test_unban_matching_masks(self) -> None:
         """Verify unban grant removes only matching ban masks."""
@@ -559,7 +554,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             runtime.add_ban(_mask)
         peer = BotPresence("beta", "bot.host", "one", "beta", "~beta")
         bot.presence.update(peer)
-        payload = {"channel": "#test", "presence": peer.to_dict()}
+        payload = {"channel": "#test", "presence": asdict(peer)}
 
         assert bot.callbacks.on_unban_request(payload)
         await bot.callbacks.on_unban_grant(payload)
@@ -576,7 +571,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.channel_mgr.request_peer("unban", "#test")
 
         assert coordinator.offer_requests == [
-            ("unban", {"channel": "#test", "presence": bot.identity.to_dict()}),
+            ("unban", {"channel": "#test", "presence": asdict(bot.identity)}),
         ]
 
     async def test_unknown_channel_does_not_request_peer(self) -> None:
@@ -621,7 +616,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
 
         async def immediate(delay: float) -> None:
             del delay
-            if calls >= EXPECTED_TICK_COUNT:
+            if calls >= 2:
                 msg = "stop"
                 raise asyncio.CancelledError(msg)
 
@@ -633,7 +628,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.maintenance_loop()
 
-        assert calls == EXPECTED_TICK_COUNT
+        assert calls == 2
 
     async def test_heartbeat_precedes_pending_state_retries(self) -> None:
         """Refresh presence before potentially slow durable-state retries."""
