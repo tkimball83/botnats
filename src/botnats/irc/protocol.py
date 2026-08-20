@@ -150,12 +150,7 @@ class ISupportState:
 
     def reset(self) -> None:
         """Reset capabilities learned from the previous server connection."""
-        self.casemapping = DEFAULT_CASEMAPPING
-        self.chanmodes = DEFAULT_CHANMODES
-        self.member_prefixes = dict(DEFAULT_MEMBER_PREFIXES)
-        self.membership_modes = DEFAULT_MEMBERSHIP_MODES
-        self.mode_limit = 1
-        self.op_mode = "o"
+        ISupportState.__init__(self)
 
 
 @dataclass(frozen=True, slots=True)

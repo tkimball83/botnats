@@ -240,17 +240,15 @@ def port(section: dict[str, Any], key: str, default: int) -> int:
 
 def positive_float(section: dict[str, Any], key: str, default: float) -> float:
     """Extract a positive numeric value from a config section."""
+    msg = f"{key} must be a positive number"
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        msg = f"{key} must be a positive number"
         raise TypeError(msg)
     try:
         number = float(value)
     except OverflowError as error:
-        msg = f"{key} must be a positive number"
         raise ValueError(msg) from error
     if not math.isfinite(number) or number <= 0:
-        msg = f"{key} must be a positive number"
         raise ValueError(msg)
     return number
 

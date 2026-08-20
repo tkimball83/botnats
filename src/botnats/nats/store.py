@@ -9,7 +9,8 @@ import json
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Any, NamedTuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from nats.errors import Error as NatsError
 from nats.js.api import KeyValueConfig, StorageType
@@ -182,8 +183,7 @@ class AttemptStore(KVStore):
 
     def key(self, identity: str, slot: int) -> str:
         """Derive an opaque key for one identity and attempt slot."""
-        message = f"botnats-auth-attempt-v1\x00{identity}\x00{slot}".encode()
-        return hmac.digest(self.secret, message, "sha256").hex()
+        return _sign_fields(self.secret, "botnats-auth-attempt-v1", identity, str(slot))
 
 
 class ChannelStore(KVStore):
@@ -196,8 +196,8 @@ class ChannelStore(KVStore):
 
     def key(self, channel: str) -> str:
         """Derive an opaque key for a channel name."""
-        message = f"botnats-channel-v1\x00{casefold(channel, 'ascii')}".encode()
-        return hmac.digest(self.secret, message, "sha256").hex()
+        folded = casefold(channel, "ascii")
+        return _sign_fields(self.secret, "botnats-channel-v1", folded)
 
     def sign(self, data: dict[str, Any]) -> dict[str, Any]:
         """Return a canonical, signed copy of a valid channel record."""
@@ -287,8 +287,7 @@ class ClaimStore(KVStore):
 
     def key(self, counter: int) -> str:
         """Derive an opaque KV key for a TOTP counter."""
-        message = f"botnats-auth-claim-v1\x00{counter}".encode()
-        return hmac.digest(self.secret, message, "sha256").hex()
+        return _sign_fields(self.secret, "botnats-auth-claim-v1", str(counter))
 
 
 class PresenceStore(KVStore):
@@ -427,8 +426,8 @@ class SessionStore(KVStore):
 
     def key(self, identity: str) -> str:
         """Derive an opaque key independent of IRC casemapping."""
-        message = f"botnats-session-v1\x00{casefold(identity, 'ascii')}".encode()
-        return hmac.digest(self.secret, message, "sha256").hex()
+        folded = casefold(identity, "ascii")
+        return _sign_fields(self.secret, "botnats-session-v1", folded)
 
     def order(
         self,
@@ -469,8 +468,9 @@ class SessionStore(KVStore):
         return await self.put_newer(self.key(identity), data, newer)
 
 
-class SessionRecord(NamedTuple):
-    """Validated fields of a signed durable session record."""
+@dataclass(frozen=True, slots=True)
+class Session:
+    """Represent an authenticated administrator session bound to an IRC prefix."""
 
     expires_at: float
     issuer: str
@@ -479,12 +479,17 @@ class SessionRecord(NamedTuple):
     version: int
     signature: str
 
+    @property
+    def order(self) -> tuple[float, int, bool]:
+        """Return the durable mutation order for this session."""
+        return self.expires_at, self.version, self.revoked
+
 
 def parse_session_record(
     secret: bytes,
     network: str,
     record: dict[str, Any],
-) -> SessionRecord | None:
+) -> Session | None:
     """Validate and extract a signed durable session record."""
     expires_at = record.get("expires_at")
     issuer = record.get("issuer")
@@ -521,7 +526,14 @@ def parse_session_record(
         signature,
     ):
         return None
-    return SessionRecord(expiry, issuer, prefix, revoked, version, signature)
+    return Session(
+        expires_at=expiry,
+        issuer=issuer,
+        prefix=prefix,
+        revoked=revoked,
+        version=version,
+        signature=signature,
+    )
 
 
 def _sign_fields(secret: bytes, *fields: str) -> str:

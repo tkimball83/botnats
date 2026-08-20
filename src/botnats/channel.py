@@ -95,22 +95,16 @@ class ChannelManager:
         if not self.bot.config.channel_modes:
             return
         required, forbidden = self.mode_intent
+        caps = self.bot.caps
         if any(
             mode_requires_argument(
                 mode,
-                adding=True,
-                chanmodes=self.bot.caps.chanmodes,
-                membership=self.bot.caps.membership_modes,
+                adding=adding,
+                chanmodes=caps.chanmodes,
+                membership=caps.membership_modes,
             )
-            for mode in required
-        ) or any(
-            mode_requires_argument(
-                mode,
-                adding=False,
-                chanmodes=self.bot.caps.chanmodes,
-                membership=self.bot.caps.membership_modes,
-            )
-            for mode in forbidden
+            for adding, modes in ((True, required), (False, forbidden))
+            for mode in modes
         ):
             LOGGER.warning(
                 "cannot enforce modes on %s: configured mode requires an argument",
