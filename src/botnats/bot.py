@@ -47,7 +47,6 @@ class Bot:
     """One stateless bot process."""
 
     def __init__(self, config: BotConfig) -> None:
-        """Initialize the bot with validated configuration."""
         coordination_key = config.coordination_secret.encode()
         self.config = config
         self.caps = ISupportState()
@@ -352,7 +351,6 @@ class NATSCallbackHandler:
     """Processes NATS coordination messages and KV watch updates."""
 
     def __init__(self, bot: Bot) -> None:
-        """Initialize the handler with a reference to the bot instance."""
         self.bot = bot
 
     def eligible(

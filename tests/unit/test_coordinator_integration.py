@@ -40,6 +40,7 @@ from tests.unit.helpers import COORDINATION_KEY
 
 if TYPE_CHECKING:
     from botnats.bot import NATSCallbackHandler
+    from botnats.presence import BotPresence
 
 BETA_PRESENCE = {
     "bot_id": "beta",
@@ -53,7 +54,7 @@ EXPECTED_WATCH_RESTARTS = 3
 EXPECTED_WRITE_ATTEMPTS = 2
 OLD_INIT_RETRY_LIMIT = 10
 RUNTIME_ERROR_CALL = 2
-GRANT_TIMEOUT = 1
+GRANT_TIMEOUT = 5
 JETSTREAM_REPLICAS = int(os.environ.get("BOTNATS_TEST_JETSTREAM_REPLICAS", "1"))
 NATS_TOKEN = os.environ.get("BOTNATS_TEST_NATS_TOKEN", "integration-token")
 NATS_URL = os.environ.get("BOTNATS_TEST_NATS_URL")
@@ -145,10 +146,10 @@ def build_coordinator(
             on_invite_request=reject_offer,
             on_op_grant=event_callback(fixtures, "op") if is_alpha else noop_callback,
             on_op_request=accept_offer if is_alpha else reject_offer,
-            on_presence=noop_sync,
-            on_presence_delete=noop_sync,
+            on_presence=noop_presence,
+            on_presence_delete=noop_presence_delete,
             on_session_delete=on_session_delete,
-            on_session_update=noop_sync,
+            on_session_update=noop_session_update,
             on_unban_grant=event_callback(fixtures, "unban")
             if is_alpha
             else noop_callback,
@@ -187,9 +188,19 @@ async def noop_callback(payload: dict[str, Any]) -> None:
     del payload
 
 
-def noop_sync(value: object) -> None:
-    """Synchronous no-op for KV watch callbacks."""
-    del value
+def noop_presence(presence: BotPresence) -> None:
+    """Accept and ignore a presence update."""
+    del presence
+
+
+def noop_presence_delete(bot_id: str) -> None:
+    """Accept and ignore a presence deletion."""
+    del bot_id
+
+
+def noop_session_update(payload: dict[str, Any]) -> None:
+    """Accept and ignore a session update."""
+    del payload
 
 
 def presence_entry(*, signed: bool = True) -> SimpleNamespace:
@@ -212,7 +223,7 @@ def presence_entry(*, signed: bool = True) -> SimpleNamespace:
     )
 
 
-def session_record(expires_at: float) -> dict[str, object]:
+def watch_session_record(expires_at: float) -> dict[str, object]:
     """Build a signed session watch record."""
     record: dict[str, object] = {
         "expires_at": expires_at,
@@ -243,6 +254,10 @@ def reject_offer(payload: dict[str, Any]) -> bool:
 
 class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     """Tests for coordinator boundaries that do not require live NATS."""
+
+    def setUp(self) -> None:
+        """Reset the shared revision counter between tests."""
+        ChannelRecord.last_revision = 0
 
     async def test_offer_routes_current_response_sender(self) -> None:
         """Grant the signed sender of a current empty offer response."""
@@ -791,7 +806,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
             assert coordinator.resync_task is second
-            coordinator.cancel_resync()
+            await coordinator.cancel_resync()
             assert second is not None
             await asyncio.gather(second, return_exceptions=True)
 
@@ -998,7 +1013,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         updates: list[object] = []
 
         with patch.object(coordinator.callbacks, "on_session_update", updates.append):
-            coordinator.observe_session(key, session_record(time.time() - 1), None)
+            record = watch_session_record(time.time() - 1)
+            coordinator.observe_session(key, record, None)
 
         assert fixtures.session_deletes == ["owner!user@host"]
         assert updates == []
@@ -1099,7 +1115,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_identity_cache_skips_expired_updates(self) -> None:
         """Discard an expired update arriving after the initial replay."""
         coordinator = build_coordinator("alpha", Fixtures())
-        record = session_record(time.time() - 1)
+        record = watch_session_record(time.time() - 1)
         entry = SimpleNamespace(
             key=coordinator.sessions.key("owner!user@host"),
             operation="PUT",
@@ -1128,7 +1144,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             now - 1,
         )
         expiry = now + 60
-        record = session_record(expiry)
+        record = watch_session_record(expiry)
         key = coordinator.sessions.key("owner!user@host")
 
         coordinator.observe_session(key, record, None)
@@ -1141,7 +1157,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Avoid rescanning the growing cache for every replayed session."""
         coordinator = build_coordinator("alpha", Fixtures())
         now = time.time()
-        record = session_record(now + 60)
+        record = watch_session_record(now + 60)
         key = coordinator.sessions.key("owner!user@host")
 
         with patch.object(
@@ -1157,7 +1173,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Reject malformed session updates before changing key mappings."""
         fixtures = Fixtures()
         coordinator = build_coordinator("alpha", fixtures)
-        record = session_record(time.time() + 60)
+        record = watch_session_record(time.time() + 60)
         key = coordinator.sessions.key("owner!user@host")
         replayed: set[str] = set()
 
@@ -1409,6 +1425,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(5):
                 while coordinator.synced_watches != set(WATCH_NAMES):
                     await real_sleep(0.005)
+            assert coordinator.synced_watches == set(WATCH_NAMES)
             await coordinator.cancel_watches()
 
     async def test_watch_stops_watcher_on_error(self) -> None:

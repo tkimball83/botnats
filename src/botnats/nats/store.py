@@ -9,7 +9,7 @@ import json
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from nats.errors import Error as NatsError
 from nats.js.api import KeyValueConfig, StorageType
@@ -51,7 +51,6 @@ class KVStore:
     """Own a reconnectable file-backed JetStream key-value bucket."""
 
     def __init__(self, bucket: str, replicas: int, ttl: float) -> None:
-        """Set the bucket identity and storage policy."""
         self.bucket = bucket
         self.js: JetStreamContext | None = None
         self.kv: KeyValue | None = None
@@ -138,7 +137,6 @@ class AttemptStore(KVStore):
     """Atomically limit authentication attempts across the bot mesh."""
 
     def __init__(self, network: str, replicas: int, secret: bytes) -> None:
-        """Set the bucket identity and key derivation secret."""
         super().__init__(f"botnats_v1_{network}_auth_attempts", replicas, ATTEMPT_TTL)
         self.secret = secret
 
@@ -165,7 +163,7 @@ class AttemptStore(KVStore):
                     continue
                 try:
                     timestamp = float.fromhex(entry.value.decode())
-                except AttributeError, UnicodeDecodeError, ValueError:
+                except UnicodeDecodeError, ValueError:
                     continue
                 if not math.isfinite(timestamp) or timestamp > cutoff:
                     continue
@@ -192,7 +190,6 @@ class ChannelStore(KVStore):
     """Durable channel records in JetStream KV."""
 
     def __init__(self, network: str, replicas: int, secret: bytes) -> None:
-        """Set the bucket identity and key derivation secret."""
         super().__init__(f"botnats_v1_{network}_channels", replicas, 0)
         self.network = network
         self.secret = secret
@@ -267,7 +264,6 @@ class ClaimStore(KVStore):
     """Atomically records used TOTP counters in JetStream KV."""
 
     def __init__(self, network: str, replicas: int, secret: bytes) -> None:
-        """Set the bucket identity and storage policy."""
         super().__init__(f"botnats_v1_{network}_used_totp", replicas, CLAIM_TTL)
         self.secret = secret
 
@@ -305,7 +301,6 @@ class PresenceStore(KVStore):
         ttl: float,
         secret: bytes,
     ) -> None:
-        """Set the bucket identity, presence TTL, and signing secret."""
         super().__init__(f"botnats_v1_{network}_presence", replicas, ttl)
         self.network = network
         self.secret = secret
@@ -426,7 +421,6 @@ class SessionStore(KVStore):
     """Auth sessions in JetStream KV with TTL-based expiry."""
 
     def __init__(self, network: str, replicas: int, secret: bytes, ttl: float) -> None:
-        """Set the bucket identity and key derivation secret."""
         super().__init__(f"botnats_v1_{network}_sessions", replicas, ttl)
         self.network = network
         self.secret = secret
@@ -443,12 +437,12 @@ class SessionStore(KVStore):
     ) -> tuple[float, int, bool] | None:
         """Validate a signed session record and return its durable order."""
         parsed = parse_session_record(self.secret, self.network, record)
-        if parsed is None or casefold(parsed[2], "ascii") != casefold(
+        if parsed is None or casefold(parsed.prefix, "ascii") != casefold(
             identity,
             "ascii",
         ):
             return None
-        return parsed[0], parsed[4], parsed[3]
+        return parsed.expires_at, parsed.version, parsed.revoked
 
     async def put(self, identity: str, data: dict[str, Any]) -> dict[str, Any]:
         """Store a session or revocation and return the authoritative record.
@@ -475,11 +469,22 @@ class SessionStore(KVStore):
         return await self.put_newer(self.key(identity), data, newer)
 
 
+class SessionRecord(NamedTuple):
+    """Validated fields of a signed durable session record."""
+
+    expires_at: float
+    issuer: str
+    prefix: str
+    revoked: bool
+    version: int
+    signature: str
+
+
 def parse_session_record(
     secret: bytes,
     network: str,
     record: dict[str, Any],
-) -> tuple[float, str, str, bool, int, str] | None:
+) -> SessionRecord | None:
     """Validate and extract a signed durable session record."""
     expires_at = record.get("expires_at")
     issuer = record.get("issuer")
@@ -516,7 +521,12 @@ def parse_session_record(
         signature,
     ):
         return None
-    return expiry, issuer, prefix, revoked, version, signature
+    return SessionRecord(expiry, issuer, prefix, revoked, version, signature)
+
+
+def _sign_fields(secret: bytes, *fields: str) -> str:
+    """HMAC-SHA256 over null-joined fields, returned as hex."""
+    return hmac.digest(secret, "\x00".join(fields).encode(), "sha256").hex()
 
 
 def channel_signature(
@@ -526,18 +536,16 @@ def channel_signature(
 ) -> str:
     """Sign the durable fields that authorize a channel configuration record."""
     channel_key = record["key"]
-    message = "\x00".join(
-        (
-            "botnats-channel-record-v1",
-            network,
-            record["channel"],
-            str(int(channel_key is not None)),
-            channel_key or "",
-            str(int(record["present"])),
-            record["revision"],
-        ),
-    ).encode()
-    return hmac.digest(secret, message, "sha256").hex()
+    return _sign_fields(
+        secret,
+        "botnats-channel-record-v1",
+        network,
+        record["channel"],
+        str(int(channel_key is not None)),
+        channel_key or "",
+        str(int(record["present"])),
+        record["revision"],
+    )
 
 
 def session_signature(
@@ -546,18 +554,16 @@ def session_signature(
     record: dict[str, Any],
 ) -> str:
     """Sign every authorization-relevant durable session field."""
-    message = "\x00".join(
-        (
-            "botnats-auth-v1",
-            network,
-            record["issuer"],
-            record["prefix"],
-            float(record["expires_at"]).hex(),
-            str(record["version"]),
-            str(int(record["revoked"])),
-        ),
-    ).encode()
-    return hmac.digest(secret, message, "sha256").hex()
+    return _sign_fields(
+        secret,
+        "botnats-auth-v1",
+        network,
+        record["issuer"],
+        record["prefix"],
+        float(record["expires_at"]).hex(),
+        str(record["version"]),
+        str(int(record["revoked"])),
+    )
 
 
 def presence_signature(
@@ -566,19 +572,17 @@ def presence_signature(
     record: dict[str, Any],
 ) -> str:
     """Sign the identity fields and freshness that bind a presence record."""
-    message = "\x00".join(
-        (
-            "botnats-presence-v1",
-            network,
-            record["bot_id"],
-            record["host"],
-            record["instance_id"],
-            record["nick"],
-            record["user"],
-            str(record["timestamp"]),
-        ),
-    ).encode()
-    return hmac.digest(secret, message, "sha256").hex()
+    return _sign_fields(
+        secret,
+        "botnats-presence-v1",
+        network,
+        record["bot_id"],
+        record["host"],
+        record["instance_id"],
+        record["nick"],
+        record["user"],
+        str(record["timestamp"]),
+    )
 
 
 def is_delete(operation: str | None) -> bool:

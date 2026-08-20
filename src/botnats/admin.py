@@ -36,13 +36,14 @@ MAX_JOIN_ARGS = 2
 MAX_RATE_BUCKETS = 8192
 MIN_TOTP_SECRET_BYTES = 20
 TOTP_CODE_LENGTH = 6
+TOTP_PERIOD = 30
+TOTP_WINDOW = 1
 
 
 class AuthFlow:
     """Handles AUTH attempts, claim deduplication, and post-auth auto-op."""
 
     def __init__(self, bot: Bot) -> None:
-        """Bind authentication flow to its bot."""
         self.bot = bot
 
     async def authenticate(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
@@ -110,7 +111,6 @@ class CommandHandler:
     """Processes authenticated admin commands from IRC private messages."""
 
     def __init__(self, bot: Bot) -> None:
-        """Initialize the handler with the bot and register command mappings."""
         self.bot = bot
         self.command_limiter = RateLimiter()
         self.handlers = {
@@ -336,7 +336,7 @@ class CommandHandler:
     async def dispatch(self, prefix: Prefix, text: str) -> None:
         """Route an incoming private message to the appropriate command handler."""
         identity = limit_identity(prefix)
-        if not self.command_limiter.check(identity, limit=8, window=10.0):
+        if not self.command_limiter.check(identity):
             return
         try:
             name, arguments = parse_command(text)
@@ -377,14 +377,15 @@ class CommandHandler:
 class RateLimiter:
     """Sliding-window rate limiter keyed by identity string."""
 
-    def __init__(self) -> None:
-        """Initialize empty rate-limit buckets."""
+    def __init__(self, *, limit: int = 8, window: float = 10.0) -> None:
         self.buckets: OrderedDict[str, deque[float]] = OrderedDict()
+        self.limit = limit
+        self.window = window
 
-    def check(self, key: str, *, limit: int, window: float) -> bool:
+    def check(self, key: str) -> bool:
         """Record an event and return whether the key is within its rate limit."""
         now = asyncio.get_running_loop().time()
-        cutoff = now - window
+        cutoff = now - self.window
         bucket = self.buckets.get(key)
         if bucket is None:
             if len(self.buckets) >= MAX_RATE_BUCKETS and not self.evict_stale(cutoff):
@@ -397,7 +398,7 @@ class RateLimiter:
             self.buckets.move_to_end(key)
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
-        if len(bucket) >= limit:
+        if len(bucket) >= self.limit:
             return False
         bucket.append(now)
         return True
@@ -435,9 +436,6 @@ class Session:
 class TotpAuthorizer:
     """TOTP verification and short-lived sessions bound to IRC prefixes."""
 
-    period = 30
-    window = 1
-
     def __init__(
         self,
         secret: str,
@@ -447,7 +445,6 @@ class TotpAuthorizer:
         scope: tuple[str, str],
         session_ttl: float,
     ) -> None:
-        """Decode the TOTP secret and validate configuration parameters."""
         normalized = "".join(secret.split()).upper()
         try:
             padding = "=" * (-len(normalized) % 8)
@@ -572,11 +569,11 @@ class TotpAuthorizer:
         """Return the TOTP counter that produced the code, or None."""
         if not code.isascii() or len(code) != TOTP_CODE_LENGTH or not code.isdigit():
             return None
-        current_counter = int((time.time() if now is None else now) // self.period)
+        current_counter = int((time.time() if now is None else now) // TOTP_PERIOD)
         for offset in (
             0,
-            *range(-1, -self.window - 1, -1),
-            *range(1, self.window + 1),
+            *range(-1, -TOTP_WINDOW - 1, -1),
+            *range(1, TOTP_WINDOW + 1),
         ):
             counter = current_counter + offset
             if hmac.compare_digest(totp(self.secret, counter), code):
@@ -627,7 +624,9 @@ class TotpAuthorizer:
             return None
         parsed = parse_session_record(self.coordination_key, self.network, value)
         if parsed is None or not (
-            current < parsed[0] <= current + self.session_ttl + SESSION_EXPIRY_GRACE
+            current
+            < parsed.expires_at
+            <= current + self.session_ttl + SESSION_EXPIRY_GRACE
         ):
             return None
         return Session(*parsed)

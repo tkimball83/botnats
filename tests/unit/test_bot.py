@@ -35,6 +35,10 @@ EXPECTED_TICK_COUNT = 2
 class BotTests(unittest.IsolatedAsyncioTestCase):
     """Tests for bot identity, op grants, rate limiting, and channel keys."""
 
+    def setUp(self) -> None:
+        """Reset the shared revision counter between tests."""
+        ChannelRecord.last_revision = 0
+
     async def test_safe_privmsg_drops_unsendable_message(self) -> None:
         """Drop an oversized PRIVMSG instead of raising into the handler."""
         bot, _ = bot_with_irc()

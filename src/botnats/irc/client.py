@@ -7,7 +7,6 @@ import asyncio
 import logging
 import secrets
 import ssl
-import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -32,8 +31,6 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_NICK_LENGTH = 9
 DESIRED_CAPS = frozenset({"chghost", "multi-prefix"})
 IRC_SCHEMES = frozenset({"irc", "ircs"})
-MIN_CAP_MULTILINE_PARAMS = 4
-MIN_CAP_PARAMS = 3
 NICK_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 NICK_COLLISION_LIMIT = 20
 OUTBOUND_LIMIT = 64
@@ -104,7 +101,6 @@ class IRCClient:
         on_disconnect: Callable[[], None],
         on_message: Callable[[IRCMessage], Awaitable[None]],
     ) -> None:
-        """Configure the client with connection and rate-limit settings."""
         self.cap_available: set[str] = set()
         self.cap_negotiating = False
         self.cap_ls_done = False
@@ -223,7 +219,7 @@ class IRCClient:
 
     async def handle_cap(self, message: IRCMessage) -> None:
         """Process CAP subcommands during capability negotiation."""
-        if len(message.params) < MIN_CAP_PARAMS:
+        if len(message.params) < 3:
             return
         subcommand = message.params[1].upper()
         caps = {cap.partition("=")[0] for cap in message.params[-1].split()}
@@ -231,10 +227,7 @@ class IRCClient:
             if not self.cap_negotiating:
                 return
             self.cap_available.update(caps)
-            if (
-                len(message.params) >= MIN_CAP_MULTILINE_PARAMS
-                and message.params[2] == "*"
-            ):
+            if len(message.params) >= 4 and message.params[2] == "*":
                 return
             self.cap_ls_done = True
             wanted = DESIRED_CAPS & self.cap_available
@@ -302,7 +295,7 @@ class IRCClient:
                 if ping_token is not None:
                     msg = "IRC server did not answer client PING"
                     raise ConnectionError(msg) from error
-                ping_token = uuid.uuid4().hex
+                ping_token = secrets.token_hex(16)
                 pong_deadline = loop.time() + self.config.pong_timeout
                 await self.send_immediate(
                     format_message("PING", (), ping_token),

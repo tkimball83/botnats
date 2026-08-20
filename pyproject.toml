@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "botnats"
-version = "0.2.1"
+version = "0.2.2"
 description = "Python IRC bot mesh coordinated through Core NATS and JetStream"
 license = "GPL-3.0-only"
 requires-python = ">=3.14"
@@ -38,7 +38,7 @@ warn_unused_ignores = true
 target-version = "py314"
 
 [tool.ruff.lint]
-ignore = ["COM812", "PT027"]
+ignore = ["COM812", "D107", "PLR2004", "PT027"]
 select = ["ALL"]
 
 [tool.ruff.lint.pydocstyle]

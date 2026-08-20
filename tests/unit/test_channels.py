@@ -30,6 +30,10 @@ EXPECTED_SPLIT_RECORDS = 2
 class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     """Tests for channel join, part, and record application."""
 
+    def setUp(self) -> None:
+        """Reset the shared revision counter between tests."""
+        ChannelRecord.last_revision = 0
+
     async def test_channel_update_rejects_oversized_mode_command(self) -> None:
         """Reject a channel update before storing an unusable mode command."""
         bot, _, coordinator = bot_with_coordinator()

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 MIN_CHANNEL_LENGTH = 2
 MAX_CHANNEL_REVISION = (1 << 63) - 1
-CHANNEL_REVISION_RE = re.compile(r"^\d{20}-[0-9a-f]{32}$")
+CHANNEL_REVISION_RE = re.compile(r"\d{20}-[0-9a-f]{32}")
 
 
 def validate_channel(value: str) -> str:

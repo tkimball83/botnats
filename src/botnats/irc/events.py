@@ -12,8 +12,11 @@ from typing import TYPE_CHECKING
 from botnats.config import mode_intent
 from botnats.irc.client import DEFAULT_NICK_LENGTH
 from botnats.irc.protocol import (
+    DEFAULT_CASEMAPPING,
+    DEFAULT_CHANMODES,
+    DEFAULT_MEMBER_PREFIXES,
+    DEFAULT_MEMBERSHIP_MODES,
     IRCMessage,
-    ISupportState,
     Prefix,
     casefold,
     iter_mode_changes,
@@ -28,21 +31,11 @@ if TYPE_CHECKING:
     from botnats.channel import ChannelRuntime
 LOGGER = logging.getLogger(__name__)
 
-MIN_BAN_LIST_PARAMS = 3
-MIN_CHANNEL_PARAMS = 2
-MIN_CHGHOST_PARAMS = 2
-MIN_KICK_PARAMS = 2
-MIN_MODE_PARAMS = 2
-MIN_NAMES_PARAMS = 4
-MIN_WHOIS_PARAMS = 4
-MIN_WHO_REPLY_PARAMS = 8
-
 
 class IRCEventHandler:
     """Routes incoming IRC messages and reacts to coordination-relevant events."""
 
     def __init__(self, bot: Bot) -> None:
-        """Initialize the handler with bot context and server capabilities."""
         self.bot = bot
         self.caps = bot.caps
         self.enforced_set, self.enforced_unset = mode_intent(
@@ -113,7 +106,7 @@ class IRCEventHandler:
 
     async def handle_ban_list(self, message: IRCMessage) -> None:
         """Record a ban mask from the channel ban list reply."""
-        if len(message.params) < MIN_BAN_LIST_PARAMS:
+        if len(message.params) < 3:
             return
         channel = message.params[1]
         mask = message.params[2]
@@ -123,7 +116,7 @@ class IRCEventHandler:
 
     async def handle_banned(self, message: IRCMessage) -> None:
         """Request an unban when the bot is banned from a channel."""
-        if len(message.params) >= MIN_CHANNEL_PARAMS:
+        if len(message.params) >= 2:
             self.bot.spawn(
                 self.bot.channel_mgr.request_peer("unban", message.params[1]),
                 "banned-unban-request",
@@ -131,7 +124,7 @@ class IRCEventHandler:
 
     async def handle_chghost(self, message: IRCMessage) -> None:
         """Revoke authorization and update member state after a host change."""
-        if message.prefix is None or len(message.params) < MIN_CHGHOST_PARAMS:
+        if message.prefix is None or len(message.params) < 2:
             return
         nick = message.prefix.nick
         new_user = message.params[0]
@@ -169,7 +162,7 @@ class IRCEventHandler:
         if (
             message.prefix is None
             or not message.prefix.complete
-            or len(message.params) < MIN_CHANNEL_PARAMS
+            or len(message.params) < 2
         ):
             return
         target, text = message.params[0], message.params[-1]
@@ -181,7 +174,7 @@ class IRCEventHandler:
 
     async def handle_end_of_names(self, message: IRCMessage) -> None:
         """Finalize channel join by requesting WHO data and enforcing modes."""
-        if len(message.params) < MIN_CHANNEL_PARAMS:
+        if len(message.params) < 2:
             return
         channel = message.params[1]
         runtime = self.bot.runtime(channel)
@@ -204,7 +197,7 @@ class IRCEventHandler:
 
     async def handle_invite(self, message: IRCMessage) -> None:
         """Join a configured channel when invited."""
-        if len(message.params) < MIN_CHANNEL_PARAMS:
+        if len(message.params) < 2:
             return
         target, channel = message.params[0], message.params[1]
         runtime = self.bot.runtime(channel)
@@ -213,20 +206,19 @@ class IRCEventHandler:
 
     def forget_isupport(self, name: str) -> None:
         """Restore default behavior for a removed ISUPPORT parameter."""
-        defaults = ISupportState()
         match name.upper():
             case "CASEMAPPING":
-                self.bot.channel_mgr.set_casemapping(defaults.casemapping)
+                self.bot.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
             case "CHANMODES":
-                self.caps.chanmodes = defaults.chanmodes
+                self.caps.chanmodes = DEFAULT_CHANMODES
             case "MODES":
-                self.caps.mode_limit = defaults.mode_limit
+                self.caps.mode_limit = 1
             case "NICKLEN":
                 self.bot.irc.set_nickname_length(DEFAULT_NICK_LENGTH)
             case "PREFIX":
-                self.caps.member_prefixes = defaults.member_prefixes
-                self.caps.membership_modes = defaults.membership_modes
-                self.caps.op_mode = defaults.op_mode
+                self.caps.member_prefixes = dict(DEFAULT_MEMBER_PREFIXES)
+                self.caps.membership_modes = DEFAULT_MEMBERSHIP_MODES
+                self.caps.op_mode = "o"
 
     async def handle_isupport(self, message: IRCMessage) -> None:
         """Parse RPL_ISUPPORT tokens into server capability state."""
@@ -278,7 +270,7 @@ class IRCEventHandler:
 
     async def handle_join_denied(self, message: IRCMessage) -> None:
         """Request a peer invite when a channel refuses a direct join."""
-        if len(message.params) >= MIN_CHANNEL_PARAMS:
+        if len(message.params) >= 2:
             self.bot.spawn(
                 self.bot.channel_mgr.request_peer("invite", message.params[1]),
                 "invite-request",
@@ -286,7 +278,7 @@ class IRCEventHandler:
 
     async def handle_kick(self, message: IRCMessage) -> None:
         """Handle a KICK by removing the target or requesting an unban for self."""
-        if len(message.params) < MIN_KICK_PARAMS:
+        if len(message.params) < 2:
             return
         channel = message.params[0]
         target = message.params[1]
@@ -304,7 +296,7 @@ class IRCEventHandler:
 
     async def handle_mode(self, message: IRCMessage) -> None:
         """Apply channel MODE changes and trigger enforcement or op requests."""
-        if len(message.params) < MIN_MODE_PARAMS:
+        if len(message.params) < 2:
             return
         channel = message.params[0]
         modes = message.params[1]
@@ -333,7 +325,7 @@ class IRCEventHandler:
 
     async def handle_names(self, message: IRCMessage) -> None:
         """Parse NAMES reply entries and update member mode prefixes."""
-        if len(message.params) < MIN_NAMES_PARAMS:
+        if len(message.params) < 4:
             return
         channel = message.params[-2]
         runtime = self.bot.runtime(channel)
@@ -351,7 +343,7 @@ class IRCEventHandler:
                     modes.add(mode)
                 nick = nick[1:]
             if nick:
-                runtime.member(nick).modes.update(modes)
+                runtime.member(nick).modes = modes
 
     async def handle_nick(self, message: IRCMessage) -> None:
         """Update member records and bot identity when a nick changes."""
@@ -448,7 +440,7 @@ class IRCEventHandler:
 
     async def handle_who(self, message: IRCMessage) -> None:
         """Update member identity and modes from a WHO reply entry."""
-        if len(message.params) < MIN_WHO_REPLY_PARAMS:
+        if len(message.params) < 8:
             return
         channel, user, host, nick, flags = (
             message.params[1],
@@ -472,7 +464,7 @@ class IRCEventHandler:
 
     async def handle_whois_user(self, message: IRCMessage) -> None:
         """Set the bot's identity from a WHOIS user reply."""
-        if len(message.params) < MIN_WHOIS_PARAMS:
+        if len(message.params) < 4:
             return
         nick = message.params[1]
         user = message.params[2]

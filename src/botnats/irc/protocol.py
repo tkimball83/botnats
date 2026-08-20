@@ -174,16 +174,16 @@ class Prefix:
 
     def matches(self, other: Prefix, casemapping: str = DEFAULT_CASEMAPPING) -> bool:
         """Check whether two complete prefixes identify the same user."""
+        s_user = self.user
+        s_host = self.host
+        o_user = other.user
+        o_host = other.host
+        if s_user is None or s_host is None or o_user is None or o_host is None:
+            return False
         return (
-            self.complete
-            and other.complete
-            and casefold(self.nick, casemapping) == casefold(other.nick, casemapping)
-            and self.host is not None
-            and other.host is not None
-            and self.user is not None
-            and other.user is not None
-            and casefold(self.user, "ascii") == casefold(other.user, "ascii")
-            and casefold(self.host, "ascii") == casefold(other.host, "ascii")
+            casefold(self.nick, casemapping) == casefold(other.nick, casemapping)
+            and casefold(s_user, "ascii") == casefold(o_user, "ascii")
+            and casefold(s_host, "ascii") == casefold(o_host, "ascii")
         )
 
     @classmethod

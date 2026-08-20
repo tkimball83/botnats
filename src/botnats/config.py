@@ -18,14 +18,14 @@ from botnats.validators import validate_server_url
 if TYPE_CHECKING:
     from collections.abc import Collection
 
-IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-MODE_STRING_RE = re.compile(r"^(?:[+-][A-Za-z]+)+$")
+IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+")
+MODE_STRING_RE = re.compile(r"(?:[+-][A-Za-z]+)+")
 MAX_JETSTREAM_REPLICAS = 5
 MAX_PORT = 65535
 MAX_SESSION_TTL = 86400
 MIN_COORDINATION_KEY_BYTES = 32
 NATS_SCHEMES = frozenset({"nats", "tls"})
-NICKNAME_RE = re.compile(r"^[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]*$")
+NICKNAME_RE = re.compile(r"[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]*")
 
 
 @dataclass(frozen=True, slots=True)

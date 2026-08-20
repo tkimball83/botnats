@@ -389,6 +389,28 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
 
+    async def test_auth_queues_session_when_uniqueness_lost(self) -> None:
+        """Queue the session when require_unique fails mid-authentication."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        coordinator.claim_result = True
+        prefix = Prefix("owner", "user", "host.example")
+        counter = int(time.time() // 30)
+        valid_code = totp(bot.authorizer.secret, counter)
+
+        with patch.object(
+            coordinator,
+            "put_session",
+            AsyncMock(side_effect=RuntimeError("duplicate bot ID")),
+        ):
+            await bot.auth_flow.authenticate(prefix, (valid_code,))
+
+        assert not bot.authorizer.authorized(prefix.render())
+        pending = bot.events.pending_sessions
+        assert len(pending) == 1
+        session = next(iter(pending.values()))
+        assert session["revoked"] is True
+        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+
     async def test_cmd_key(self) -> None:
         """Verify KEY command reports the channel key."""
         bot, fake_irc, _ = bot_with_coordinator()

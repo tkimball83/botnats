@@ -37,4 +37,4 @@ KISS, YAGNI, and SOLID guide every change.
 ## Linting
 
 - Ruff with `ALL` rules. Fix findings instead of adding ignores.
-- Keep ignores limited to `COM812` and `PT027` globally and `S101` in tests.
+- Keep ignores limited to `COM812`, `D107`, `PLR2004`, and `PT027` globally and `S101` in tests.

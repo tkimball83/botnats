@@ -17,6 +17,7 @@ from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     FailingPartIRC,
+    FailingPublishCoordinator,
     FakeCoordinator,
     FakeIRC,
     bot_with_channel,
@@ -148,6 +149,24 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert len(coordinator.session_puts) == 1
         assert coordinator.session_puts[0][1]["revoked"] is True
 
+    async def test_chghost_queues_revocation_when_nats_unavailable(self) -> None:
+        """Queue revocation as a pending session when put_session fails."""
+        bot, _, _ = bot_with_coordinator()
+        bot.coordinator = FailingPublishCoordinator()
+        old_prefix = Prefix("owner", "user", "old.host")
+        bot.authorizer.grant(old_prefix.render())
+        bot.channel_mgr.channels[casefold("#test")].member("owner").prefix = old_prefix
+
+        await bot.events.on_irc_message(
+            IRCMessage("CHGHOST", ("newuser", "new.host"), old_prefix),
+        )
+
+        assert not bot.authorizer.authorized(old_prefix.render())
+        pending = bot.events.pending_sessions
+        assert len(pending) == 1
+        session = next(iter(pending.values()))
+        assert session["revoked"] is True
+
     async def test_chghost_without_identity_skips_revocation(self) -> None:
         """Log and skip revocation when no complete old identity exists."""
         bot, _, coordinator = bot_with_coordinator()
@@ -236,6 +255,18 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         assert runtime.member("bob").modes == set()
+
+    async def test_names_replaces_stale_modes(self) -> None:
+        """Verify a NAMES reply without op prefix clears a prior op mode."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.member("carol").modes.add("o")
+
+        await bot.events.on_irc_message(
+            IRCMessage("353", ("alpha", "=", "#test", "carol")),
+        )
+
+        assert runtime.member("carol").modes == set()
 
     async def test_quit_with_host_only_prefix_removes_member(self) -> None:
         """Remove a member whose QUIT prefix omits the user part."""

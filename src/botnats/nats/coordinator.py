@@ -156,7 +156,6 @@ class Coordinator:
         config: NATSConfig,
         envelope: Envelope,
     ) -> None:
-        """Initialize the coordinator with NATS connection parameters."""
         coordination_key = envelope.coordination_key
         self.attempts = AttemptStore(
             config.network,
@@ -182,7 +181,6 @@ class Coordinator:
         self.nats_token = config.token
         self.nc: nats.NATS | None = None
         self.ns = f"botnats.v1.{config.network}"
-        self.last_decode_warning = float("-inf")
         self.transient_warnings: dict[str, tuple[float, int]] = {}
         self.presence_store = PresenceStore(
             config.network,
@@ -216,7 +214,6 @@ class Coordinator:
         self.resync_task: asyncio.Task[None] | None = None
         self.session_identities: dict[str, tuple[str, float]] = {}
         self.store_generation = 0
-        self.suppressed_warnings = 0
         self.synced_watches: set[str] = set()
         self.unique = True
         self.watch_generation = 0
@@ -235,7 +232,7 @@ class Coordinator:
         """Close the NATS connection and cancel watches."""
         nc = self.nc
         self.nc = None
-        self.cancel_resync()
+        await self.cancel_resync()
         await self.cancel_watches()
         async with self.presence_lock:
             revision = self.presence_revision
@@ -340,7 +337,7 @@ class Coordinator:
 
     async def on_disconnected(self) -> None:
         """Invalidate JetStream handles when Core NATS disconnects."""
-        self.cancel_resync()
+        await self.cancel_resync()
         await self.cancel_watches()
         async with self.presence_lock:
             self.owns_presence = False
@@ -360,7 +357,7 @@ class Coordinator:
         callback runner for the whole outage.
         """
         LOGGER.info("reconnected to Core NATS")
-        self.cancel_resync()
+        await self.cancel_resync()
         self.resync_task = asyncio.create_task(self.resync(), name="nats-resync")
         self.resync_task.add_done_callback(self.resync_done)
 
@@ -383,12 +380,13 @@ class Coordinator:
         await self.init_stores()
         await self.start_watches()
 
-    def cancel_resync(self) -> None:
+    async def cancel_resync(self) -> None:
         """Cancel an in-flight reconnect resynchronization task."""
         task = self.resync_task
         self.resync_task = None
         if task is not None:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def publish(self, suffix: str, payload: dict[str, Any]) -> None:
         """Broadcast a signed message on the given subject suffix."""
@@ -671,7 +669,11 @@ class Coordinator:
                 cb=partial(self.offer, offer_callback),
             )
 
-    def should_warn(self, context: str) -> str | None:
+    def should_warn(
+        self,
+        context: str,
+        interval: float = TRANSIENT_WARNING_INTERVAL,
+    ) -> str | None:
         """Claim one rate-limited log slot for a context.
 
         Returns the suppression suffix to append when the context may log
@@ -681,7 +683,7 @@ class Coordinator:
         """
         now = time.monotonic()
         last, suppressed = self.transient_warnings.get(context, (float("-inf"), 0))
-        if now - last < TRANSIENT_WARNING_INTERVAL:
+        if now - last < interval:
             self.transient_warnings[context] = (last, suppressed + 1)
             return None
         self.transient_warnings[context] = (now, 0)
@@ -695,24 +697,15 @@ class Coordinator:
 
     def warn_decode(self, kind: str, subject: str, error: Exception) -> None:
         """Rate-limit warnings for malformed NATS messages."""
-        now = time.monotonic()
-        if now - self.last_decode_warning < DECODE_WARNING_INTERVAL:
-            self.suppressed_warnings += 1
-            return
-        suffix = (
-            f"; suppressed {self.suppressed_warnings} similar warning(s)"
-            if self.suppressed_warnings
-            else ""
-        )
-        LOGGER.warning(
-            "ignored malformed %s on %s: %s%s",
-            kind,
-            subject,
-            error_label(error),
-            suffix,
-        )
-        self.last_decode_warning = now
-        self.suppressed_warnings = 0
+        suffix = self.should_warn("decode", DECODE_WARNING_INTERVAL)
+        if suffix is not None:
+            LOGGER.warning(
+                "ignored malformed %s on %s: %s%s",
+                kind,
+                subject,
+                error_label(error),
+                suffix,
+            )
 
     async def watch_channels(self) -> None:
         """Watch the channels KV bucket and apply record updates."""

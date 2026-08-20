@@ -46,7 +46,6 @@ class HealthCheck:
         ready: Callable[[], bool],
         port: int,
     ) -> None:
-        """Initialize the server with a readiness callback."""
         self.port = port
         self.ready = ready
         self.server: asyncio.Server | None = None
