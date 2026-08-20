@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Taylor Kimball
+# SPDX-License-Identifier: GPL-3.0-only
+
 set -eu
 
 compose_file=tests/integration/compose.yml
@@ -45,16 +48,21 @@ compose build alpha
 compose up --detach --no-build --wait --wait-timeout 120
 
 # Assign before export so a failed command substitution aborts under set -e
-# instead of being masked by export's own zero exit status.
-nats_address=$(compose port nats-1 4222)
+# instead of being masked by export's own zero exit status. Container
+# restarts remap the published host ports, so re-run after every restart.
+export_nats_addresses() {
+  nats_address=$(compose port nats-1 4222)
+  nats_2_address=$(compose port nats-2 4222)
+  nats_3_address=$(compose port nats-3 4222)
+  export BOTNATS_TEST_NATS_URL="nats://$nats_address"
+  export BOTNATS_TEST_NATS_URLS="nats://$nats_address,nats://$nats_2_address,nats://$nats_3_address"
+}
+
 irc_address=$(compose port irc 6667)
-nats_2_address=$(compose port nats-2 4222)
-nats_3_address=$(compose port nats-3 4222)
 export BOTNATS_TEST_IRC_ADDRESS="$irc_address"
 export BOTNATS_TEST_JETSTREAM_REPLICAS=3
 export BOTNATS_TEST_NATS_TOKEN=integration-token
-export BOTNATS_TEST_NATS_URL="nats://$nats_address"
-export BOTNATS_TEST_NATS_URLS="nats://$nats_address,nats://$nats_2_address,nats://$nats_3_address"
+export_nats_addresses
 
 venv/bin/python -m unittest tests.unit.test_coordinator_integration.CoordinatorIntegrationTests -v
 
@@ -72,14 +80,12 @@ for service in alpha beta gamma; do
 done
 venv/bin/python -m tests.integration.test_failover claim "$leader"
 compose up --detach --no-build --wait --wait-timeout 120 "$leader"
-nats_address=$(compose port nats-1 4222)
-export BOTNATS_TEST_NATS_URL="nats://$nats_address"
+export_nats_addresses
 
 venv/bin/python -m tests.integration.test_restart mark
 compose kill nats-1 nats-2 nats-3
 compose up --detach --no-build --wait --wait-timeout 120
-nats_address=$(compose port nats-1 4222)
-export BOTNATS_TEST_NATS_URL="nats://$nats_address"
+export_nats_addresses
 # Check durable state before waiting on bot readiness so the TTL'd claim is
 # read well inside CLAIM_TTL; the bots' own recovery is verified afterwards.
 venv/bin/python -m tests.integration.test_restart check

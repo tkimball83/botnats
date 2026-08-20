@@ -138,12 +138,27 @@ class IRCEventHandler:
         new_host = message.params[1]
         new_prefix = Prefix(nick, new_user, new_host)
         folded = self.bot.fold(nick)
+        # Capture the old full identity before overwriting member state: a
+        # nick-only CHGHOST prefix would otherwise destroy the only copy and
+        # silently skip the required revocation.
+        old_prefix = message.prefix
         for runtime in self.bot.channel_mgr.channels.values():
             member = runtime.members.get(folded)
             if member is not None:
+                if (
+                    not old_prefix.complete
+                    and member.prefix is not None
+                    and member.prefix.complete
+                ):
+                    old_prefix = member.prefix
                 member.prefix = new_prefix
-        if message.prefix.complete:
-            await self.revoke_session(message.prefix)
+        if old_prefix.complete:
+            await self.revoke_session(old_prefix)
+        else:
+            LOGGER.debug(
+                "CHGHOST for %s carried no complete identity; nothing to revoke",
+                nick,
+            )
         if self.bot.identity is not None and folded == self.bot.fold(
             self.bot.identity.nick,
         ):
@@ -324,6 +339,9 @@ class IRCEventHandler:
         runtime = self.bot.runtime(channel)
         if runtime is None:
             return
+        # A prefix symbol not yet advertised via ISUPPORT stays attached to
+        # the nick and creates a phantom member; the WHO that follows
+        # end-of-names replaces it with the correctly keyed record.
         for decorated_nick in message.params[-1].split():
             modes: set[str] = set()
             nick = decorated_nick
@@ -343,17 +361,23 @@ class IRCEventHandler:
         new_nick = message.params[-1]
         old_folded = self.bot.fold(old_nick)
         new_folded = self.bot.fold(new_nick)
-        new_prefix = Prefix(new_nick, message.prefix.user, message.prefix.host)
+        # Capture the old full identity from member state before rewriting
+        # it, so a nick-only NICK prefix still moves the session the same
+        # way handle_chghost still revokes.
+        old_prefix = message.prefix
         for runtime in self.bot.channel_mgr.channels.values():
             member = runtime.members.pop(old_folded, None)
             if member is not None:
                 member.nick = new_nick
                 prefix = member.prefix
                 if prefix is not None:
+                    if not old_prefix.complete and prefix.complete:
+                        old_prefix = prefix
                     member.prefix = Prefix(new_nick, prefix.user, prefix.host)
                 runtime.members[new_folded] = member
-        if message.prefix.complete:
-            old_identity = message.prefix.render()
+        new_prefix = Prefix(new_nick, old_prefix.user, old_prefix.host)
+        if old_prefix.complete:
+            old_identity = old_prefix.render()
             new_identity = new_prefix.render()
             moved = self.bot.authorizer.move(
                 old_identity,

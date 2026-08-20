@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from nats.js.api import ClusterInfo, PeerInfo
 
-from botnats.nats.status import NATSStatus, collect, route_count
+from botnats.nats.status import NATSStatus, collect, route_count, stream_info
 
 EXPECTED_LAG = 4
 EXPECTED_ROUTES = 2
@@ -53,6 +53,54 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         assert status.render() == (
             "nats connection=up routes=1 jetstream=degraded leader=nats-1 "
             "replicas=2/3 lag=4 offline=nats-3"
+        )
+
+    async def test_collect_healthy_cluster(self) -> None:
+        """Report a fully current cluster with a leader as up."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.return_value = SimpleNamespace(
+            stream_info=SimpleNamespace(
+                cluster=ClusterInfo(
+                    leader="nats-1",
+                    replicas=[
+                        PeerInfo(current=True, lag=0, name="nats-2"),
+                        PeerInfo(current=True, lag=0, name="nats-3"),
+                    ],
+                ),
+                config=SimpleNamespace(num_replicas=3),
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await collect(nc, kv, 3, 8222)
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=3/3 lag=0"
+        )
+
+    async def test_collect_single_node(self) -> None:
+        """Report a replication-free single-node stream as up."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.return_value = SimpleNamespace(
+            stream_info=SimpleNamespace(
+                cluster=None,
+                config=SimpleNamespace(num_replicas=1),
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=0),
+        ):
+            status = await collect(nc, kv, 1, 8222)
+
+        assert status.render() == (
+            "nats connection=up routes=0 jetstream=up leader=? replicas=1/1 lag=0"
         )
 
     async def test_collect_unknown_when_disconnected(self) -> None:
@@ -129,6 +177,28 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             routes = await route_count("nats-1", 8222)
 
         assert routes is None
+
+    async def test_route_count_rejects_oversized_response(self) -> None:
+        """Refuse a monitoring response that exceeds the size limit."""
+        reader = AsyncMock()
+        reader.read.side_effect = lambda n: b"x" * n
+        writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+
+        with patch(
+            "botnats.nats.status.asyncio.open_connection",
+            AsyncMock(return_value=(reader, writer)),
+        ):
+            routes = await route_count("nats-1", 8222)
+
+        assert routes is None
+
+    async def test_stream_info_surfaces_programming_errors(self) -> None:
+        """Never render a code defect as a transient unknown status."""
+        kv = AsyncMock()
+        kv.status.side_effect = TypeError("bug")
+
+        with self.assertRaises(TypeError):
+            await stream_info(kv)
 
     async def test_route_count_rejects_invalid_payloads(self) -> None:
         """Reject malformed monitoring payloads and impossible route counts."""

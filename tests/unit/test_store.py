@@ -15,6 +15,7 @@ from nats.js.errors import KeyNotFoundError, KeyWrongLastSequenceError
 
 from botnats.nats.store import (
     ATTEMPT_LIMIT,
+    CAS_ATTEMPT_LIMIT,
     AttemptStore,
     ChannelStore,
     ClaimStore,
@@ -499,6 +500,50 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert channels.kv.update.await_count == EXPECTED_OPEN_CALLS
         assert channels.kv.update.await_args_list[1].kwargs["last"] == LATEST_REVISION
+
+    async def test_channel_put_retries_create_race(self) -> None:
+        """Retry against the racing writer's record after a lost create."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        channels.kv = AsyncMock()
+        channels.kv.get.side_effect = (
+            KeyNotFoundError(),
+            SimpleNamespace(revision=7, value=json.dumps(channel_record(1)).encode()),
+        )
+        channels.kv.create.side_effect = KeyWrongLastSequenceError()
+        channels.kv.update.side_effect = (None,)
+
+        incoming = channel_record(2)
+        assert await channels.put("#test", incoming) == incoming
+
+        channels.kv.create.assert_awaited_once()
+        channels.kv.update.assert_awaited_once()
+
+    async def test_put_newer_bounds_lost_create_races(self) -> None:
+        """Count lost create races toward the same CAS attempt bound."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        channels.kv = AsyncMock()
+        channels.kv.get.side_effect = KeyNotFoundError()
+        channels.kv.create.side_effect = KeyWrongLastSequenceError()
+
+        with self.assertRaisesRegex(NatsError, "update races"):
+            await channels.put("#test", channel_record(1))
+
+        assert channels.kv.create.await_count == CAS_ATTEMPT_LIMIT
+
+    async def test_put_newer_bounds_lost_cas_races(self) -> None:
+        """Raise for the caller's retry path after repeated lost CAS races."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        channels.kv = AsyncMock()
+        channels.kv.get.return_value = SimpleNamespace(
+            revision=7,
+            value=json.dumps(channel_record(1)).encode(),
+        )
+        channels.kv.update.side_effect = KeyWrongLastSequenceError()
+
+        with self.assertRaisesRegex(NatsError, "update races"):
+            await channels.put("#test", channel_record(2))
+
+        assert channels.kv.update.await_count == CAS_ATTEMPT_LIMIT
 
     async def test_session_revocation_wins_equal_expiry(self) -> None:
         """Prevent a delayed active session from replacing its revocation."""

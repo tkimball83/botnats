@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+OP_BATCH_COALESCE_DELAY = 0.05
 PEER_REQUEST_COOLDOWN = 0.5
 
 
@@ -133,7 +134,7 @@ class ChannelManager:
         """Send batched operator mode grants after a short coalescing delay."""
         cancelled = False
         try:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(OP_BATCH_COALESCE_DELAY)
             channel = self.desired_channels.get(folded_channel)
             runtime = self.channels.get(folded_channel)
             # Drop the batch if we lost op during the coalescing window rather
@@ -208,13 +209,15 @@ class ChannelManager:
             present=True,
             after=current.revision,
         )
-        await self.apply_record(record)
         try:
             stored = await self.bot.coordinator.put_channel(
                 channel,
                 record.to_dict(),
             )
         except PUBLISH_ERRORS:
+            # Keep the observed IRC key locally and queue the durable write;
+            # retry_pending_records drops the entry if a newer record lands.
+            await self.apply_record(record)
             self.pending_records[casefold(record.channel, "ascii")] = record
         else:
             await self.apply_record(ChannelRecord.from_dict(stored))
@@ -293,6 +296,35 @@ class ChannelManager:
                 error_label(error),
             )
 
+    def _migrate_runtimes(
+        self,
+        casemapping: str,
+        old_channels: dict[str, ChannelRuntime],
+        old_desired: dict[str, str],
+        old_records: dict[str, ChannelRecord],
+    ) -> dict[str, ChannelRuntime]:
+        """Rekey channel runtimes under the new casemapping."""
+        channels: dict[str, ChannelRuntime] = {}
+        for old_folded, runtime in old_channels.items():
+            channel = old_desired.get(old_folded)
+            if channel is None:
+                fallback = old_records.get(old_folded)
+                channel = fallback.channel if fallback is not None else None
+            if channel is None:
+                continue
+            folded = self.bot.fold(channel)
+            if folded in channels:
+                LOGGER.warning(
+                    "casemapping %s folds %s onto an existing channel; "
+                    "dropping duplicate tracking",
+                    casemapping,
+                    channel,
+                )
+                continue
+            runtime.set_casemapping(casemapping)
+            channels[folded] = runtime
+        return channels
+
     def set_casemapping(self, casemapping: str) -> None:
         """Rekey all channel lookups when the server's casemapping changes."""
         if casemapping not in CASEMAPPINGS:
@@ -320,25 +352,9 @@ class ChannelManager:
             if record.present
         }
 
-        channels: dict[str, ChannelRuntime] = {}
-        for old_folded, runtime in old_channels.items():
-            channel = old_desired.get(old_folded)
-            if channel is None:
-                fallback = old_records.get(old_folded)
-                channel = fallback.channel if fallback is not None else None
-            if channel is None:
-                continue
-            folded = self.bot.fold(channel)
-            if folded in channels:
-                LOGGER.warning(
-                    "casemapping %s folds %s onto an existing channel; "
-                    "dropping duplicate tracking",
-                    casemapping,
-                    channel,
-                )
-                continue
-            runtime.set_casemapping(casemapping)
-            channels[folded] = runtime
+        channels = self._migrate_runtimes(
+            casemapping, old_channels, old_desired, old_records
+        )
         parted = {
             folded: records[folded].channel
             for folded, runtime in channels.items()
@@ -381,6 +397,8 @@ class ChannelMember:
 class ChannelRecord:
     """A channel update, including part tombstones for offline peers."""
 
+    # Process-wide by design: one bot per process, and every locally minted
+    # record must share one monotonic revision order.
     last_revision: ClassVar[int] = 0
 
     channel: str

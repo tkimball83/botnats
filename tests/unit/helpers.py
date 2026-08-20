@@ -173,6 +173,7 @@ class FakeCoordinator:
         self.auth_requests: list[str] = []
         self.bot_id = "alpha"
         self.channel_puts: list[tuple[str, dict[str, Any]]] = []
+        self.claim_requests: list[int] = []
         self.claim_result = claim_result
         self.connected = True
         self.offer_requests: list[tuple[str, dict[str, object]]] = []
@@ -234,7 +235,7 @@ class FakeCoordinator:
 
     async def request_claim(self, counter: int) -> bool:
         """Allow or deny claims, failing closed when not ready."""
-        del counter
+        self.claim_requests.append(counter)
         return self.ready and self.claim_result
 
     async def request_offer(self, base_suffix: str, payload: dict[str, object]) -> bool:

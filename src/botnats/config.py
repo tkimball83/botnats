@@ -84,9 +84,9 @@ class BotConfig:
         )
         unsupported(raw, "root")
 
-        bot_id = identifier(bot, "id")
-        network = identifier(bot, "network")
-        nickname = nick(bot, "nickname")
+        bot_id = identifier(bot, "id", "bot")
+        network = identifier(bot, "network", "bot")
+        nickname = nick(bot, "nickname", "bot")
         servers = irc_servers(irc)
         nats_servers = nats_urls(nats_section)
         totp_secret, nats_token, coordination_secret = load_secrets()
@@ -136,18 +136,20 @@ def boolean(section: dict[str, Any], key: str, *, default: bool) -> bool:
     return value
 
 
-def identifier(section: dict[str, Any], key: str) -> str:
+def identifier(section: dict[str, Any], key: str, label: str) -> str:
     """Extract and validate an identifier from a config section."""
-    value = text(section, key)
+    value = text(section, key, label)
     if not IDENTIFIER_RE.fullmatch(value):
-        msg = f"{key} contains unsupported characters"
+        msg = f"{label}.{key} contains unsupported characters"
         raise ValueError(msg)
     return value
 
 
 def irc_servers(section: dict[str, Any]) -> tuple[IRCServer, ...]:
     """Parse and validate the IRC server list from a config section."""
-    servers = tuple(IRCServer.parse(value) for value in text_list(section, "servers"))
+    servers = tuple(
+        IRCServer.parse(value) for value in text_list(section, "servers", "irc")
+    )
     if not servers:
         msg = "irc.servers must not be empty"
         raise ValueError(msg)
@@ -211,7 +213,7 @@ def mode_intent(value: str) -> tuple[frozenset[str], frozenset[str]]:
 
 def nats_urls(section: dict[str, Any]) -> tuple[str, ...]:
     """Parse and validate the NATS server list from a config section."""
-    servers = text_list(section, "servers")
+    servers = text_list(section, "servers", "nats")
     if not servers:
         msg = "nats.servers must not be empty"
         raise ValueError(msg)
@@ -220,11 +222,11 @@ def nats_urls(section: dict[str, Any]) -> tuple[str, ...]:
     return servers
 
 
-def nick(section: dict[str, Any], key: str) -> str:
+def nick(section: dict[str, Any], key: str, label: str) -> str:
     """Extract and validate an IRC nickname from a config section."""
-    value = text(section, key)
+    value = text(section, key, label)
     if not NICKNAME_RE.fullmatch(value):
-        msg = f"{key} is not a valid IRC nickname"
+        msg = f"{label}.{key} is not a valid IRC nickname"
         raise ValueError(msg)
     return value
 
@@ -273,31 +275,35 @@ def replica_count(section: dict[str, Any]) -> int:
 
 
 def table(raw: dict[str, Any], key: str, *allowed: str) -> dict[str, Any]:
-    """Extract a configuration section and reject unsupported fields."""
-    value = raw.pop(key, None)
+    """Extract a configuration section and reject unsupported fields.
+
+    A missing section reads as empty so tables whose keys all have defaults
+    can be omitted; required keys still fail with their own messages.
+    """
+    value = raw.pop(key, {})
     if not isinstance(value, dict):
-        msg = f"missing [{key}] configuration table"
+        msg = f"[{key}] must be a configuration table"
         raise TypeError(msg)
     unsupported(set(value).difference(allowed), key)
     return value
 
 
-def text(section: dict[str, Any], key: str) -> str:
+def text(section: dict[str, Any], key: str, label: str) -> str:
     """Extract a required non-empty string from a config section."""
     value = section.get(key)
     if not isinstance(value, str) or not value:
-        msg = f"{key} must be a non-empty string"
+        msg = f"{label}.{key} must be a non-empty string"
         raise ValueError(msg)
     return value
 
 
-def text_list(section: dict[str, Any], key: str) -> tuple[str, ...]:
+def text_list(section: dict[str, Any], key: str, label: str) -> tuple[str, ...]:
     """Extract a required list of non-empty strings from a config section."""
     value = section.get(key)
     if not isinstance(value, list) or any(
         not isinstance(item, str) or not item for item in value
     ):
-        msg = f"{key} must be a list of non-empty strings"
+        msg = f"{label}.{key} must be a list of non-empty strings"
         raise ValueError(msg)
     return tuple(value)
 

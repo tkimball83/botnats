@@ -452,6 +452,35 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert bot.channel_mgr.pending_records[folded] == newer
 
+    async def test_record_key_defers_local_apply_to_durable_write(self) -> None:
+        """Apply only the record the durable store returns on success."""
+        bot = bot_with_channel()
+        folded = casefold("#test")
+        before = bot.channel_mgr.channel_records[folded]
+        seen: list[ChannelRecord] = []
+
+        async def put_channel(
+            channel: str,
+            record: dict[str, object],
+        ) -> dict[str, object]:
+            del channel
+            seen.append(bot.channel_mgr.channel_records[folded])
+            return record
+
+        coordinator = FakeCoordinator()
+        bot.coordinator = coordinator
+        with patch.object(
+            coordinator,
+            "put_channel",
+            AsyncMock(side_effect=put_channel),
+        ):
+            await bot.channel_mgr.record_key("#test", "recordkey")
+
+        # The locally minted record must not shadow remote authoritative
+        # records while the durable write is still in flight.
+        assert seen == [before]
+        assert bot.channel_mgr.channel_records[folded].key == "recordkey"
+
     async def test_record_key_applies_authoritative_winner(self) -> None:
         """Converge local channel state when a newer durable mutation wins."""
         bot = bot_with_channel()

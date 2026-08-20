@@ -154,7 +154,7 @@ class IRCClient:
         ping_token: str | None,
     ) -> str | None:
         """Handle one parsed message and return the updated PING token."""
-        if message.command == "PING" and message.params:
+        if message.command == "PING":
             # Echo the server's raw token bytes: lossy decoding can inflate
             # them past 512, and a re-encoded token would not byte-match.
             await self.send_immediate(pong_reply(raw), writer)
@@ -209,7 +209,6 @@ class IRCClient:
         self.cap_ls_done = False
         self.current_nick = self.desired_nick
         self.nickname_attempts = 0
-        self.registered_with_server = False
         LOGGER.info("connected to IRC server %s:%s", server.host, server.port)
         await self.send("CAP", "LS", "302")
         await self.send("NICK", self.current_nick)
@@ -313,13 +312,8 @@ class IRCClient:
             except ValueError as error:
                 msg = "IRC server sent an oversized line"
                 raise ConnectionError(msg) from error
-            if not raw or len(raw) > MAX_IRC_MESSAGE_BYTES:
-                msg = (
-                    "IRC server closed the connection"
-                    if not raw
-                    else "IRC server sent an oversized line"
-                )
-                raise ConnectionError(msg)
+            if not check_line(raw):
+                continue
             try:
                 message = parse_message(raw.decode(errors="replace"))
             except ValueError:
@@ -487,6 +481,23 @@ class IRCClient:
             self.current_nick = message.params[-1]
 
 
+def check_line(raw: bytes) -> bool:
+    """Return whether a complete line is parseable; raise on truncation.
+
+    readline yields an unterminated fragment at EOF; a partial line cut off
+    by a dying peer must not be parsed as a complete message. A complete but
+    oversized line (tags or a sloppy server pushing past 512 bytes) is merely
+    skipped: disconnecting would turn one bad line into reconnect churn.
+    """
+    if not raw.endswith(b"\n"):
+        msg = "IRC server closed the connection"
+        raise ConnectionError(msg)
+    if len(raw) > MAX_IRC_MESSAGE_BYTES:
+        LOGGER.debug("ignoring oversized %d-byte IRC line", len(raw))
+        return False
+    return True
+
+
 def pong_reply(line: bytes) -> bytes:
     """Build a PONG that echoes a PING's raw token bytes.
 
@@ -498,13 +509,18 @@ def pong_reply(line: bytes) -> bytes:
     rest = line.rstrip(b"\r\n")
     if rest.startswith(b"@"):
         _, _, rest = rest.partition(b" ")
+        # parse_message filters empty words, so repeated separators leave a
+        # leading space here that must not survive into token extraction.
+        rest = rest.lstrip(b" ")
     if rest.startswith(b":"):
         _, _, rest = rest.partition(b" ")
-    _, trailing_sep, trailing = rest.partition(b" :")
+        rest = rest.lstrip(b" ")
+    head, trailing_sep, trailing = rest.partition(b" :")
+    tokens = [token for token in head.split(b" ")[1:] if token]
+    reply = b" ".join([b"PONG", *tokens])
     if trailing_sep:
-        return b"PONG :" + trailing + b"\r\n"
-    tokens = [token for token in rest.split(b" ")[1:] if token]
-    return b"PONG " + b" ".join(tokens) + b"\r\n"
+        return reply + b" :" + trailing + b"\r\n"
+    return reply + b"\r\n"
 
 
 def next_nickname(length: int) -> str:

@@ -27,6 +27,7 @@ from botnats.nats.store import (
     ClaimStore,
     PresenceStore,
     SessionStore,
+    StoreUnavailableError,
     is_delete,
 )
 from botnats.presence import BotPresence
@@ -212,6 +213,7 @@ class Coordinator:
         self.owns_presence = False
         self.presence_lock = asyncio.Lock()
         self.presence_revision: int | None = None
+        self.resync_task: asyncio.Task[None] | None = None
         self.session_identities: dict[str, tuple[str, float]] = {}
         self.store_generation = 0
         self.suppressed_warnings = 0
@@ -233,6 +235,7 @@ class Coordinator:
         """Close the NATS connection and cancel watches."""
         nc = self.nc
         self.nc = None
+        self.cancel_resync()
         await self.cancel_watches()
         async with self.presence_lock:
             revision = self.presence_revision
@@ -321,16 +324,23 @@ class Coordinator:
 
     async def offer(self, callback: OfferCallback, message: Msg) -> None:
         """Evaluate an offer request and respond if eligible."""
-        if not self.ready or not message.reply:
+        # The reply subject is an unsigned NATS header; accepting only inbox
+        # replies keeps a replayed request from minting a signed envelope
+        # bound to an arbitrary coordination subject.
+        if not self.ready or not message.reply.startswith("_INBOX."):
             return
         payload = self.decode_action(message, "offer")
         if payload is None:
             return
         if callback(payload):
-            await message.respond(self.envelope.encode(message.reply, {}))
+            try:
+                await message.respond(self.envelope.encode(message.reply, {}))
+            except PUBLISH_ERRORS as error:
+                self.warn_transient("offer response failed", error)
 
     async def on_disconnected(self) -> None:
         """Invalidate JetStream handles when Core NATS disconnects."""
+        self.cancel_resync()
         await self.cancel_watches()
         async with self.presence_lock:
             self.owns_presence = False
@@ -343,10 +353,42 @@ class Coordinator:
         LOGGER.warning("NATS error: %s", error_label(error))
 
     async def on_reconnected(self) -> None:
-        """Resynchronize state after a NATS reconnection."""
+        """Resynchronize state after a NATS reconnection.
+
+        Runs as a background task: init_stores retries for as long as
+        JetStream stays down, and blocking here would park the nats-py
+        callback runner for the whole outage.
+        """
         LOGGER.info("reconnected to Core NATS")
+        self.cancel_resync()
+        self.resync_task = asyncio.create_task(self.resync(), name="nats-resync")
+        self.resync_task.add_done_callback(self.resync_done)
+
+    def resync_done(self, task: asyncio.Task[None]) -> None:
+        """Surface a failed resynchronization instead of losing it to GC."""
+        if self.resync_task is task:
+            self.resync_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            LOGGER.error(
+                "NATS resynchronization failed: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def resync(self) -> None:
+        """Reopen JetStream stores and restart watches after a reconnect."""
         await self.init_stores()
         await self.start_watches()
+
+    def cancel_resync(self) -> None:
+        """Cancel an in-flight reconnect resynchronization task."""
+        task = self.resync_task
+        self.resync_task = None
+        if task is not None:
+            task.cancel()
 
     async def publish(self, suffix: str, payload: dict[str, Any]) -> None:
         """Broadcast a signed message on the given subject suffix."""
@@ -442,6 +484,18 @@ class Coordinator:
             self.presence_revision = None
             self.mark_duplicate()
 
+    async def try_reclaim_presence(self) -> None:
+        """Reclaim presence from a watch, containing transient store errors.
+
+        A lost-race or transient failure concerns only this key; letting it
+        propagate would restart the whole watch and drop readiness for a full
+        replay. The next presence heartbeat retries the reclaim.
+        """
+        try:
+            await self.reclaim_presence()
+        except PUBLISH_ERRORS as error:
+            self.warn_transient("presence reclaim failed; awaiting heartbeat", error)
+
     async def request_auth(self, identity: str) -> bool:
         """Atomically reserve one mesh-wide authentication attempt."""
         return self.ready and await self.attempts.allow(identity)
@@ -511,14 +565,16 @@ class Coordinator:
                 await watch_fn()
             except asyncio.CancelledError:
                 raise
-            except CONNECT_ERRORS as error:
+            except (*CONNECT_ERRORS, StoreUnavailableError) as error:
                 if not self.connected:
                     return
                 self.warn_transient(f"watch {name} failed", error)
             except Exception:
                 if not self.connected:
                     return
-                LOGGER.exception("watch %s crashed", name)
+                suffix = self.should_warn(f"watch {name} crashed")
+                if suffix is not None:
+                    LOGGER.exception("watch %s crashed%s", name, suffix)
             finally:
                 self.discard_watch_synced(name, generation)
             await asyncio.sleep(RECONNECT_WAIT)
@@ -615,16 +671,27 @@ class Coordinator:
                 cb=partial(self.offer, offer_callback),
             )
 
-    def warn_transient(self, context: str, error: Exception) -> None:
-        """Rate-limit warnings per context for repeating transient failures."""
+    def should_warn(self, context: str) -> str | None:
+        """Claim one rate-limited log slot for a context.
+
+        Returns the suppression suffix to append when the context may log
+        now, or None while it is throttled. Crash tracebacks share this
+        throttle: a deterministic bug retried every second must not flood
+        the log with one traceback per attempt.
+        """
         now = time.monotonic()
         last, suppressed = self.transient_warnings.get(context, (float("-inf"), 0))
         if now - last < TRANSIENT_WARNING_INTERVAL:
             self.transient_warnings[context] = (last, suppressed + 1)
-            return
-        suffix = f"; suppressed {suppressed} similar warning(s)" if suppressed else ""
-        LOGGER.warning("%s: %s%s", context, error_label(error), suffix)
+            return None
         self.transient_warnings[context] = (now, 0)
+        return f"; suppressed {suppressed} similar warning(s)" if suppressed else ""
+
+    def warn_transient(self, context: str, error: Exception) -> None:
+        """Rate-limit warnings per context for repeating transient failures."""
+        suffix = self.should_warn(context)
+        if suffix is not None:
+            LOGGER.warning("%s: %s%s", context, error_label(error), suffix)
 
     def warn_decode(self, kind: str, subject: str, error: Exception) -> None:
         """Rate-limit warnings for malformed NATS messages."""
@@ -677,7 +744,7 @@ class Coordinator:
                 if entry is None:
                     async with self.presence_lock:
                         if not saw_conflict and not self.owns_presence:
-                            await self.reclaim_presence()
+                            await self.try_reclaim_presence()
                     self.mark_watch_synced("watch-presence")
                     continue
                 if is_delete(entry.operation):
@@ -686,7 +753,7 @@ class Coordinator:
                         async with self.presence_lock:
                             self.owns_presence = False
                             self.presence_revision = None
-                            await self.reclaim_presence()
+                            await self.try_reclaim_presence()
                     continue
                 data = _decode_record(entry.value)
                 if data is not None and await self.observe_presence(
@@ -754,9 +821,9 @@ class Coordinator:
         expiry = order[0]
         if expiry > now:
             self.session_identities[key] = (prefix, expiry)
+            self.callbacks.on_session_update(data)
         elif mapped := self.session_identities.pop(key, None):
             self.callbacks.on_session_delete(mapped[0])
-        self.callbacks.on_session_update(data)
 
     async def watch_sessions(self) -> None:
         """Watch the sessions KV bucket and update local auth state."""

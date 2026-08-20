@@ -26,6 +26,8 @@ class Envelope:
         """Initialize the envelope with a bot identity and signing key."""
         self.bot_id = bot_id
         self.coordination_key = coordination_key
+        # Per-process by design: a restarted bot accepts replays inside the
+        # drift window; payload-level presence checks bound the impact.
         self.seen_nonces: OrderedDict[str, float] = OrderedDict()
 
     @staticmethod

@@ -1,7 +1,7 @@
 ---
 'on':
   pull_request:
-    paths: &paths
+    paths:
       - .dockerignore
       - .github/workflows/container.yml
       - .python-version
@@ -14,7 +14,6 @@
   push:
     branches:
       - main
-    paths: *paths
     tags:
       - v*
 

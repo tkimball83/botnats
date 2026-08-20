@@ -1,13 +1,14 @@
-# Makefile
+# Copyright (C) 2026 Taylor Kimball
+# SPDX-License-Identifier: GPL-3.0-only
 
 PYTHON ?= python3.14
 
-.PHONY: all clean hooks install integration test unit
+.PHONY: all clean hooks install integration test unit venv
 
 all: test
 
 clean:
-	$(RM) -r .mypy_cache .ruff_cache build dist \
+	$(RM) -r .mypy_cache .pytest_cache .ruff_cache build dist \
 		src/*.egg-info venv
 	find src tests -type d -name __pycache__ -prune -exec $(RM) -r {} +
 
@@ -29,5 +30,7 @@ integration: install
 
 test: unit integration
 
-venv:
+venv: venv/bin/python
+
+venv/bin/python:
 	$(PYTHON) -m venv --upgrade-deps venv
