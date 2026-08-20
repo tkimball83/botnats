@@ -31,13 +31,6 @@ from botnats.irc.protocol import (
     parse_message,
 )
 
-BACKOFF_BASE = 1.5
-BACKOFF_JITTER = 1.0
-COLLISION_NICK_LENGTH = 9
-FAILOVER_ATTEMPTS = 4
-RATE_TEST_MESSAGES = 6
-RESET_ATTEMPTS = 3
-STABLE_ATTEMPT = 2
 MASK_MATCH_BUDGET_SECONDS = 0.5
 
 
@@ -239,9 +232,9 @@ class IRCProtocolTests(unittest.TestCase):
 
     def test_nickname_collision(self) -> None:
         """Verify collision nicknames have correct length and are alphabetic."""
-        candidates = [next_nickname(COLLISION_NICK_LENGTH) for _ in range(20)]
+        candidates = [next_nickname(9) for _ in range(20)]
 
-        assert all(len(candidate) == COLLISION_NICK_LENGTH for candidate in candidates)
+        assert all(len(candidate) == 9 for candidate in candidates)
         assert all(candidate.isalpha() for candidate in candidates)
 
     def test_parse_rejects_control_chars_in_params(self) -> None:
@@ -341,7 +334,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def failing_connection(server: IRCServer) -> None:
             ports.append(server.port)
-            if len(ports) >= FAILOVER_ATTEMPTS:
+            if len(ports) >= 4:
                 client.stopping = True
             msg = "connection refused"
             raise OSError(msg)
@@ -359,8 +352,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert ports == [6667, 6668, 6667, 6668]
         assert len(delays) == len(ports) - 1
         for attempt, delay in enumerate(delays, start=1):
-            base = BACKOFF_BASE**attempt
-            assert base <= delay < base + BACKOFF_JITTER
+            base = 1.5**attempt
+            assert base <= delay < base + 1.0
 
     async def test_run_forever_resets_backoff_after_stable_session(self) -> None:
         """Reset backoff and keep the server after a stable registered session."""
@@ -370,8 +363,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def connection(server: IRCServer) -> None:
             ports.append(server.port)
-            client.registered_with_server = len(ports) == STABLE_ATTEMPT
-            if len(ports) >= RESET_ATTEMPTS:
+            client.registered_with_server = len(ports) == 2
+            if len(ports) >= 3:
                 client.stopping = True
             msg = "connection lost"
             raise OSError(msg)
@@ -390,8 +383,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         # Failure rotates away; the stable session keeps its server and
         # resets the backoff to the base delay.
         assert ports == [6667, 6668, 6668]
-        assert delays[0] >= BACKOFF_BASE
-        assert 1.0 <= delays[1] < 1.0 + BACKOFF_JITTER
+        assert delays[0] >= 1.5
+        assert 1.0 <= delays[1] < 1.0 + 1.0
 
     async def test_send_loop_rate_limits_after_burst(self) -> None:
         """Delay sends once the token-bucket burst allowance is spent."""
@@ -399,7 +392,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         writer = mock_writer()
         client.writer = writer
         outbound: asyncio.Queue[bytes] = asyncio.Queue()
-        for index in range(RATE_TEST_MESSAGES):
+        for index in range(6):
             outbound.put_nowait(b"PRIVMSG nick :%d\r\n" % index)
         sleeps: list[float] = []
         real_sleep = asyncio.sleep
@@ -412,12 +405,12 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(client, "send_immediate", AsyncMock()) as send,
         ):
             task = asyncio.create_task(client.send_loop(writer, outbound))
-            while send.await_count < RATE_TEST_MESSAGES:
+            while send.await_count < 6:
                 await real_sleep(0)
             task.cancel()
 
         # The burst allowance goes out untouched; the rest wait ~1s each.
-        assert len(sleeps) == RATE_TEST_MESSAGES - int(SEND_BURST)
+        assert len(sleeps) == 6 - int(SEND_BURST)
         assert all(delay > 1.0 / (2 * SEND_RATE) for delay in sleeps)
 
     async def test_registration_nick_rejections_retry(self) -> None:

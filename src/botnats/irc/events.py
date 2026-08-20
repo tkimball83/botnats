@@ -7,9 +7,9 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
-from botnats.config import mode_intent
 from botnats.irc.client import DEFAULT_NICK_LENGTH
 from botnats.irc.protocol import (
     DEFAULT_CASEMAPPING,
@@ -38,9 +38,7 @@ class IRCEventHandler:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
         self.caps = bot.caps
-        self.enforced_set, self.enforced_unset = mode_intent(
-            bot.config.channel_modes,
-        )
+        self.enforced_set, self.enforced_unset = bot.channel_mgr.mode_intent
         self.pending_sessions: dict[str, dict[str, object]] = {}
         # ponytail: global ordering; use dependency-aware queues if contention appears.
         self.session_lock = asyncio.Lock()
@@ -256,7 +254,8 @@ class IRCEventHandler:
                 try:
                     await self.bot.irc.send("PART", channel)
                 except ConnectionError:
-                    self.bot.channel_mgr.schedule_part(channel)
+                    mgr = self.bot.channel_mgr
+                    mgr.pending_parts[self.bot.fold(channel)] = channel
             return
         if is_self:
             runtime.reset()
@@ -377,13 +376,13 @@ class IRCEventHandler:
             )
             if moved is not None:
                 previous, session = moved
-                if await self.sync_session(old_identity, previous.to_dict()):
-                    await self.sync_session(new_identity, session.to_dict())
+                if await self.sync_session(old_identity, asdict(previous)):
+                    await self.sync_session(new_identity, asdict(session))
                 else:
                     async with self.session_lock:
                         key = casefold(new_identity, "ascii")
                         self.pending_sessions.pop(key, None)
-                        self.pending_sessions[key] = session.to_dict()
+                        self.pending_sessions[key] = asdict(session)
         identity = self.bot.identity
         if identity is not None and old_folded == self.bot.fold(identity.nick):
             # Fall back to the known identity when the NICK prefix omits
@@ -436,7 +435,7 @@ class IRCEventHandler:
     async def handle_welcome(self, message: IRCMessage) -> None:
         """Notify the bot that IRC registration is complete."""
         LOGGER.debug("received welcome: %s", " ".join(message.params))
-        await self.bot.on_registered()
+        self.bot.on_registered()
 
     async def handle_who(self, message: IRCMessage) -> None:
         """Update member identity and modes from a WHO reply entry."""
@@ -534,12 +533,10 @@ class IRCEventHandler:
 
     async def revoke_session(self, prefix: Prefix) -> None:
         """Revoke authorization and propagate the signed revocation to peers."""
-        revoked = self.bot.authorizer.revoke(prefix.render())
+        identity = prefix.render()
+        revoked = self.bot.authorizer.revoke(identity)
         if revoked is not None:
-            await self.sync_session(
-                prefix.render(),
-                revoked.to_dict(),
-            )
+            await self.sync_session(identity, asdict(revoked))
 
     async def retry_pending_sessions(self) -> None:
         """Retry session writes that failed while JetStream was unavailable."""
@@ -586,13 +583,15 @@ class IRCEventHandler:
         if session.get("revoked") is True:
             winner = self.bot.authorizer.parse(stored, time.time())
             if winner is not None and not winner.revoked:
-                replacement = self.bot.authorizer.create(
-                    winner.prefix,
-                    winner.expires_at,
-                    winner.issuer,
-                    winner.version + 1,
-                    revoked=True,
-                ).to_dict()
+                replacement = asdict(
+                    self.bot.authorizer.create(
+                        winner.prefix,
+                        winner.expires_at,
+                        winner.issuer,
+                        winner.version + 1,
+                        revoked=True,
+                    ),
+                )
                 self.bot.authorizer.import_session(replacement)
                 self.pending_sessions[identity] = replacement
                 return False

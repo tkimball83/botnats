@@ -6,6 +6,7 @@
 import asyncio
 import time
 import unittest
+from dataclasses import asdict
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
@@ -38,10 +39,6 @@ CUSTOM_ISUPPORT = IRCMessage(
         "supported",
     ),
 )
-EXPECTED_MODE_LIMIT = 6
-EXPECTED_SESSION_MOVE_PUTS = 2
-EXPECTED_NICK_LENGTH = 12
-EXPECTED_WRITE_ATTEMPTS = 2
 UNSET_MODE = IRCMessage("MODE", ("#test", "-n"), Prefix("someone", "user", "host"))
 
 
@@ -79,9 +76,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             coordinator,
             "put_session",
-            AsyncMock(return_value=winner.to_dict()),
+            AsyncMock(return_value=asdict(winner)),
         ):
-            synced = await bot.events.sync_session(prefix, stale.to_dict())
+            synced = await bot.events.sync_session(prefix, asdict(stale))
 
         assert not synced
         pending = bot.events.pending_sessions[casefold(prefix, "ascii")]
@@ -333,11 +330,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert bot.caps.casemapping == "ascii"
         assert bot.fold("[") != bot.fold("{")
-        assert bot.caps.mode_limit == EXPECTED_MODE_LIMIT
+        assert bot.caps.mode_limit == 6
         assert bot.caps.op_mode == "y"
         assert bot.is_self_opped(runtime)
         assert fake_irc.casemapping == "ascii"
-        assert fake_irc.nickname_length == EXPECTED_NICK_LENGTH
+        assert fake_irc.nickname_length == 12
 
     async def test_isupport_removals_restore_defaults(self) -> None:
         """Restore default behavior when the server removes ISUPPORT values."""
@@ -372,7 +369,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert bot.caps.casemapping == "ascii"
-        assert fake_irc.nickname_length == EXPECTED_NICK_LENGTH
+        assert fake_irc.nickname_length == 12
 
     async def test_higher_prefix_counts_as_opped(self) -> None:
         """Verify PREFIX modes above operator retain operator privileges."""
@@ -576,7 +573,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         new_prefix = Prefix("newowner", "user", "host.example")
         assert bot.authorizer.authorized(new_prefix.render())
         assert not bot.authorizer.authorized(old_prefix.render())
-        assert len(coordinator.session_puts) == EXPECTED_SESSION_MOVE_PUTS
+        assert len(coordinator.session_puts) == 2
 
     async def test_mode_key_unusable(self) -> None:
         """Verify unusable channel key is ignored and not republished."""
@@ -703,7 +700,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.authorizer.authorized(old_prefix.render())
         assert bot.authorizer.authorized(new_prefix.render())
-        assert len(coordinator.session_puts) == EXPECTED_WRITE_ATTEMPTS
+        assert len(coordinator.session_puts) == 2
         assert coordinator.session_puts[0][1]["revoked"] is True
 
     async def test_nick_change_waits_for_durable_revocation(self) -> None:
@@ -723,7 +720,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 IRCMessage("NICK", (new_prefix.nick,), old_prefix),
             )
             assert attempts == [(old_prefix.render().casefold(), True)]
-            assert len(bot.events.pending_sessions) == EXPECTED_WRITE_ATTEMPTS
+            assert len(bot.events.pending_sessions) == 2
             await bot.events.retry_pending_sessions()
 
         assert attempts == [
@@ -815,7 +812,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         ) -> dict[str, object]:
             del identity
             attempts.append(session)
-            return winner.to_dict() if len(attempts) == 1 else session
+            return asdict(winner) if len(attempts) == 1 else session
 
         with patch.object(
             coordinator,
@@ -827,7 +824,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             assert bot.events.pending_sessions
             await bot.events.retry_pending_sessions()
 
-        assert len(attempts) == EXPECTED_WRITE_ATTEMPTS
+        assert len(attempts) == 2
         assert attempts[-1]["revoked"] is True
         assert attempts[-1]["version"] == winner.version + 1
         assert not bot.events.pending_sessions
@@ -850,7 +847,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await bot.events.retry_pending_sessions()
 
         assert not bot.events.pending_sessions
-        assert put.await_count == EXPECTED_WRITE_ATTEMPTS
+        assert put.await_count == 2
 
     async def test_duplicate_coordinator_queues_session_writes(self) -> None:
         """Queue session writes while the coordinator reports a duplicate ID."""
@@ -880,20 +877,24 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_revocation_blocks_later_session_writes(self) -> None:
         """Never write a queued grant past an earlier still-pending revocation."""
         bot, _, coordinator = bot_with_coordinator()
-        blocked = bot.authorizer.create(
-            "old!user@host.example",
-            time.time() + 100,
-            bot.authorizer.issuer,
-            1,
-            revoked=True,
-        ).to_dict()
+        blocked = asdict(
+            bot.authorizer.create(
+                "old!user@host.example",
+                time.time() + 100,
+                bot.authorizer.issuer,
+                1,
+                revoked=True,
+            ),
+        )
         identity = "new!user@host.example"
-        session = bot.authorizer.create(
-            identity,
-            time.time() + 100,
-            bot.authorizer.issuer,
-            1,
-        ).to_dict()
+        session = asdict(
+            bot.authorizer.create(
+                identity,
+                time.time() + 100,
+                bot.authorizer.issuer,
+                1,
+            ),
+        )
 
         async def put_session(
             stored_identity: str,
@@ -913,27 +914,31 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             assert not await bot.events.sync_session("old!user@host.example", blocked)
             assert not await bot.events.sync_session(identity, session)
 
-        assert put.await_count == EXPECTED_WRITE_ATTEMPTS
+        assert put.await_count == 2
         assert all(call.args[1] is blocked for call in put.await_args_list)
         assert casefold(identity, "ascii") in bot.events.pending_sessions
 
     async def test_expired_revocation_drains_from_pending_queue(self) -> None:
         """Drop a pending revocation once its durable record has expired."""
         bot, _, coordinator = bot_with_coordinator()
-        revocation = bot.authorizer.create(
-            "old!user@host.example",
-            time.time() - 1,
-            bot.authorizer.issuer,
-            1,
-            revoked=True,
-        ).to_dict()
+        revocation = asdict(
+            bot.authorizer.create(
+                "old!user@host.example",
+                time.time() - 1,
+                bot.authorizer.issuer,
+                1,
+                revoked=True,
+            ),
+        )
         identity = "new!user@host.example"
-        session = bot.authorizer.create(
-            identity,
-            time.time() + 100,
-            bot.authorizer.issuer,
-            1,
-        ).to_dict()
+        session = asdict(
+            bot.authorizer.create(
+                identity,
+                time.time() + 100,
+                bot.authorizer.issuer,
+                1,
+            ),
+        )
 
         with patch.object(
             coordinator,
@@ -956,19 +961,23 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         old_identity = "Owner!user@host.example"
         identity = old_identity.casefold()
         expires_at = time.time() + 100
-        session = bot.authorizer.create(
-            identity,
-            expires_at,
-            bot.authorizer.issuer,
-            2,
-        ).to_dict()
-        revocation = bot.authorizer.create(
-            old_identity,
-            expires_at,
-            bot.authorizer.issuer,
-            1,
-            revoked=True,
-        ).to_dict()
+        session = asdict(
+            bot.authorizer.create(
+                identity,
+                expires_at,
+                bot.authorizer.issuer,
+                2,
+            ),
+        )
+        revocation = asdict(
+            bot.authorizer.create(
+                old_identity,
+                expires_at,
+                bot.authorizer.issuer,
+                1,
+                revoked=True,
+            ),
+        )
 
         async def put_session(
             stored_identity: str,
@@ -989,7 +998,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             assert await bot.events.sync_session(identity, session)
             await bot.events.retry_pending_sessions()
 
-        assert put.await_count == EXPECTED_WRITE_ATTEMPTS
+        assert put.await_count == 2
         assert coordinator.session_puts == [(identity, session)]
         assert not bot.events.pending_sessions
 
@@ -1008,9 +1017,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             coordinator,
             "put_session",
-            AsyncMock(return_value=winner.to_dict()),
+            AsyncMock(return_value=asdict(winner)),
         ):
-            assert await bot.events.sync_session(identity, active.to_dict())
+            assert await bot.events.sync_session(identity, asdict(active))
         assert not bot.authorizer.authorized(identity)
 
     async def test_self_join_clears_state(self) -> None:

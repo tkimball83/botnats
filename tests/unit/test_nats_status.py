@@ -12,9 +12,6 @@ from nats.js.api import ClusterInfo, PeerInfo
 
 from botnats.nats.status import NATSStatus, collect, route_count, stream_info
 
-EXPECTED_LAG = 4
-EXPECTED_ROUTES = 2
-
 
 class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
     """Tests for bounded cluster monitoring and status rendering."""
@@ -48,7 +45,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             status = await collect(nc, kv, 3, 8222)
 
         assert status.jetstream == "degraded"
-        assert status.lag == EXPECTED_LAG
+        assert status.lag == 4
         assert status.offline == ("nats-3",)
         assert status.render() == (
             "nats connection=up routes=1 jetstream=degraded leader=nats-1 "
@@ -155,7 +152,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 with patch("botnats.nats.status.asyncio.open_connection", connect):
                     routes = await route_count(host, 8222)
 
-                assert routes == EXPECTED_ROUTES
+                assert routes == 2
                 assert connect.await_args is not None
                 assert connect.await_args.args == (host, 8222)
                 writer.close.assert_called_once_with()

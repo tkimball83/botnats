@@ -28,9 +28,6 @@ from botnats.nats.store import (
 )
 from tests.unit.helpers import COORDINATION_KEY as SECRET
 
-EXPECTED_CREATE_CALLS = 2
-EXPECTED_OPEN_CALLS = 2
-LATEST_REVISION = 8
 SHA256_HEX_LENGTH = 64
 
 
@@ -56,14 +53,14 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         store = PresenceStore("efnet", 1, 15.0, SECRET)
         owned = signed_presence("inst")
         entry = SimpleNamespace(
-            revision=LATEST_REVISION,
+            revision=8,
             value=json.dumps(owned).encode(),
         )
         kv = AsyncMock()
         kv.get = AsyncMock(return_value=entry)
         store.kv = kv
 
-        assert await store.reclaim("Alpha", owned, "inst") == LATEST_REVISION
+        assert await store.reclaim("Alpha", owned, "inst") == 8
         kv.get.assert_awaited_with("alpha")
         kv.update.assert_not_awaited()
 
@@ -223,7 +220,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         assert await attempts.allow("host.example", now=60)
-        assert attempts.kv.create.await_count == EXPECTED_CREATE_CALLS
+        assert attempts.kv.create.await_count == 2
 
     async def test_denies_after_limit(self) -> None:
         """Verify a full attempt window denies another authentication attempt."""
@@ -382,7 +379,7 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
             await claims.open(js)
 
         assert await claims.claim(42)
-        assert js.create_key_value.await_count == EXPECTED_OPEN_CALLS
+        assert js.create_key_value.await_count == 2
 
     async def test_reset(self) -> None:
         """Verify disconnect cleanup invalidates all JetStream handles."""
@@ -416,9 +413,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         presence = PresenceStore("efnet", 1, 15, SECRET)
         presence.kv = AsyncMock()
 
-        await presence.delete("Alpha", LATEST_REVISION)
+        await presence.delete("Alpha", 8)
 
-        presence.kv.delete.assert_awaited_once_with("alpha", last=LATEST_REVISION)
+        presence.kv.delete.assert_awaited_once_with("alpha", last=8)
 
     async def test_channel_put_keeps_highest_revision(self) -> None:
         """Prevent a delayed channel write from replacing newer durable state."""
@@ -498,8 +495,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         incoming = channel_record(3)
         assert await channels.put("#test", incoming) == incoming
 
-        assert channels.kv.update.await_count == EXPECTED_OPEN_CALLS
-        assert channels.kv.update.await_args_list[1].kwargs["last"] == LATEST_REVISION
+        assert channels.kv.update.await_count == 2
+        assert channels.kv.update.await_args_list[1].kwargs["last"] == 8
 
     async def test_channel_put_retries_create_race(self) -> None:
         """Retry against the racing writer's record after a lost create."""

@@ -4,7 +4,7 @@
 """Bot identity and NATS presence heartbeat tracking."""
 
 import time
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 
 from botnats.irc.protocol import DEFAULT_CASEMAPPING, Prefix
 
@@ -37,10 +37,6 @@ class BotPresence:
     def matches(self, prefix: Prefix, casemapping: str = DEFAULT_CASEMAPPING) -> bool:
         """Check whether this presence corresponds to the given IRC prefix."""
         return self.to_prefix().matches(prefix, casemapping)
-
-    def to_dict(self) -> dict[str, str]:
-        """Serialize the presence fields to a plain dictionary."""
-        return asdict(self)
 
     def to_prefix(self) -> Prefix:
         """Convert to an IRC prefix for mask matching."""
