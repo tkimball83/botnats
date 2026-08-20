@@ -12,9 +12,9 @@ from collections import OrderedDict
 from typing import Any
 
 MAX_ENVELOPE_BYTES = 262_144
-NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+NONCE_RE = re.compile(r"[0-9a-f]{32}")
 NONCE_TTL = 90  # must exceed 2 * TIMESTAMP_DRIFT_WINDOW to close the replay window
-SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
+SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
 SUBJECT_FIELD = "_botnats_subject"
 TIMESTAMP_DRIFT_WINDOW = 30
 
@@ -23,7 +23,6 @@ class Envelope:
     """Encodes and decodes nonce-protected, HMAC-signed JSON envelopes."""
 
     def __init__(self, bot_id: str, coordination_key: bytes) -> None:
-        """Initialize the envelope with a bot identity and signing key."""
         self.bot_id = bot_id
         self.coordination_key = coordination_key
         # Per-process by design: a restarted bot accepts replays inside the

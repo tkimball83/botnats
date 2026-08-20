@@ -85,18 +85,19 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bucket_eviction(self) -> None:
         """Evict only expired buckets at capacity; deny new keys otherwise."""
-        limiter = RateLimiter()
+        limiter = RateLimiter(limit=10, window=60)
         with patch("botnats.admin.MAX_RATE_BUCKETS", 2):
-            assert limiter.check("a", limit=10, window=60)
-            assert limiter.check("b", limit=10, window=60)
-            assert limiter.check("a", limit=10, window=60)
+            assert limiter.check("a")
+            assert limiter.check("b")
+            assert limiter.check("a")
             # Every bucket is fresh: a new key is denied instead of evicting
             # one, which would reset an actively limited key's budget.
-            assert not limiter.check("c", limit=10, window=60)
+            assert not limiter.check("c")
             assert "c" not in limiter.buckets
             assert "b" in limiter.buckets
             # A zero window expires the LRU bucket, so eviction proceeds.
-            assert limiter.check("c", limit=10, window=0)
+            limiter.window = 0
+            assert limiter.check("c")
         assert "a" in limiter.buckets
         assert "b" not in limiter.buckets
         assert "c" in limiter.buckets
@@ -113,20 +114,20 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_independent_keys(self) -> None:
         """Verify rate limits are tracked independently per key."""
-        limiter = RateLimiter()
-        assert limiter.check("alice", limit=1, window=60)
-        assert limiter.check("bob", limit=1, window=60)
-        assert not limiter.check("alice", limit=1, window=60)
+        limiter = RateLimiter(limit=1, window=60)
+        assert limiter.check("alice")
+        assert limiter.check("bob")
+        assert not limiter.check("alice")
 
     async def test_window_expiry(self) -> None:
         """Verify rate limit resets after window expires."""
-        limiter = RateLimiter()
-        assert limiter.check("user", limit=1, window=0.0)
-        assert limiter.check("user", limit=1, window=0.0)
+        limiter = RateLimiter(limit=1, window=0.0)
+        assert limiter.check("user")
+        assert limiter.check("user")
 
     async def test_within_limit(self) -> None:
         """Verify requests within limit are allowed and excess is denied."""
-        limiter = RateLimiter()
+        limiter = RateLimiter(limit=3, window=60)
         for _ in range(3):
-            assert limiter.check("user", limit=3, window=60)
-        assert not limiter.check("user", limit=3, window=60)
+            assert limiter.check("user")
+        assert not limiter.check("user")

@@ -41,7 +41,6 @@ class ChannelManager:
     """Manages channel joins, parts, mode enforcement, and peer requests."""
 
     def __init__(self, bot: Bot) -> None:
-        """Initialize channel tracking state and cooldown timers."""
         self.bot = bot
         self.channel_records: dict[str, ChannelRecord] = {}
         self.source_records: dict[str, ChannelRecord] = {}

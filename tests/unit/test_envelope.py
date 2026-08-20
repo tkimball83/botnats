@@ -50,6 +50,24 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allowed window"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
+    def test_decode_rejects_stale_timestamp(self) -> None:
+        """Reject an envelope with a plausible but expired timestamp."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        encoded = json.loads(envelope.encode(SUBJECT, {}))
+        encoded["timestamp"] = int(time.time()) - 60
+
+        with self.assertRaisesRegex(ValueError, "allowed window"):
+            envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
+    def test_decode_rejects_future_timestamp(self) -> None:
+        """Reject an envelope with a timestamp too far in the future."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        encoded = json.loads(envelope.encode(SUBJECT, {}))
+        encoded["timestamp"] = int(time.time()) + 60
+
+        with self.assertRaisesRegex(ValueError, "allowed window"):
+            envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
     def test_decode_rejects_unbound_payload(self) -> None:
         """Reject signed envelopes that are not bound to their subject."""
         sender = Envelope("alpha", COORDINATION_KEY)

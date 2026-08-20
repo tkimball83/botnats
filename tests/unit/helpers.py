@@ -3,6 +3,7 @@
 
 """Shared fakes and factories for bot-level tests."""
 
+import time
 from typing import Any
 
 from nats.errors import Error as NatsError
@@ -13,7 +14,7 @@ from botnats.config import BotConfig
 from botnats.irc.client import IRCServer
 from botnats.irc.protocol import casefold, format_message
 from botnats.nats.status import NATSStatus
-from botnats.nats.store import ATTEMPT_LIMIT
+from botnats.nats.store import ATTEMPT_LIMIT, ATTEMPT_WINDOW
 
 AUTH_SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
 COORDINATION_KEY = b"coordination-secret-used-only-for-tests"
@@ -170,7 +171,7 @@ class FakeCoordinator:
 
     def __init__(self, *, claim_result: bool = False) -> None:
         """Initialize empty recording buffers."""
-        self.auth_requests: list[str] = []
+        self.auth_slots: dict[str, list[float]] = {}
         self.bot_id = "alpha"
         self.channel_puts: list[tuple[str, dict[str, Any]]] = []
         self.claim_requests: list[int] = []
@@ -227,20 +228,34 @@ class FakeCoordinator:
         return self.connected and self.unique and self.synced and self.owns_presence
 
     async def request_auth(self, identity: str) -> bool:
-        """Record and limit attempts per identity, failing closed if not ready."""
+        """Claim one attempt slot per identity, matching real slot-based store."""
         if not self.ready:
             return False
-        self.auth_requests.append(identity)
-        return self.auth_requests.count(identity) <= ATTEMPT_LIMIT
+        now = time.monotonic()
+        cutoff = now - ATTEMPT_WINDOW
+        slots = self.auth_slots.setdefault(identity, [])
+        for idx, ts in enumerate(slots):
+            if ts <= cutoff:
+                slots[idx] = now
+                return True
+        if len(slots) < ATTEMPT_LIMIT:
+            slots.append(now)
+            return True
+        return False
 
     async def request_claim(self, counter: int) -> bool:
         """Allow or deny claims, failing closed when not ready."""
+        if not self.ready:
+            return False
         self.claim_requests.append(counter)
-        return self.ready and self.claim_result
+        return self.claim_result
 
     async def request_offer(self, base_suffix: str, payload: dict[str, object]) -> bool:
-        """Record an offer request, refusing when not ready."""
+        """Record an offer request, refusing when not ready or misowned."""
         if not self.ready:
+            return False
+        presence = payload.get("presence")
+        if not isinstance(presence, dict) or presence.get("bot_id") != self.bot_id:
             return False
         self.offer_requests.append((base_suffix, payload))
         return True
