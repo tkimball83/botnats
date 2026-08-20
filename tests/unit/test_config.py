@@ -44,6 +44,8 @@ CONFIG = b"""{
 }
 """
 DEFAULT_FLOAT = 2.5
+DEFAULT_PRESENCE_TTL = 15
+DEFAULT_SESSION_TTL = 3600
 EXPECTED_COORDINATION_KEY = "coordination-secret-used-only-for-tests"
 EXPECTED_HEALTH_PORT = 8080
 EXPECTED_MONITOR_PORT = 8222
@@ -77,6 +79,60 @@ class ConfigTests(unittest.TestCase):
         assert config.jetstream_replicas == EXPECTED_REPLICAS
         assert config.health_port == EXPECTED_HEALTH_PORT
         assert config.irc_servers == (IRCServer("irc.example.test", 6697, tls=True),)
+
+    def test_optional_tables_may_be_omitted(self) -> None:
+        """Load defaults for tables whose keys are all optional."""
+        raw = json.loads(CONFIG)
+        del raw["authorization"]
+        del raw["coordination"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bot.json")
+            path.write_text(json.dumps(raw))
+            with patch.dict(os.environ, SECRETS):
+                config = BotConfig.load(path)
+
+        assert config.auth_session_ttl == DEFAULT_SESSION_TTL
+        assert config.presence_ttl == DEFAULT_PRESENCE_TTL
+
+    def test_required_key_errors_name_their_section(self) -> None:
+        """Qualify required-key errors with their configuration table."""
+        cases = (
+            ("bot", r"bot\.id must be a non-empty string"),
+            ("irc", r"irc\.servers must be a list of non-empty strings"),
+            ("nats", r"nats\.servers must be a list of non-empty strings"),
+        )
+        for section, message in cases:
+            with self.subTest(section=section):
+                raw = json.loads(CONFIG)
+                del raw[section]
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory, "bot.json")
+                    path.write_text(json.dumps(raw))
+                    with self.assertRaisesRegex(ValueError, message):
+                        BotConfig.load(path)
+
+    def test_invalid_value_errors_name_their_section(self) -> None:
+        """Qualify invalid-value errors with their configuration table."""
+        raw = json.loads(CONFIG)
+        raw["bot"]["nickname"] = "1bad"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bot.json")
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(
+                ValueError,
+                r"bot\.nickname is not a valid IRC nickname",
+            ):
+                BotConfig.load(path)
+
+    def test_non_table_section_is_rejected(self) -> None:
+        """Reject a section that is present but not an object."""
+        raw = json.loads(CONFIG)
+        raw["authorization"] = []
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bot.json")
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(TypeError, "configuration table"):
+                BotConfig.load(path)
 
     def test_config_requires_object(self) -> None:
         """Verify a non-object JSON document produces a clear config error."""

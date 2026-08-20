@@ -22,6 +22,7 @@ CHANNELS = (
 )
 COMMAND_TIMEOUT = 15.0
 MIN_CHANNEL_MODE_PARAMS = 3
+MIN_NAMES_REPLY_PARAMS = 2
 MIN_NATS_ROUTES = 2
 MIN_PRIVMSG_PARAMS = 2
 STARTUP_TIMEOUT = 45.0
@@ -151,11 +152,11 @@ def names_reply(channel: str) -> Callable[[IRCMessage], bool]:
     """Return a predicate for NAMES replies belonging to one channel."""
 
     def matches(message: IRCMessage) -> bool:
-        if message.command == "353" and len(message.params) >= MIN_PRIVMSG_PARAMS:
+        if message.command == "353" and len(message.params) >= MIN_NAMES_REPLY_PARAMS:
             return message.params[-2].casefold() == channel.casefold()
         return (
             message.command == "366"
-            and len(message.params) >= MIN_PRIVMSG_PARAMS
+            and len(message.params) >= MIN_NAMES_REPLY_PARAMS
             and message.params[1].casefold() == channel.casefold()
         )
 
@@ -218,32 +219,13 @@ async def run() -> None:
             )
             await wait_for_channel(session, channel, key)
 
-        await session.send("PRIVMSG", "beta", trailing="STATUS")
-        local_status = await session.read_until(
-            private_message("beta"),
-            wait_seconds=COMMAND_TIMEOUT,
-        )
-        nats_status = await session.read_until(
-            private_message("beta"),
-            wait_seconds=COMMAND_TIMEOUT,
-        )
-        assert "peers=2" in local_status.params[-1]
-        assert "channels=2" in local_status.params[-1]
-        nats_fields = dict(
-            field.split("=", 1) for field in nats_status.params[-1].split()[1:]
-        )
-        assert nats_fields["connection"] == "up"
-        assert int(nats_fields["routes"]) >= MIN_NATS_ROUTES
-        assert nats_fields["jetstream"] == "up"
-        assert nats_fields["replicas"] == "3/3"
+        await wait_for_status(session, "beta")
 
         for channel, key in CHANNELS:
-            assert await command(session, "gamma", f"KEY {channel}") == (
-                f"Key for {channel}: {key}"
+            await wait_for_reply(
+                session, "gamma", f"KEY {channel}", f"Key for {channel}: {key}"
             )
             channel_modes = await modes(session, channel)
-            # "m" is not an ergo default, so its presence proves the bots
-            # actively enforced the configured modes rather than inheriting them.
             assert "m" in channel_modes
             assert "n" in channel_modes
             assert "t" in channel_modes
@@ -347,6 +329,36 @@ async def wait_for_operators(
             await asyncio.sleep(0.25)
 
 
+async def wait_for_status(session: IRCSession, bot: str) -> None:
+    """Poll STATUS until the bot reports the expected mesh state."""
+    async with asyncio.timeout(STARTUP_TIMEOUT):
+        while True:
+            await session.send("PRIVMSG", bot, trailing="STATUS")
+            local_status = await session.read_until(
+                private_message(bot),
+                wait_seconds=COMMAND_TIMEOUT,
+            )
+            nats_status = await session.read_until(
+                private_message(bot),
+                wait_seconds=COMMAND_TIMEOUT,
+            )
+            local_text = local_status.params[-1]
+            if "peers=2" not in local_text or "channels=2" not in local_text:
+                await asyncio.sleep(2.0)
+                continue
+            nats_fields = dict(
+                field.split("=", 1) for field in nats_status.params[-1].split()[1:]
+            )
+            if (
+                nats_fields.get("connection") == "up"
+                and int(nats_fields.get("routes", "0")) >= MIN_NATS_ROUTES
+                and nats_fields.get("jetstream") == "up"
+                and nats_fields.get("replicas") == "3/3"
+            ):
+                return
+            await asyncio.sleep(2.0)
+
+
 async def wait_for_reply(
     session: IRCSession,
     bot: str,
@@ -358,7 +370,7 @@ async def wait_for_reply(
         while True:
             if await command(session, bot, command_text) == expected:
                 return
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(2.0)
 
 
 if __name__ == "__main__":

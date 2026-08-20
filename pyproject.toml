@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "botnats"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python IRC bot mesh coordinated through Core NATS and JetStream"
 license = "GPL-3.0-only"
 requires-python = ">=3.14"
@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "isort==8.0.1",
   "mypy==2.3.0",
   "ruff==0.16.1",
 ]
@@ -23,6 +24,10 @@ botnats = "botnats.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.isort]
+profile = "black"
+known_first_party = ["botnats"]
 
 [tool.mypy]
 disallow_untyped_defs = true

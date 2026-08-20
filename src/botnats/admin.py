@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from botnats.irc.protocol import Prefix
 
 ADMIN_COMMAND_ARGS = 2
+INVALID_CLAIM_COUNTER = -1
 MAX_JOIN_ARGS = 2
 MAX_RATE_BUCKETS = 8192
 MIN_TOTP_SECRET_BYTES = 20
@@ -58,7 +59,12 @@ class AuthFlow:
         if not await coordinator.request_auth(identity):
             return
         counter = bot.authorizer.match(arguments[0])
-        if counter is not None and await coordinator.request_claim(counter):
+        # A wrong code still performs the claim round trip so response
+        # timing cannot distinguish it from a valid-but-replayed code.
+        claimed = await coordinator.request_claim(
+            counter if counter is not None else INVALID_CLAIM_COUNTER,
+        )
+        if counter is not None and claimed:
             session = bot.authorizer.grant(rendered)
             if not await bot.events.sync_session(
                 rendered,
@@ -335,7 +341,13 @@ class CommandHandler:
         try:
             name, arguments = parse_command(text)
         except ValueError as error:
-            await self.bot.safe_privmsg(prefix.nick, str(error) or "Command failed")
+            # Unauthenticated senders get silence, not a parse-error reply
+            # that would confirm a bot is listening.
+            if self.bot.authorizer.authorized(prefix.render()):
+                await self.bot.safe_privmsg(
+                    prefix.nick,
+                    str(error) or "Command failed",
+                )
             return
 
         if name == "AUTH":
@@ -375,8 +387,10 @@ class RateLimiter:
         cutoff = now - window
         bucket = self.buckets.get(key)
         if bucket is None:
-            if len(self.buckets) >= MAX_RATE_BUCKETS:
-                self.buckets.popitem(last=False)
+            if len(self.buckets) >= MAX_RATE_BUCKETS and not self.evict_stale(cutoff):
+                # Fail closed: evicting a fresh bucket would let identity
+                # churn reset an actively limited key's budget.
+                return False
             bucket = deque()
             self.buckets[key] = bucket
         else:
@@ -386,6 +400,14 @@ class RateLimiter:
         if len(bucket) >= limit:
             return False
         bucket.append(now)
+        return True
+
+    def evict_stale(self, cutoff: float) -> bool:
+        """Evict the least-recently-used bucket only if it has fully expired."""
+        key, bucket = next(iter(self.buckets.items()))
+        if bucket and bucket[-1] > cutoff:
+            return False
+        del self.buckets[key]
         return True
 
 

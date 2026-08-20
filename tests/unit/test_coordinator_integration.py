@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from nats.aio.msg import Msg
+from nats.errors import Error as NatsError
 from nats.js.errors import KeyWrongLastSequenceError
+from nats.js.kv import KV_DEL
 
 from botnats.channel import ChannelRecord
 from botnats.nats.coordinator import WATCH_NAMES, Coordinator, NATSConfig
@@ -30,6 +32,7 @@ from botnats.nats.store import (
     ClaimStore,
     PresenceStore,
     SessionStore,
+    StoreUnavailableError,
     presence_signature,
     session_signature,
 )
@@ -49,6 +52,7 @@ EXPECTED_WARNING_COUNT = 2
 EXPECTED_WATCH_RESTARTS = 3
 EXPECTED_WRITE_ATTEMPTS = 2
 OLD_INIT_RETRY_LIMIT = 10
+RUNTIME_ERROR_CALL = 2
 GRANT_TIMEOUT = 1
 JETSTREAM_REPLICAS = int(os.environ.get("BOTNATS_TEST_JETSTREAM_REPLICAS", "1"))
 NATS_TOKEN = os.environ.get("BOTNATS_TEST_NATS_TOKEN", "integration-token")
@@ -308,6 +312,70 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             )
 
         assert not selected
+
+    async def test_offer_rejects_non_inbox_reply(self) -> None:
+        """Never sign an envelope for a reply outside the inbox namespace."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        client = AsyncMock()
+        subject = f"{coordinator.ns}.op.request"
+        message = Msg(
+            client,
+            subject=subject,
+            reply=f"{coordinator.ns}.op.grant.alpha",
+            data=Envelope("beta", COORDINATION_KEY).encode(
+                subject,
+                {"channel": "#test", "presence": BETA_PRESENCE},
+            ),
+        )
+
+        with patch.object(Coordinator, "ready", PropertyMock(return_value=True)):
+            await coordinator.offer(accept_offer, message)
+
+        client.publish.assert_not_awaited()
+
+    async def test_offer_answers_inbox_reply(self) -> None:
+        """Respond to an eligible offer request on its inbox reply."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        client = AsyncMock()
+        subject = f"{coordinator.ns}.op.request"
+        message = Msg(
+            client,
+            subject=subject,
+            reply="_INBOX.reply",
+            data=Envelope("beta", COORDINATION_KEY).encode(
+                subject,
+                {"channel": "#test", "presence": BETA_PRESENCE},
+            ),
+        )
+
+        with patch.object(Coordinator, "ready", PropertyMock(return_value=True)):
+            await coordinator.offer(accept_offer, message)
+
+        client.publish.assert_awaited_once()
+
+    async def test_offer_response_failure_is_contained(self) -> None:
+        """Warn instead of crashing the callback when a respond fails."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        client = AsyncMock()
+        client.publish.side_effect = OSError("connection lost")
+        subject = f"{coordinator.ns}.op.request"
+        message = Msg(
+            client,
+            subject=subject,
+            reply="_INBOX.reply",
+            data=Envelope("beta", COORDINATION_KEY).encode(
+                subject,
+                {"channel": "#test", "presence": BETA_PRESENCE},
+            ),
+        )
+
+        with (
+            patch.object(Coordinator, "ready", PropertyMock(return_value=True)),
+            self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs,
+        ):
+            await coordinator.offer(accept_offer, message)
+
+        assert any("offer response failed" in line for line in logs.output)
 
     async def test_action_rejects_mismatched_sender(self) -> None:
         """Reject action payloads whose presence does not own the envelope."""
@@ -616,19 +684,135 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             del delay
             steps.append("sleep")
 
+        async def start_watches() -> None:
+            steps.append("watches")
+
         with (
             patch.object(AttemptStore, "open", open_store),
             patch.object(ChannelStore, "open", open_store),
             patch.object(ClaimStore, "open", open_store),
             patch.object(PresenceStore, "open", open_store),
             patch.object(SessionStore, "open", open_store),
+            patch.object(coordinator, "start_watches", start_watches),
             patch("botnats.nats.coordinator.asyncio.sleep", sleep),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             await coordinator.on_reconnected()
-            await coordinator.cancel_watches()
+            # Resynchronization runs as a background task so a JetStream
+            # outage cannot park the nats-py reconnected callback.
+            task = coordinator.resync_task
+            assert task is not None
+            await task
 
-        assert steps == ["open", "sleep", "open", "open", "open", "open", "open"]
+        assert steps == [
+            "open",
+            "sleep",
+            "open",
+            "open",
+            "open",
+            "open",
+            "open",
+            "watches",
+        ]
+
+    async def test_resync_failure_is_logged(self) -> None:
+        """Log a failed resynchronization instead of losing it to GC."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.nc = MagicMock()
+
+        resync = AsyncMock(side_effect=TypeError("bug"))
+        with (
+            patch.object(coordinator, "resync", resync),
+            self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
+        ):
+            await coordinator.on_reconnected()
+            task = coordinator.resync_task
+            assert task is not None
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        assert coordinator.resync_task is None
+        assert any("resynchronization failed" in line for line in logs.output)
+
+    async def test_crash_logs_are_rate_limited(self) -> None:
+        """Throttle repeated crash tracebacks from one watch."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.nc = MagicMock(is_connected=True)
+        calls = 0
+        real_sleep = asyncio.sleep
+
+        async def crash_twice(*arguments: object) -> None:
+            del arguments
+            nonlocal calls
+            calls += 1
+            if calls <= RUNTIME_ERROR_CALL:
+                msg = "boom"
+                raise ValueError(msg)
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(coordinator, "watch_channels", crash_twice),
+            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+            self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
+        ):
+            coordinator.watch_generation += 1
+            task = asyncio.create_task(
+                coordinator.run_watch(
+                    "watch-channels",
+                    coordinator.watch_channels,
+                    coordinator.watch_generation,
+                ),
+            )
+            async with asyncio.timeout(5):
+                while calls <= RUNTIME_ERROR_CALL:
+                    await real_sleep(0.001)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert sum("crashed" in line for line in logs.output) == 1
+
+    async def test_replaced_resync_keeps_new_task(self) -> None:
+        """Keep the new resync task when a superseded one finishes."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.nc = MagicMock()
+        hang = asyncio.Event()
+
+        async def hang_resync() -> None:
+            await hang.wait()
+
+        with patch.object(coordinator, "resync", hang_resync):
+            await coordinator.on_reconnected()
+            first = coordinator.resync_task
+            await coordinator.on_reconnected()
+            second = coordinator.resync_task
+            assert first is not None
+            assert first is not second
+            await asyncio.gather(first, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            assert coordinator.resync_task is second
+            coordinator.cancel_resync()
+            assert second is not None
+            await asyncio.gather(second, return_exceptions=True)
+
+    async def test_disconnect_cancels_resync(self) -> None:
+        """Cancel an in-flight resynchronization when Core NATS drops."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.nc = MagicMock()
+        hang = asyncio.Event()
+
+        async def hang_resync() -> None:
+            await hang.wait()
+
+        with patch.object(coordinator, "resync", hang_resync):
+            await coordinator.on_reconnected()
+            task = coordinator.resync_task
+            assert task is not None
+            await coordinator.on_disconnected()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert task.cancelled()
+        assert coordinator.resync_task is None
 
     async def test_ready_waits_for_watch_replay(self) -> None:
         """Keep readiness false until every KV watch reaches its sentinel."""
@@ -784,6 +968,40 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert coordinator.unique
         assert not coordinator.owns_presence
+
+    async def test_watch_survives_lost_reclaim_races(self) -> None:
+        """Contain reclaim exhaustion to the key instead of the whole watch."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        entry = SimpleNamespace(key="alpha", operation=KV_DEL, value=None)
+        kv, _ = watcher(entry, None)
+        coordinator.presence_store.kv = kv
+        coordinator.presence_store.js = MagicMock()
+
+        with (
+            patch.object(
+                coordinator,
+                "reclaim_presence",
+                AsyncMock(side_effect=NatsError("lost repeated update races")),
+            ),
+            self.assertLogs("botnats.nats.coordinator", level="WARNING"),
+        ):
+            await coordinator.watch_presence()
+
+        assert "watch-presence" in coordinator.synced_watches
+
+    async def test_expired_session_update_fires_delete_only(self) -> None:
+        """Fire only the delete callback for an already-expired record."""
+        fixtures = Fixtures()
+        coordinator = build_coordinator("alpha", fixtures)
+        key = coordinator.sessions.key("owner!user@host")
+        coordinator.session_identities[key] = ("owner!user@host", time.time() + 60)
+        updates: list[object] = []
+
+        with patch.object(coordinator.callbacks, "on_session_update", updates.append):
+            coordinator.observe_session(key, session_record(time.time() - 1), None)
+
+        assert fixtures.session_deletes == ["owner!user@host"]
+        assert updates == []
 
     async def test_grant_dispatches_during_watch_resync(self) -> None:
         """Deliver a grant while watches replay once presence is owned."""
@@ -1054,6 +1272,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             if calls == 1:
                 msg = "transient"
                 raise OSError(msg)
+            if calls == RUNTIME_ERROR_CALL:
+                # KVStore.open raises this while JetStream handles are
+                # reset; a watch must treat it as transient, not a crash.
+                msg = "JetStream is unavailable"
+                raise StoreUnavailableError(msg)
             await asyncio.Event().wait()
 
         with (
@@ -1217,6 +1440,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             nonlocal calls
             calls += 1
             if calls <= EXPECTED_WATCH_RESTARTS:
+                # A bare RuntimeError is a programming failure, unlike the
+                # StoreUnavailableError subclass watches treat as transient.
                 msg = "missing attribute"
                 raise RuntimeError(msg)
             await asyncio.Event().wait()

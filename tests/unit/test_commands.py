@@ -4,6 +4,7 @@
 """Tests for command parsing, input validation, and rate limiting."""
 
 import unittest
+from collections import deque
 from unittest.mock import patch
 
 from botnats.admin import RateLimiter, parse_command
@@ -83,16 +84,32 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
     """Tests for rate limiter windowing and bucket eviction."""
 
     async def test_bucket_eviction(self) -> None:
-        """Verify the least recently used bucket is evicted at capacity."""
+        """Evict only expired buckets at capacity; deny new keys otherwise."""
         limiter = RateLimiter()
         with patch("botnats.admin.MAX_RATE_BUCKETS", 2):
-            limiter.check("a", limit=10, window=60)
-            limiter.check("b", limit=10, window=60)
-            limiter.check("a", limit=10, window=60)
-            limiter.check("c", limit=10, window=60)
+            assert limiter.check("a", limit=10, window=60)
+            assert limiter.check("b", limit=10, window=60)
+            assert limiter.check("a", limit=10, window=60)
+            # Every bucket is fresh: a new key is denied instead of evicting
+            # one, which would reset an actively limited key's budget.
+            assert not limiter.check("c", limit=10, window=60)
+            assert "c" not in limiter.buckets
+            assert "b" in limiter.buckets
+            # A zero window expires the LRU bucket, so eviction proceeds.
+            assert limiter.check("c", limit=10, window=0)
         assert "a" in limiter.buckets
         assert "b" not in limiter.buckets
         assert "c" in limiter.buckets
+
+    async def test_evict_stale_boundary(self) -> None:
+        """Treat a bucket whose newest entry sits exactly at the cutoff as stale."""
+        limiter = RateLimiter()
+        limiter.buckets["old"] = deque([5.0])
+
+        assert not limiter.evict_stale(4.9)
+        assert "old" in limiter.buckets
+        assert limiter.evict_stale(5.0)
+        assert "old" not in limiter.buckets
 
     async def test_independent_keys(self) -> None:
         """Verify rate limits are tracked independently per key."""

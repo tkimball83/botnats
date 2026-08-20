@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, create_autospec, patch
 
 from botnats.irc.client import (
     DESIRED_CAPS,
+    NICK_COLLISION_LIMIT,
     SEND_BURST,
     SEND_RATE,
     IRCClient,
@@ -21,6 +22,7 @@ from botnats.irc.client import (
 )
 from botnats.irc.protocol import (
     MAX_IRC_MESSAGE_BYTES,
+    IRCMessage,
     Prefix,
     casefold,
     format_message,
@@ -82,7 +84,7 @@ class IRCProtocolTests(unittest.TestCase):
         assert pong_reply(b"PING :token\r\n") == b"PONG :token\r\n"
         assert pong_reply(b"PING token\r\n") == b"PONG token\r\n"
         assert pong_reply(b":server PING :token\r\n") == b"PONG :token\r\n"
-        assert pong_reply(b"PING server1 :token\r\n") == b"PONG :token\r\n"
+        assert pong_reply(b"PING server1 :token\r\n") == b"PONG server1 :token\r\n"
         assert pong_reply(b"PING srv1 srv2\r\n") == b"PONG srv1 srv2\r\n"
         assert pong_reply(b"PING  token\r\n") == b"PONG token\r\n"
         assert pong_reply(b"PING a\tb\r\n") == b"PONG a\tb\r\n"
@@ -92,6 +94,10 @@ class IRCProtocolTests(unittest.TestCase):
             == b"PONG :token\r\n"
         )
         assert pong_reply(b"@id=1 PING token\r\n") == b"PONG token\r\n"
+        # Repeated separator spaces are filtered by parse_message and must
+        # not corrupt the byte-level echo either.
+        assert pong_reply(b":srv  PING :token\r\n") == b"PONG :token\r\n"
+        assert pong_reply(b"@id=1  PING  :token\r\n") == b"PONG :token\r\n"
 
         inflating = b"PING :" + b"\xe9" * 400 + b"\r\n"
         reply = pong_reply(inflating)
@@ -114,6 +120,15 @@ class IRCProtocolTests(unittest.TestCase):
         start = time.perf_counter()
         mask_matches(evil, prefix)
         assert time.perf_counter() - start < MASK_MATCH_BUDGET_SECONDS
+
+    def test_ban_mask_host_folding_uses_ascii(self) -> None:
+        """Verify mask_matches folds user/host with ascii, not server casemapping."""
+        prefix = Prefix("nick", "user[1]", "host[2]")
+
+        assert mask_matches("nick!user[1]@host[2]", prefix)
+        assert not mask_matches("nick!user{1}@host{2}", prefix)
+        assert mask_matches("NICK!*@*", prefix, "rfc1459")
+        assert not mask_matches("nick!user{1}@*", prefix, "rfc1459")
 
     def test_ban_mask_wildcards(self) -> None:
         """Verify single- and multi-character wildcards and non-matches."""
@@ -449,6 +464,23 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert send.await_args is not None
         assert send.await_args.args[0] == b"PONG :" + b"\xe9" * 400 + b"\r\n"
 
+    async def test_bare_ping_gets_pong(self) -> None:
+        """Answer a PING with no token instead of ignoring it."""
+        client = self.cap_client()
+        raw = b"PING\r\n"
+
+        with patch.object(client, "send_immediate", AsyncMock()) as send:
+            await client.dispatch_line(
+                parse_message(raw.decode()),
+                raw,
+                mock_writer(),
+                None,
+            )
+
+        send.assert_awaited_once()
+        assert send.await_args is not None
+        assert send.await_args.args[0] == b"PONG\r\n"
+
     async def test_cap_new_ack_mid_ls_does_not_end_negotiation(self) -> None:
         """Verify a NEW-triggered ACK before LS completes keeps negotiating."""
         client = self.cap_client()
@@ -574,8 +606,15 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             server.close()
             await server.wait_closed()
 
-    async def test_oversized_server_line_disconnects(self) -> None:
-        """Disconnect when a server sends a line over the IRC limit."""
+    async def test_oversized_server_line_is_skipped(self) -> None:
+        """Skip a complete oversized line without dropping the session."""
+        dispatched: list[str] = []
+
+        async def record_message(message: IRCMessage) -> None:
+            dispatched.append(message.command)
+
+        boundary = b":server 002 alpha :" + b"x" * 491 + b"\r\n"
+        assert len(boundary) == MAX_IRC_MESSAGE_BYTES
 
         async def server_handler(
             reader: asyncio.StreamReader,
@@ -583,7 +622,72 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         ) -> None:
             for _ in range(3):
                 await reader.readline()
-            writer.write(b"PING :" + b"x" * 505 + b"\r\n")
+            writer.write(b":server 005 " + b"x" * 505 + b" :are supported\r\n")
+            writer.write(boundary)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        client = irc_client(port=port)
+        client.on_message = record_message
+        try:
+            with (
+                self.assertLogs("botnats.irc.client", level="DEBUG") as logs,
+                self.assertRaisesRegex(ConnectionError, "closed the connection"),
+            ):
+                await client.run_connection(client.config.servers[0])
+            # The oversized line is dropped with a trace; the 512-byte
+            # boundary line and the session itself survive it.
+            assert dispatched == ["002"]
+            assert any("oversized" in line for line in logs.output)
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    async def test_partial_line_at_eof_is_not_dispatched(self) -> None:
+        """Drop a line truncated by a dying peer instead of parsing it."""
+        dispatched: list[object] = []
+
+        async def record_message(message: object) -> None:
+            dispatched.append(message)
+
+        async def server_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            for _ in range(3):
+                await reader.readline()
+            writer.write(b":x!u@h MODE #chan -o bo")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        client = irc_client(port=port)
+        client.on_message = record_message
+        try:
+            with self.assertRaisesRegex(ConnectionError, "closed the connection"):
+                await client.run_connection(client.config.servers[0])
+            assert dispatched == []
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    async def test_readline_limit_overflow_disconnects(self) -> None:
+        """Disconnect when a line overflows the stream reader's buffer."""
+
+        async def server_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            for _ in range(3):
+                await reader.readline()
+            writer.write(b"x" * 70_000 + b"\r\n")
             await writer.drain()
             writer.close()
             await writer.wait_closed()
@@ -598,6 +702,60 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
             server.close()
             await server.wait_closed()
+
+    async def test_registration_timeout_disconnects(self) -> None:
+        """Disconnect when the server never completes registration."""
+
+        async def server_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            for _ in range(3):
+                await reader.readline()
+            await asyncio.sleep(1.0)
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        client = irc_client(port=port)
+        try:
+            with (
+                patch("botnats.irc.client.REGISTRATION_TIMEOUT", 0.05),
+                self.assertRaisesRegex(ConnectionError, "complete registration"),
+            ):
+                await client.run_connection(client.config.servers[0])
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    async def test_nick_collision_limit_disconnects(self) -> None:
+        """Raise once nickname collisions exhaust the retry limit."""
+        client = self.cap_client()
+        client.nickname_attempts = NICK_COLLISION_LIMIT
+
+        with self.assertRaisesRegex(ConnectionError, "collision limit"):
+            await client.nick_collision()
+
+    async def test_send_immediate_write_timeout_disconnects(self) -> None:
+        """Close the socket and raise when a write never drains."""
+        client = irc_client()
+        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        writer.is_closing.return_value = False
+
+        async def slow_drain() -> None:
+            await asyncio.sleep(60)
+
+        writer.drain = slow_drain
+        client.writer = writer
+
+        with (
+            patch("botnats.irc.client.WRITE_TIMEOUT", 0.01),
+            self.assertRaisesRegex(ConnectionError, "write timed out"),
+        ):
+            await client.send_immediate(b"PING :token\r\n", writer)
+        writer.close.assert_called_once_with()
 
     async def test_outbound_queue_bounded(self) -> None:
         """Verify outbound queue raises ConnectionError when full."""

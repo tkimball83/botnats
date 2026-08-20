@@ -6,9 +6,10 @@
 import asyncio
 import ssl
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from botnats import error_label
+from botnats.admin import INVALID_CLAIM_COUNTER
 from botnats.bot import Bot
 from botnats.channel import ChannelRecord
 from botnats.irc.client import IRCClient
@@ -130,13 +131,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(config())
         fake_irc = FakeIRC()
         bot.irc = fake_irc
-        bot.identity_retry_attempts = 1
 
         async def receive_identity(delay: float) -> None:
             del delay
             bot.identity = BotPresence("alpha", "host", "one", "alpha", "user")
 
-        with patch("botnats.bot.asyncio.sleep", receive_identity):
+        with (
+            patch("botnats.bot.IDENTITY_RETRY_ATTEMPTS", 1),
+            patch("botnats.bot.asyncio.sleep", receive_identity),
+        ):
             await bot.discover_identity(bot.identity_generation)
 
         assert fake_irc.reconnects == 0
@@ -146,12 +149,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(config())
         fake_irc = FakeIRC()
         bot.irc = fake_irc
-        bot.identity_retry_attempts = 1
-        bot.identity_retry_delay = 0
-
-        await bot.on_registered()
-        tasks = tuple(bot.tasks)
-        await asyncio.gather(*tasks)
+        with (
+            patch("botnats.bot.IDENTITY_RETRY_ATTEMPTS", 1),
+            patch("botnats.bot.IDENTITY_RETRY_DELAY", 0),
+        ):
+            await bot.on_registered()
+            tasks = tuple(bot.tasks)
+            await asyncio.gather(*tasks)
 
         assert fake_irc.sent == [
             ("WHOIS", ("alpha",)),
@@ -349,9 +353,94 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         another.irc = another_irc
         for _ in range(20):
             await another.events.handle_command(
-                IRCMessage("PRIVMSG", ("alpha", " "), prefix),
+                IRCMessage("PRIVMSG", ("alpha", "AUTH"), prefix),
             )
         assert len(another_irc.privmsgs) == COMMAND_RATE_LIMIT_REPLIES
+
+    async def test_wrong_auth_code_with_available_claim_fails(self) -> None:
+        """Deny a wrong code even when the equalizing claim succeeds."""
+        bot = Bot(config())
+        bot.irc = FakeIRC()
+        bot.coordinator = FakeCoordinator(claim_result=True)
+        prefix = Prefix("owner", "user", "host.example")
+
+        with patch.object(bot.authorizer, "match", return_value=None):
+            await bot.events.handle_command(
+                IRCMessage("PRIVMSG", ("alpha", "AUTH 000000"), prefix),
+            )
+
+        assert not bot.authorizer.authorized(prefix.render())
+        assert bot.irc.privmsgs == [("owner", "Authorization failed")]
+
+    async def test_prefix_without_op_mode_fails_closed(self) -> None:
+        """Never count a sub-operator PREFIX rank as channel operator."""
+        bot = Bot(config())
+
+        bot.caps.parse_prefix("(v)+")
+        assert bot.caps.op_mode == "o"
+        assert not bot.caps.is_opped({"v"})
+
+        bot.caps.parse_prefix("(qv)~+")
+        assert bot.caps.op_mode == "q"
+        assert bot.caps.is_opped({"q"})
+        assert not bot.caps.is_opped({"v"})
+
+    async def test_wrong_auth_code_still_claims(self) -> None:
+        """Perform the claim round trip even for an unmatched TOTP code."""
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+
+        with patch.object(bot.authorizer, "match", return_value=None):
+            await bot.events.handle_command(
+                IRCMessage("PRIVMSG", ("alpha", "AUTH 000000"), prefix),
+            )
+
+        assert coordinator.claim_requests == [INVALID_CLAIM_COUNTER]
+
+    async def test_rate_limited_admin_is_silent(self) -> None:
+        """Silently drop an authenticated admin's commands over the limit."""
+        bot = Bot(config())
+        bot.irc = FakeIRC()
+        prefix = Prefix("owner", "user", "host.example")
+        bot.authorizer.grant(prefix.render())
+
+        for _ in range(20):
+            await bot.events.handle_command(
+                IRCMessage("PRIVMSG", ("alpha", "BOGUS"), prefix),
+            )
+
+        assert len(bot.irc.privmsgs) == COMMAND_RATE_LIMIT_REPLIES
+        assert all(text == "Unknown command" for _, text in bot.irc.privmsgs)
+
+    async def test_maintenance_tick_before_coordinator_connects(self) -> None:
+        """Stay quiet when maintenance runs before NATS has ever connected."""
+        bot = Bot(config())
+        bot.irc = FakeIRC()
+        bot.registered = True
+        bot.identity = BotPresence(
+            "alpha",
+            "host.example",
+            bot.instance_id,
+            "alpha",
+            "~alpha",
+        )
+
+        await bot.maintenance_tick()
+
+        assert bot.irc.sent == []
+
+    async def test_unauthenticated_commands_are_silent(self) -> None:
+        """Drop parse errors and non-AUTH commands from unauthenticated users."""
+        bot = Bot(config())
+        bot.irc = FakeIRC()
+        prefix = Prefix("owner", "user", "host.example")
+
+        for text in (" ", "OP #alpha owner", "BOGUS"):
+            await bot.events.handle_command(
+                IRCMessage("PRIVMSG", ("alpha", text), prefix),
+            )
+
+        assert bot.irc.privmsgs == []
 
     async def test_rate_limiting_ignores_nick_change(self) -> None:
         """Verify the command limiter keys on host so nick cycling cannot bypass it."""
@@ -361,10 +450,34 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for index in range(20):
             prefix = Prefix(f"nick{index}", "user", "host.example")
             await bot.events.handle_command(
-                IRCMessage("PRIVMSG", ("alpha", " "), prefix),
+                IRCMessage("PRIVMSG", ("alpha", "AUTH"), prefix),
             )
 
         assert len(bot.irc.privmsgs) == COMMAND_RATE_LIMIT_REPLIES
+
+    async def test_run_does_not_wait_for_coordinator(self) -> None:
+        """Serve IRC while coordinator startup blocks on an outage."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        coordinator_started = asyncio.Event()
+        irc_ran = asyncio.Event()
+
+        async def blocked_start() -> None:
+            coordinator_started.set()
+            await asyncio.Event().wait()
+
+        async def run_forever() -> None:
+            await coordinator_started.wait()
+            irc_ran.set()
+
+        with (
+            patch.object(coordinator, "start", blocked_start),
+            patch.object(fake_irc, "run_forever", run_forever),
+            patch.object(bot.health_check, "start", AsyncMock()),
+            patch.object(bot.health_check, "close", AsyncMock()),
+        ):
+            await asyncio.wait_for(bot.run(), timeout=5)
+
+        assert irc_ran.is_set()
 
     async def test_ready(self) -> None:
         """Verify readiness requires IRC registration and NATS connectivity."""

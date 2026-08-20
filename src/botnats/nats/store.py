@@ -32,9 +32,19 @@ LOGGER = logging.getLogger(__name__)
 ATTEMPT_LIMIT = 3
 ATTEMPT_TTL = 120.0
 ATTEMPT_WINDOW = 60
+CAS_ATTEMPT_LIMIT = 8
 CLAIM_TTL = 300.0
 PRESENCE_DRIFT = 30.0
 SESSION_EXPIRY_GRACE = 60.0
+
+
+class StoreUnavailableError(RuntimeError):
+    """JetStream handles are reset or replaced while Core NATS reconnects.
+
+    A RuntimeError subclass so every PUBLISH_ERRORS handler treats it as
+    transient, while watches can distinguish it from a genuine RuntimeError
+    programming failure.
+    """
 
 
 class KVStore:
@@ -60,7 +70,7 @@ class KVStore:
             context = self.js
             if context is None:
                 msg = "JetStream is unavailable"
-                raise RuntimeError(msg)
+                raise StoreUnavailableError(msg)
             kv = await context.create_key_value(
                 KeyValueConfig(
                     bucket=self.bucket,
@@ -72,7 +82,7 @@ class KVStore:
             )
             if self.js is not context:
                 msg = "JetStream changed while opening a bucket"
-                raise RuntimeError(msg)
+                raise StoreUnavailableError(msg)
             self.kv = kv
             return kv
 
@@ -92,10 +102,15 @@ class KVStore:
         data: dict[str, Any],
         newer: Callable[[dict[str, Any]], bool],
     ) -> dict[str, Any]:
-        """Atomically store JSON and return the authoritative value."""
+        """Atomically store JSON and return the authoritative value.
+
+        Bounded like reclaim: repeatedly losing the CAS race against a
+        handful of peers is transient, so exhaustion raises for the caller's
+        retry path instead of spinning against the bucket.
+        """
         kv = await self.open()
         encoded = json.dumps(data).encode()
-        while True:
+        for _ in range(CAS_ATTEMPT_LIMIT):
             try:
                 entry = await kv.get(key)
             except KeyNotFoundError:
@@ -115,6 +130,8 @@ class KVStore:
             except KeyWrongLastSequenceError:
                 continue
             return data
+        msg = "durable write lost repeated update races"
+        raise NatsError(msg)
 
 
 class AttemptStore(KVStore):
@@ -323,6 +340,9 @@ class PresenceStore(KVStore):
         caller's transient retry path instead of reporting a duplicate.
         """
         kv = await self.open()
+        # Deliberately tighter than CAS_ATTEMPT_LIMIT: one create race plus
+        # one update race already prove live contention, and the presence
+        # heartbeat retries far sooner than eight rounds would resolve.
         for _ in range(2):
             try:
                 entry = await kv.get(bot_id.casefold())
@@ -431,7 +451,12 @@ class SessionStore(KVStore):
         return parsed[0], parsed[4], parsed[3]
 
     async def put(self, identity: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Store a session or revocation and return the authoritative record."""
+        """Store a session or revocation and return the authoritative record.
+
+        Only the future horizon is bounded: an already-expired record must
+        stay writable so a near-expiry revocation is not rejected under
+        clock skew, and consumers treat expired records as deletions.
+        """
         order = self.order(identity, data)
         if order is None or order[0] > time.time() + self.ttl + SESSION_EXPIRY_GRACE:
             msg = "session record is invalid"
@@ -439,10 +464,11 @@ class SessionStore(KVStore):
 
         def newer(current: dict[str, Any]) -> bool:
             current_order = self.order(identity, current)
+            now = time.time()
             return (
                 current_order is None
-                or current_order[0] <= time.time()
-                or current_order[0] > time.time() + self.ttl + SESSION_EXPIRY_GRACE
+                or current_order[0] <= now
+                or current_order[0] > now + self.ttl + SESSION_EXPIRY_GRACE
                 or current_order < order
             )
 

@@ -169,7 +169,7 @@ async def stream_info(kv: KeyValue | None) -> StreamInfo | None:
     try:
         async with asyncio.timeout(STATUS_TIMEOUT):
             return (await kv.status()).stream_info
-    except NatsError, OSError, RuntimeError, TypeError, ValueError:
+    except NatsError, OSError, RuntimeError:
         return None
 
 

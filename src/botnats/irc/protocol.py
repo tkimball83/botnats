@@ -143,10 +143,11 @@ class ISupportState:
             return
         self.member_prefixes = dict(zip(symbols, modes, strict=True))
         self.membership_modes = modes
-        self.op_mode = self.member_prefixes.get(
-            "@",
-            "o" if "o" in modes else modes[0],
-        )
+        # Without "@" fall back through the conventional operator tiers; a
+        # PREFIX advertising only sub-operator modes (e.g. "(v)+") must not
+        # count its highest rank as opped.
+        fallback = next((mode for mode in ("o", "a", "q") if mode in modes), "o")
+        self.op_mode = self.member_prefixes.get("@", fallback)
 
     def reset(self) -> None:
         """Reset capabilities learned from the previous server connection."""
@@ -327,9 +328,17 @@ def mask_matches(
     casemapping: str = DEFAULT_CASEMAPPING,
 ) -> bool:
     """Match a standard IRC nick!user@host mask using only * and ? wildcards."""
-    return glob_matches(
-        casefold(mask, casemapping),
-        casefold(prefix.render(), casemapping),
+    mask_prefix = Prefix.parse(mask)
+    nick = casefold(prefix.nick, casemapping)
+    mask_nick = casefold(mask_prefix.nick, casemapping)
+    user = casefold(prefix.user or "", "ascii")
+    mask_user = casefold(mask_prefix.user or "*", "ascii")
+    host = casefold(prefix.host or "", "ascii")
+    mask_host = casefold(mask_prefix.host or "*", "ascii")
+    return (
+        glob_matches(mask_nick, nick)
+        and glob_matches(mask_user, user)
+        and glob_matches(mask_host, host)
     )
 
 

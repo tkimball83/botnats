@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
     from botnats.config import BotConfig
 
+IDENTITY_RETRY_ATTEMPTS = 5
+IDENTITY_RETRY_DELAY = 5.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -61,8 +63,6 @@ class Bot:
         self.commands = CommandHandler(self)
         self.identity: BotPresence | None = None
         self.identity_generation = 0
-        self.identity_retry_attempts = 5
-        self.identity_retry_delay = 5.0
         self.instance_id = uuid.uuid4().hex
         self.health_check = HealthCheck(ready=self.ready, port=config.health_port)
         self.events = IRCEventHandler(self)
@@ -104,6 +104,8 @@ class Bot:
             if folded == self_folded or not self.caps.is_opped(member.modes):
                 continue
             if member.prefix is None:
+                # Optimism before WHO answers: an unfulfillable offer times
+                # out harmlessly, while pessimism would delay coordination.
                 return True
             if any(
                 peer.matches(member.prefix, self.caps.casemapping) for peer in peers
@@ -182,7 +184,7 @@ class Bot:
 
     async def discover_identity(self, generation: int) -> None:
         """Query the IRC server to resolve the bot's host and user prefix."""
-        for _ in range(self.identity_retry_attempts):
+        for _ in range(IDENTITY_RETRY_ATTEMPTS):
             if generation != self.identity_generation or self.identity is not None:
                 return
             try:
@@ -190,7 +192,7 @@ class Bot:
                 await self.irc.send("USERHOST", self.irc.current_nick)
             except ConnectionError:
                 return
-            await asyncio.sleep(self.identity_retry_delay)
+            await asyncio.sleep(IDENTITY_RETRY_DELAY)
         if generation == self.identity_generation and self.identity is None:
             LOGGER.warning("IRC identity discovery failed; reconnecting")
             await self.irc.reconnect()
@@ -279,10 +281,15 @@ class Bot:
         return self.registered and self.irc.connected and self.coordinator.ready
 
     async def run(self) -> None:
-        """Start all services and run the IRC connection loop until stopped."""
+        """Start all services and run the IRC connection loop until stopped.
+
+        Coordinator startup retries in the background for as long as NATS or
+        JetStream is unavailable; the fail-closed boundary is authentication,
+        not process liveness, so IRC must not wait on it.
+        """
         await self.health_check.start()
         try:
-            await self.coordinator.start()
+            self.spawn(self.coordinator.start(), "coordinator-start")
             self.spawn(self.maintenance_loop(), "maintenance")
             await self.irc.run_forever()
         finally:

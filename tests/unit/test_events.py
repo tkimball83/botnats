@@ -38,6 +38,7 @@ CUSTOM_ISUPPORT = IRCMessage(
     ),
 )
 EXPECTED_MODE_LIMIT = 6
+EXPECTED_SESSION_MOVE_PUTS = 2
 EXPECTED_NICK_LENGTH = 12
 EXPECTED_WRITE_ATTEMPTS = 2
 UNSET_MODE = IRCMessage("MODE", ("#test", "-n"), Prefix("someone", "user", "host"))
@@ -131,6 +132,33 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.authorizer.authorized(new_prefix.render())
         assert len(coordinator.session_puts) == 1
         assert coordinator.session_puts[0][1]["revoked"] is True
+
+    async def test_chghost_nick_only_prefix_revokes_via_member(self) -> None:
+        """Revoke from the stored member identity on a nick-only CHGHOST."""
+        bot, _, coordinator = bot_with_coordinator()
+        old_prefix = Prefix("owner", "user", "old.host")
+        bot.authorizer.grant(old_prefix.render())
+        bot.channel_mgr.channels[casefold("#test")].member("owner").prefix = old_prefix
+
+        await bot.events.on_irc_message(
+            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("owner")),
+        )
+
+        assert not bot.authorizer.authorized(old_prefix.render())
+        assert len(coordinator.session_puts) == 1
+        assert coordinator.session_puts[0][1]["revoked"] is True
+
+    async def test_chghost_without_identity_skips_revocation(self) -> None:
+        """Log and skip revocation when no complete old identity exists."""
+        bot, _, coordinator = bot_with_coordinator()
+
+        with self.assertLogs("botnats.irc.events", level="DEBUG") as logs:
+            await bot.events.on_irc_message(
+                IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("owner")),
+            )
+
+        assert coordinator.session_puts == []
+        assert any("no complete identity" in line for line in logs.output)
 
     async def test_chghost_updates_member_prefix(self) -> None:
         """Verify CHGHOST updates the member prefix in channel state."""
@@ -502,6 +530,22 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.identity is not None
         assert bot.identity.nick == "newalpha"
         assert bot.identity.host == "host.example"
+
+    async def test_nick_only_prefix_moves_session_via_member(self) -> None:
+        """Move the session using the stored member identity on a bare NICK."""
+        bot, _, coordinator = bot_with_coordinator()
+        old_prefix = Prefix("owner", "user", "host.example")
+        bot.authorizer.grant(old_prefix.render())
+        bot.channel_mgr.channels[casefold("#test")].member("owner").prefix = old_prefix
+
+        await bot.events.on_irc_message(
+            IRCMessage("NICK", ("newowner",), Prefix("owner")),
+        )
+
+        new_prefix = Prefix("newowner", "user", "host.example")
+        assert bot.authorizer.authorized(new_prefix.render())
+        assert not bot.authorizer.authorized(old_prefix.render())
+        assert len(coordinator.session_puts) == EXPECTED_SESSION_MOVE_PUTS
 
     async def test_mode_key_unusable(self) -> None:
         """Verify unusable channel key is ignored and not republished."""

@@ -33,7 +33,7 @@ def session_record() -> dict[str, object]:
         "revoked": False,
         "version": 1,
     }
-    record["signature"] = session_signature(SECRET, "efnet", record)
+    record["signature"] = session_signature(SECRET, "restart-test", record)
     return record
 
 
@@ -62,9 +62,9 @@ async def run(phase: str) -> None:
     """Create or verify the restart-test claim."""
     nc = await connect()
     try:
-        claims = ClaimStore("efnet", 3, SECRET)
-        channels = ChannelStore("efnet", 3, SECRET)
-        sessions = SessionStore("efnet", 3, SECRET, SESSION_TTL)
+        claims = ClaimStore("restart-test", 3, SECRET)
+        channels = ChannelStore("restart-test", 3, SECRET)
+        sessions = SessionStore("restart-test", 3, SECRET, SESSION_TTL)
         if phase == "mark":
             await claims.open(nc.jetstream())
             assert await claims.claim(COUNTER)

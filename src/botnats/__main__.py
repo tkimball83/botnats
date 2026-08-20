@@ -23,9 +23,12 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     level = os.environ.get("BOTNATS_LOG_LEVEL", "INFO").strip().upper()
+    levels = logging.getLevelNamesMapping()
+    if level not in levels:
+        parser.error(f"BOTNATS_LOG_LEVEL is not a valid log level: {level}")
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        level=logging.getLevelNamesMapping().get(level, logging.INFO),
+        level=levels[level],
     )
     config = BotConfig.load(arguments.config)
 
