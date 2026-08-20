@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
-from botnats import error_label
+from botnats import error_label, log_task_failure
 from botnats.admin import AuthFlow, CommandHandler, TotpAuthorizer
 from botnats.channel import ChannelManager, ChannelRecord, ChannelRuntime
 from botnats.health_check import HealthCheck
@@ -336,16 +336,7 @@ class Bot:
     def task_done(self, task: asyncio.Task[None]) -> None:
         """Handle completion of a background task and log any failures."""
         self.tasks.discard(task)
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            LOGGER.error(
-                "background task %s failed: %s",
-                task.get_name(),
-                error,
-                exc_info=(type(error), error, error.__traceback__),
-            )
+        log_task_failure(task, LOGGER, f"background task {task.get_name()}")
 
 
 class NATSCallbackHandler:

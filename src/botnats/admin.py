@@ -9,7 +9,7 @@ import binascii
 import hmac
 import time
 from collections import OrderedDict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 from botnats.channel import ChannelRecord
@@ -18,6 +18,7 @@ from botnats.irc.protocol import casefold, format_message
 from botnats.nats.coordinator import PUBLISH_ERRORS
 from botnats.nats.store import (
     SESSION_EXPIRY_GRACE,
+    Session,
     parse_session_record,
     session_signature,
 )
@@ -411,23 +412,6 @@ class RateLimiter:
         return True
 
 
-@dataclass(frozen=True, slots=True)
-class Session:
-    """Represent an authenticated administrator session bound to an IRC prefix."""
-
-    expires_at: float
-    issuer: str
-    prefix: str
-    revoked: bool
-    version: int
-    signature: str
-
-    @property
-    def order(self) -> tuple[float, int, bool]:
-        """Return the durable mutation order for this session."""
-        return self.expires_at, self.version, self.revoked
-
-
 class TotpAuthorizer:
     """TOTP verification and short-lived sessions bound to IRC prefixes."""
 
@@ -624,7 +608,7 @@ class TotpAuthorizer:
             <= current + self.session_ttl + SESSION_EXPIRY_GRACE
         ):
             return None
-        return Session(*parsed)
+        return parsed
 
     def prune(self, current: float | None = None) -> None:
         """Remove expired sessions and revocations."""

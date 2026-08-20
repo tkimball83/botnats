@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import nats
 from nats.errors import Error as NatsError
 
-from botnats import error_label
+from botnats import error_label, log_task_failure
 from botnats.config import IDENTIFIER_RE
 from botnats.nats.status import NATSStatus, collect
 from botnats.nats.store import (
@@ -374,15 +374,7 @@ class Coordinator:
         """Surface a failed resynchronization instead of losing it to GC."""
         if self.resync_task is task:
             self.resync_task = None
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            LOGGER.error(
-                "NATS resynchronization failed: %s",
-                error,
-                exc_info=(type(error), error, error.__traceback__),
-            )
+        log_task_failure(task, LOGGER, "NATS resynchronization")
 
     async def resync(self) -> None:
         """Reopen JetStream stores and restart watches after a reconnect."""

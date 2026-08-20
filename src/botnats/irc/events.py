@@ -463,13 +463,10 @@ class IRCEventHandler:
 
     async def handle_whois_user(self, message: IRCMessage) -> None:
         """Set the bot's identity from a WHOIS user reply."""
-        if len(message.params) < 4:
-            return
-        nick = message.params[1]
-        user = message.params[2]
-        host = message.params[3]
-        if self.bot.is_self(nick):
-            await self.bot.set_identity(Prefix(nick, user, host))
+        if len(message.params) >= 4 and self.bot.is_self(message.params[1]):
+            await self.bot.set_identity(
+                Prefix(message.params[1], message.params[2], message.params[3]),
+            )
 
     async def on_irc_message(self, message: IRCMessage) -> None:
         """Route an IRC message to its registered handler."""

@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from botnats import error_label
+from botnats import error_label, log_task_failure
 from botnats.irc.protocol import (
     CASEMAPPINGS,
     DEFAULT_CASEMAPPING,
@@ -426,11 +426,7 @@ class IRCClient:
 
     def sender_done(self, task: asyncio.Task[None]) -> None:
         """Log unexpected sender task failures."""
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            LOGGER.error("IRC sender failed", exc_info=error)
+        log_task_failure(task, LOGGER, "IRC sender")
 
     def set_casemapping(self, casemapping: str) -> None:
         """Apply the server-advertised case-folding rule."""
