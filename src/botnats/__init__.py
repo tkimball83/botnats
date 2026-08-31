@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     import logging
 
 
-def error_label(error: Exception) -> str:
+def error_label(error: BaseException) -> str:
     """Return a description of the error, falling back to the type name."""
     return str(error) or type(error).__name__
 
@@ -25,9 +25,4 @@ def log_task_failure(
         return
     error = task.exception()
     if error is not None:
-        logger.error(
-            "%s failed: %s",
-            label,
-            error,
-            exc_info=(type(error), error, error.__traceback__),
-        )
+        logger.error("%s failed: %s", label, error_label(error), exc_info=error)
