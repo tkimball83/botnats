@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from botnats.bot import Bot
     from botnats.channel import ChannelRuntime
 
-ISON_POLL_INTERVAL = 30.0
+ISON_POLL_INTERVAL = 5.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -51,6 +51,7 @@ class IRCEventHandler:
             "302": self.handle_userhost,
             "303": self.handle_ison_reply,
             "311": self.handle_whois_user,
+            "324": self.handle_channel_modes,
             "352": self.handle_who,
             "353": self.handle_names,
             "366": self.handle_end_of_names,
@@ -81,6 +82,9 @@ class IRCEventHandler:
         """Apply individual mode changes and return enforcement flags."""
         lost_enforced = False
         saw_new_op = False
+        channel_modes = (
+            self.caps.chanmodes[1] + self.caps.chanmodes[2] + self.caps.chanmodes[3]
+        )
         for adding, mode, argument in iter_mode_changes(
             modes,
             arguments,
@@ -91,10 +95,10 @@ class IRCEventHandler:
                 adding and mode in self.enforced_unset
             ):
                 lost_enforced = True
+            if mode in channel_modes:
+                self.update_channel_modes(runtime, mode, adding=adding)
             if argument is None:
                 if mode == "k" and not adding and runtime.key is not None:
-                    # Some servers strip the key argument from -k; unsetting
-                    # never needs it, and skipping would keep a stale key.
                     self.process_key(runtime, channel, "", adding=False)
                 continue
             if mode == "b":
@@ -116,6 +120,15 @@ class IRCEventHandler:
         runtime = self.bot.runtime(channel)
         if runtime is not None:
             runtime.add_ban(mask)
+
+    async def handle_channel_modes(self, message: IRCMessage) -> None:
+        """Store the channel mode string from an RPL_CHANNELMODEIS reply."""
+        if len(message.params) < 3:
+            return
+        channel = message.params[1]
+        runtime = self.bot.runtime(channel)
+        if runtime is not None:
+            runtime.modes = message.params[2]
 
     async def handle_banned(self, message: IRCMessage) -> None:
         """Request an unban when the bot is banned from a channel."""
@@ -185,6 +198,8 @@ class IRCEventHandler:
             return
         with suppress(ConnectionError):
             await self.bot.irc.send("WHO", channel)
+        with suppress(ConnectionError):
+            await self.bot.irc.send("MODE", channel)
         with suppress(ConnectionError):
             await self.bot.irc.send("MODE", channel, "+b")
         if self.bot.is_self_opped(runtime):
@@ -643,6 +658,22 @@ class IRCEventHandler:
             member.modes.add(mode)
         else:
             member.modes.discard(mode)
+
+    @staticmethod
+    def update_channel_modes(
+        runtime: ChannelRuntime,
+        mode: str,
+        *,
+        adding: bool,
+    ) -> None:
+        """Add or remove a mode letter from the channel mode string."""
+        current = runtime.modes.lstrip("+")
+        if adding:
+            if mode not in current:
+                runtime.modes = f"+{current}{mode}"
+        elif mode in current:
+            remaining = current.replace(mode, "")
+            runtime.modes = f"+{remaining}" if remaining else ""
 
     async def revoke_session(self, prefix: Prefix) -> None:
         """Revoke authorization and propagate the signed revocation to peers."""

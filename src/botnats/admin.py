@@ -113,7 +113,8 @@ class CommandHandler:
         self.command_limiter = RateLimiter()
         self.handlers = {
             "BAN": self.cmd_ban,
-            "BANS": self.cmd_bans,
+            "GETBANS": self.cmd_getbans,
+            "GETMODES": self.cmd_getmodes,
             "DEOP": self.cmd_deop,
             "INVITE": self.cmd_invite,
             "JOIN": self.cmd_join,
@@ -175,10 +176,10 @@ class CommandHandler:
         await self.bot.irc.send("MODE", channel, "+b", mask)
         await self.bot.safe_privmsg(prefix.nick, f"Banned {mask} on {channel}")
 
-    async def cmd_bans(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
+    async def cmd_getbans(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """List all tracked ban masks for a channel."""
         if len(arguments) != 1:
-            msg = "BANS <channel>"
+            msg = "GETBANS <channel>"
             raise ValueError(msg)
         channel = validate_channel(arguments[0])
         runtime = self.bot.runtime(channel)
@@ -189,6 +190,26 @@ class CommandHandler:
                 await self.bot.safe_privmsg(prefix.nick, f"{channel} +b {mask}")
         else:
             await self.bot.safe_privmsg(prefix.nick, f"No bans tracked for {channel}")
+
+    async def cmd_getmodes(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
+        """Display the tracked channel modes."""
+        if len(arguments) != 1:
+            msg = "GETMODES <channel>"
+            raise ValueError(msg)
+        channel = validate_channel(arguments[0])
+        runtime = self.bot.runtime(channel)
+        if runtime is None:
+            await self.bot.safe_privmsg(prefix.nick, f"No record for {channel}")
+        elif runtime.modes:
+            parts = [f"{channel} {runtime.modes}"]
+            if runtime.key:
+                parts.append(runtime.key)
+            await self.bot.safe_privmsg(prefix.nick, " ".join(parts))
+        else:
+            await self.bot.safe_privmsg(
+                prefix.nick,
+                f"No modes tracked for {channel}",
+            )
 
     async def cmd_deop(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Remove operator status from a user on a channel."""
