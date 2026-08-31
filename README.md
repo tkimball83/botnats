@@ -134,19 +134,20 @@ Authentication allows three attempts per identity in a mesh-wide sliding
 Use private messages for every command. All commands except `AUTH` require an
 active session.
 
-| Command  | Arguments          | Action                      |
-| -------- | ------------------ | --------------------------- |
-| `AUTH`   | `<totp-code>`      | Authenticate                |
-| `BAN`    | `<channel> <mask>` | Add a ban                   |
-| `BANS`   | `<channel>`        | List tracked bans           |
-| `DEOP`   | `<channel> <nick>` | Remove operator status      |
-| `INVITE` | `<channel> <nick>` | Invite a user               |
-| `JOIN`   | `<channel> [key]`  | Add a desired channel       |
-| `KEY`    | `<channel>`        | Show the stored channel key |
-| `OP`     | `<channel> <nick>` | Grant operator status       |
-| `PART`   | `<channel>`        | Remove a desired channel    |
-| `STATUS` |                    | Show bot and NATS status    |
-| `UNBAN`  | `<channel> <mask>` | Remove a tracked ban        |
+| Command    | Arguments          | Action                           |
+| ---------- | ------------------ | -------------------------------- |
+| `AUTH`     | `<totp-code>`      | Authenticate                     |
+| `BAN`      | `<channel> <mask>` | Add a ban                        |
+| `DEOP`     | `<channel> <nick>` | Remove operator status           |
+| `GETBANS`  | `<channel>`        | List tracked bans                |
+| `GETMODES` | `<channel>`        | Show tracked channel modes       |
+| `INVITE`   | `<channel> <nick>` | Invite a user                    |
+| `JOIN`     | `<channel> [key]`  | Add a desired channel            |
+| `KEY`      | `<channel>`        | Show the stored channel key      |
+| `OP`       | `<channel> <nick>` | Grant operator status            |
+| `PART`     | `<channel>`        | Remove a desired channel         |
+| `STATUS`   |                    | Show bot and NATS status         |
+| `UNBAN`    | `<channel> <mask>` | Remove a tracked ban             |
 
 ## Development
 
