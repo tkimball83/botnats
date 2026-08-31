@@ -105,6 +105,7 @@ class ISupportState:
     )
     membership_modes: str = DEFAULT_MEMBERSHIP_MODES
     mode_limit: int = 1
+    monitor_limit: int | None = None
     op_mode: str = "o"
 
     @property

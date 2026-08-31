@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 
     from botnats.bot import Bot
     from botnats.channel import ChannelRuntime
+
+ISON_POLL_INTERVAL = 30.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -42,10 +44,12 @@ class IRCEventHandler:
         self.pending_sessions: dict[str, dict[str, object]] = {}
         # ponytail: global ordering; use dependency-aware queues if contention appears.
         self.session_lock = asyncio.Lock()
+        self.nick_watch_task: asyncio.Task[None] | None = None
         self.handlers: dict[str, Callable[[IRCMessage], Awaitable[None]]] = {
             "001": self.handle_welcome,
             "005": self.handle_isupport,
             "302": self.handle_userhost,
+            "303": self.handle_ison_reply,
             "311": self.handle_whois_user,
             "352": self.handle_who,
             "353": self.handle_names,
@@ -55,6 +59,7 @@ class IRCEventHandler:
             "473": self.handle_join_denied,
             "474": self.handle_banned,
             "475": self.handle_join_denied,
+            "731": self.handle_monitor_offline,
             "CHGHOST": self.handle_chghost,
             "INVITE": self.handle_invite,
             "JOIN": self.handle_join,
@@ -202,6 +207,93 @@ class IRCEventHandler:
         if runtime is not None and not runtime.joined and self.bot.is_self(target):
             await self.bot.channel_mgr.safe_join(channel, runtime.key)
 
+    async def handle_ison_reply(self, message: IRCMessage) -> None:
+        """Reclaim the desired nickname when ISON reports it offline."""
+        if not message.params:
+            return
+        nicks = message.params[-1].split()
+        desired = self.bot.irc.desired_nick
+        folded = self.bot.fold(desired)
+        for nick in nicks:
+            if self.bot.fold(nick) == folded:
+                return
+        await self.try_nick_reclaim()
+
+    async def handle_monitor_offline(self, message: IRCMessage) -> None:
+        """Reclaim the desired nickname when MONITOR reports it offline."""
+        if not message.params:
+            return
+        targets = message.params[-1].split(",")
+        desired = self.bot.irc.desired_nick
+        folded = self.bot.fold(desired)
+        for target in targets:
+            nick = target.partition("!")[0]
+            if self.bot.fold(nick) == folded:
+                await self.try_nick_reclaim()
+                return
+
+    async def try_nick_reclaim(self) -> None:
+        """Send a NICK command to reclaim the desired nickname."""
+        desired = self.bot.irc.desired_nick
+        if self.bot.fold(self.bot.irc.current_nick) == self.bot.fold(desired):
+            return
+        with suppress(ConnectionError):
+            await self.bot.irc.send("NICK", desired)
+
+    def start_nick_watch(self) -> None:
+        """Begin watching for the desired nickname to become available."""
+        self.stop_nick_watch()
+        if self.bot.fold(self.bot.irc.current_nick) == self.bot.fold(
+            self.bot.irc.desired_nick,
+        ):
+            return
+        if self.caps.monitor_limit is not None:
+            self.bot.spawn(self.monitor_nick(), "nick-monitor")
+        else:
+            self.nick_watch_task = asyncio.create_task(
+                self.ison_poll_loop(),
+                name="nick-ison-poll",
+            )
+            self.nick_watch_task.add_done_callback(self.bot.task_done)
+            self.bot.tasks.add(self.nick_watch_task)
+
+    def stop_nick_watch(self) -> None:
+        """Cancel any running nickname watch."""
+        task = self.nick_watch_task
+        self.nick_watch_task = None
+        if task is not None:
+            task.cancel()
+
+    async def stop_nick_watch_async(self) -> None:
+        """Cancel the nickname watch and unsubscribe from MONITOR."""
+        self.stop_nick_watch()
+        if self.caps.monitor_limit is not None:
+            with suppress(ConnectionError):
+                await self.bot.irc.send(
+                    "MONITOR",
+                    "-",
+                    self.bot.irc.desired_nick,
+                )
+
+    async def monitor_nick(self) -> None:
+        """Subscribe to MONITOR notifications for the desired nickname."""
+        await self.bot.irc.send(
+            "MONITOR",
+            "+",
+            self.bot.irc.desired_nick,
+        )
+
+    async def ison_poll_loop(self) -> None:
+        """Poll ISON at a fixed interval until the desired nickname is free."""
+        while True:
+            await asyncio.sleep(ISON_POLL_INTERVAL)
+            if self.bot.fold(self.bot.irc.current_nick) == self.bot.fold(
+                self.bot.irc.desired_nick,
+            ):
+                return
+            with suppress(ConnectionError):
+                await self.bot.irc.send("ISON", self.bot.irc.desired_nick)
+
     def forget_isupport(self, name: str) -> None:
         """Restore default behavior for a removed ISUPPORT parameter."""
         match name.upper():
@@ -211,12 +303,34 @@ class IRCEventHandler:
                 self.caps.chanmodes = DEFAULT_CHANMODES
             case "MODES":
                 self.caps.mode_limit = 1
+            case "MONITOR":
+                self.caps.monitor_limit = None
             case "NICKLEN":
                 self.bot.irc.set_nickname_length(DEFAULT_NICK_LENGTH)
             case "PREFIX":
                 self.caps.member_prefixes = dict(DEFAULT_MEMBER_PREFIXES)
                 self.caps.membership_modes = DEFAULT_MEMBERSHIP_MODES
                 self.caps.op_mode = "o"
+
+    def apply_isupport(self, name: str, value: str) -> None:
+        """Apply a single ISUPPORT name=value token."""
+        match name.upper():
+            case "CASEMAPPING":
+                self.bot.channel_mgr.set_casemapping(value.lower())
+            case "CHANMODES":
+                self.caps.parse_chanmodes(value)
+            case "MODES":
+                self.caps.parse_modes(value)
+            case "MONITOR":
+                with suppress(ValueError):
+                    self.caps.monitor_limit = max(1, int(value))
+                if self.caps.monitor_limit is not None:
+                    self.start_nick_watch()
+            case "NICKLEN":
+                with suppress(ValueError):
+                    self.bot.irc.set_nickname_length(int(value))
+            case "PREFIX":
+                self.caps.parse_prefix(value)
 
     async def handle_isupport(self, message: IRCMessage) -> None:
         """Parse RPL_ISUPPORT tokens into server capability state."""
@@ -229,18 +343,7 @@ class IRCEventHandler:
                 if name.startswith("-"):
                     self.forget_isupport(name[1:])
                 continue
-            match name.upper():
-                case "CASEMAPPING":
-                    self.bot.channel_mgr.set_casemapping(value.lower())
-                case "CHANMODES":
-                    self.caps.parse_chanmodes(value)
-                case "MODES":
-                    self.caps.parse_modes(value)
-                case "NICKLEN":
-                    with suppress(ValueError):
-                        self.bot.irc.set_nickname_length(int(value))
-                case "PREFIX":
-                    self.caps.parse_prefix(value)
+            self.apply_isupport(name, value)
 
     async def handle_join(self, message: IRCMessage) -> None:
         """Process a JOIN event, initializing channel state for self-joins."""
@@ -351,42 +454,12 @@ class IRCEventHandler:
         old_nick = message.prefix.nick
         new_nick = message.params[-1]
         old_folded = self.bot.fold(old_nick)
-        new_folded = self.bot.fold(new_nick)
-        # Capture the old full identity from member state before rewriting
-        # it, so a nick-only NICK prefix still moves the session the same
-        # way handle_chghost still revokes.
-        old_prefix = message.prefix
-        for runtime in self.bot.channel_mgr.channels.values():
-            member = runtime.members.pop(old_folded, None)
-            if member is not None:
-                member.nick = new_nick
-                prefix = member.prefix
-                if prefix is not None:
-                    if not old_prefix.complete and prefix.complete:
-                        old_prefix = prefix
-                    member.prefix = Prefix(new_nick, prefix.user, prefix.host)
-                runtime.members[new_folded] = member
+        old_prefix = self.update_nick_members(message.prefix, new_nick)
         new_prefix = Prefix(new_nick, old_prefix.user, old_prefix.host)
         if old_prefix.complete:
-            old_identity = old_prefix.render()
-            new_identity = new_prefix.render()
-            moved = self.bot.authorizer.move(
-                old_identity,
-                new_identity,
-            )
-            if moved is not None:
-                previous, session = moved
-                if await self.sync_session(old_identity, asdict(previous)):
-                    await self.sync_session(new_identity, asdict(session))
-                else:
-                    async with self.session_lock:
-                        key = casefold(new_identity, "ascii")
-                        self.pending_sessions.pop(key, None)
-                        self.pending_sessions[key] = asdict(session)
+            await self.move_nick_session(old_prefix, new_prefix)
         identity = self.bot.identity
         if identity is not None and old_folded == self.bot.fold(identity.nick):
-            # Fall back to the known identity when the NICK prefix omits
-            # user@host, so the advertised presence nick still moves.
             await self.bot.set_identity(
                 Prefix(
                     new_nick,
@@ -394,6 +467,48 @@ class IRCEventHandler:
                     new_prefix.host or identity.host or None,
                 ),
             )
+        if self.bot.is_self(new_nick):
+            if self.bot.fold(new_nick) == self.bot.fold(self.bot.irc.desired_nick):
+                await self.stop_nick_watch_async()
+            elif self.bot.registered:
+                self.start_nick_watch()
+
+    def update_nick_members(self, prefix: Prefix, new_nick: str) -> Prefix:
+        """Rekey channel members for a nick change and return the best old prefix."""
+        old_folded = self.bot.fold(prefix.nick)
+        new_folded = self.bot.fold(new_nick)
+        old_prefix = prefix
+        for runtime in self.bot.channel_mgr.channels.values():
+            member = runtime.members.pop(old_folded, None)
+            if member is not None:
+                member.nick = new_nick
+                member_prefix = member.prefix
+                if member_prefix is not None:
+                    if not old_prefix.complete and member_prefix.complete:
+                        old_prefix = member_prefix
+                    member.prefix = Prefix(
+                        new_nick,
+                        member_prefix.user,
+                        member_prefix.host,
+                    )
+                runtime.members[new_folded] = member
+        return old_prefix
+
+    async def move_nick_session(self, old_prefix: Prefix, new_prefix: Prefix) -> None:
+        """Move an authenticated session from the old to the new identity."""
+        old_identity = old_prefix.render()
+        new_identity = new_prefix.render()
+        moved = self.bot.authorizer.move(old_identity, new_identity)
+        if moved is None:
+            return
+        previous, session = moved
+        if await self.sync_session(old_identity, asdict(previous)):
+            await self.sync_session(new_identity, asdict(session))
+        else:
+            async with self.session_lock:
+                key = casefold(new_identity, "ascii")
+                self.pending_sessions.pop(key, None)
+                self.pending_sessions[key] = asdict(session)
 
     async def handle_part(self, message: IRCMessage) -> None:
         """Remove a member on PART or reset channel state for self-parts."""
@@ -436,6 +551,7 @@ class IRCEventHandler:
         """Notify the bot that IRC registration is complete."""
         LOGGER.debug("received welcome: %s", " ".join(message.params))
         self.bot.on_registered()
+        self.start_nick_watch()
 
     async def handle_who(self, message: IRCMessage) -> None:
         """Update member identity and modes from a WHO reply entry."""
