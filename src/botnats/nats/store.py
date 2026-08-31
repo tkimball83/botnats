@@ -441,7 +441,7 @@ class SessionStore(KVStore):
             "ascii",
         ):
             return None
-        return parsed.expires_at, parsed.version, parsed.revoked
+        return parsed.order
 
     async def put(self, identity: str, data: dict[str, Any]) -> dict[str, Any]:
         """Store a session or revocation and return the authoritative record.
