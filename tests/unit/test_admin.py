@@ -437,33 +437,6 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         assert session["revoked"] is True
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
 
-    async def test_cmd_key(self) -> None:
-        """Verify KEY command reports the channel key."""
-        bot, fake_irc, _ = bot_with_coordinator()
-        bot.authorizer.grant(OWNER.render())
-
-        await bot.events.handle_command(
-            IRCMessage("PRIVMSG", ("alpha", "KEY #test"), OWNER),
-        )
-        assert fake_irc.privmsgs == [("owner", "No key set for #test")]
-
-        fake_irc.privmsgs.clear()
-        bot.channel_mgr.channels[casefold("#test")].key = "secret"
-        await bot.events.handle_command(
-            IRCMessage("PRIVMSG", ("alpha", "KEY #test"), OWNER),
-        )
-        assert fake_irc.privmsgs == [("owner", "Key for #test: secret")]
-
-    async def test_cmd_key_unknown_channel(self) -> None:
-        """Verify KEY command reports unknown channels."""
-        bot, fake_irc, _ = bot_with_coordinator()
-        bot.authorizer.grant(OWNER.render())
-
-        await bot.events.handle_command(
-            IRCMessage("PRIVMSG", ("alpha", "KEY #unknown"), OWNER),
-        )
-        assert fake_irc.privmsgs == [("owner", "No record for #unknown")]
-
     async def test_cmd_status(self) -> None:
         """Verify STATUS command returns bot identity and channel count."""
         bot, fake_irc, _ = bot_with_coordinator()

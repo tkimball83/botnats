@@ -218,9 +218,9 @@ async def run() -> None:
         await wait_for_status(session, "beta")
 
         for channel, key in CHANNELS:
-            await wait_for_reply(
-                session, "gamma", f"KEY {channel}", f"Key for {channel}: {key}"
-            )
+            reply = await command(session, "gamma", f"GETMODES {channel}")
+            assert key in reply
+            assert "k" in reply
             channel_modes = await modes(session, channel)
             assert "m" in channel_modes
             assert "n" in channel_modes
@@ -257,9 +257,8 @@ async def run() -> None:
         assert await command(session, "alpha", f"PART {first}") == f"Parting {first}"
         await wait_for_names(session, first, absent=BOTS)
         await wait_for_names(session, second, present=BOTS)
-        assert await command(session, "gamma", f"KEY {second}") == (
-            f"Key for {second}: {second_key}"
-        )
+        reply = await command(session, "gamma", f"GETMODES {second}")
+        assert second_key in reply
         assert "channels=1" in await command(session, "beta", "STATUS")
     finally:
         await session.close()

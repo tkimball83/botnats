@@ -143,7 +143,6 @@ active session.
 | `GETMODES` | `<channel>`        | Show tracked channel modes       |
 | `INVITE`   | `<channel> <nick>` | Invite a user                    |
 | `JOIN`     | `<channel> [key]`  | Add a desired channel            |
-| `KEY`      | `<channel>`        | Show the stored channel key      |
 | `OP`       | `<channel> <nick>` | Grant operator status            |
 | `PART`     | `<channel>`        | Remove a desired channel         |
 | `STATUS`   |                    | Show bot and NATS status         |

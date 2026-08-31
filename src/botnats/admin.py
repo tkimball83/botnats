@@ -118,7 +118,6 @@ class CommandHandler:
             "DEOP": self.cmd_deop,
             "INVITE": self.cmd_invite,
             "JOIN": self.cmd_join,
-            "KEY": self.cmd_key,
             "OP": self.cmd_op,
             "PART": self.cmd_part,
             "STATUS": self.cmd_status,
@@ -256,23 +255,6 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         key = validate_key(arguments[1]) if len(arguments) == 2 else None
         await self.channel_update(prefix, channel, key, present=True)
-
-    async def cmd_key(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
-        """Display the stored key for a channel."""
-        if len(arguments) != 1:
-            msg = "KEY <channel>"
-            raise ValueError(msg)
-        channel = validate_channel(arguments[0])
-        runtime = self.bot.runtime(channel)
-        if runtime is None:
-            await self.bot.safe_privmsg(prefix.nick, f"No record for {channel}")
-        elif runtime.key:
-            await self.bot.safe_privmsg(
-                prefix.nick,
-                f"Key for {channel}: {runtime.key}",
-            )
-        else:
-            await self.bot.safe_privmsg(prefix.nick, f"No key set for {channel}")
 
     async def cmd_op(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Grant operator status to a user on a channel."""
