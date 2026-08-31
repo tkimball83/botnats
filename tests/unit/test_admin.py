@@ -52,14 +52,14 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
-    async def test_admin_bans(self) -> None:
-        """Verify BANS command lists tracked channel bans."""
+    async def test_admin_getbans(self) -> None:
+        """Verify GETBANS command lists tracked channel bans."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         bot.authorizer.grant(OWNER.render())
 
         await bot.events.handle_command(
-            IRCMessage("PRIVMSG", ("alpha", "BANS #test"), OWNER),
+            IRCMessage("PRIVMSG", ("alpha", "GETBANS #test"), OWNER),
         )
         assert fake_irc.privmsgs == [("owner", "No bans tracked for #test")]
 
@@ -67,12 +67,37 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         for _mask in ("*!*@bad.host", "*!*@evil.host"):
             runtime.add_ban(_mask)
         await bot.events.handle_command(
-            IRCMessage("PRIVMSG", ("alpha", "BANS #test"), OWNER),
+            IRCMessage("PRIVMSG", ("alpha", "GETBANS #test"), OWNER),
         )
         assert fake_irc.privmsgs == [
             ("owner", "#test +b *!*@bad.host"),
             ("owner", "#test +b *!*@evil.host"),
         ]
+
+    async def test_admin_getmodes(self) -> None:
+        """Verify GETMODES command reports tracked channel modes."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        bot.authorizer.grant(OWNER.render())
+
+        await bot.events.handle_command(
+            IRCMessage("PRIVMSG", ("alpha", "GETMODES #test"), OWNER),
+        )
+        assert fake_irc.privmsgs == [("owner", "No modes tracked for #test")]
+
+        fake_irc.privmsgs.clear()
+        runtime.modes = "+nst"
+        await bot.events.handle_command(
+            IRCMessage("PRIVMSG", ("alpha", "GETMODES #test"), OWNER),
+        )
+        assert fake_irc.privmsgs == [("owner", "#test +nst")]
+
+        fake_irc.privmsgs.clear()
+        runtime.key = "secret"
+        await bot.events.handle_command(
+            IRCMessage("PRIVMSG", ("alpha", "GETMODES #test"), OWNER),
+        )
+        assert fake_irc.privmsgs == [("owner", "#test +nst secret")]
 
     async def test_admin_commands_with_disconnected_irc(self) -> None:
         """Verify admin commands degrade gracefully when IRC is disconnected."""

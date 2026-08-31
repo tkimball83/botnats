@@ -11,9 +11,9 @@ from tests.integration.test_mesh import (
     CHANNELS,
     COMMAND_TIMEOUT,
     connect,
-    operators,
     wait_for_bots,
     wait_for_names,
+    wait_for_operators,
 )
 
 
@@ -29,7 +29,7 @@ async def run() -> None:
         await wait_for_names(session, first, absent=restarted_bot)
         await session.send("JOIN", second, second_key)
         await wait_for_names(session, second, present=BOTS)
-        assert await operators(session, second) >= BOTS
+        await wait_for_operators(session, second, present=BOTS)
     finally:
         await asyncio.wait_for(session.close(), timeout=COMMAND_TIMEOUT)
 

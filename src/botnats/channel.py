@@ -425,6 +425,7 @@ class ChannelRuntime:
     joined: bool = False
     key: str | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
+    modes: str = ""
 
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""
@@ -453,6 +454,7 @@ class ChannelRuntime:
         self.bans.clear()
         self.joined = False
         self.members.clear()
+        self.modes = ""
 
     def set_casemapping(self, casemapping: str) -> None:
         """Apply a new casemapping and re-key members and bans."""

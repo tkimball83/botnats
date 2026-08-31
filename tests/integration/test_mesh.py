@@ -244,8 +244,13 @@ async def run() -> None:
         assert await command(session, "alpha", f"BAN {first} {TEST_BAN}") == (
             f"Banned {TEST_BAN} on {first}"
         )
-        await wait_for_reply(session, "beta", f"BANS {first}", f"{first} +b {TEST_BAN}")
-        assert await command(session, "beta", f"BANS {second}") == (
+        await wait_for_reply(
+            session,
+            "beta",
+            f"GETBANS {first}",
+            f"{first} +b {TEST_BAN}",
+        )
+        assert await command(session, "beta", f"GETBANS {second}") == (
             f"No bans tracked for {second}"
         )
 

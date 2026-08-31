@@ -599,6 +599,83 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key == "old-key"
         assert coordinator.channel_puts == []
 
+    async def test_channel_modes_from_324(self) -> None:
+        """Verify RPL_CHANNELMODEIS populates the runtime mode string."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.joined = True
+
+        await bot.events.on_irc_message(
+            IRCMessage("324", ("alpha", "#test", "+nstk", "secret"), None),
+        )
+        assert runtime.modes == "+nstk"
+
+    async def test_channel_modes_updated_on_change(self) -> None:
+        """Verify MODE changes update the tracked channel mode string."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.joined = True
+        runtime.modes = "+nst"
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "+i"),
+                Prefix("chanserv", "service", "services.host"),
+            ),
+        )
+        assert runtime.modes == "+nsti"
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "-s"),
+                Prefix("chanserv", "service", "services.host"),
+            ),
+        )
+        assert runtime.modes == "+nti"
+
+    async def test_channel_modes_tracks_type_b(self) -> None:
+        """Verify type-B modes are removed from the mode string on unset."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.joined = True
+        runtime.modes = "+nstk"
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "-k", "*"),
+                Prefix("chanserv", "service", "services.host"),
+            ),
+        )
+        assert runtime.modes == "+nst"
+
+    async def test_channel_modes_removal_clears_string(self) -> None:
+        """Verify removing the last mode produces an empty string, not '+'."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.joined = True
+        runtime.modes = "+n"
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "-n"),
+                Prefix("chanserv", "service", "services.host"),
+            ),
+        )
+        assert runtime.modes == ""
+
+    async def test_channel_modes_reset_on_disconnect(self) -> None:
+        """Verify channel modes are cleared on reset."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.modes = "+nst"
+
+        runtime.reset()
+        assert runtime.modes == ""
+
     async def test_mode_no_enforce_when_not_opped(self) -> None:
         """Verify mode enforcement is skipped when bot is not opped."""
         bot, fake_irc = bot_with_irc()
