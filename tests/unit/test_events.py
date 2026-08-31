@@ -6,6 +6,7 @@
 import asyncio
 import time
 import unittest
+from contextlib import suppress
 from dataclasses import asdict
 from unittest.mock import AsyncMock, patch
 
@@ -1157,3 +1158,200 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.identity is not None
         assert bot.identity.user == "~user"
         assert bot.identity.host == "real.host"
+
+
+class NickWatchTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for ISON and MONITOR nickname reclaim."""
+
+    async def test_ison_reply_reclaims_nick(self) -> None:
+        """Reclaim the desired nickname when ISON reports it offline."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+
+        await bot.events.on_irc_message(
+            IRCMessage("303", ("alpha", "")),
+        )
+
+        assert ("NICK", ("alpha",)) in fake_irc.sent
+
+    async def test_ison_reply_skips_when_nick_online(self) -> None:
+        """Do not reclaim when ISON reports the desired nick is still taken."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+
+        await bot.events.on_irc_message(
+            IRCMessage("303", ("fallback", "alpha")),
+        )
+
+        assert ("NICK", ("alpha",)) not in fake_irc.sent
+
+    async def test_monitor_offline_reclaims_nick(self) -> None:
+        """Reclaim the desired nickname when MONITOR reports it offline."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.caps.monitor_limit = 100
+
+        await bot.events.on_irc_message(
+            IRCMessage("731", ("fallback", "alpha!user@host")),
+        )
+
+        assert ("NICK", ("alpha",)) in fake_irc.sent
+
+    async def test_monitor_offline_ignores_unrelated_nick(self) -> None:
+        """Ignore MONITOR offline for nicks other than the desired one."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.caps.monitor_limit = 100
+
+        await bot.events.on_irc_message(
+            IRCMessage("731", ("fallback", "stranger!user@host")),
+        )
+
+        assert ("NICK", ("alpha",)) not in fake_irc.sent
+
+    async def test_welcome_starts_ison_poll(self) -> None:
+        """Start ISON polling when registered with a fallback nick."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+
+        await bot.events.on_irc_message(
+            IRCMessage("001", ("fallback", "Welcome")),
+        )
+
+        assert bot.events.nick_watch_task is not None
+        bot.events.stop_nick_watch()
+
+    async def test_welcome_skips_watch_when_nick_matches(self) -> None:
+        """Skip nick watch when registered with the desired nick."""
+        bot, _ = bot_with_irc()
+
+        await bot.events.on_irc_message(
+            IRCMessage("001", ("alpha", "Welcome")),
+        )
+
+        assert bot.events.nick_watch_task is None
+
+    async def test_isupport_monitor_upgrades_to_monitor(self) -> None:
+        """Upgrade from ISON polling to MONITOR when ISUPPORT advertises it."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.registered = True
+        bot.events.start_nick_watch()
+        assert bot.events.nick_watch_task is not None
+
+        await bot.events.on_irc_message(
+            IRCMessage("005", ("fallback", "MONITOR=100", "supported")),
+        )
+        await asyncio.sleep(0)
+
+        assert bot.events.nick_watch_task is None
+        assert ("MONITOR", ("+", "alpha")) in fake_irc.sent
+
+    async def test_nick_reclaim_stops_ison_watch(self) -> None:
+        """Stop the ISON poll when the bot reclaims its desired nickname."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.registered = True
+        bot.events.start_nick_watch()
+        assert bot.events.nick_watch_task is not None
+
+        fake_irc.current_nick = "alpha"
+        await bot.events.on_irc_message(
+            IRCMessage("NICK", ("alpha",), Prefix("fallback", "~alpha", "host")),
+        )
+
+        assert bot.events.nick_watch_task is None
+
+    async def test_nick_change_away_starts_watch(self) -> None:
+        """Start a nick watch when the bot's nick changes away from desired."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "forced"
+        bot.registered = True
+
+        await bot.events.on_irc_message(
+            IRCMessage("NICK", ("forced",), Prefix("alpha", "~alpha", "host")),
+        )
+
+        assert bot.events.nick_watch_task is not None
+        bot.events.stop_nick_watch()
+
+    async def test_other_user_nick_change_does_not_start_watch(self) -> None:
+        """Ignore nick changes from other users for watch lifecycle."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.registered = True
+
+        await bot.events.on_irc_message(
+            IRCMessage(
+                "NICK",
+                ("newnick",),
+                Prefix("stranger", "user", "host"),
+            ),
+        )
+
+        assert bot.events.nick_watch_task is None
+
+    async def test_nick_change_away_skips_watch_before_registration(self) -> None:
+        """Do not start a nick watch before registration completes."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "forced"
+
+        await bot.events.on_irc_message(
+            IRCMessage("NICK", ("forced",), Prefix("alpha", "~alpha", "host")),
+        )
+
+        assert bot.events.nick_watch_task is None
+
+    async def test_nick_reclaim_sends_monitor_unsubscribe(self) -> None:
+        """Send MONITOR - when reclaiming a nick on a MONITOR-capable server."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "alpha"
+        bot.caps.monitor_limit = 100
+
+        await bot.events.on_irc_message(
+            IRCMessage("NICK", ("alpha",), Prefix("fallback", "~alpha", "host")),
+        )
+
+        assert ("MONITOR", ("-", "alpha")) in fake_irc.sent
+
+    async def test_disconnect_stops_watch(self) -> None:
+        """Stop the nick watch when IRC disconnects."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.registered = True
+        bot.events.start_nick_watch()
+        assert bot.events.nick_watch_task is not None
+
+        bot.on_irc_disconnect()
+
+        assert bot.events.nick_watch_task is None
+
+    async def test_ison_poll_loop_sends_ison(self) -> None:
+        """Verify the ISON poll loop sends periodic ISON commands."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+
+        with patch("botnats.irc.events.ISON_POLL_INTERVAL", 0):
+            task = asyncio.create_task(bot.events.ison_poll_loop())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        ison_commands = [s for s in fake_irc.sent if s[0] == "ISON"]
+        assert len(ison_commands) >= 1
+        assert ison_commands[0] == ("ISON", ("alpha",))
+
+    async def test_ison_poll_loop_exits_when_nick_reclaimed(self) -> None:
+        """Verify the ISON poll loop exits when current nick matches desired."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+
+        async def reclaim_nick() -> None:
+            await asyncio.sleep(0.02)
+            fake_irc.current_nick = "alpha"
+
+        with patch("botnats.irc.events.ISON_POLL_INTERVAL", 0.01):
+            task = asyncio.create_task(reclaim_nick())
+            await asyncio.wait_for(bot.events.ison_poll_loop(), timeout=1.0)
+            await task

@@ -231,9 +231,6 @@ class Bot:
         self.authorizer.prune()
         self.presence.prune()
         if self.registered:
-            if self.fold(self.irc.current_nick) != self.fold(self.irc.desired_nick):
-                with suppress(ConnectionError):
-                    await self.irc.send("NICK", self.irc.desired_nick)
             await self.channel_mgr.retry_pending_parts()
             if self.identity is not None:
                 with suppress(*PUBLISH_ERRORS):
@@ -256,6 +253,7 @@ class Bot:
 
     def on_irc_disconnect(self) -> None:
         """Clear connection-scoped state when the IRC connection drops."""
+        self.events.stop_nick_watch()
         self.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
         self.caps.reset()
         self.irc.reset_caps()
