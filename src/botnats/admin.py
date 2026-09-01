@@ -115,6 +115,7 @@ class CommandHandler:
             "BAN": self.cmd_ban,
             "GETBANS": self.cmd_getbans,
             "GETMODES": self.cmd_getmodes,
+            "GETUSERS": self.cmd_getusers,
             "DEOP": self.cmd_deop,
             "INVITE": self.cmd_invite,
             "JOIN": self.cmd_join,
@@ -208,6 +209,33 @@ class CommandHandler:
             await self.bot.safe_privmsg(
                 prefix.nick,
                 f"No modes tracked for {channel}",
+            )
+
+    async def cmd_getusers(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
+        """List tracked members of a channel."""
+        if len(arguments) != 1:
+            msg = "GETUSERS <channel>"
+            raise ValueError(msg)
+        channel = validate_channel(arguments[0])
+        runtime = self.bot.runtime(channel)
+        if runtime is None:
+            await self.bot.safe_privmsg(prefix.nick, f"No record for {channel}")
+        elif runtime.members:
+            nicks = sorted(
+                (
+                    f"@{m.nick}" if self.bot.caps.is_opped(m.modes) else m.nick
+                    for m in runtime.members.values()
+                ),
+                key=lambda n: n.lstrip("@").casefold(),
+            )
+            await self.bot.safe_privmsg(
+                prefix.nick,
+                f"{channel} {' '.join(nicks)}",
+            )
+        else:
+            await self.bot.safe_privmsg(
+                prefix.nick,
+                f"No users tracked for {channel}",
             )
 
     async def cmd_deop(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
