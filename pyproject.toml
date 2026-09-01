@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "isort==8.0.1",
+  "isort==9.0.1",
   "mypy==2.3.0",
   "ruff==0.16.1",
 ]
