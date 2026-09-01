@@ -141,6 +141,7 @@ active session.
 | `DEOP`     | `<channel> <nick>` | Remove operator status           |
 | `GETBANS`  | `<channel>`        | List tracked bans                |
 | `GETMODES` | `<channel>`        | Show tracked channel modes       |
+| `GETUSERS` | `<channel>`        | List tracked channel members     |
 | `INVITE`   | `<channel> <nick>` | Invite a user                    |
 | `JOIN`     | `<channel> [key]`  | Add a desired channel            |
 | `OP`       | `<channel> <nick>` | Grant operator status            |

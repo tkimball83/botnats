@@ -99,6 +99,28 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         )
         assert fake_irc.privmsgs == [("owner", "#test +nst secret")]
 
+    async def test_admin_getusers(self) -> None:
+        """Verify GETUSERS command lists channel members with op prefixes."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        bot.authorizer.grant(OWNER.render())
+
+        await bot.events.handle_command(
+            IRCMessage("PRIVMSG", ("alpha", "GETUSERS #test"), OWNER),
+        )
+        assert fake_irc.privmsgs == [("owner", "No users tracked for #test")]
+
+        fake_irc.privmsgs.clear()
+        runtime.member("alpha").modes.add("o")
+        runtime.member("beta")
+        runtime.member("gamma").modes.add("o")
+        await bot.events.handle_command(
+            IRCMessage("PRIVMSG", ("alpha", "GETUSERS #test"), OWNER),
+        )
+        assert fake_irc.privmsgs == [
+            ("owner", "#test @alpha beta @gamma"),
+        ]
+
     async def test_admin_commands_with_disconnected_irc(self) -> None:
         """Verify admin commands degrade gracefully when IRC is disconnected."""
         bot, _, _ = bot_with_coordinator()
