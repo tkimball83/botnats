@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from botnats.channel import ChannelRecord
 from botnats.config import MIN_COORDINATION_KEY_BYTES
-from botnats.irc.protocol import casefold, format_message
+from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, casefold, format_message
 from botnats.nats.coordinator import PUBLISH_ERRORS
 from botnats.nats.store import (
     SESSION_EXPIRY_GRACE,
@@ -228,10 +228,20 @@ class CommandHandler:
                 ),
                 key=lambda n: n.lstrip("@").casefold(),
             )
-            await self.bot.safe_privmsg(
-                prefix.nick,
-                f"{channel} {' '.join(nicks)}",
-            )
+            overhead = len(format_message("PRIVMSG", (prefix.nick,), ""))
+            limit = MAX_IRC_MESSAGE_BYTES - overhead
+            lines: list[str] = []
+            current = channel
+            for nick in nicks:
+                candidate = f"{current} {nick}"
+                if len(candidate.encode()) > limit:
+                    lines.append(current)
+                    current = f"{channel} {nick}"
+                else:
+                    current = candidate
+            lines.append(current)
+            for line in lines:
+                await self.bot.safe_privmsg(prefix.nick, line)
         else:
             await self.bot.safe_privmsg(
                 prefix.nick,

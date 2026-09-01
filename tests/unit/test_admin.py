@@ -121,6 +121,25 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
             ("owner", "#test @alpha beta @gamma"),
         ]
 
+    async def test_admin_getusers_chunked(self) -> None:
+        """Verify GETUSERS splits long nick lists across multiple messages."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        bot.authorizer.grant(OWNER.render())
+
+        for i in range(80):
+            runtime.member(f"longernickname{i:03d}")
+        await bot.events.handle_command(
+            IRCMessage("PRIVMSG", ("alpha", "GETUSERS #test"), OWNER),
+        )
+        assert len(fake_irc.privmsgs) > 1
+        for _, text in fake_irc.privmsgs:
+            assert text.startswith("#test ")
+        all_nicks = []
+        for _, text in fake_irc.privmsgs:
+            all_nicks.extend(text.split()[1:])
+        assert len(all_nicks) == 80
+
     async def test_admin_commands_with_disconnected_irc(self) -> None:
         """Verify admin commands degrade gracefully when IRC is disconnected."""
         bot, _, _ = bot_with_coordinator()
