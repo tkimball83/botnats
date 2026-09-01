@@ -16,7 +16,7 @@ dependencies = [
 dev = [
   "isort==8.0.1",
   "mypy==2.3.0",
-  "ruff==0.16.1",
+  "ruff==0.16.5",
 ]
 
 [project.scripts]
