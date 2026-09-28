@@ -239,6 +239,7 @@ class FakeCoordinator:
         """Initialize empty recording buffers."""
         self.auth_slots: dict[str, list[float]] = {}
         self.bot_id = "alpha"
+        self.channel_expected: list[str | None] = []
         self.channel_puts: list[tuple[str, dict[str, Any]]] = []
         self.claim_requests: list[int] = []
         self.claim_result = claim_result
@@ -264,10 +265,13 @@ class FakeCoordinator:
         self,
         channel: str,
         record: dict[str, Any],
+        *,
+        expected: str | None,
     ) -> dict[str, Any]:
-        """Record a channel KV put."""
+        """Record a channel KV put and the revision it was written after."""
         self.require_unique()
         self.channel_puts.append((channel, record))
+        self.channel_expected.append(expected)
         return record
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
@@ -361,13 +365,15 @@ class FailingPublishCoordinator(FakeCoordinator):
         self,
         channel: str,
         record: dict[str, Any],
+        *,
+        expected: str | None,
     ) -> dict[str, Any]:
         """Raise NatsError while failing, to simulate a NATS disconnect."""
         if self.failing:
             msg = f"NATS disconnected: channel {channel} with {len(record)} fields"
             raise NatsError(msg)
 
-        return await super().put_channel(channel, record)
+        return await super().put_channel(channel, record, expected=expected)
 
     async def put_session(
         self,

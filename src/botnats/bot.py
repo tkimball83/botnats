@@ -140,7 +140,7 @@ class Bot:
 
         if self.coordinator.ready:
             await self.sessions.retry()
-            await self.channel_mgr.retry_pending_records()
+            await self.channel_mgr.retry_pending_keys()
 
         if not self.identity.registered:
             return

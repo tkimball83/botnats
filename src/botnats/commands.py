@@ -91,6 +91,7 @@ class CommandHandler:
         stored = await self.bot.coordinator.put_channel(
             channel,
             asdict(record),
+            expected=self.bot.channel_mgr.durable_revision(channel),
         )
         authoritative = ChannelRecord.from_dict(stored)
         await self.bot.channel_mgr.apply_record(authoritative)

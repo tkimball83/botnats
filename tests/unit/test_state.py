@@ -7,6 +7,7 @@ import unittest
 from dataclasses import asdict
 
 from botnats.channel import ChannelRecord, ChannelRuntime
+from botnats.validators import validate_channel_revision
 
 
 class StateTests(unittest.TestCase):
@@ -23,6 +24,15 @@ class StateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unsupported characters"):
             ChannelRecord.from_dict(unsafe)
+
+    def test_channel_revision_requires_ascii_digits(self) -> None:
+        """Reject revision counters written with non-ASCII decimal digits."""
+        arabic_indic = "\u0660" * 19 + "\u0661"
+        assert int(arabic_indic) == 1
+        with self.assertRaisesRegex(ValueError, "invalid revision"):
+            validate_channel_revision(f"{arabic_indic}-{'0' * 32}")
+
+        validate_channel_revision(f"{'0' * 19}1-{'0' * 32}")
 
     def test_channel_revision_ordering(self) -> None:
         """Verify channel record revision ordering and serialization."""

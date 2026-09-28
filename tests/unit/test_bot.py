@@ -583,7 +583,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(coordinator, "put_presence", heartbeat),
             patch.object(bot.sessions, "retry", retry_sessions),
-            patch.object(bot.channel_mgr, "retry_pending_records", retry_records),
+            patch.object(bot.channel_mgr, "retry_pending_keys", retry_records),
         ):
             await bot.maintenance_tick()
 

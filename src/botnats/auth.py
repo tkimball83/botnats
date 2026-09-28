@@ -74,7 +74,7 @@ class AuthFlow:
             ) or not bot.authorizer.authorized(rendered):
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
-                    await bot.sessions.sync(rendered, asdict(revoked))
+                    await bot.sessions.sync(revoked.prefix, asdict(revoked))
 
                 await bot.commands.reply(prefix.nick, "Authorization failed")
                 return
@@ -237,7 +237,10 @@ class SessionSync:
         self.invalidate(identity)
         revoked = self.authorizer.revoke(identity)
         if revoked is not None:
-            self.queue(identity, asdict(revoked))
+            # File it under the session's own prefix: the observed prefix can
+            # differ in IRC-case-equivalent characters, and the store keys and
+            # validates sessions by their own prefix.
+            self.queue(revoked.prefix, asdict(revoked))
             self.tasks.spawn(self.retry(), "session-sync")
 
     async def drain(self) -> None:
@@ -254,7 +257,7 @@ class SessionSync:
             return False
 
         self.authorizer.import_session(stored)
-        # revoke() and move() queue without the lock, so a newer mutation for
+        # revoke() queues without the lock, so a newer mutation for
         # this identity may have replaced this entry during the write; it is
         # still unwritten and must stay queued for its own drain.
         if self.pending.get(identity) is not session:

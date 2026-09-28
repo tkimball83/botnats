@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection
 
 MAX_CHANNEL_REVISION = (1 << 63) - 1
-CHANNEL_REVISION_RE = re.compile(r"\d{20}-[0-9a-f]{32}")
+CHANNEL_REVISION_RE = re.compile(r"[0-9]{20}-[0-9a-f]{32}")
 
 
 def _has_control_chars(value: str) -> bool:
