@@ -16,7 +16,7 @@ dependencies = [
 dev = [
   "blank-line-after-blocks==0.1.4",
   "mypy==2.3.0",
-  "ruff==0.16.1",
+  "ruff==0.16.9",
 ]
 
 [project.scripts]
