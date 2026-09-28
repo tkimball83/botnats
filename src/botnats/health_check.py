@@ -75,6 +75,7 @@ class HealthCheck:
                 response = RESPONSE_OK if self.ready() else RESPONSE_UNHEALTHY
             else:
                 response = RESPONSE_NOT_FOUND
+
             writer.write(response)
             await writer.drain()
         except OSError, ValueError:

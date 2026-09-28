@@ -64,6 +64,10 @@ class IRCProtocol(Protocol):
         """Return whether the socket is open."""
         ...
 
+    def is_self(self, nickname: str) -> bool:
+        """Return whether a nickname identifies this client."""
+        ...
+
     async def reconnect(self) -> None:
         """Force a reconnection."""
         ...
@@ -105,7 +109,7 @@ class ISupportState:
     )
     membership_modes: str = DEFAULT_MEMBERSHIP_MODES
     mode_limit: int = 1
-    monitor_limit: int | None = None
+    monitor: bool = False
     op_mode: str = "o"
 
     @property
@@ -113,6 +117,18 @@ class ISupportState:
         """Return membership modes with at least channel operator privileges."""
         op_index = self.membership_modes.find(self.op_mode)
         return self.membership_modes[: op_index + 1] if op_index >= 0 else self.op_mode
+
+    def fold(self, value: str) -> str:
+        """Normalize a string using the server's casemapping rules."""
+        return casefold(value, self.casemapping)
+
+    def fold_identity(self, prefix: str) -> str:
+        """Normalize a nick!user@host identity for case-insensitive comparison."""
+        nick, bang, rest = prefix.partition("!")
+        if not bang:
+            return self.fold(nick)
+
+        return self.fold(nick) + "!" + casefold(rest, "ascii")
 
     def is_opped(self, modes: set[str]) -> bool:
         """Return whether the given mode set includes channel operator status."""
@@ -136,11 +152,14 @@ class ISupportState:
             self.membership_modes = ""
             self.op_mode = "o"
             return
+
         if not value.startswith("(") or ")" not in value:
             return
+
         modes, symbols = value[1:].split(")", 1)
         if not modes or len(modes) != len(symbols):
             return
+
         self.member_prefixes = dict(zip(symbols, modes, strict=True))
         self.membership_modes = modes
         # Without "@" fall back through the conventional operator tiers; a
@@ -175,6 +194,7 @@ class Prefix:
         o_host = other.host
         if s_user is None or s_host is None or o_user is None or o_host is None:
             return False
+
         return (
             casefold(self.nick, casemapping) == casefold(other.nick, casemapping)
             and casefold(s_user, "ascii") == casefold(o_user, "ascii")
@@ -188,6 +208,7 @@ class Prefix:
         if not bang:
             nick, at, host = value.partition("@")
             return cls(nick=nick, host=(host or None) if at else None)
+
         user, at, host = remainder.partition("@")
         return cls(nick=nick, user=user or None, host=(host or None) if at else None)
 
@@ -195,6 +216,7 @@ class Prefix:
         """Format the prefix as a nick!user@host string."""
         if not self.complete:
             return self.nick
+
         return f"{self.nick}!{self.user}@{self.host}"
 
 
@@ -204,6 +226,7 @@ def casefold(value: str, casemapping: str = DEFAULT_CASEMAPPING) -> str:
     if table is None:
         msg = f"unsupported casemapping: {casemapping!r}"
         raise ValueError(msg)
+
     return value.translate(table)
 
 
@@ -216,20 +239,25 @@ def format_message(
     if not command or not command.isascii() or not command.isalnum():
         msg = "IRC command contains unsupported characters"
         raise ValueError(msg)
+
     for param in params:
         if not param or param[0] == ":" or not ILLEGAL_PARAM_CHARS.isdisjoint(param):
             msg = "IRC parameter contains unsupported characters"
             raise ValueError(msg)
+
     if trailing is not None and not ILLEGAL_TRAILING_CHARS.isdisjoint(trailing):
         msg = "IRC trailing parameter contains unsupported characters"
         raise ValueError(msg)
+
     components = [command, *params]
     if trailing is not None:
         components.append(f":{trailing}")
+
     encoded = (" ".join(components) + "\r\n").encode()
     if len(encoded) > MAX_IRC_MESSAGE_BYTES:
         msg = "IRC message exceeds 512 bytes"
         raise ValueError(msg)
+
     return encoded
 
 
@@ -256,8 +284,10 @@ def _glob_matches(pattern: str, value: str) -> bool:
             value_index = star_value_index
         else:
             return False
+
     while pattern_index < len(pattern) and pattern[pattern_index] == "*":
         pattern_index += 1
+
     return pattern_index == len(pattern)
 
 
@@ -274,10 +304,13 @@ def iter_mode_changes(
         if mode == "+":
             adding = True
             continue
+
         if mode == "-":
             adding = False
             continue
+
         changes.append((adding, mode))
+
     consumes = [
         mode_requires_argument(
             mode,
@@ -295,12 +328,14 @@ def iter_mode_changes(
             if mode == "k" and not adding and consumes[position]:
                 consumes[position] = False
                 break
+
     argument_index = 0
     for (adding, mode), consume in zip(changes, consumes, strict=True):
         argument = None
         if consume and argument_index < len(arguments):
             argument = arguments[argument_index]
             argument_index += 1
+
         yield adding, mode, argument
 
 
@@ -343,6 +378,7 @@ def parse_message(line: str) -> IRCMessage:
     if not ILLEGAL_TRAILING_CHARS.isdisjoint(rest):
         msg = "IRC message contains control characters"
         raise ValueError(msg)
+
     prefix: Prefix | None = None
 
     if rest.startswith("@"):
@@ -356,6 +392,7 @@ def parse_message(line: str) -> IRCMessage:
         if not separator:
             msg = "IRC prefix was not followed by a command"
             raise ValueError(msg)
+
         prefix = Prefix.parse(raw_prefix)
 
     middle, separator, trailing = rest.partition(" :")
@@ -363,9 +400,11 @@ def parse_message(line: str) -> IRCMessage:
     if not words:
         msg = "IRC message has no command"
         raise ValueError(msg)
+
     params = words[1:]
     if separator:
         params.append(trailing)
+
     return IRCMessage(
         command=words[0].upper(),
         params=tuple(params),

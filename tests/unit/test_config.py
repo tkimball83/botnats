@@ -108,16 +108,36 @@ class ConfigTests(unittest.TestCase):
 
     def test_invalid_value_errors_name_their_section(self) -> None:
         """Qualify invalid-value errors with their configuration table."""
-        raw = json.loads(CONFIG)
-        raw["bot"]["nickname"] = "1bad"
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_text(json.dumps(raw))
-            with self.assertRaisesRegex(
-                ValueError,
-                r"bot\.nickname is not a valid IRC nickname",
-            ):
-                BotConfig.load(path)
+        cases = (
+            ("bot", "nickname", "1bad", r"bot\.nickname is not a valid IRC nickname"),
+            ("bot", "health_port", 0, r"bot\.health_port must be an integer"),
+            ("irc", "verify_tls", "yes", r"irc\.verify_tls must be a boolean"),
+            ("irc", "channel_modes", 1, r"irc\.channel_modes must be a string"),
+            (
+                "coordination",
+                "presence_ttl_seconds",
+                -1,
+                r"coordination\.presence_ttl_seconds must be a positive number",
+            ),
+            (
+                "nats",
+                "jetstream_replicas",
+                9,
+                r"nats\.jetstream_replicas must be an integer",
+            ),
+        )
+        for section, key, value, message in cases:
+            with self.subTest(key=key):
+                raw = json.loads(CONFIG)
+                raw.setdefault(section, {})[key] = value
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory, "bot.json")
+                    path.write_text(json.dumps(raw))
+                    with (
+                        patch.dict(os.environ, SECRETS),
+                        self.assertRaisesRegex((TypeError, ValueError), message),
+                    ):
+                        BotConfig.load(path)
 
     def test_non_table_section_is_rejected(self) -> None:
         """Reject a section that is present but not an object."""
@@ -126,7 +146,9 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "bot.json")
             path.write_text(json.dumps(raw))
-            with self.assertRaisesRegex(TypeError, "configuration table"):
+            with self.assertRaisesRegex(
+                TypeError, "authorization must be a JSON object"
+            ):
                 BotConfig.load(path)
 
     def test_config_requires_object(self) -> None:
@@ -140,25 +162,25 @@ class ConfigTests(unittest.TestCase):
     def test_channel_modes_reject_contradictions(self) -> None:
         """Reject modes configured as both required and forbidden."""
         with self.assertRaisesRegex(ValueError, "require and forbid"):
-            mode_string({"channel_modes": "+n-n"}, "channel_modes", "")
+            mode_string({"channel_modes": "+n-n"}, "channel_modes", "irc", "")
 
     def test_channel_modes_reject_oversized_message(self) -> None:
         """Reject channel modes that cannot fit in an IRC MODE command."""
         with self.assertRaisesRegex(ValueError, "512 bytes"):
-            mode_string({"channel_modes": "+" + "n" * 510}, "channel_modes", "")
+            mode_string({"channel_modes": "+" + "n" * 510}, "channel_modes", "irc", "")
 
     def test_channel_modes_reject_unusable_syntax(self) -> None:
         """Reject unsigned, empty, and argument-consuming channel modes."""
         for value in ("nt", "+", "+k", "-b", "+o"):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                mode_string({"channel_modes": value}, "channel_modes", "")
+                mode_string({"channel_modes": value}, "channel_modes", "irc", "")
 
     def test_port_validation(self) -> None:
         """Verify monitoring ports default and stay in the TCP port range."""
-        assert port({}, "monitor_port", 8222) == 8222
+        assert port({}, "monitor_port", "nats", 8222) == 8222
         for bad in (True, 0, 65536, 8222.0, "8222"):
             with self.assertRaisesRegex(ValueError, "integer between 1 and 65535"):
-                port({"monitor_port": bad}, "monitor_port", 8222)
+                port({"monitor_port": bad}, "monitor_port", "nats", 8222)
 
     def test_positive_float_rejects_non_finite(self) -> None:
         """Verify positive_float rejects NaN, infinities, and non-positive values."""
@@ -171,8 +193,9 @@ class ConfigTests(unittest.TestCase):
             -1,
         ):
             with self.assertRaisesRegex(ValueError, "positive number"):
-                positive_float({"value": bad}, "value", 1.0)
-        assert positive_float({}, "value", 2.5) == 2.5
+                positive_float({"value": bad}, "value", "test", 1.0)
+
+        assert positive_float({}, "value", "test", 2.5) == 2.5
 
     def test_presence_ttl_exceeds_maintenance_interval(self) -> None:
         """Reject presence expiry that is no longer than its heartbeat interval."""
@@ -224,7 +247,9 @@ class ConfigTests(unittest.TestCase):
                     "invalid NATS server URL",
                 ) as raised:
                     nats_urls({"servers": [value]})
+
                 assert value not in str(raised.exception)
+
         for value in invalid_irc:
             with self.subTest(value=value):
                 with self.assertRaisesRegex(
@@ -232,6 +257,7 @@ class ConfigTests(unittest.TestCase):
                     "invalid IRC server URL",
                 ) as raised:
                     IRCServer.parse(value)
+
                 assert value not in str(raised.exception)
 
     def test_unknown_keys(self) -> None:

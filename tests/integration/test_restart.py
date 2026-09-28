@@ -6,7 +6,6 @@
 import asyncio
 import json
 import os
-import sys
 import time
 from dataclasses import asdict
 
@@ -15,6 +14,7 @@ from nats.errors import Error as NatsError
 
 from botnats.channel import ChannelRecord
 from botnats.nats.store import ChannelStore, ClaimStore, SessionStore, session_signature
+from tests.integration.test_failover import ignore_error
 from tests.unit.helpers import COORDINATION_KEY as SECRET
 
 CHANNEL = "#botnats-restart"
@@ -54,67 +54,65 @@ async def connect() -> nats.NATS:
                 await asyncio.sleep(0.2)
 
 
-async def ignore_error(error: Exception) -> None:
-    """Suppress expected connection errors during host-port recovery."""
-    del error
-
-
-async def run(phase: str) -> None:
-    """Create or verify the restart-test claim."""
+async def mark() -> None:
+    """Write a claim, channel, and session that must survive the restart."""
     nc = await connect()
     try:
         claims = ClaimStore("restart-test", 3, SECRET)
         channels = ChannelStore("restart-test", 3, SECRET)
         sessions = SessionStore("restart-test", 3, SECRET, SESSION_TTL)
-        if phase == "mark":
-            await claims.open(nc.jetstream())
-            assert await claims.claim(COUNTER)
-            await channels.open(nc.jetstream())
-            record = asdict(ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True))
-            stored = await channels.put(CHANNEL, record)
-            assert stored["key"] == CHANNEL_KEY
-            await sessions.open(nc.jetstream())
-            session = await sessions.put(SESSION_IDENTITY, session_record())
-            assert session["prefix"] == SESSION_IDENTITY
-        elif phase == "check":
-            # A missing key here can be transient while JetStream replays after
-            # the restart, so keep retrying; only a genuine loss (or an elapsed
-            # claim TTL) exhausts the timeout, which we surface as a clear error
-            # instead of an opaque TimeoutError.
-            try:
-                async with asyncio.timeout(CONNECT_TIMEOUT):
-                    while True:
-                        try:
-                            kv = await claims.open(nc.jetstream())
-                            entry = await kv.get(claims.key(COUNTER))
-                            channel_kv = await channels.open(nc.jetstream())
-                            channel_entry = await channel_kv.get(channels.key(CHANNEL))
-                            session_kv = await sessions.open(nc.jetstream())
-                            session_entry = await session_kv.get(
-                                sessions.key(SESSION_IDENTITY),
-                            )
-                        except NatsError:
-                            await asyncio.sleep(0.5)
-                            continue
-                        assert entry.value == b"1"
-                        assert channel_entry.value is not None
-                        channel_record = json.loads(channel_entry.value)
-                        assert channel_record["key"] == CHANNEL_KEY
-                        assert channel_record["present"] is True
-                        assert session_entry.value is not None
-                        stored_session = json.loads(session_entry.value)
-                        assert stored_session["prefix"] == SESSION_IDENTITY
-                        assert stored_session["issuer"] == "restart-test"
-                        break
-            except TimeoutError:
-                msg = "durable state missing after NATS restart"
-                raise AssertionError(msg) from None
-        else:
-            msg = f"unknown restart-test phase: {phase}"
-            raise ValueError(msg)
+        await claims.open(nc.jetstream())
+        assert await claims.claim(COUNTER)
+        await channels.open(nc.jetstream())
+        record = asdict(ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True))
+        stored = await channels.put(CHANNEL, record)
+        assert stored["key"] == CHANNEL_KEY
+        await sessions.open(nc.jetstream())
+        session = await sessions.put(SESSION_IDENTITY, session_record())
+        assert session["prefix"] == SESSION_IDENTITY
     finally:
         await nc.drain()
 
 
-if __name__ == "__main__":
-    asyncio.run(run(sys.argv[1]))
+async def check() -> None:
+    """Verify the marked claim, channel, and session after the restart."""
+    nc = await connect()
+    try:
+        claims = ClaimStore("restart-test", 3, SECRET)
+        channels = ChannelStore("restart-test", 3, SECRET)
+        sessions = SessionStore("restart-test", 3, SECRET, SESSION_TTL)
+        # A missing key here can be transient while JetStream replays after
+        # the restart, so keep retrying; only a genuine loss (or an elapsed
+        # claim TTL) exhausts the timeout, which we surface as a clear error
+        # instead of an opaque TimeoutError.
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT):
+                while True:
+                    try:
+                        kv = await claims.open(nc.jetstream())
+                        entry = await kv.get(claims.key(COUNTER))
+                        channel_kv = await channels.open(nc.jetstream())
+                        channel_entry = await channel_kv.get(channels.key(CHANNEL))
+                        session_kv = await sessions.open(nc.jetstream())
+                        session_entry = await session_kv.get(
+                            sessions.key(SESSION_IDENTITY),
+                        )
+                    except NatsError:
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    assert entry.value == b"1"
+                    assert channel_entry.value is not None
+                    channel_record = json.loads(channel_entry.value)
+                    assert channel_record["key"] == CHANNEL_KEY
+                    assert channel_record["present"] is True
+                    assert session_entry.value is not None
+                    stored_session = json.loads(session_entry.value)
+                    assert stored_session["prefix"] == SESSION_IDENTITY
+                    assert stored_session["issuer"] == "restart-test"
+                    break
+        except TimeoutError:
+            msg = "durable state missing after NATS restart"
+            raise AssertionError(msg) from None
+    finally:
+        await nc.drain()

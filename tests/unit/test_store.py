@@ -24,9 +24,9 @@ from botnats.nats.store import (
     SessionStore,
     channel_signature,
     presence_signature,
-    session_signature,
 )
 from tests.unit.helpers import COORDINATION_KEY as SECRET
+from tests.unit.helpers import session_record
 
 SHA256_HEX_LENGTH = 64
 
@@ -188,24 +188,6 @@ def channel_record(revision: int) -> dict[str, object]:
     return record
 
 
-def session_record(
-    expires_at: float,
-    version: int,
-    *,
-    revoked: bool,
-) -> dict[str, object]:
-    """Build a valid signed durable session record."""
-    record: dict[str, object] = {
-        "expires_at": expires_at,
-        "issuer": "alpha",
-        "prefix": "owner!user@host",
-        "revoked": revoked,
-        "version": version,
-    }
-    record["signature"] = session_signature(SECRET, "efnet", record)
-    return record
-
-
 class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
     """Tests for fail-closed mesh-wide authentication limits."""
 
@@ -241,6 +223,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await attempts.allow("host.example", now=60)
+
         assert not attempts.ready
 
     async def test_keys_hide_identity(self) -> None:
@@ -360,6 +343,7 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await claims.claim(42)
+
         assert not claims.ready
 
     async def test_missing_store(self) -> None:
@@ -660,5 +644,6 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "changed while opening"):
             await task
+
         assert store.js is None
         assert store.kv is None

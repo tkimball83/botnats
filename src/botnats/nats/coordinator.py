@@ -14,12 +14,14 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
 import nats
-from nats.errors import Error as NatsError
 
 from botnats import error_label, log_task_failure
 from botnats.config import IDENTIFIER_RE
+from botnats.nats.claim import PresenceClaim
 from botnats.nats.status import NATSStatus, collect
 from botnats.nats.store import (
+    CONNECT_ERRORS,
+    PUBLISH_ERRORS,
     SESSION_EXPIRY_GRACE,
     AttemptStore,
     ChannelStore,
@@ -41,14 +43,10 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-CONNECT_ERRORS = (NatsError, OSError)
 DECODE_ERRORS = (RecursionError, TypeError, ValueError)
 DECODE_WARNING_INTERVAL = 5.0
-OFFER_TIMEOUT = 0.35
 TRANSIENT_WARNING_INTERVAL = 60.0
-PUBLISH_ERRORS = (*CONNECT_ERRORS, RuntimeError)
 RECONNECT_WAIT = 1
-REQUEST_ERRORS = (*CONNECT_ERRORS, *DECODE_ERRORS, RuntimeError)
 WATCH_NAMES = frozenset({"watch-channels", "watch-presence", "watch-sessions"})
 
 # Task-local generation of the running watch, None outside watch tasks.
@@ -112,12 +110,8 @@ class CoordinatorProtocol(Protocol):
         """Atomically claim a TOTP counter."""
         ...
 
-    async def request_offer(
-        self,
-        base_suffix: str,
-        payload: dict[str, Any],
-    ) -> bool:
-        """Send an offer request and grant the winning responder."""
+    async def request_help(self, kind: str, payload: dict[str, Any]) -> None:
+        """Broadcast an op, invite, or unban request to every peer."""
         ...
 
     async def start(self) -> None:
@@ -140,7 +134,121 @@ def _decode_record(value: bytes | None) -> dict[str, Any] | None:
         data = json.loads(value) if value is not None else None
     except DECODE_ERRORS:
         return None
+
     return data if isinstance(data, dict) else None
+
+
+class HelpRequests:
+    """Broadcast op, invite, and unban requests to every peer over Core NATS.
+
+    Each eligible peer acts on its own after a short random delay, rechecking
+    IRC state first, so no peer waits on another. Two peers answering the same
+    request send a duplicate MODE or INVITE, which IRC servers treat as a no-op.
+    """
+
+    def __init__(self, coordinator: Coordinator) -> None:
+        self.coordinator = coordinator
+
+    def decode(
+        self,
+        message: Msg,
+        kind: str = "NATS message",
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Decode a signed message, logging malformed input consistently."""
+        try:
+            return self.coordinator.envelope.decode(message.subject, message.data)
+        except DECODE_ERRORS as error:
+            self.warn_decode(kind, message.subject, error)
+            return None
+
+    def decode_action(
+        self,
+        message: Msg,
+        kind: str = "NATS message",
+    ) -> dict[str, Any] | None:
+        """Decode an action whose signed sender owns its presence identity."""
+        decoded = self.decode(message, kind)
+        if decoded is None:
+            return None
+
+        sender, payload = decoded
+        if not sender_owns_presence(sender, payload):
+            self.warn_decode(
+                kind,
+                message.subject,
+                ValueError("sender does not match presence"),
+            )
+            return None
+
+        return payload
+
+    async def deliver(
+        self,
+        callback: Callable[[dict[str, Any]], None],
+        message: Msg,
+    ) -> None:
+        """Hand a peer's request to the bot; skip it while unready or our own."""
+        if not self.coordinator.ready:
+            return
+
+        payload = self.decode_action(message, "help request")
+        if (
+            payload is not None
+            and payload["presence"]["bot_id"] != self.coordinator.envelope.bot_id
+        ):
+            callback(payload)
+
+    async def publish(self, suffix: str, payload: dict[str, Any]) -> None:
+        """Broadcast a signed message on the given subject suffix."""
+        self.coordinator.claim.require()
+        if self.coordinator.nc is None:
+            msg = "NATS is unavailable"
+            raise RuntimeError(msg)
+
+        subject = f"{self.coordinator.ns}.{suffix}"
+        await self.coordinator.nc.publish(
+            subject, self.coordinator.envelope.encode(subject, payload)
+        )
+
+    async def request(self, kind: str, payload: dict[str, Any]) -> None:
+        """Broadcast a help request from this bot; a lost one is asked again."""
+        if not self.coordinator.ready or not sender_owns_presence(
+            self.coordinator.envelope.bot_id,
+            payload,
+        ):
+            return
+
+        with suppress(*PUBLISH_ERRORS):
+            await self.publish(kind, payload)
+
+    async def subscribe(self) -> None:
+        """Subscribe to help requests on the active connection."""
+        nc = self.coordinator.nc
+        if nc is None:
+            return
+
+        callbacks = self.coordinator.callbacks
+        for kind, callback in (
+            ("invite", callbacks.on_invite),
+            ("op", callbacks.on_op),
+            ("unban", callbacks.on_unban),
+        ):
+            await nc.subscribe(
+                f"{self.coordinator.ns}.{kind}",
+                cb=partial(self.deliver, callback),
+            )
+
+    def warn_decode(self, kind: str, subject: str, error: Exception) -> None:
+        """Rate-limit warnings for malformed NATS messages."""
+        suffix = self.coordinator.should_warn("decode", DECODE_WARNING_INTERVAL)
+        if suffix is not None:
+            LOGGER.warning(
+                "ignored malformed %s on %s: %s%s",
+                kind,
+                subject,
+                error_label(error),
+                suffix,
+            )
 
 
 class Coordinator:
@@ -160,7 +268,6 @@ class Coordinator:
             coordination_key,
         )
         self.callbacks = callbacks
-        self.bot_id = envelope.bot_id
         self.channels_store = ChannelStore(
             config.network,
             config.replicas,
@@ -172,7 +279,6 @@ class Coordinator:
             coordination_key,
         )
         self.envelope = envelope
-        self.instance_id = config.instance_id
         self.monitor_port = config.monitor_port
         self.nats_servers = config.servers
         self.nats_token = config.token
@@ -198,21 +304,15 @@ class Coordinator:
             self.presence_store,
             self.sessions,
         )
-        self.last_presence: dict[str, Any] = {
-            "bot_id": envelope.bot_id,
-            "host": "",
-            "instance_id": config.instance_id,
-            "nick": "",
-            "user": "",
-        }
-        self.owns_presence = False
-        self.presence_lock = asyncio.Lock()
-        self.presence_revision: int | None = None
+        self.help_requests = HelpRequests(self)
+        self.claim = PresenceClaim(
+            self.presence_store,
+            envelope.bot_id,
+            config.instance_id,
+        )
         self.resync_task: asyncio.Task[None] | None = None
-        self.session_identities: dict[str, tuple[str, float]] = {}
         self.store_generation = 0
         self.synced_watches: set[str] = set()
-        self.unique = True
         self.watch_generation = 0
         self.watch_tasks: list[asyncio.Task[None]] = []
 
@@ -222,6 +322,7 @@ class Coordinator:
         self.watch_tasks = []
         for task in tasks:
             task.cancel()
+
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -231,15 +332,10 @@ class Coordinator:
         self.nc = None
         await self.cancel_resync()
         await self.cancel_watches()
-        async with self.presence_lock:
-            revision = self.presence_revision
-            if self.owns_presence and revision is not None:
-                with suppress(*PUBLISH_ERRORS):
-                    await self.presence_store.delete(self.bot_id, revision)
-            self.owns_presence = False
-            self.presence_revision = None
+        await self.claim.release()
         for store in self.stores:
             store.reset()
+
         if nc is not None and not nc.is_closed:
             await nc.close()
 
@@ -248,60 +344,12 @@ class Coordinator:
         """Return whether the NATS connection is active."""
         return self.nc is not None and self.nc.is_connected
 
-    def decode(
-        self,
-        message: Msg,
-        kind: str = "NATS message",
-    ) -> tuple[str, dict[str, Any]] | None:
-        """Decode a signed message, logging malformed input consistently."""
-        try:
-            return self.envelope.decode(message.subject, message.data)
-        except DECODE_ERRORS as error:
-            self.warn_decode(kind, message.subject, error)
-            return None
-
-    def decode_action(
-        self,
-        message: Msg,
-        kind: str = "NATS message",
-    ) -> dict[str, Any] | None:
-        """Decode an action whose signed sender owns its presence identity."""
-        decoded = self.decode(message, kind)
-        if decoded is None:
-            return None
-        sender, payload = decoded
-        if not sender_owns_presence(sender, payload):
-            self.warn_decode(
-                kind,
-                message.subject,
-                ValueError("sender does not match presence"),
-            )
-            return None
-        return payload
-
-    async def dispatch(
-        self,
-        callback: Callable[[dict[str, Any]], Awaitable[None]],
-        message: Msg,
-    ) -> None:
-        """Decode a NATS message and invoke the callback with its payload."""
-        if (payload := self.decode_action(message)) is not None:
-            await callback(payload)
-
-    async def grant(
-        self,
-        callback: Callable[[dict[str, Any]], Awaitable[None]],
-        message: Msg,
-    ) -> None:
-        """Dispatch a targeted grant unless this bot ID conflicts with a peer."""
-        if self.unique and self.owns_presence:
-            await self.dispatch(callback, message)
-
     async def init_stores(self) -> None:
         """Retry JetStream store initialization while Core NATS is connected."""
         nc = self.nc
         if nc is None:
             return
+
         self.store_generation += 1
         generation = self.store_generation
         js = nc.jetstream()
@@ -318,39 +366,11 @@ class Coordinator:
             else:
                 return
 
-    def mark_duplicate(self) -> None:
-        """Record a conflicting live instance using this bot ID."""
-        if self.unique:
-            LOGGER.error("duplicate bot ID detected: %s", self.bot_id)
-        self.unique = False
-
-    async def offer(
-        self,
-        callback: Callable[[dict[str, Any]], bool],
-        message: Msg,
-    ) -> None:
-        """Evaluate an offer request and respond if eligible."""
-        # The reply subject is an unsigned NATS header; accepting only inbox
-        # replies keeps a replayed request from minting a signed envelope
-        # bound to an arbitrary coordination subject.
-        if not self.ready or not message.reply.startswith("_INBOX."):
-            return
-        payload = self.decode_action(message, "offer")
-        if payload is None:
-            return
-        if callback(payload):
-            try:
-                await message.respond(self.envelope.encode(message.reply, {}))
-            except PUBLISH_ERRORS as error:
-                self.warn_transient("offer response failed", error)
-
     async def on_disconnected(self) -> None:
         """Invalidate JetStream handles when Core NATS disconnects."""
         await self.cancel_resync()
         await self.cancel_watches()
-        async with self.presence_lock:
-            self.owns_presence = False
-            self.presence_revision = None
+        self.claim.reset()
         for store in self.stores:
             store.reset()
 
@@ -374,6 +394,7 @@ class Coordinator:
         """Surface a failed resynchronization instead of losing it to GC."""
         if self.resync_task is task:
             self.resync_task = None
+
         log_task_failure(task, LOGGER, "NATS resynchronization")
 
     async def resync(self) -> None:
@@ -389,50 +410,18 @@ class Coordinator:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def publish(self, suffix: str, payload: dict[str, Any]) -> None:
-        """Broadcast a signed message on the given subject suffix."""
-        self.require_unique()
-        if self.nc is None:
-            msg = "NATS is unavailable"
-            raise RuntimeError(msg)
-        subject = f"{self.ns}.{suffix}"
-        await self.nc.publish(subject, self.envelope.encode(subject, payload))
-
     async def put_channel(
         self,
         channel: str,
         record: dict[str, Any],
     ) -> dict[str, Any]:
         """Store a channel record and return the authoritative record."""
-        self.require_unique()
+        self.claim.require()
         return await self.channels_store.put(channel, record)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
         """Store or refresh bot presence in JetStream KV."""
-        if presence.get("bot_id") != self.bot_id:
-            msg = "presence does not match coordinator bot ID"
-            raise ValueError(msg)
-        async with self.presence_lock:
-            self.last_presence = presence
-            if not self.owns_presence:
-                await self.reclaim_presence()
-                self.require_unique()
-                return
-            self.require_unique()
-            revision = self.presence_revision
-            if revision is not None:
-                revision = await self.presence_store.update(
-                    self.bot_id,
-                    presence,
-                    revision,
-                )
-            if revision is None:
-                self.owns_presence = False
-                self.presence_revision = None
-                await self.reclaim_presence()
-                self.require_unique()
-                return
-            self.presence_revision = revision
+        await self.claim.put(presence)
 
     async def put_session(
         self,
@@ -440,7 +429,7 @@ class Coordinator:
         session: dict[str, Any],
     ) -> dict[str, Any]:
         """Store an auth session and return the authoritative record."""
-        self.require_unique()
+        self.claim.require()
         return await self.sessions.put(identity, session)
 
     @property
@@ -450,48 +439,18 @@ class Coordinator:
             self.connected
             and all(store.ready for store in self.stores)
             and self.synced_watches == WATCH_NAMES
-            and self.owns_presence
-            and self.unique
+            and self.claim.owned
         )
 
-    async def reclaim_presence(self) -> None:
-        """Atomically reclaim the presence key while holding presence_lock."""
-        was_unique = self.unique
-        revision = await self.presence_store.create(
-            self.bot_id,
-            self.last_presence,
-        )
-        if revision is None:
-            # The key is occupied: adopt this instance's own still-live record
-            # after a reconnect, or overwrite an unsigned or forged clobber; a
-            # validly signed foreign record leaves revision None (a duplicate).
-            # A transient store error propagates to the caller's retry path
-            # instead of being misread as a duplicate bot ID.
-            revision = await self.presence_store.reclaim(
-                self.bot_id,
-                self.last_presence,
-                self.instance_id,
-            )
-        if revision is not None:
-            if not was_unique:
-                LOGGER.info("duplicate bot ID conflict resolved: %s", self.bot_id)
-            self.owns_presence = True
-            self.presence_revision = revision
-            self.unique = True
-        else:
-            self.owns_presence = False
-            self.presence_revision = None
-            self.mark_duplicate()
+    async def try_reclaim(self, transition: Callable[[], Awaitable[None]]) -> None:
+        """Run a presence reclaim from a watch, containing transient errors.
 
-    async def try_reclaim_presence(self) -> None:
-        """Reclaim presence from a watch, containing transient store errors.
-
-        A lost-race or transient failure concerns only this key; letting it
+        A lost race or transient failure concerns only this key; letting it
         propagate would restart the whole watch and drop readiness for a full
         replay. The next presence heartbeat retries the reclaim.
         """
         try:
-            await self.reclaim_presence()
+            await transition()
         except PUBLISH_ERRORS as error:
             self.warn_transient("presence reclaim failed; awaiting heartbeat", error)
 
@@ -503,42 +462,9 @@ class Coordinator:
         """Atomically claim a TOTP counter via JetStream; deny on any failure."""
         return self.ready and await self.claims.claim(counter)
 
-    async def request_offer(
-        self,
-        base_suffix: str,
-        payload: dict[str, Any],
-    ) -> bool:
-        """Send an offer request and grant the winning responder."""
-        if (
-            not self.ready
-            or self.nc is None
-            or not sender_owns_presence(self.bot_id, payload)
-        ):
-            return False
-        try:
-            subject = f"{self.ns}.{base_suffix}.request"
-            response = await self.nc.request(
-                subject,
-                self.envelope.encode(subject, payload),
-                timeout=OFFER_TIMEOUT,
-            )
-            offer = self.decode(response, "offer response")
-            if offer is None:
-                return False
-            bot_id, response_payload = offer
-            if not IDENTIFIER_RE.fullmatch(bot_id) or response_payload:
-                return False
-            await self.publish(f"{base_suffix}.grant.{bot_id}", payload)
-        except REQUEST_ERRORS:
-            return False
-        else:
-            return True
-
-    def require_unique(self) -> None:
-        """Require this process to own its unique bot presence."""
-        if not self.unique or not self.owns_presence:
-            msg = f"duplicate bot ID: {self.bot_id}"
-            raise RuntimeError(msg)
+    async def request_help(self, kind: str, payload: dict[str, Any]) -> None:
+        """Broadcast an op, invite, or unban request to every peer."""
+        await self.help_requests.request(kind, payload)
 
     def discard_watch_synced(self, name: str, generation: int) -> None:
         """Invalidate one watch's replay marker unless it was superseded."""
@@ -567,15 +493,18 @@ class Coordinator:
             except (*CONNECT_ERRORS, StoreUnavailableError) as error:
                 if not self.connected:
                     return
+
                 self.warn_transient(f"watch {name} failed", error)
             except Exception:
                 if not self.connected:
                     return
+
                 suffix = self.should_warn(f"watch {name} crashed")
                 if suffix is not None:
                     LOGGER.exception("watch %s crashed%s", name, suffix)
             finally:
                 self.discard_watch_synced(name, generation)
+
             await asyncio.sleep(RECONNECT_WAIT)
 
     async def start(self) -> None:
@@ -585,7 +514,7 @@ class Coordinator:
                 nc = await nats.connect(
                     servers=list(self.nats_servers),
                     token=self.nats_token,
-                    name=f"botnats-{self.bot_id}",
+                    name=f"botnats-{self.envelope.bot_id}",
                     allow_reconnect=True,
                     max_reconnect_attempts=-1,
                     reconnect_time_wait=RECONNECT_WAIT,
@@ -595,7 +524,7 @@ class Coordinator:
                 )
                 self.nc = nc
                 await self.init_stores()
-                await self.subscribe()
+                await self.help_requests.subscribe()
             except CONNECT_ERRORS as error:
                 LOGGER.warning(
                     "NATS connection failed; retrying: %s",
@@ -604,8 +533,11 @@ class Coordinator:
                 if self.nc is not None:
                     with suppress(*PUBLISH_ERRORS):
                         await self.nc.close()
+
                     self.nc = None
+
                 await asyncio.sleep(RECONNECT_WAIT)
+
         await self.start_watches()
         LOGGER.info("connected to Core NATS")
 
@@ -617,6 +549,7 @@ class Coordinator:
         await self.cancel_watches()
         if self.watch_generation != generation:
             return
+
         watches = (
             ("watch-channels", self.watch_channels),
             ("watch-presence", self.watch_presence),
@@ -644,32 +577,6 @@ class Coordinator:
             self.monitor_port,
         )
 
-    async def subscribe(self) -> None:
-        """Subscribe to offer coordination subjects on the active connection."""
-        nc = self.nc
-        if nc is None:
-            return
-        grants = (
-            ("invite.grant", self.callbacks.on_invite_grant),
-            ("op.grant", self.callbacks.on_op_grant),
-            ("unban.grant", self.callbacks.on_unban_grant),
-        )
-        offers = (
-            ("invite.request", self.callbacks.on_invite_request),
-            ("op.request", self.callbacks.on_op_request),
-            ("unban.request", self.callbacks.on_unban_request),
-        )
-        for suffix, grant_callback in grants:
-            await nc.subscribe(
-                f"{self.ns}.{suffix}.{self.bot_id}",
-                cb=partial(self.grant, grant_callback),
-            )
-        for suffix, offer_callback in offers:
-            await nc.subscribe(
-                f"{self.ns}.{suffix}",
-                cb=partial(self.offer, offer_callback),
-            )
-
     def should_warn(
         self,
         context: str,
@@ -687,6 +594,7 @@ class Coordinator:
         if now - last < interval:
             self.transient_warnings[context] = (last, suppressed + 1)
             return None
+
         self.transient_warnings[context] = (now, 0)
         return f"; suppressed {suppressed} similar warning(s)" if suppressed else ""
 
@@ -695,18 +603,6 @@ class Coordinator:
         suffix = self.should_warn(context)
         if suffix is not None:
             LOGGER.warning("%s: %s%s", context, error_label(error), suffix)
-
-    def warn_decode(self, kind: str, subject: str, error: Exception) -> None:
-        """Rate-limit warnings for malformed NATS messages."""
-        suffix = self.should_warn("decode", DECODE_WARNING_INTERVAL)
-        if suffix is not None:
-            LOGGER.warning(
-                "ignored malformed %s on %s: %s%s",
-                kind,
-                subject,
-                error_label(error),
-                suffix,
-            )
 
     async def watch_channels(self) -> None:
         """Watch the channels KV bucket and apply record updates."""
@@ -717,8 +613,10 @@ class Coordinator:
                 if entry is None:
                     self.mark_watch_synced("watch-channels")
                     continue
+
                 if is_delete(entry.operation):
                     continue
+
                 data = _decode_record(entry.value)
                 if (
                     data is not None
@@ -736,21 +634,21 @@ class Coordinator:
             saw_conflict = False
             async for entry in watcher:
                 if entry is None:
-                    async with self.presence_lock:
-                        if not saw_conflict and not self.owns_presence:
-                            await self.try_reclaim_presence()
+                    if not saw_conflict:
+                        await self.try_reclaim(self.claim.reclaim)
+
                     self.mark_watch_synced("watch-presence")
                     continue
+
                 if is_delete(entry.operation):
                     self.callbacks.on_presence_delete(entry.key)
-                    if entry.key == self.bot_id.casefold():
-                        async with self.presence_lock:
-                            self.owns_presence = False
-                            self.presence_revision = None
-                            await self.try_reclaim_presence()
+                    if entry.key == self.claim.key:
+                        await self.try_reclaim(self.claim.expired)
+
                     continue
+
                 data = _decode_record(entry.value)
-                if data is not None and await self.observe_presence(
+                if data is not None and self.observe_presence(
                     entry.key,
                     data,
                     entry.revision,
@@ -759,7 +657,7 @@ class Coordinator:
         finally:
             await watcher.stop()
 
-    async def observe_presence(
+    def observe_presence(
         self,
         key: str,
         data: dict[str, Any],
@@ -770,57 +668,35 @@ class Coordinator:
             presence = BotPresence.from_dict(data)
         except TypeError, ValueError:
             return False
+
         if (
             not IDENTIFIER_RE.fullmatch(presence.bot_id)
             or presence.bot_id.casefold() != key
             or not self.presence_store.valid(data)
         ):
             return False
+
         self.callbacks.on_presence(presence)
-        async with self.presence_lock:
-            if presence.bot_id.casefold() != self.bot_id.casefold():
-                return False
-            if presence.instance_id != self.instance_id:
-                self.owns_presence = False
-                self.presence_revision = None
-                self.mark_duplicate()
-                return True
-            if not self.unique:
-                LOGGER.info("duplicate bot ID conflict resolved: %s", self.bot_id)
-            self.owns_presence = True
-            self.presence_revision = max(self.presence_revision or 0, revision)
-            self.unique = True
+        if key != self.claim.key:
             return False
 
-    def observe_session(
-        self,
-        key: str,
-        data: dict[str, Any],
-        replayed: set[str] | None,
-    ) -> None:
-        """Apply one session update and retain its unexpired KV-key mapping."""
+        return self.claim.observe(presence.instance_id, revision)
+
+    def valid_session(self, key: str, data: dict[str, Any]) -> bool:
+        """Return whether a watched record is signed, key-bound, and in horizon."""
         prefix = data.get("prefix")
         if not isinstance(prefix, str):
-            return
+            return False
+
         order = self.sessions.order(prefix, data)
-        if order is None or self.sessions.key(prefix) != key:
-            return
-        now = time.time()
-        if replayed is None:
-            self.prune_session_identities(now)
-        if order[0] > now + self.sessions.ttl + SESSION_EXPIRY_GRACE:
-            return
-        if replayed is not None:
-            replayed.add(key)
-        expiry = order[0]
-        if expiry > now:
-            self.session_identities[key] = (prefix, expiry)
-            self.callbacks.on_session_update(data)
-        elif mapped := self.session_identities.pop(key, None):
-            self.callbacks.on_session_delete(mapped[0])
+        return (
+            order is not None
+            and self.sessions.key(prefix) == key
+            and order[0] <= time.time() + self.sessions.ttl + SESSION_EXPIRY_GRACE
+        )
 
     async def watch_sessions(self) -> None:
-        """Watch the sessions KV bucket and update local auth state."""
+        """Watch the sessions KV bucket and report validated records by key."""
         replayed: set[str] | None = set()
         kv = await self.sessions.open()
         watcher = await kv.watchall()
@@ -828,30 +704,27 @@ class Coordinator:
             async for entry in watcher:
                 if entry is None:
                     if replayed is not None:
-                        self.prune_session_identities()
-                        for key in self.session_identities.keys() - replayed:
-                            self.callbacks.on_session_delete(
-                                self.session_identities.pop(key)[0],
-                            )
+                        self.callbacks.on_sessions_replayed(replayed)
                         replayed = None
+
                     self.mark_watch_synced("watch-sessions")
                     continue
+
                 if is_delete(entry.operation):
-                    mapped = self.session_identities.pop(entry.key, None)
-                    if mapped is not None:
-                        self.callbacks.on_session_delete(mapped[0])
+                    self.callbacks.on_session_delete(entry.key)
                     continue
+
                 data = _decode_record(entry.value)
-                if data is not None:
-                    self.observe_session(entry.key, data, replayed)
+                if data is None or not self.valid_session(entry.key, data):
+                    continue
+
+                if replayed is not None:
+                    replayed.add(entry.key)
+
+                self.callbacks.on_session_update(
+                    entry.key,
+                    data,
+                    replaying=replayed is not None,
+                )
         finally:
             await watcher.stop()
-
-    def prune_session_identities(self, now: float | None = None) -> None:
-        """Discard expired KV-key mappings that receive no TTL delete event."""
-        current = time.time() if now is None else now
-        self.session_identities = {
-            key: mapped
-            for key, mapped in self.session_identities.items()
-            if mapped[1] > current
-        }

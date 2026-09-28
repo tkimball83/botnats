@@ -11,8 +11,9 @@ Full Docker mesh: three NATS nodes, one IRC server, three bots.
 make integration
 ```
 
-Requires Docker. `tests/integration/run.sh` manages compose lifecycle, health
-checks, serial bot replacement, and teardown. Logs are dumped on failure.
+Requires Docker. `tests/integration/run.py` starts the compose mesh, runs each
+named phase in order (live coordinator, NATS failover and restart, mesh, recovery,
+serial bot replacement), dumps compose logs on failure, and always tears down.
 
 ## Dependencies
 

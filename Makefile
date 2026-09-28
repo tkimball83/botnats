@@ -26,7 +26,7 @@ unit: install
 	venv/bin/python -m unittest discover -s tests/unit -t . -v
 
 integration: install
-	sh tests/integration/run.sh
+	venv/bin/python -m tests.integration.run
 
 test: unit integration
 

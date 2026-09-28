@@ -24,10 +24,13 @@ class PresenceTests(unittest.TestCase):
         }
         with self.assertRaises(TypeError):
             BotPresence.from_dict("not a dict")
+
         with self.assertRaises(ValueError):
             BotPresence.from_dict({**base, "bot_id": ""})
+
         with self.assertRaises(ValueError):
             BotPresence.from_dict({**base, "nick": 42})
+
         with self.assertRaises(ValueError):
             BotPresence.from_dict({"bot_id": "b"})
 

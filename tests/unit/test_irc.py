@@ -148,12 +148,16 @@ class IRCProtocolTests(unittest.TestCase):
         IRCClientConfig(*args, verify_tls=True)
         with self.assertRaisesRegex(ValueError, "positive"):
             IRCClientConfig(0, "bot", srv, verify_tls=True)
+
         with self.assertRaisesRegex(ValueError, "positive"):
             IRCClientConfig(*args, verify_tls=True, idle_timeout=0)
+
         with self.assertRaisesRegex(ValueError, "positive"):
             IRCClientConfig(*args, verify_tls=True, pong_timeout=0)
+
         with self.assertRaisesRegex(ValueError, "empty"):
             IRCClientConfig(30, "bot", (), verify_tls=True)
+
         oversized = "n" * 300
         with self.assertRaisesRegex(ValueError, "512 bytes"):
             IRCClientConfig(
@@ -336,6 +340,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             ports.append(server.port)
             if len(ports) >= 4:
                 client.stopping = True
+
             msg = "connection refused"
             raise OSError(msg)
 
@@ -366,6 +371,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             client.registered_with_server = len(ports) == 2
             if len(ports) >= 3:
                 client.stopping = True
+
             msg = "connection lost"
             raise OSError(msg)
 
@@ -394,6 +400,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         outbound: asyncio.Queue[bytes] = asyncio.Queue()
         for index in range(6):
             outbound.put_nowait(b"PRIVMSG nick :%d\r\n" % index)
+
         sleeps: list[float] = []
         real_sleep = asyncio.sleep
 
@@ -407,6 +414,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(client.send_loop(writer, outbound))
             while send.await_count < 6:
                 await real_sleep(0)
+
             task.cancel()
 
         # The burst allowance goes out untouched; the rest wait ~1s each.
@@ -582,7 +590,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             ping = await reader.readline()
             if ping.startswith(b"PING :"):
                 ping_seen.set()
-            await asyncio.sleep(0.5)
+            # Never answer the PING; hold the connection until the client leaves.
+            await reader.read()
             writer.close()
             await writer.wait_closed()
 
@@ -593,6 +602,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         try:
             with self.assertRaisesRegex(ConnectionError, "did not answer"):
                 await client.run_connection(client.config.servers[0])
+
             assert ping_seen.is_set()
         finally:
             await client.close()
@@ -615,6 +625,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         ) -> None:
             for _ in range(3):
                 await reader.readline()
+
             writer.write(b":server 005 " + b"x" * 505 + b" :are supported\r\n")
             writer.write(boundary)
             await writer.drain()
@@ -653,6 +664,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         ) -> None:
             for _ in range(3):
                 await reader.readline()
+
             writer.write(b":x!u@h MODE #chan -o bo")
             await writer.drain()
             writer.close()
@@ -665,6 +677,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         try:
             with self.assertRaisesRegex(ConnectionError, "closed the connection"):
                 await client.run_connection(client.config.servers[0])
+
             assert dispatched == []
         finally:
             await client.close()
@@ -680,6 +693,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         ) -> None:
             for _ in range(3):
                 await reader.readline()
+
             writer.write(b"x" * 70_000 + b"\r\n")
             await writer.drain()
             writer.close()
@@ -705,7 +719,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         ) -> None:
             for _ in range(3):
                 await reader.readline()
-            await asyncio.sleep(1.0)
+            # Hold the connection open until the client gives up and leaves.
+            await reader.read()
             writer.close()
             await writer.wait_closed()
 
@@ -748,6 +763,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaisesRegex(ConnectionError, "write timed out"),
         ):
             await client.send_immediate(b"PING :token\r\n", writer)
+
         writer.close.assert_called_once_with()
 
     async def test_outbound_queue_bounded(self) -> None:
@@ -764,6 +780,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             client.sender_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await client.sender_task
+
             client.sender_task = None
             client.outbound = None
             client.writer = None

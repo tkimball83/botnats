@@ -12,11 +12,12 @@ stores shared durable state and atomic authentication controls.
 - Signed, versioned channel records and part tombstones reject stale and forged state.
 - Signed, versioned session records make authorization and revocation converge across restarts.
 - Signed NATS messages bind a nonce and timestamp to the exact subject.
-- Automatic op, invite, and unban recovery uses request, offer, and targeted grant flows; admin
-  commands execute directly on the receiving bot.
+- Automatic op, invite, and unban recovery broadcasts a request; every eligible peer acts
+  after a short random delay, rechecking IRC state first. Admin commands execute directly on
+  the receiving bot.
 - Each bot ID atomically claims a case-insensitive presence key; duplicates remain unready.
-- Authorization binds the visible nick, user, and host. NICK moves the session;
-  any other identity change requires new authentication.
+- Authorization binds the visible nick, user, and host. Any identity change,
+  NICK included, requires new authentication.
 
 ### State
 
@@ -91,7 +92,7 @@ Example `bot.json`:
 | `irc.verify_tls`                            | Applies only to `ircs://` connections                       |
 | `nats.jetstream_replicas`                   | Use `3` only when three JetStream storage peers are present |
 | `nats.monitor_port`                         | Connected-server monitoring port used by `STATUS`           |
-| `nats.servers`                              | Ordered Core NATS failover endpoints                        |
+| `nats.servers`                              | Ordered `nats://` or `tls://` failover endpoints            |
 
 Plain IRC exposes commands and responses, so use a trusted network when IRCS is
 unavailable. JetStream requires file storage; persist each peer's directory.
@@ -128,8 +129,9 @@ Enroll the TOTP seed with SHA-1, six digits, and a 30-second period. Then send:
 /msg mybot AUTH <totp-code>
 ```
 
-Authentication allows three attempts per identity in a mesh-wide sliding
-60-second window. Each TOTP counter can be claimed once.
+Authentication allows three attempts per host in a mesh-wide sliding 60-second
+window; users sharing a hostname share that budget. Each TOTP counter can be
+claimed once.
 
 Use private messages for every command. All commands except `AUTH` require an
 active session.

@@ -53,6 +53,7 @@ class BotConfig:
         """Read and validate a configuration file and environment secrets."""
         with Path(path).open() as stream:
             raw = json.load(stream)
+
         if not isinstance(raw, dict):
             msg = "configuration must be an object"
             raise TypeError(msg)
@@ -88,20 +89,34 @@ class BotConfig:
         servers = irc_servers(irc)
         nats_servers = nats_urls(nats_section)
         totp_secret, nats_token, coordination_secret = load_secrets()
-        channel_modes = mode_string(irc, "channel_modes", "")
+        channel_modes = mode_string(irc, "channel_modes", "irc", "")
         maintenance_interval = positive_float(
             coordination,
             "maintenance_interval_seconds",
+            "coordination",
             3,
         )
-        presence_ttl = positive_float(coordination, "presence_ttl_seconds", 15)
+        presence_ttl = positive_float(
+            coordination,
+            "presence_ttl_seconds",
+            "coordination",
+            15,
+        )
         if presence_ttl <= maintenance_interval:
-            msg = "presence_ttl_seconds must exceed maintenance_interval_seconds"
+            msg = (
+                "coordination.presence_ttl_seconds must exceed "
+                "coordination.maintenance_interval_seconds"
+            )
             raise ValueError(msg)
 
-        session_ttl = positive_float(authorization, "session_ttl_seconds", 3600)
+        session_ttl = positive_float(
+            authorization,
+            "session_ttl_seconds",
+            "authorization",
+            3600,
+        )
         if session_ttl > MAX_SESSION_TTL:
-            msg = f"session_ttl_seconds must not exceed {MAX_SESSION_TTL}"
+            msg = f"authorization.session_ttl_seconds must not exceed {MAX_SESSION_TTL}"
             raise ValueError(msg)
 
         return cls(
@@ -109,13 +124,18 @@ class BotConfig:
             bot_id=bot_id,
             channel_modes=channel_modes,
             coordination_secret=coordination_secret,
-            health_port=port(bot, "health_port", 8080),
-            irc_connect_timeout=positive_float(irc, "connect_timeout_seconds", 30),
+            health_port=port(bot, "health_port", "bot", 8080),
+            irc_connect_timeout=positive_float(
+                irc,
+                "connect_timeout_seconds",
+                "irc",
+                30,
+            ),
             irc_servers=servers,
-            irc_verify_tls=boolean(irc, "verify_tls", default=True),
+            irc_verify_tls=boolean(irc, "verify_tls", "irc", default=True),
             jetstream_replicas=replica_count(nats_section),
             maintenance_interval=maintenance_interval,
-            nats_monitor_port=port(nats_section, "monitor_port", 8222),
+            nats_monitor_port=port(nats_section, "monitor_port", "nats", 8222),
             nats_servers=nats_servers,
             nats_token=nats_token,
             network=network,
@@ -125,12 +145,13 @@ class BotConfig:
         )
 
 
-def boolean(section: dict[str, Any], key: str, *, default: bool) -> bool:
+def boolean(section: dict[str, Any], key: str, label: str, *, default: bool) -> bool:
     """Extract a boolean value from a config section."""
     value = section.get(key, default)
     if not isinstance(value, bool):
-        msg = f"{key} must be a boolean"
+        msg = f"{label}.{key} must be a boolean"
         raise TypeError(msg)
+
     return value
 
 
@@ -140,6 +161,7 @@ def identifier(section: dict[str, Any], key: str, label: str) -> str:
     if not IDENTIFIER_RE.fullmatch(value):
         msg = f"{label}.{key} contains unsupported characters"
         raise ValueError(msg)
+
     return value
 
 
@@ -151,6 +173,7 @@ def irc_servers(section: dict[str, Any]) -> tuple[IRCServer, ...]:
     if not servers:
         msg = "irc.servers must not be empty"
         raise ValueError(msg)
+
     return servers
 
 
@@ -162,37 +185,49 @@ def load_secrets() -> tuple[str, str, str]:
     if not totp_secret:
         msg = "BOTNATS_TOTP_SECRET is required"
         raise ValueError(msg)
+
     if not nats_token:
         msg = "BOTNATS_NATS_TOKEN is required"
         raise ValueError(msg)
+
     if len(coordination_secret.encode()) < MIN_COORDINATION_KEY_BYTES:
         msg = "BOTNATS_COORDINATION_SECRET must contain at least 32 bytes"
         raise ValueError(msg)
+
     return totp_secret, nats_token, coordination_secret
 
 
-def mode_string(section: dict[str, Any], key: str, default: str) -> str:
+def mode_string(
+    section: dict[str, Any],
+    key: str,
+    label: str,
+    default: str,
+) -> str:
     """Extract and validate a channel mode string from a config section."""
     value = section.get(key, default)
     if not isinstance(value, str):
-        msg = f"{key} must be a string"
+        msg = f"{label}.{key} must be a string"
         raise TypeError(msg)
+
     required, forbidden = mode_intent(value)
     if any(mode_requires_argument(mode, adding=True) for mode in required) or any(
         mode_requires_argument(mode, adding=False) for mode in forbidden
     ):
-        msg = f"{key} contains a mode that requires an argument"
+        msg = f"{label}.{key} contains a mode that requires an argument"
         raise ValueError(msg)
+
     if value:
         format_message("MODE", ("#x", value), None)
+
     return value
 
 
 def mode_intent(value: str) -> tuple[frozenset[str], frozenset[str]]:
     """Return modes required to be set and unset, rejecting contradictions."""
     if value and MODE_STRING_RE.fullmatch(value) is None:
-        msg = "channel_modes contains unsupported characters"
+        msg = "irc.channel_modes contains unsupported characters"
         raise ValueError(msg)
+
     required: set[str] = set()
     forbidden: set[str] = set()
     adding = True
@@ -203,9 +238,11 @@ def mode_intent(value: str) -> tuple[frozenset[str], frozenset[str]]:
             adding = False
         else:
             (required if adding else forbidden).add(character)
+
     if required & forbidden:
         msg = "channel_modes cannot require and forbid the same mode"
         raise ValueError(msg)
+
     return frozenset(required), frozenset(forbidden)
 
 
@@ -215,8 +252,10 @@ def nats_urls(section: dict[str, Any]) -> tuple[str, ...]:
     if not servers:
         msg = "nats.servers must not be empty"
         raise ValueError(msg)
+
     for server in servers:
         validate_server_url(server, NATS_SCHEMES, "NATS")
+
     return servers
 
 
@@ -226,30 +265,40 @@ def nick(section: dict[str, Any], key: str, label: str) -> str:
     if not NICKNAME_RE.fullmatch(value):
         msg = f"{label}.{key} is not a valid IRC nickname"
         raise ValueError(msg)
+
     return value
 
 
-def port(section: dict[str, Any], key: str, default: int) -> int:
+def port(section: dict[str, Any], key: str, label: str, default: int) -> int:
     """Extract a valid TCP port number."""
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
-        msg = f"{key} must be an integer between 1 and 65535"
+        msg = f"{label}.{key} must be an integer between 1 and 65535"
         raise ValueError(msg)
+
     return value
 
 
-def positive_float(section: dict[str, Any], key: str, default: float) -> float:
+def positive_float(
+    section: dict[str, Any],
+    key: str,
+    label: str,
+    default: float,
+) -> float:
     """Extract a positive numeric value from a config section."""
-    msg = f"{key} must be a positive number"
+    msg = f"{label}.{key} must be a positive number"
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(msg)
+
     try:
         number = float(value)
     except OverflowError as error:
         raise ValueError(msg) from error
+
     if not math.isfinite(number) or number <= 0:
         raise ValueError(msg)
+
     return number
 
 
@@ -257,8 +306,9 @@ def replica_count(section: dict[str, Any]) -> int:
     """Extract a valid JetStream replica count."""
     value = section.get("jetstream_replicas", 1)
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
-        msg = "jetstream_replicas must be an integer between 1 and 5"
+        msg = "nats.jetstream_replicas must be an integer between 1 and 5"
         raise ValueError(msg)
+
     return value
 
 
@@ -270,8 +320,9 @@ def table(raw: dict[str, Any], key: str, *allowed: str) -> dict[str, Any]:
     """
     value = raw.pop(key, {})
     if not isinstance(value, dict):
-        msg = f"[{key}] must be a configuration table"
+        msg = f"{key} must be a JSON object"
         raise TypeError(msg)
+
     unsupported(set(value).difference(allowed), key)
     return value
 
@@ -282,6 +333,7 @@ def text(section: dict[str, Any], key: str, label: str) -> str:
     if not isinstance(value, str) or not value:
         msg = f"{label}.{key} must be a non-empty string"
         raise ValueError(msg)
+
     return value
 
 
@@ -293,6 +345,7 @@ def text_list(section: dict[str, Any], key: str, label: str) -> tuple[str, ...]:
     ):
         msg = f"{label}.{key} must be a list of non-empty strings"
         raise ValueError(msg)
+
     return tuple(value)
 
 

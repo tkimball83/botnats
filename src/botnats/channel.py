@@ -5,9 +5,11 @@
 
 import asyncio
 import logging
+import secrets
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, ClassVar
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any
 
 from botnats import error_label
 from botnats.config import mode_intent
@@ -16,9 +18,12 @@ from botnats.irc.protocol import (
     DEFAULT_CASEMAPPING,
     Prefix,
     casefold,
+    format_message,
+    mask_matches,
     mode_requires_argument,
 )
-from botnats.nats.coordinator import PUBLISH_ERRORS
+from botnats.nats.store import PUBLISH_ERRORS
+from botnats.presence import BotPresence
 from botnats.validators import (
     MAX_CHANNEL_REVISION,
     parse_channel_record,
@@ -28,12 +33,18 @@ from botnats.validators import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from botnats.bot import Bot
-    from botnats.presence import BotPresence
 
 LOGGER = logging.getLogger(__name__)
 
+# Retry a JOIN that got no reply at all (no echo, no refusal) after this long:
+# a full outbound queue (64 lines at one per second) drains within a minute.
+JOIN_REPLY_TIMEOUT = 96.0
 OP_BATCH_COALESCE_DELAY = 0.05
+# Upper bound of the random wait before answering a peer's help request.
+PEER_HELP_DELAY = 1.0
 PEER_REQUEST_COOLDOWN = 0.5
 
 
@@ -42,16 +53,19 @@ class ChannelManager:
 
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
+        # Durable records, including part tombstones, under the IRC fold and
+        # under the ASCII fold that keys the store.
         self.channel_records: dict[str, ChannelRecord] = {}
         self.source_records: dict[str, ChannelRecord] = {}
+        # One live owner per desired channel: its state, joins, and requests.
         self.channels: dict[str, ChannelRuntime] = {}
-        self.cooldowns: dict[tuple[str, str], float] = {}
-        self.desired_channels: dict[str, str] = {}
         self.mode_intent = mode_intent(bot.config.channel_modes)
-        self.pending_op_flushes: set[str] = set()
-        self.pending_ops: dict[str, dict[str, BotPresence]] = {}
+        # Channels no longer desired whose PART could not be sent yet.
         self.pending_parts: dict[str, str] = {}
         self.pending_records: dict[str, ChannelRecord] = {}
+        # Highest revision this bot has minted: concurrent local changes to
+        # one channel (two admin commands, say) get distinct, ordered revisions.
+        self.last_revision = 0
 
     async def apply_record(self, record: ChannelRecord) -> None:
         """Apply a channel configuration record, joining or parting as needed."""
@@ -59,30 +73,30 @@ class ChannelManager:
         source = self.source_records.get(source_key)
         if source is not None and source.revision >= record.revision:
             return
+
         self.source_records[source_key] = record
-        folded = self.bot.fold(record.channel)
+        folded = self.bot.caps.fold(record.channel)
         current = self.channel_records.get(folded)
         if current is not None and current.revision >= record.revision:
             return
+
         self.channel_records[folded] = record
         if record.present:
-            self.desired_channels[folded] = record.channel
             self.pending_parts.pop(folded, None)
             existing = self.channels.get(folded)
             runtime = existing or ChannelRuntime(casemapping=self.bot.caps.casemapping)
             self.channels[folded] = runtime
+            runtime.channel = record.channel
             runtime.key = record.key
             if (
-                self.bot.registered
-                and self.bot.identity is not None
-                and not runtime.joined
+                self.bot.identity.registered
+                and self.bot.identity.current is not None
+                and runtime.join_due()
             ):
-                await self.safe_join(record.channel, record.key)
+                await self.safe_join(runtime)
+
             return
 
-        self.desired_channels.pop(folded, None)
-        self.cooldowns = {k: v for k, v in self.cooldowns.items() if k[1] != folded}
-        self.pending_ops.pop(folded, None)
         parted = self.channels.pop(folded, None)
         if parted is not None:
             try:
@@ -94,6 +108,7 @@ class ChannelManager:
         """Set the configured channel modes when the bot has operator status."""
         if not self.bot.config.channel_modes:
             return
+
         required, forbidden = self.mode_intent
         caps = self.bot.caps
         if any(
@@ -111,6 +126,7 @@ class ChannelManager:
                 channel,
             )
             return
+
         try:
             await self.bot.irc.send(
                 "MODE",
@@ -129,64 +145,70 @@ class ChannelManager:
         cancelled = False
         try:
             await asyncio.sleep(OP_BATCH_COALESCE_DELAY)
-            channel = self.desired_channels.get(folded_channel)
             runtime = self.channels.get(folded_channel)
             # Drop the batch if we lost op during the coalescing window rather
             # than re-queue: retrying here would busy-spin while unopped, and
             # the requesting peer re-asks on its own maintenance tick.
-            queued = self.pending_ops.pop(folded_channel, {})
-            if (
-                channel is not None
-                and runtime is not None
-                and self.bot.is_self_opped(runtime)
-            ):
-                targets = [
-                    p.nick
-                    for p in queued.values()
-                    if (m := runtime.members.get(self.bot.fold(p.nick))) is not None
-                    and not self.bot.caps.is_opped(m.modes)
-                    and m.prefix is not None
-                    and p.matches(m.prefix, self.bot.caps.casemapping)
-                ]
-                await self.bot.batch_mode(
-                    channel,
-                    "+",
-                    self.bot.caps.op_mode,
-                    targets,
-                    "opped",
-                )
+            if runtime is not None:
+                queued, runtime.pending_ops = runtime.pending_ops, {}
+                if self.is_self_opped(runtime):
+                    targets = [
+                        p.nick
+                        for p in queued.values()
+                        if (m := runtime.members.get(self.bot.caps.fold(p.nick)))
+                        is not None
+                        and not self.bot.caps.is_opped(m.modes)
+                        and m.prefix is not None
+                        and p.matches(m.prefix, self.bot.caps.casemapping)
+                    ]
+                    await self.batch_mode(
+                        runtime.channel,
+                        "+",
+                        self.bot.caps.op_mode,
+                        targets,
+                        "opped",
+                    )
         except asyncio.CancelledError:
             cancelled = True
             raise
         finally:
-            self.pending_op_flushes.discard(folded_channel)
-            if not cancelled and self.pending_ops.get(folded_channel):
-                self.pending_op_flushes.add(folded_channel)
-                self.bot.spawn(self.flush_pending_ops(folded_channel), "op-batch")
+            runtime = self.channels.get(folded_channel)
+            if runtime is not None:
+                runtime.op_flush_scheduled = False
+                if not cancelled and runtime.pending_ops:
+                    runtime.op_flush_scheduled = True
+                    self.bot.tasks.spawn(
+                        self.flush_pending_ops(folded_channel), "op-batch"
+                    )
 
     async def join_desired(self) -> None:
         """Attempt to join all desired channels not yet entered."""
-        if self.bot.identity is None:
+        if self.bot.identity.current is None:
             return
-        for folded, channel in tuple(self.desired_channels.items()):
-            runtime = self.channels.get(folded)
-            if runtime is not None and not runtime.joined:
-                await self.safe_join(channel, runtime.key)
+
+        for runtime in tuple(self.channels.values()):
+            if runtime.join_due():
+                await self.safe_join(runtime)
 
     def queue_pending_op(self, folded: str, presence: BotPresence) -> None:
-        """Add a peer bot to the pending operator grant batch."""
-        self.pending_ops.setdefault(folded, {})[presence.bot_id.casefold()] = presence
-        if folded not in self.pending_op_flushes:
-            self.pending_op_flushes.add(folded)
-            self.bot.spawn(self.flush_pending_ops(folded), "op-batch")
+        """Add a peer bot to the channel's pending operator grant batch."""
+        runtime = self.channels.get(folded)
+        if runtime is None:
+            return
+
+        runtime.pending_ops[presence.bot_id.casefold()] = presence
+        if not runtime.op_flush_scheduled:
+            runtime.op_flush_scheduled = True
+            self.bot.tasks.spawn(self.flush_pending_ops(folded), "op-batch")
 
     async def record_key(self, channel: str, key: str | None) -> None:
         """Record and broadcast a versioned channel key update."""
-        folded = self.bot.fold(channel)
+        folded = self.bot.caps.fold(channel)
         current = self.channel_records.get(folded)
         if current is None or not current.present or current.key == key:
             return
-        record = ChannelRecord.new(
+
+        record = self.new_record(
             channel,
             key,
             present=True,
@@ -205,22 +227,264 @@ class ChannelManager:
         else:
             await self.apply_record(ChannelRecord.from_dict(stored))
 
+    def new_record(
+        self,
+        channel: str,
+        key: str | None,
+        *,
+        present: bool,
+        after: str | None = None,
+    ) -> ChannelRecord:
+        """Mint a record ordered after both after and this bot's earlier records."""
+        record = ChannelRecord.new(
+            channel,
+            key,
+            present=present,
+            after=after,
+            floor=self.last_revision,
+        )
+        self.last_revision = revision_number(record.revision)
+        return record
+
+    def any_peer_opped(self, runtime: ChannelRuntime) -> bool:
+        """Return whether any known peer bot holds operator status."""
+        self_folded = self.bot.caps.fold(self.bot.irc.current_nick)
+        peers = self.bot.presence.active()
+        for folded, member in runtime.members.items():
+            if folded == self_folded or not self.bot.caps.is_opped(member.modes):
+                continue
+
+            if member.prefix is None:
+                # Optimism before WHO answers: peers recheck before acting, so
+                # a needless request is harmless, while pessimism would delay
+                # coordination.
+                return True
+
+            if any(
+                peer.matches(member.prefix, self.bot.caps.casemapping) for peer in peers
+            ):
+                return True
+
+        return False
+
+    async def batch_mode(
+        self,
+        channel: str,
+        prefix: str,
+        char: str,
+        targets: list[str],
+        label: str,
+    ) -> None:
+        """Apply mode changes in batches respecting server and IRC limits."""
+        index = 0
+        while index < len(targets):
+            end = min(index + self.bot.caps.mode_limit, len(targets))
+            while end > index:
+                batch = targets[index:end]
+                try:
+                    format_message(
+                        "MODE",
+                        (channel, prefix + (char * len(batch)), *batch),
+                        None,
+                    )
+                except ValueError:
+                    end -= 1
+                else:
+                    break
+
+            if end == index:
+                LOGGER.warning(
+                    "cannot apply %s to %s on %s: IRC MODE exceeds 512 bytes",
+                    label,
+                    targets[index],
+                    channel,
+                )
+                index += 1
+                continue
+
+            try:
+                await self.bot.irc.send(
+                    "MODE",
+                    channel,
+                    prefix + (char * len(batch)),
+                    *batch,
+                )
+            except ConnectionError:
+                return
+
+            LOGGER.info("%s %s on %s", label, ",".join(batch), channel)
+            index = end
+
+    def is_self_opped(self, runtime: ChannelRuntime) -> bool:
+        """Check whether this bot holds operator status in the channel."""
+        member = runtime.members.get(self.bot.caps.fold(self.bot.irc.current_nick))
+        return member is not None and self.bot.caps.is_opped(member.modes)
+
+    def runtime(self, channel: str) -> ChannelRuntime | None:
+        """Return the live owner of a desired channel, by IRC case folding."""
+        return self.channels.get(self.bot.caps.fold(channel))
+
+    def forget_member(self, nick: str) -> None:
+        """Remove a user who quit IRC from every channel."""
+        for runtime in self.channels.values():
+            runtime.remove(nick)
+
+    def rename_member(self, prefix: Prefix, new_nick: str) -> Prefix:
+        """Rekey a user's membership after NICK; return their full old prefix.
+
+        A nick-only NICK prefix is completed from member state before the
+        members are renamed, since that would otherwise lose the only copy.
+        """
+        old_folded = self.bot.caps.fold(prefix.nick)
+        new_folded = self.bot.caps.fold(new_nick)
+        old_prefix = prefix
+        for runtime in self.channels.values():
+            member = runtime.members.pop(old_folded, None)
+            if member is None:
+                continue
+
+            member.nick = new_nick
+            member_prefix = member.prefix
+            if member_prefix is not None:
+                if not old_prefix.complete and member_prefix.complete:
+                    old_prefix = member_prefix
+
+                member.prefix = Prefix(new_nick, member_prefix.user, member_prefix.host)
+
+            runtime.members[new_folded] = member
+
+        return old_prefix
+
+    def change_member_host(self, prefix: Prefix, new_prefix: Prefix) -> Prefix:
+        """Apply a CHGHOST to a user's membership; return their full old prefix.
+
+        A nick-only CHGHOST prefix is completed from member state before it is
+        overwritten, since that would otherwise lose the only copy.
+        """
+        folded = self.bot.caps.fold(prefix.nick)
+        old_prefix = prefix
+        for runtime in self.channels.values():
+            member = runtime.members.get(folded)
+            if member is None:
+                continue
+
+            if (
+                not old_prefix.complete
+                and member.prefix is not None
+                and member.prefix.complete
+            ):
+                old_prefix = member.prefix
+
+            member.prefix = new_prefix
+
+        return old_prefix
+
+    def help_eligible(
+        self,
+        payload: dict[str, Any],
+        *,
+        require_member: bool = True,
+    ) -> tuple[str, BotPresence, ChannelRuntime] | None:
+        """Return a validated peer action this bot can fulfill."""
+        try:
+            channel = payload["channel"]
+            presence = BotPresence.from_dict(payload["presence"])
+            if not isinstance(channel, str):
+                return None
+        except KeyError, TypeError, ValueError:
+            return None
+
+        runtime = self.runtime(channel)
+        if (
+            runtime is None
+            or not self.bot.presence.has(presence)
+            or not self.bot.irc.connected
+            or not self.is_self_opped(runtime)
+        ):
+            return None
+
+        if require_member:
+            member = runtime.members.get(self.bot.caps.fold(presence.nick))
+            if (
+                member is None
+                or self.bot.caps.is_opped(member.modes)
+                or member.prefix is None
+                or not presence.matches(member.prefix, self.bot.caps.casemapping)
+            ):
+                return None
+
+        return channel, presence, runtime
+
+    async def invite_peer(self, payload: dict[str, Any]) -> None:
+        """Invite a peer bot into a channel this bot holds operator status in."""
+        parsed = self.help_eligible(payload, require_member=False)
+        if parsed is None:
+            return
+
+        channel, presence, _ = parsed
+        try:
+            await self.bot.irc.send("INVITE", presence.nick, channel)
+        except ConnectionError:
+            return
+
+        LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
+
+    async def op_peer(self, payload: dict[str, Any]) -> None:
+        """Queue an operator mode grant for a peer bot."""
+        parsed = self.help_eligible(payload)
+        if parsed is None:
+            return
+
+        channel, presence, _ = parsed
+        self.queue_pending_op(self.bot.caps.fold(channel), presence)
+
+    async def unban_peer(self, payload: dict[str, Any]) -> None:
+        """Remove channel bans matching a peer bot's hostmask."""
+        parsed = self.help_eligible(payload, require_member=False)
+        if parsed is None:
+            return
+
+        channel, presence, runtime = parsed
+        prefix = presence.to_prefix()
+        masks = sorted(
+            mask
+            for mask in runtime.bans.values()
+            if mask_matches(mask, prefix, self.bot.caps.casemapping)
+        )
+        await self.batch_mode(channel, "-", "b", masks, "removed bot ban(s)")
+
+    async def help_after_delay(
+        self,
+        action: Callable[[dict[str, Any]], Awaitable[None]],
+        payload: dict[str, Any],
+    ) -> None:
+        """Wait a random moment so answering peers spread out, then act.
+
+        The action rechecks eligibility against live IRC state, so a peer that
+        another peer already helped sends nothing, or a harmless duplicate.
+        """
+        await asyncio.sleep(secrets.randbelow(1000) / 1000 * PEER_HELP_DELAY)
+        await action(payload)
+
     async def request_peer(self, kind: str, channel: str) -> None:
         """Send a coordination request to peers, respecting cooldown limits."""
-        if self.bot.identity is None:
+        identity = self.bot.identity.current
+        if identity is None:
             return
-        folded = self.bot.fold(channel)
+
+        folded = self.bot.caps.fold(channel)
         runtime = self.channels.get(folded)
-        if runtime is None or (runtime.joined and not self.bot.any_peer_opped(runtime)):
+        if runtime is None or (runtime.joined and not self.any_peer_opped(runtime)):
             return
+
         loop_time = asyncio.get_running_loop().time()
-        key = (kind, folded)
-        if loop_time - self.cooldowns.get(key, 0) < PEER_REQUEST_COOLDOWN:
+        if loop_time - runtime.cooldowns.get(kind, 0) < PEER_REQUEST_COOLDOWN:
             return
-        self.cooldowns[key] = loop_time
-        await self.bot.coordinator.request_offer(
+
+        runtime.cooldowns[kind] = loop_time
+        await self.bot.coordinator.request_help(
             kind,
-            {"channel": channel, "presence": asdict(self.bot.identity)},
+            {"channel": channel, "presence": asdict(identity)},
         )
 
     async def retry_pending_records(self) -> None:
@@ -229,6 +493,7 @@ class ChannelManager:
             if self.source_records.get(source_key) != record:
                 self.pending_records.pop(source_key, None)
                 continue
+
             try:
                 stored = await self.bot.coordinator.put_channel(
                     record.channel,
@@ -236,6 +501,7 @@ class ChannelManager:
                 )
             except PUBLISH_ERRORS:
                 return
+
             await self.apply_record(ChannelRecord.from_dict(stored))
             if self.pending_records.get(source_key) == record:
                 self.pending_records.pop(source_key, None)
@@ -244,123 +510,87 @@ class ChannelManager:
         """Clear all runtime state and cooldowns after a reconnection."""
         for runtime in self.channels.values():
             runtime.reset()
-        self.cooldowns.clear()
-        self.pending_op_flushes.clear()
-        self.pending_ops.clear()
+
         self.pending_parts.clear()
 
     async def retry_pending_parts(self) -> None:
         """Reattempt PART for channels that failed to leave previously."""
         for folded, channel in tuple(self.pending_parts.items()):
-            if folded in self.desired_channels:
+            if folded in self.channels:
                 self.pending_parts.pop(folded, None)
                 continue
+
             try:
                 await self.bot.irc.send("PART", channel)
             except ConnectionError:
                 continue
+
             self.pending_parts.pop(folded, None)
 
-    async def safe_join(self, channel: str, key: str | None) -> None:
-        """Join a channel, silently handling connection and validation errors."""
+    async def safe_join(self, runtime: ChannelRuntime) -> None:
+        """Send JOIN, silently handling connection and validation errors."""
         try:
-            params = (channel, key) if key else (channel,)
+            params = (
+                (runtime.channel, runtime.key) if runtime.key else (runtime.channel,)
+            )
             await self.bot.irc.send("JOIN", *params)
         except ConnectionError:
             return
         except ValueError as error:
             LOGGER.warning(
                 "cannot join %s: %s",
-                channel,
+                runtime.channel,
                 error_label(error),
             )
-
-    def _migrate_runtimes(
-        self,
-        casemapping: str,
-        old_channels: dict[str, ChannelRuntime],
-        old_desired: dict[str, str],
-        old_records: dict[str, ChannelRecord],
-    ) -> dict[str, ChannelRuntime]:
-        """Rekey channel runtimes under the new casemapping."""
-        channels: dict[str, ChannelRuntime] = {}
-        for old_folded, runtime in old_channels.items():
-            channel = old_desired.get(old_folded)
-            if channel is None:
-                fallback = old_records.get(old_folded)
-                channel = fallback.channel if fallback is not None else None
-            if channel is None:
-                continue
-            folded = self.bot.fold(channel)
-            if folded in channels:
-                LOGGER.warning(
-                    "casemapping %s folds %s onto an existing channel; "
-                    "dropping duplicate tracking",
-                    casemapping,
-                    channel,
-                )
-                continue
-            runtime.set_casemapping(casemapping)
-            channels[folded] = runtime
-        return channels
+            return
+        # Only a JOIN that actually reached the send queue is in flight.
+        runtime.start_join()
 
     def set_casemapping(self, casemapping: str) -> None:
-        """Rekey all channel lookups when the server's casemapping changes."""
-        if casemapping not in CASEMAPPINGS:
-            return
-        if casemapping == self.bot.caps.casemapping:
+        """Rebuild channel lookups under a new casemapping.
+
+        Servers advertise CASEMAPPING while registering, before this bot joins
+        anything, and a disconnect resets channel state anyway; so live state
+        is rebuilt from the durable records rather than rekeyed.
+        """
+        if casemapping not in CASEMAPPINGS or casemapping == self.bot.caps.casemapping:
             return
 
-        old_channels = self.channels
-        old_desired = self.desired_channels
-        old_records = self.channel_records
         self.bot.caps.casemapping = casemapping
         self.bot.authorizer.rekey()
         self.bot.irc.set_casemapping(casemapping)
 
         records: dict[str, ChannelRecord] = {}
         for record in self.source_records.values():
-            folded = self.bot.fold(record.channel)
+            folded = self.bot.caps.fold(record.channel)
             current = records.get(folded)
             if current is None or record.revision > current.revision:
                 records[folded] = record
+
+        joined = [
+            runtime.channel for runtime in self.channels.values() if runtime.joined
+        ]
         self.channel_records = records
-        self.desired_channels = {
-            folded: record.channel
+        self.channels = {
+            folded: ChannelRuntime(
+                casemapping=casemapping,
+                channel=record.channel,
+                key=record.key,
+            )
             for folded, record in records.items()
             if record.present
         }
-
-        channels = self._migrate_runtimes(
-            casemapping, old_channels, old_desired, old_records
-        )
-        parted = {
-            folded: records[folded].channel
-            for folded, runtime in channels.items()
-            if folded not in self.desired_channels
-            and runtime.joined
-            and folded in records
-        }
-        channels = {
-            folded: runtime
-            for folded, runtime in channels.items()
-            if folded in self.desired_channels
-        }
-        for folded in self.desired_channels:
-            record = records[folded]
-            runtime = channels.setdefault(
-                folded,
-                ChannelRuntime(casemapping=casemapping),
-            )
-            runtime.key = record.key
-        self.channels = channels
+        # Leave any joined channel that no longer folds onto a desired one.
         self.pending_parts = {
-            self.bot.fold(channel): channel for channel in self.pending_parts.values()
+            self.bot.caps.fold(channel): channel
+            for channel in (*self.pending_parts.values(), *joined)
+            if self.bot.caps.fold(channel) not in self.channels
         }
-        self.pending_parts.update(parted)
-        self.cooldowns.clear()
-        self.pending_op_flushes.clear()
-        self.pending_ops.clear()
+
+
+def revision_number(revision: str) -> int:
+    """Return the counter part of a validated channel revision."""
+    return int(validate_channel_revision(revision).partition("-")[0])
 
 
 @dataclass(slots=True)
@@ -375,10 +605,6 @@ class ChannelMember:
 @dataclass(frozen=True, slots=True)
 class ChannelRecord:
     """A channel update, including part tombstones for offline peers."""
-
-    # Process-wide by design: one bot per process, and every locally minted
-    # record must share one monotonic revision order.
-    last_revision: ClassVar[int] = 0
 
     channel: str
     key: str | None
@@ -398,34 +624,76 @@ class ChannelRecord:
         *,
         present: bool,
         after: str | None = None,
+        floor: int = 0,
     ) -> ChannelRecord:
-        """Create a channel record with a monotonic revision."""
-        previous = 0
+        """Create a record whose revision follows both after and floor."""
+        previous = floor
         if after is not None:
-            previous = int(validate_channel_revision(after).partition("-")[0])
-        cls.last_revision = max(cls.last_revision + 1, previous + 1)
-        if cls.last_revision > MAX_CHANNEL_REVISION:
+            previous = max(previous, revision_number(after))
+
+        number = previous + 1
+        if number > MAX_CHANNEL_REVISION:
             msg = "channel revision counter is exhausted"
             raise ValueError(msg)
+
         channel, key = validate_join(channel, key)
         return cls(
             channel=channel,
             key=key,
             present=present,
-            revision=f"{cls.last_revision:020d}-{uuid.uuid4().hex}",
+            revision=f"{number:020d}-{uuid.uuid4().hex}",
         )
+
+
+class JoinState(Enum):
+    """Where this bot stands in joining a desired channel."""
+
+    IDLE = auto()
+    JOINING = auto()
+    JOINED = auto()
 
 
 @dataclass(slots=True)
 class ChannelRuntime:
-    """Maintain live channel state including members, bans, and keys."""
+    """Own one desired channel: live state, joining, and peer requests."""
 
     bans: dict[str, str] = field(default_factory=dict)
     casemapping: str = DEFAULT_CASEMAPPING
-    joined: bool = False
+    channel: str = ""
+    cooldowns: dict[str, float] = field(default_factory=dict)
+    join: JoinState = JoinState.IDLE
+    join_sent_at: float = 0.0
     key: str | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
     modes: str = ""
+    op_flush_scheduled: bool = False
+    pending_ops: dict[str, BotPresence] = field(default_factory=dict)
+
+    @property
+    def joined(self) -> bool:
+        """Return whether the server has confirmed this bot's JOIN."""
+        return self.join is JoinState.JOINED
+
+    def join_due(self) -> bool:
+        """Return whether to send JOIN: idle, or a JOIN that got no reply."""
+        if self.join is JoinState.IDLE:
+            return True
+
+        return (
+            self.join is JoinState.JOINING
+            and asyncio.get_running_loop().time() - self.join_sent_at
+            >= JOIN_REPLY_TIMEOUT
+        )
+
+    def start_join(self) -> None:
+        """Record a JOIN queued for the server."""
+        self.join = JoinState.JOINING
+        self.join_sent_at = asyncio.get_running_loop().time()
+
+    def refuse_join(self) -> None:
+        """Record a refused JOIN so the next tick may try again."""
+        if self.join is JoinState.JOINING:
+            self.join = JoinState.IDLE
 
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""
@@ -438,6 +706,7 @@ class ChannelRuntime:
         if member is None:
             member = ChannelMember(nickname)
             self.members[folded] = member
+
         member.nick = nickname
         return member
 
@@ -449,27 +718,19 @@ class ChannelRuntime:
         """Delete a ban mask from the channel ban list."""
         self.bans.pop(casefold(mask, self.casemapping), None)
 
+    def clear_requests(self) -> None:
+        """Drop peer request cooldowns and queued operator grants."""
+        self.cooldowns.clear()
+        self.op_flush_scheduled = False
+        self.pending_ops.clear()
+
     def reset(self) -> None:
         """Clear connection-specific channel state."""
         self.bans.clear()
-        self.joined = False
+        self.clear_requests()
+        self.join = JoinState.IDLE
         self.members.clear()
         self.modes = ""
-
-    def set_casemapping(self, casemapping: str) -> None:
-        """Apply a new casemapping and re-key members and bans."""
-        self.casemapping = casemapping
-        members: dict[str, ChannelMember] = {}
-        for member in self.members.values():
-            if not member.nick:
-                continue
-            folded = casefold(member.nick, casemapping)
-            members.setdefault(folded, member)
-        self.members = members
-        rekeyed: dict[str, str] = {}
-        for mask in self.bans.values():
-            rekeyed.setdefault(casefold(mask, casemapping), mask)
-        self.bans = rekeyed
 
     def set_key(self, key: str | None) -> bool:
         """Set the channel key, validating a non-None key.
@@ -483,5 +744,6 @@ class ChannelRuntime:
                 validate_key(key)
             except ValueError:
                 return False
+
         self.key = key
         return True

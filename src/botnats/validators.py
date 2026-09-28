@@ -11,6 +11,7 @@ from botnats.irc.protocol import format_message
 
 if TYPE_CHECKING:
     from collections.abc import Collection
+
 MAX_CHANNEL_REVISION = (1 << 63) - 1
 CHANNEL_REVISION_RE = re.compile(r"\d{20}-[0-9a-f]{32}")
 
@@ -24,9 +25,11 @@ def validate_channel(value: str) -> str:
     if len(value) < 2 or not value.startswith(("#", "&", "+", "!")):
         msg = "channel must start with #, &, +, or !"
         raise ValueError(msg)
+
     if "," in value or "\x07" in value or _has_control_chars(value):
         msg = "channel contains unsupported characters"
         raise ValueError(msg)
+
     return value
 
 
@@ -35,9 +38,11 @@ def validate_key(value: str) -> str:
     if not value:
         msg = "channel key must not be empty"
         raise ValueError(msg)
+
     if value.startswith(":") or "," in value or _has_control_chars(value):
         msg = "channel key contains unsupported characters"
         raise ValueError(msg)
+
     return value
 
 
@@ -58,6 +63,7 @@ def validate_channel_revision(value: object) -> str:
     ):
         msg = "channel record has an invalid revision"
         raise ValueError(msg)
+
     return value
 
 
@@ -66,18 +72,22 @@ def parse_channel_record(value: object) -> tuple[str, str | None, bool, str]:
     if not isinstance(value, dict):
         msg = "channel record must be an object"
         raise TypeError(msg)
+
     channel = value.get("channel")
     key = value.get("key")
     present = value.get("present")
     if not isinstance(channel, str):
         msg = "channel record has an invalid channel"
         raise TypeError(msg)
+
     if "key" not in value or (key is not None and not isinstance(key, str)):
         msg = "channel record has an invalid key"
         raise ValueError(msg)
+
     if not isinstance(present, bool):
         msg = "channel record has an invalid presence flag"
         raise TypeError(msg)
+
     channel, key = validate_join(channel, key)
     return channel, key, present, validate_channel_revision(value.get("revision"))
 
@@ -97,6 +107,7 @@ def validate_server_url(
     except ValueError as error:
         msg = f"invalid {label} server URL"
         raise ValueError(msg) from error
+
     if (
         parsed.scheme not in schemes
         or not hostname
@@ -114,6 +125,7 @@ def validate_server_url(
     ):
         msg = f"invalid {label} server URL"
         raise ValueError(msg)
+
     return parsed.scheme, hostname, port
 
 
@@ -122,7 +134,9 @@ def validate_target(value: str) -> str:
     if not value:
         msg = "target must not be empty"
         raise ValueError(msg)
+
     if value.startswith(":") or _has_control_chars(value):
         msg = "target contains unsupported characters"
         raise ValueError(msg)
+
     return value

@@ -7,15 +7,10 @@ import unittest
 from dataclasses import asdict
 
 from botnats.channel import ChannelRecord, ChannelRuntime
-from botnats.irc.protocol import Prefix
 
 
 class StateTests(unittest.TestCase):
     """Tests for channel record ordering and runtime state management."""
-
-    def setUp(self) -> None:
-        """Reset process-global revision counter between tests."""
-        ChannelRecord.last_revision = 0
 
     def test_channel_record_injection(self) -> None:
         """Verify channel record rejects injection in channel names."""
@@ -66,17 +61,6 @@ class StateTests(unittest.TestCase):
 
         assert runtime.member("user") is member
         assert member.nick == "user"
-
-    def test_set_casemapping_member_collision(self) -> None:
-        """Verify casemapping change merges colliding member entries."""
-        runtime = ChannelRuntime(casemapping="ascii")
-
-        runtime.member("user[").prefix = Prefix("user[", "u", "host")
-        runtime.member("user{").prefix = Prefix("user{", "u", "host")
-        assert len(runtime.members) == 2
-
-        runtime.set_casemapping("rfc1459")
-        assert len(runtime.members) == 1
 
     def test_set_key_validation(self) -> None:
         """Verify runtime set_key rejects invalid keys."""

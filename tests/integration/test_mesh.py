@@ -9,7 +9,7 @@ import os
 import time
 from typing import TYPE_CHECKING
 
-from botnats.admin import totp
+from botnats.auth import totp
 from botnats.irc.protocol import IRCMessage, format_message, parse_message
 
 if TYPE_CHECKING:
@@ -57,15 +57,18 @@ class IRCSession:
                     if not raw:
                         msg = "IRC server closed the integration-test connection"
                         raise AssertionError(msg)
+
                     line = raw.decode(errors="replace").rstrip("\r\n")
                     self.transcript.append(line)
                     message = parse_message(line)
                     if message.command == "PING" and message.params:
                         await self.send("PONG", trailing=message.params[-1])
+
                     if predicate(message):
                         return message
         except TimeoutError:
             pass
+
         recent = "\n".join(self.transcript[-20:])
         msg = f"timed out waiting for IRC response; recent traffic:\n{recent}"
         raise AssertionError(msg)
@@ -97,6 +100,7 @@ async def connect(address: str) -> IRCSession:
     if not separator:
         msg = f"invalid IRC address: {address!r}"
         raise ValueError(msg)
+
     reader, writer = await asyncio.open_connection(host, int(raw_port))
     session = IRCSession(reader, writer)
     await session.send("NICK", "owner")
@@ -141,6 +145,7 @@ async def names_entries(session: IRCSession, channel: str) -> list[str]:
         )
         if response.command == "366":
             return result
+
         result.extend(response.params[-1].split())
 
 
@@ -150,6 +155,7 @@ def names_reply(channel: str) -> Callable[[IRCMessage], bool]:
     def matches(message: IRCMessage) -> bool:
         if message.command == "353" and len(message.params) >= 2:
             return message.params[-2].casefold() == channel.casefold()
+
         return (
             message.command == "366"
             and len(message.params) >= 2
@@ -276,6 +282,7 @@ async def wait_for_bots(session: IRCSession) -> None:
             online = set(response.params[-1].casefold().split())
             if online == BOTS:
                 return
+
             await asyncio.sleep(0.25)
 
 
@@ -298,6 +305,7 @@ async def wait_for_names(
             current = await names(session, channel)
             if current >= present and current.isdisjoint(absent):
                 return
+
             await asyncio.sleep(0.25)
 
 
@@ -312,6 +320,7 @@ async def wait_for_modes(
         while True:
             if present in await modes(session, channel):
                 return
+
             await asyncio.sleep(0.25)
 
 
@@ -326,6 +335,7 @@ async def wait_for_operators(
         while True:
             if await operators(session, channel) >= present:
                 return
+
             await asyncio.sleep(0.25)
 
 
@@ -346,6 +356,7 @@ async def wait_for_status(session: IRCSession, bot: str) -> None:
             if "peers=2" not in local_text or "channels=2" not in local_text:
                 await asyncio.sleep(2.0)
                 continue
+
             nats_fields = dict(
                 field.split("=", 1) for field in nats_status.params[-1].split()[1:]
             )
@@ -356,6 +367,7 @@ async def wait_for_status(session: IRCSession, bot: str) -> None:
                 and nats_fields.get("replicas") == "3/3"
             ):
                 return
+
             await asyncio.sleep(2.0)
 
 
@@ -370,8 +382,5 @@ async def wait_for_reply(
         while True:
             if await command(session, bot, command_text) == expected:
                 return
+
             await asyncio.sleep(2.0)
-
-
-if __name__ == "__main__":
-    asyncio.run(run())
