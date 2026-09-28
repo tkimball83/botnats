@@ -26,6 +26,7 @@ def main() -> None:
     levels = logging.getLevelNamesMapping()
     if level not in levels:
         parser.error(f"BOTNATS_LOG_LEVEL is not a valid log level: {level}")
+
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=levels[level],
@@ -46,6 +47,7 @@ async def run(config: BotConfig) -> None:
                 signal.SIGTERM,
                 task.cancel,
             )
+
     await bot.run()
 
 

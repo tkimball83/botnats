@@ -80,9 +80,11 @@ class IRCClientConfig:
         ):
             msg = "IRC timeouts must be positive"
             raise ValueError(msg)
+
         if not self.servers:
             msg = "IRC servers must not be empty"
             raise ValueError(msg)
+
         format_message("NICK", (self.nickname,), None)
         format_message(
             "USER",
@@ -121,6 +123,7 @@ class IRCClient:
         if self.tls_context is not None and not config.verify_tls:
             self.tls_context.check_hostname = False
             self.tls_context.verify_mode = ssl.CERT_NONE
+
         self.writer: asyncio.StreamWriter | None = None
         self.write_lock = asyncio.Lock()
 
@@ -155,6 +158,7 @@ class IRCClient:
             # them past 512, and a re-encoded token would not byte-match.
             await self.send_immediate(pong_reply(raw), writer)
             return ping_token
+
         if (
             message.command == "PONG"
             and ping_token is not None
@@ -162,20 +166,24 @@ class IRCClient:
             and message.params[-1] == ping_token
         ):
             return None
+
         if (
             message.command in {"432", "433", "436", "437"}
             and not self.registered_with_server
         ):
             await self.nick_collision()
             return ping_token
+
         if message.command == "CAP":
             await self.handle_cap(message)
             return ping_token
+
         self.track_registration(message)
         try:
             await self.on_message(message)
         except Exception:
             LOGGER.exception("IRC message handler failed for %s", message.command)
+
         return ping_token
 
     async def establish(
@@ -221,14 +229,17 @@ class IRCClient:
         """Process CAP subcommands during capability negotiation."""
         if len(message.params) < 3:
             return
+
         subcommand = message.params[1].upper()
         caps = {cap.partition("=")[0] for cap in message.params[-1].split()}
         if subcommand == "LS":
             if not self.cap_negotiating:
                 return
+
             self.cap_available.update(caps)
             if len(message.params) >= 4 and message.params[2] == "*":
                 return
+
             self.cap_ls_done = True
             wanted = DESIRED_CAPS & self.cap_available
             if wanted:
@@ -246,12 +257,20 @@ class IRCClient:
             await self.send("CAP", "END")
             self.cap_negotiating = False
 
+    def is_self(self, nickname: str) -> bool:
+        """Return whether a nickname identifies this client."""
+        return casefold(nickname, self.casemapping) == casefold(
+            self.current_nick,
+            self.casemapping,
+        )
+
     async def nick_collision(self) -> None:
         """Pick a random fallback nickname after registration rejects one."""
         self.nickname_attempts += 1
         if self.nickname_attempts > NICK_COLLISION_LIMIT:
             msg = "IRC nickname collision limit exceeded"
             raise ConnectionError(msg)
+
         self.current_nick = next_nickname(
             min(len(self.desired_nick), self.nickname_length),
         )
@@ -280,8 +299,10 @@ class IRCClient:
                 timeout = self.config.idle_timeout
             else:
                 timeout = max(0.0, pong_deadline - now)
+
             if not self.registered_with_server:
                 timeout = min(timeout, max(0.0, registration_deadline - now))
+
             try:
                 async with asyncio.timeout(timeout):
                     raw = await reader.readline()
@@ -292,9 +313,11 @@ class IRCClient:
                 ):
                     msg = "IRC server did not complete registration"
                     raise ConnectionError(msg) from error
+
                 if ping_token is not None:
                     msg = "IRC server did not answer client PING"
                     raise ConnectionError(msg) from error
+
                 ping_token = secrets.token_hex(16)
                 pong_deadline = loop.time() + self.config.pong_timeout
                 await self.send_immediate(
@@ -305,12 +328,15 @@ class IRCClient:
             except ValueError as error:
                 msg = "IRC server sent an oversized line"
                 raise ConnectionError(msg) from error
+
             if not check_line(raw):
                 continue
+
             try:
                 message = parse_message(raw.decode(errors="replace"))
             except ValueError:
                 continue
+
             ping_token = await self.dispatch_line(message, raw, writer, ping_token)
 
     async def run_forever(self) -> None:
@@ -335,6 +361,7 @@ class IRCClient:
                     self.on_disconnect()
                 except Exception:
                     LOGGER.exception("IRC disconnect callback failed")
+
                 try:
                     await self.stop_sender()
                 finally:
@@ -342,15 +369,19 @@ class IRCClient:
                         self.writer.close()
                         with suppress(OSError):
                             await self.writer.wait_closed()
+
                         self.writer = None
+
             if self.stopping:
                 break
+
             duration = loop.time() - session_start
             if self.registered_with_server and duration >= STABLE_SESSION_SECONDS:
                 backoff = 0
             else:
                 index += 1
                 backoff = min(backoff + 1, 8)
+
             delay = min(30.0, 1.5**backoff) + secrets.randbelow(1000) / 1000
             await asyncio.sleep(delay)
 
@@ -372,6 +403,7 @@ class IRCClient:
         ):
             msg = "IRC is not connected"
             raise ConnectionError(msg)
+
         try:
             outbound.put_nowait(encoded)
         except asyncio.QueueFull as error:
@@ -388,6 +420,7 @@ class IRCClient:
             if self.writer is not writer or writer.is_closing():
                 msg = "IRC is not connected"
                 raise ConnectionError(msg)
+
             writer.write(encoded)
             try:
                 async with asyncio.timeout(WRITE_TIMEOUT):
@@ -420,6 +453,7 @@ class IRCClient:
                     tokens = 0.0
                 else:
                     tokens -= 1.0
+
                 await self.send_immediate(encoded, writer)
         except OSError, RuntimeError:
             writer.close()
@@ -481,9 +515,11 @@ def check_line(raw: bytes) -> bool:
     if not raw.endswith(b"\n"):
         msg = "IRC server closed the connection"
         raise ConnectionError(msg)
+
     if len(raw) > MAX_IRC_MESSAGE_BYTES:
         LOGGER.debug("ignoring oversized %d-byte IRC line", len(raw))
         return False
+
     return True
 
 
@@ -501,14 +537,17 @@ def pong_reply(line: bytes) -> bytes:
         # parse_message filters empty words, so repeated separators leave a
         # leading space here that must not survive into token extraction.
         rest = rest.lstrip(b" ")
+
     if rest.startswith(b":"):
         _, _, rest = rest.partition(b" ")
         rest = rest.lstrip(b" ")
+
     head, trailing_sep, trailing = rest.partition(b" :")
     tokens = [token for token in head.split(b" ")[1:] if token]
     reply = b" ".join([b"PONG", *tokens])
     if trailing_sep:
         return reply + b" :" + trailing + b"\r\n"
+
     return reply + b"\r\n"
 
 

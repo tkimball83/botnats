@@ -6,6 +6,9 @@ Test every behavior change. Fakes for unit tests, Docker for integration.
 
 - Prefer `unittest` and standard-library test helpers.
 - Use fakes for focused unit tests.
+- Keep tests that need live NATS or IRC under `tests/integration/`; `tests/unit/` needs no services.
+- Confirm each new test fails without the change it covers, and that a fake's defaults cannot
+  satisfy its assertions.
 
 ## Integration tests
 
@@ -21,4 +24,3 @@ Test every behavior change. Fakes for unit tests, Docker for integration.
 - Cover missed events and eventual state convergence.
 - Cover stale-write and compare-and-set conflicts for durable channel, session, and presence state.
 - Cover watch replay and resynchronization before readiness.
-- Run `make test` (unit + integration) before handoff.

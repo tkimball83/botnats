@@ -20,14 +20,14 @@ using JetStream KV for shared durable state and Core NATS pub/sub for auto-coord
 Invoke the repository skills instead of reconstructing commands. Set up the project virtualenv
 first.
 
-| Change                      | Required skills  |
-| --------------------------- | ---------------- |
-| Any Python source           | `unit`           |
-| Integration or coordination | `integration`    |
-| Before handoff              | `test`           |
-| Python version bump         | `python-version` |
-| New module                  | `new-module`     |
-| Version release             | `release`        |
+| Change                      | Required skills                   |
+| --------------------------- | --------------------------------- |
+| Any Python source           | `blank-line-after-blocks`, `unit` |
+| Integration or coordination | `integration`                     |
+| Before handoff              | `test`                            |
+| Python version bump         | `python-version`                  |
+| New module                  | `new-module`                      |
+| Version release             | `release`                         |
 
 Use the `virtualenv` skill before all other repository tooling except `python-version`, which cleans
 and rebuilds the environment itself.

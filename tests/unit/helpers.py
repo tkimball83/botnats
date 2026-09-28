@@ -3,55 +3,106 @@
 
 """Shared fakes and factories for bot-level tests."""
 
+import asyncio
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nats.errors import Error as NatsError
 
 from botnats.bot import Bot
-from botnats.channel import ChannelRecord, ChannelRuntime
+from botnats.channel import ChannelRuntime
 from botnats.config import BotConfig
 from botnats.irc.client import IRCServer
-from botnats.irc.protocol import casefold, format_message
+from botnats.irc.protocol import IRCMessage, Prefix, casefold, format_message
 from botnats.nats.status import NATSStatus
-from botnats.nats.store import ATTEMPT_LIMIT, ATTEMPT_WINDOW
+from botnats.nats.store import ATTEMPT_LIMIT, ATTEMPT_WINDOW, session_signature
+
+if TYPE_CHECKING:
+    from botnats.irc.protocol import IRCProtocol
+    from botnats.nats.coordinator import CoordinatorProtocol
 
 AUTH_SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
 COORDINATION_KEY = b"coordination-secret-used-only-for-tests"
 COORDINATION_KEY_TEXT = "coordination-secret-used-only-for-tests"
 NATS_CREDENTIAL = "nats-token"
+OWNER = Prefix("owner", "user", "real.host")
 
 
-def bot_with_channel() -> Bot:
+async def drain_session_writes(bot: Bot) -> None:
+    """Wait for durable session writes that IRC handlers run in background."""
+    await asyncio.gather(
+        *(task for task in tuple(bot.tasks) if task.get_name() == "session-sync"),
+    )
+
+
+async def send_command(bot: Bot, prefix: Prefix, text: str) -> None:
+    """Queue a private-message command as IRC delivers it and wait for it."""
+    await bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
+    await asyncio.gather(
+        *(task for task in tuple(bot.tasks) if task.get_name() == "admin-command"),
+    )
+
+
+def session_record(
+    expires_at: float,
+    version: int = 0,
+    *,
+    revoked: bool = False,
+) -> dict[str, object]:
+    """Build a signed durable session record for owner!user@host."""
+    record: dict[str, object] = {
+        "expires_at": expires_at,
+        "issuer": "alpha",
+        "prefix": "owner!user@host",
+        "revoked": revoked,
+        "version": version,
+    }
+    record["signature"] = session_signature(COORDINATION_KEY, "efnet", record)
+    return record
+
+
+def bot_with_channel(
+    *,
+    irc: IRCProtocol | None = None,
+    coordinator: CoordinatorProtocol | None = None,
+) -> Bot:
     """Create a bot with a single test channel registered."""
-    bot = Bot(config())
+    bot = Bot(config(), irc=irc, coordinator=coordinator)
     folded = casefold("#test")
-    record = ChannelRecord.new(
+    record = bot.channel_mgr.new_record(
         "#test",
         None,
         present=True,
     )
     bot.channel_mgr.channel_records[folded] = record
     bot.channel_mgr.source_records[casefold(record.channel, "ascii")] = record
-    bot.channel_mgr.desired_channels[folded] = "#test"
-    bot.channel_mgr.channels[folded] = ChannelRuntime()
+    bot.channel_mgr.channels[folded] = ChannelRuntime(channel="#test")
     return bot
 
 
-def bot_with_coordinator() -> tuple[Bot, FakeIRC, FakeCoordinator]:
+def bot_with_coordinator(
+    coordinator: FakeCoordinator | None = None,
+    *,
+    irc: FakeIRC | None = None,
+) -> tuple[Bot, FakeIRC, FakeCoordinator]:
     """Create a bot wired to a fake IRC client and fake coordinator."""
-    bot, fake_irc = bot_with_irc()
-    coordinator = FakeCoordinator()
-    bot.coordinator = coordinator
-    return bot, fake_irc, coordinator
+    coordinator = coordinator or FakeCoordinator()
+    fake_irc = irc or FakeIRC()
+    return (
+        bot_with_channel(irc=fake_irc, coordinator=coordinator),
+        fake_irc,
+        coordinator,
+    )
 
 
-def bot_with_irc() -> tuple[Bot, FakeIRC]:
+def bot_with_irc(
+    irc: FakeIRC | None = None,
+    *,
+    coordinator: CoordinatorProtocol | None = None,
+) -> tuple[Bot, FakeIRC]:
     """Create a bot wired to a fake IRC client."""
-    bot = bot_with_channel()
-    fake_irc = FakeIRC()
-    bot.irc = fake_irc
-    return bot, fake_irc
+    fake_irc = irc or FakeIRC()
+    return bot_with_channel(irc=fake_irc, coordinator=coordinator), fake_irc
 
 
 def config() -> BotConfig:
@@ -96,6 +147,13 @@ class FakeIRC:
         """No-op close."""
         return
 
+    def is_self(self, nickname: str) -> bool:
+        """Return whether a nickname identifies this client."""
+        return casefold(nickname, self.casemapping) == casefold(
+            self.current_nick,
+            self.casemapping,
+        )
+
     async def reconnect(self) -> None:
         """Increment the reconnect counter."""
         self.reconnects += 1
@@ -118,9 +176,11 @@ class FakeIRC:
         if not self.connected:
             msg = "IRC is not connected"
             raise ConnectionError(msg)
+
         format_message(command, params, trailing)
         if command == "MODE" and params[1:]:
             self.modes.append((params[0], params[1], params[2:]))
+
         if command == "PRIVMSG" and params and trailing is not None:
             self.privmsgs.append((params[0], trailing))
         else:
@@ -151,7 +211,12 @@ class FailingIRC(FakeIRC):
 
 
 class FailingPartIRC(FakeIRC):
-    """IRC stub that raises ConnectionError on part."""
+    """IRC stub that raises ConnectionError on PART until it recovers."""
+
+    def __init__(self) -> None:
+        """Start failing PART commands."""
+        super().__init__()
+        self.failing = True
 
     async def send(
         self,
@@ -159,15 +224,16 @@ class FailingPartIRC(FakeIRC):
         *params: str,
         trailing: str | None = None,
     ) -> None:
-        """Raise ConnectionError for PART commands."""
-        if command == "PART":
+        """Raise ConnectionError for PART commands while failing."""
+        if self.failing and command == "PART":
             msg = "IRC outbound queue is full"
             raise ConnectionError(msg)
+
         await super().send(command, *params, trailing=trailing)
 
 
 class FakeCoordinator:
-    """In-memory coordinator stub that records KV puts and offers."""
+    """In-memory coordinator stub that records KV puts and help requests."""
 
     def __init__(self, *, claim_result: bool = False) -> None:
         """Initialize empty recording buffers."""
@@ -177,7 +243,7 @@ class FakeCoordinator:
         self.claim_requests: list[int] = []
         self.claim_result = claim_result
         self.connected = True
-        self.offer_requests: list[tuple[str, dict[str, object]]] = []
+        self.help_requests: list[tuple[str, dict[str, object]]] = []
         self.owns_presence = True
         self.presence_puts: list[dict[str, Any]] = []
         self.session_puts: list[tuple[str, dict[str, Any]]] = []
@@ -209,6 +275,7 @@ class FakeCoordinator:
         if presence.get("bot_id") != self.bot_id:
             msg = "presence does not match coordinator bot ID"
             raise ValueError(msg)
+
         self.require_unique()
         self.presence_puts.append(presence)
 
@@ -231,6 +298,7 @@ class FakeCoordinator:
         """Claim one attempt slot per identity, matching real slot-based store."""
         if not self.ready:
             return False
+
         now = time.monotonic()
         cutoff = now - ATTEMPT_WINDOW
         slots = self.auth_slots.setdefault(identity, [])
@@ -238,27 +306,30 @@ class FakeCoordinator:
             if ts <= cutoff:
                 slots[idx] = now
                 return True
+
         if len(slots) < ATTEMPT_LIMIT:
             slots.append(now)
             return True
+
         return False
 
     async def request_claim(self, counter: int) -> bool:
         """Allow or deny claims, failing closed when not ready."""
         if not self.ready:
             return False
+
         self.claim_requests.append(counter)
         return self.claim_result
 
-    async def request_offer(self, base_suffix: str, payload: dict[str, object]) -> bool:
-        """Record an offer request, refusing when not ready or misowned."""
-        if not self.ready:
-            return False
+    async def request_help(self, kind: str, payload: dict[str, object]) -> None:
+        """Record a help request, dropping it when not ready or misowned."""
         presence = payload.get("presence")
-        if not isinstance(presence, dict) or presence.get("bot_id") != self.bot_id:
-            return False
-        self.offer_requests.append((base_suffix, payload))
-        return True
+        if (
+            self.ready
+            and isinstance(presence, dict)
+            and presence.get("bot_id") == self.bot_id
+        ):
+            self.help_requests.append((kind, payload))
 
     async def start(self) -> None:
         """No-op start."""
@@ -279,22 +350,33 @@ class FakeCoordinator:
 
 
 class FailingPublishCoordinator(FakeCoordinator):
-    """Coordinator stub that raises NatsError on all KV writes."""
+    """Coordinator stub whose KV writes raise NatsError until it recovers."""
+
+    def __init__(self, *, claim_result: bool = False) -> None:
+        """Start failing every KV write."""
+        super().__init__(claim_result=claim_result)
+        self.failing = True
 
     async def put_channel(
         self,
         channel: str,
         record: dict[str, Any],
     ) -> dict[str, Any]:
-        """Raise NatsError to simulate a NATS disconnect."""
-        msg = f"NATS disconnected: channel {channel} with {len(record)} fields"
-        raise NatsError(msg)
+        """Raise NatsError while failing, to simulate a NATS disconnect."""
+        if self.failing:
+            msg = f"NATS disconnected: channel {channel} with {len(record)} fields"
+            raise NatsError(msg)
+
+        return await super().put_channel(channel, record)
 
     async def put_session(
         self,
         identity: str,
         session: dict[str, Any],
     ) -> dict[str, Any]:
-        """Raise NatsError to simulate a NATS disconnect."""
-        msg = f"NATS disconnected: session {identity} with {len(session)} fields"
-        raise NatsError(msg)
+        """Raise NatsError while failing, to simulate a NATS disconnect."""
+        if self.failing:
+            msg = f"NATS disconnected: session {identity} with {len(session)} fields"
+            raise NatsError(msg)
+
+        return await super().put_session(identity, session)

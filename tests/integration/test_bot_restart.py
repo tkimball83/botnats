@@ -17,9 +17,9 @@ from tests.integration.test_mesh import (
 )
 
 
-async def run() -> None:
+async def run(restarted: str) -> None:
     """Check desired channels and keys after a bot restart."""
-    restarted_bot = frozenset({os.environ["BOTNATS_TEST_RESTARTED_BOT"]})
+    restarted_bot = frozenset({restarted})
     session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
     try:
         await wait_for_bots(session)
@@ -32,7 +32,3 @@ async def run() -> None:
         await wait_for_operators(session, second, present=BOTS)
     finally:
         await asyncio.wait_for(session.close(), timeout=COMMAND_TIMEOUT)
-
-
-if __name__ == "__main__":
-    asyncio.run(run())

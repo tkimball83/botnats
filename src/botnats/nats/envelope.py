@@ -57,14 +57,17 @@ class Envelope:
         if len(value) > MAX_ENVELOPE_BYTES:
             msg = "NATS envelope exceeds the size limit"
             raise ValueError(msg)
+
         try:
             envelope = json.loads(value)
         except RecursionError as error:
             msg = "NATS envelope is too deeply nested"
             raise ValueError(msg) from error
+
         if not isinstance(envelope, dict):
             msg = "NATS envelope is not an object"
             raise TypeError(msg)
+
         nonce = envelope.get("nonce")
         payload = envelope.get("payload")
         sender = envelope.get("sender")
@@ -92,6 +95,7 @@ class Envelope:
         ):
             msg = "NATS envelope timestamp is outside the allowed window"
             raise ValueError(msg)
+
         self.prune_nonces(now)
         if nonce in self.seen_nonces:
             msg = "NATS envelope was replayed"
@@ -101,13 +105,16 @@ class Envelope:
         if not hmac.compare_digest(expected, signature):
             msg = "NATS envelope signature is invalid"
             raise ValueError(msg)
+
         bound_subject = payload.get(SUBJECT_FIELD)
         if bound_subject is None:
             msg = "NATS envelope is not bound to a subject"
             raise ValueError(msg)
+
         if bound_subject != subject:
             msg = "NATS envelope subject is invalid"
             raise ValueError(msg)
+
         payload.pop(SUBJECT_FIELD, None)
         self.seen_nonces[nonce] = now + NONCE_TTL
         return sender, payload
@@ -117,6 +124,7 @@ class Envelope:
         if SUBJECT_FIELD in payload:
             msg = f"payload field {SUBJECT_FIELD!r} is reserved"
             raise ValueError(msg)
+
         signed_payload = {**payload, SUBJECT_FIELD: subject}
         nonce = secrets.token_hex(16)
         timestamp = int(time.time())
@@ -140,6 +148,7 @@ class Envelope:
         if len(encoded) > MAX_ENVELOPE_BYTES:
             msg = "NATS envelope exceeds the size limit"
             raise ValueError(msg)
+
         return encoded
 
     def mac(self, value: bytes) -> str:
@@ -157,4 +166,5 @@ class Envelope:
             nonce, expiry = next(iter(self.seen_nonces.items()))
             if expiry > current:
                 break
+
             del self.seen_nonces[nonce]

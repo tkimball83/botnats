@@ -4,7 +4,7 @@ Minimal, scoped diffs. Delete what is unused.
 
 ## Scope
 
-- Fix demonstrated issues without speculative functionality.
+- Fix demonstrated issues.
 - Keep changes within the requested scope.
 - Avoid wire-format changes without a concrete requirement.
 - Before 1.0, replace obsolete wire and storage formats in place; do not add legacy compatibility or
@@ -14,6 +14,7 @@ Minimal, scoped diffs. Delete what is unused.
 
 - Delete pass-through wrappers, unused values, unused defaults, and speculative flexibility.
 - Reuse existing owners and stdlib before adding abstractions or dependencies.
+- Rename identifiers whose names still describe replaced behavior.
 
 ## Git
 

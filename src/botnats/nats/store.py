@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+# Transport failures, and the RuntimeError family a store or presence claim
+# raises when a write cannot proceed (unavailable store, duplicate bot ID).
+CONNECT_ERRORS = (NatsError, OSError)
+PUBLISH_ERRORS = (*CONNECT_ERRORS, RuntimeError)
+
 ATTEMPT_LIMIT = 3
 ATTEMPT_TTL = 120.0
 ATTEMPT_WINDOW = 60
@@ -65,12 +70,15 @@ class KVStore:
             if js is not None and js is not self.js:
                 self.js = js
                 self.kv = None
+
             if self.kv is not None:
                 return self.kv
+
             context = self.js
             if context is None:
                 msg = "JetStream is unavailable"
                 raise StoreUnavailableError(msg)
+
             kv = await context.create_key_value(
                 KeyValueConfig(
                     bucket=self.bucket,
@@ -83,6 +91,7 @@ class KVStore:
             if self.js is not context:
                 msg = "JetStream changed while opening a bucket"
                 raise StoreUnavailableError(msg)
+
             self.kv = kv
             return kv
 
@@ -118,18 +127,24 @@ class KVStore:
                     await kv.create(key, encoded)
                 except KeyWrongLastSequenceError:
                     continue
+
                 return data
+
             try:
                 current = json.loads(entry.value) if entry.value is not None else None
             except RecursionError, ValueError:
                 current = None
+
             if isinstance(current, dict) and not newer(current):
                 return current
+
             try:
                 await kv.update(key, encoded, last=entry.revision)
             except KeyWrongLastSequenceError:
                 continue
+
             return data
+
         msg = "durable write lost repeated update races"
         raise NatsError(msg)
 
@@ -145,6 +160,7 @@ class AttemptStore(KVStore):
         """Claim one attempt slot, failing closed when KV is unavailable."""
         if self.kv is None and self.js is None:
             return False
+
         current = time.time() if now is None else now
         cutoff = current - ATTEMPT_WINDOW
         encoded = float(current).hex().encode()
@@ -159,19 +175,25 @@ class AttemptStore(KVStore):
                         await kv.create(key, encoded)
                     except KeyWrongLastSequenceError:
                         continue
+
                     return True
+
                 if entry.value is None:
                     continue
+
                 try:
                     timestamp = float.fromhex(entry.value.decode())
                 except UnicodeDecodeError, ValueError:
                     continue
+
                 if not math.isfinite(timestamp) or timestamp > cutoff:
                     continue
+
                 try:
                     await kv.update(key, encoded, last=entry.revision)
                 except KeyWrongLastSequenceError:
                     continue
+
                 return True
         except (NatsError, OSError, RuntimeError) as error:
             self.kv = None
@@ -179,6 +201,7 @@ class AttemptStore(KVStore):
                 "authentication limit failed; denying: %s",
                 error_label(error),
             )
+
         return False
 
     def key(self, identity: str, slot: int) -> str:
@@ -223,6 +246,7 @@ class ChannelStore(KVStore):
             channel, channel_key, present, revision = parse_channel_record(record)
         except TypeError, ValueError:
             return None
+
         signature = record.get("signature")
         if (
             self.key(channel) != key
@@ -230,6 +254,7 @@ class ChannelStore(KVStore):
             or SIGNATURE_RE.fullmatch(signature) is None
         ):
             return None
+
         expected = channel_signature(
             self.secret,
             self.network,
@@ -242,6 +267,7 @@ class ChannelStore(KVStore):
         )
         if not hmac.compare_digest(expected, signature):
             return None
+
         return revision
 
     async def put(self, channel: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -271,6 +297,7 @@ class ClaimStore(KVStore):
         """Claim a counter once, failing closed when KV is unavailable."""
         if self.kv is None and self.js is None:
             return False
+
         try:
             kv = await self.open()
             await kv.create(self.key(counter), b"1")
@@ -283,6 +310,7 @@ class ClaimStore(KVStore):
                 error_label(error),
             )
             return False
+
         return True
 
     def key(self, counter: int) -> str:
@@ -348,17 +376,21 @@ class PresenceStore(KVStore):
                 revision = await self.create(bot_id, data)
                 if revision is not None:
                     return revision
+
                 continue
+
             try:
                 current = json.loads(entry.value) if entry.value is not None else None
             except RecursionError, TypeError, ValueError:
                 current = None
+
             if isinstance(current, dict) and self.valid(current):
                 return (
                     entry.revision
                     if current.get("instance_id") == instance_id
                     else None
                 )
+
             try:
                 return await kv.update(
                     bot_id.casefold(), self.sign(data), last=entry.revision
@@ -368,6 +400,7 @@ class PresenceStore(KVStore):
                 # writer instead of misreporting a forged clobber as a
                 # genuine duplicate.
                 continue
+
         msg = "presence reclaim lost repeated update races"
         raise NatsError(msg)
 
@@ -402,6 +435,7 @@ class PresenceStore(KVStore):
             or isinstance(timestamp, bool)
         ):
             return False
+
         current = time.time() if now is None else now
         if (
             not current - self.ttl - PRESENCE_DRIFT
@@ -409,10 +443,12 @@ class PresenceStore(KVStore):
             <= current + PRESENCE_DRIFT
         ):
             return False
+
         try:
             expected = presence_signature(self.secret, self.network, data)
         except KeyError, TypeError, UnicodeEncodeError:
             return False
+
         return hmac.compare_digest(expected, signature)
 
 
@@ -441,6 +477,7 @@ class SessionStore(KVStore):
             "ascii",
         ):
             return None
+
         return parsed.order
 
     async def put(self, identity: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -512,20 +549,24 @@ def parse_session_record(
         or version < 0
     ):
         return None
+
     try:
         issuer.encode()
         prefix.encode()
     except UnicodeEncodeError:
         return None
+
     try:
         expiry = float(expires_at)
     except OverflowError:
         return None
+
     if not math.isfinite(expiry) or not hmac.compare_digest(
         session_signature(secret, network, record),
         signature,
     ):
         return None
+
     return Session(
         expires_at=expiry,
         issuer=issuer,

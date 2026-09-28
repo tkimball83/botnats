@@ -49,6 +49,7 @@ class NATSStatus:
         ]
         if self.offline:
             fields.append(f"offline={','.join(self.offline)}")
+
         return " ".join(fields)
 
 
@@ -112,7 +113,9 @@ async def read_response(reader: asyncio.StreamReader) -> bytes:
         chunk = await reader.read(min(65_536, MAX_RESPONSE_BYTES + 1 - len(response)))
         if not chunk:
             break
+
         response.extend(chunk)
+
     return bytes(response)
 
 
@@ -125,6 +128,7 @@ async def route_count(host: str | None, port: int) -> int | None:
     """
     if host is None:
         return None
+
     location = f"[{host}]" if ":" in host else host
     writer: asyncio.StreamWriter | None = None
     try:
@@ -141,12 +145,15 @@ async def route_count(host: str | None, port: int) -> int | None:
             response = await read_response(reader)
         if len(response) > MAX_RESPONSE_BYTES:
             return None
+
         header, separator, body = response.partition(b"\r\n\r\n")
         if not separator or not header.startswith((b"HTTP/1.0 200", b"HTTP/1.1 200")):
             return None
+
         payload = json.loads(body)
         if not isinstance(payload, dict):
             return None
+
         value = payload.get("num_routes")
         return (
             value
@@ -166,6 +173,7 @@ async def stream_info(kv: KeyValue | None) -> StreamInfo | None:
     """Return the claim bucket stream information within a short timeout."""
     if kv is None:
         return None
+
     try:
         async with asyncio.timeout(STATUS_TIMEOUT):
             return (await kv.status()).stream_info
