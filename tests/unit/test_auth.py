@@ -15,6 +15,7 @@ from botnats import Tasks
 from botnats.auth import SessionSync, TotpAuthorizer, totp
 from botnats.channel import JoinState
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
+from botnats.nats.store import SessionStore
 from tests.unit.helpers import (
     AUTH_SEED,
     COORDINATION_KEY,
@@ -285,6 +286,27 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert pending["prefix"] == prefix.render()
         assert pending["revoked"] is True
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+
+    async def test_revocation_uses_session_prefix_across_case_folding(self) -> None:
+        """File a revocation under its session's prefix, not the observed one.
+
+        Under rfc1459, foo[ and foo{ fold together, so a QUIT seen as foo{
+        revokes the session granted to foo[; the store rejects a record filed
+        under a key that differs from its own prefix.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        store = SessionStore("efnet", 1, COORDINATION_KEY, 3600)
+        bot.authorizer.grant("foo[!u@h")
+
+        bot.sessions.revoke(Prefix("foo{", "u", "h"))
+        with patch.object(coordinator, "put_session", store.put):
+            await bot.sessions.retry()
+
+        key, record = next(iter(bot.sessions.pending.items()))
+        assert record["prefix"] == "foo[!u@h"
+        assert key == casefold("foo[!u@h", "ascii")
+        assert store.order("foo[!u@h", record) is not None
+        await bot.tasks.drain()
 
     async def test_auth_refuses_identity_invalidated_mid_auth(self) -> None:
         """Grant nothing when the user quits while AUTH waits on JetStream."""

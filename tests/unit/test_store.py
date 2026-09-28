@@ -176,13 +176,18 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         assert not store.valid(non_ascii_signature, now=now)
 
 
+def channel_revision(number: int) -> str:
+    """Return the sortable revision channel_record(number) carries."""
+    return f"{number:020d}-{'0' * 32}"
+
+
 def channel_record(revision: int) -> dict[str, object]:
     """Build a valid, signed durable channel record with a sortable revision."""
     record: dict[str, object] = {
         "channel": "#test",
         "key": None,
         "present": True,
-        "revision": f"{revision:020d}-{'0' * 32}",
+        "revision": channel_revision(revision),
     }
     record["signature"] = channel_signature(SECRET, "efnet", record)
     return record
@@ -215,7 +220,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert attempts.kv.create.await_count == ATTEMPT_LIMIT
 
     async def test_error_fails_closed(self) -> None:
-        """Verify unavailable JetStream denies authentication."""
+        """Deny during a JetStream error, then allow once it recovers."""
         attempts = AttemptStore("efnet", 3, SECRET)
         attempts.kv = AsyncMock()
         attempts.kv.get.side_effect = KeyNotFoundError()
@@ -224,7 +229,10 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await attempts.allow("host.example", now=60)
 
-        assert not attempts.ready
+        # One error must not leave the store unready: nothing would reopen it.
+        assert attempts.ready
+        attempts.kv.create.side_effect = None
+        assert await attempts.allow("host.example", now=61)
 
     async def test_keys_hide_identity(self) -> None:
         """Verify persisted attempt keys do not expose the IRC identity."""
@@ -336,7 +344,7 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         assert not await claims.claim(42)
 
     async def test_error(self) -> None:
-        """Verify unavailable JetStream fails closed."""
+        """Fail closed during a JetStream error, then claim once it recovers."""
         claims = ClaimStore("efnet", 3, SECRET)
         claims.kv = AsyncMock()
         claims.kv.create.side_effect = NatsError("unavailable")
@@ -344,7 +352,10 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await claims.claim(42)
 
-        assert not claims.ready
+        # One error must not leave the store unready: nothing would reopen it.
+        assert claims.ready
+        claims.kv.create.side_effect = None
+        assert await claims.claim(42)
 
     async def test_missing_store(self) -> None:
         """Verify a claim is denied until the bucket is open."""
@@ -411,7 +422,11 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             value=json.dumps(current).encode(),
         )
 
-        stored = await channels.put("#test", channel_record(1))
+        stored = await channels.put(
+            "#test",
+            channel_record(1),
+            expected=channel_revision(0),
+        )
 
         assert stored == current
         channels.kv.update.assert_not_awaited()
@@ -466,38 +481,65 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert channels.order(key, {**signed, "key": "swapped"}) is None
         assert channels.order(key, {**signed, "present": False}) is None
 
-    async def test_channel_put_retries_cas_conflict(self) -> None:
-        """Retry a newer channel write after another writer wins the CAS."""
+    async def test_channel_put_yields_to_concurrent_writer(self) -> None:
+        """Return another bot's record when it lands between our read and write."""
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
+        concurrent = channel_record(2)
         channels.kv.get.side_effect = (
             SimpleNamespace(revision=7, value=json.dumps(channel_record(1)).encode()),
-            SimpleNamespace(revision=8, value=json.dumps(channel_record(2)).encode()),
+            SimpleNamespace(revision=8, value=json.dumps(concurrent).encode()),
         )
         channels.kv.update.side_effect = (KeyWrongLastSequenceError(), None)
 
-        incoming = channel_record(3)
-        assert await channels.put("#test", incoming) == incoming
+        stored = await channels.put(
+            "#test",
+            channel_record(3),
+            expected=channel_revision(1),
+        )
 
-        assert channels.kv.update.await_count == 2
-        assert channels.kv.update.await_args_list[1].kwargs["last"] == 8
+        assert stored == concurrent
+        channels.kv.update.assert_awaited_once()
 
-    async def test_channel_put_retries_create_race(self) -> None:
-        """Retry against the racing writer's record after a lost create."""
+    async def test_channel_put_yields_to_racing_create(self) -> None:
+        """Yield to a racing writer that created the record first."""
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
+        racer = channel_record(1)
         channels.kv.get.side_effect = (
             KeyNotFoundError(),
-            SimpleNamespace(revision=7, value=json.dumps(channel_record(1)).encode()),
+            SimpleNamespace(revision=7, value=json.dumps(racer).encode()),
         )
         channels.kv.create.side_effect = KeyWrongLastSequenceError()
-        channels.kv.update.side_effect = (None,)
 
-        incoming = channel_record(2)
-        assert await channels.put("#test", incoming) == incoming
+        stored = await channels.put("#test", channel_record(2), expected=None)
 
+        assert stored == racer
         channels.kv.create.assert_awaited_once()
-        channels.kv.update.assert_awaited_once()
+        channels.kv.update.assert_not_awaited()
+
+    async def test_channel_put_rejects_same_number_from_stale_base(self) -> None:
+        """Keep another bot's same-numbered record whatever the random suffix."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        channels.kv = AsyncMock()
+        theirs = {**channel_record(2), "revision": f"{2:020d}-{'0' * 32}"}
+        theirs["signature"] = channel_signature(SECRET, "efnet", theirs)
+        channels.kv.get.return_value = SimpleNamespace(
+            revision=7,
+            value=json.dumps(theirs).encode(),
+        )
+        # Ours has the same counter and a suffix that sorts higher, so the old
+        # revision tie-break would have let it overwrite theirs.
+        ours = {**channel_record(2), "revision": f"{2:020d}-{'f' * 32}"}
+
+        stored = await channels.put(
+            "#test",
+            ours,
+            expected=channel_revision(1),
+        )
+
+        assert stored == theirs
+        channels.kv.update.assert_not_awaited()
 
     async def test_put_newer_bounds_lost_create_races(self) -> None:
         """Count lost create races toward the same CAS attempt bound."""
@@ -507,7 +549,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.create.side_effect = KeyWrongLastSequenceError()
 
         with self.assertRaisesRegex(NatsError, "update races"):
-            await channels.put("#test", channel_record(1))
+            await channels.put("#test", channel_record(1), expected=None)
 
         assert channels.kv.create.await_count == CAS_ATTEMPT_LIMIT
 
@@ -522,7 +564,11 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.update.side_effect = KeyWrongLastSequenceError()
 
         with self.assertRaisesRegex(NatsError, "update races"):
-            await channels.put("#test", channel_record(2))
+            await channels.put(
+                "#test",
+                channel_record(2),
+                expected=channel_revision(1),
+            )
 
         assert channels.kv.update.await_count == CAS_ATTEMPT_LIMIT
 
@@ -565,7 +611,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_channel = channel_record(2)
-        assert await channels.put("#test", valid_channel) == valid_channel
+        assert (
+            await channels.put("#test", valid_channel, expected=None) == valid_channel
+        )
         channels.kv.update.assert_awaited_once()
 
         sessions = SessionStore("efnet", 1, SECRET, 60)
@@ -590,7 +638,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_channel = channel_record(2)
-        assert await channels.put("#test", valid_channel) == valid_channel
+        assert (
+            await channels.put("#test", valid_channel, expected=None) == valid_channel
+        )
         channels.kv.update.assert_awaited_once()
 
     async def test_state_keys_do_not_depend_on_irc_casemapping(self) -> None:

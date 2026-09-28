@@ -81,8 +81,10 @@ class CoordinatorProtocol(Protocol):
         self,
         channel: str,
         record: dict[str, Any],
+        *,
+        expected: str | None,
     ) -> dict[str, Any]:
-        """Store a channel record and return the authoritative record."""
+        """Store a channel record written after expected; return the winner."""
         ...
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
@@ -414,10 +416,12 @@ class Coordinator:
         self,
         channel: str,
         record: dict[str, Any],
+        *,
+        expected: str | None,
     ) -> dict[str, Any]:
-        """Store a channel record and return the authoritative record."""
+        """Store a channel record written after expected; return the winner."""
         self.claim.require()
-        return await self.channels_store.put(channel, record)
+        return await self.channels_store.put(channel, record, expected=expected)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
         """Store or refresh bot presence in JetStream KV."""

@@ -62,7 +62,13 @@ class ChannelManager:
         self.mode_intent = mode_intent(bot.config.channel_modes)
         # Channels no longer desired whose PART could not be sent yet.
         self.pending_parts: dict[str, str] = {}
-        self.pending_records: dict[str, ChannelRecord] = {}
+        # ASCII-folded channel -> channel whose key write failed. A retry
+        # writes the key this bot sees on IRC at that moment, never the one
+        # it saw when the write failed, so a superseded change is not replayed.
+        self.pending_keys: dict[str, str] = {}
+        # Key writes and their retries run one at a time, so each compares
+        # against the record the previous write left.
+        self.key_lock = asyncio.Lock()
         # Highest revision this bot has minted: concurrent local changes to
         # one channel (two admin commands, say) get distinct, ordered revisions.
         self.last_revision = 0
@@ -87,7 +93,12 @@ class ChannelManager:
             runtime = existing or ChannelRuntime(casemapping=self.bot.caps.casemapping)
             self.channels[folded] = runtime
             runtime.channel = record.channel
-            runtime.key = record.key
+            # Take the key only from a record that changes it: a record that
+            # carries the old key over must not clobber a newer key this bot
+            # observed on IRC and is still writing.
+            if existing is None or current is None or current.key != record.key:
+                runtime.key = record.key
+
             if (
                 self.bot.identity.registered
                 and self.bot.identity.current is not None
@@ -203,10 +214,20 @@ class ChannelManager:
 
     async def record_key(self, channel: str, key: str | None) -> None:
         """Record and broadcast a versioned channel key update."""
-        folded = self.bot.caps.fold(channel)
-        current = self.channel_records.get(folded)
+        async with self.key_lock:
+            await self.write_key(channel, key)
+
+    async def write_key(self, channel: str, key: str | None) -> bool:
+        """Write a key change after the current record; return False on failure.
+
+        A failed write is not applied locally, where it would shadow newer
+        remote records; the channel is marked for a retry instead.
+        """
+        source_key = casefold(channel, "ascii")
+        current = self.channel_records.get(self.bot.caps.fold(channel))
         if current is None or not current.present or current.key == key:
-            return
+            self.pending_keys.pop(source_key, None)
+            return True
 
         record = self.new_record(
             channel,
@@ -218,14 +239,25 @@ class ChannelManager:
             stored = await self.bot.coordinator.put_channel(
                 channel,
                 asdict(record),
+                expected=self.durable_revision(channel),
             )
         except PUBLISH_ERRORS:
-            # Keep the observed IRC key locally and queue the durable write;
-            # retry_pending_records drops the entry if a newer record lands.
-            await self.apply_record(record)
-            self.pending_records[casefold(record.channel, "ascii")] = record
-        else:
-            await self.apply_record(ChannelRecord.from_dict(stored))
+            self.pending_keys[source_key] = channel
+            return False
+
+        self.pending_keys.pop(source_key, None)
+        await self.apply_record(ChannelRecord.from_dict(stored))
+        return True
+
+    def durable_revision(self, channel: str) -> str | None:
+        """Return the stored revision of this exact channel name, if any.
+
+        The store keys records by ASCII fold, while the local view merges
+        IRC-equivalent names (#a[ and #a{ under rfc1459); a write must name
+        the record under its own key, or the store can never accept it.
+        """
+        record = self.source_records.get(casefold(channel, "ascii"))
+        return record.revision if record is not None else None
 
     def new_record(
         self,
@@ -487,24 +519,19 @@ class ChannelManager:
             {"channel": channel, "presence": asdict(identity)},
         )
 
-    async def retry_pending_records(self) -> None:
-        """Republish channel records whose JetStream writes failed."""
-        for source_key, record in tuple(self.pending_records.items()):
-            if self.source_records.get(source_key) != record:
-                self.pending_records.pop(source_key, None)
-                continue
+    async def retry_pending_keys(self) -> None:
+        """Retry failed key writes with the key this bot sees on IRC now.
 
-            try:
-                stored = await self.bot.coordinator.put_channel(
-                    record.channel,
-                    asdict(record),
-                )
-            except PUBLISH_ERRORS:
-                return
-
-            await self.apply_record(ChannelRecord.from_dict(stored))
-            if self.pending_records.get(source_key) == record:
-                self.pending_records.pop(source_key, None)
+        A bot no longer in the channel cannot see its key; the peers still in
+        it observe the same MODE changes and record them.
+        """
+        async with self.key_lock:
+            for source_key, channel in tuple(self.pending_keys.items()):
+                runtime = self.runtime(channel)
+                if runtime is None or not runtime.joined:
+                    self.pending_keys.pop(source_key, None)
+                elif not await self.write_key(channel, runtime.key):
+                    return
 
     def reset(self) -> None:
         """Clear all runtime state and cooldowns after a reconnection."""

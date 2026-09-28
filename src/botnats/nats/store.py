@@ -196,7 +196,10 @@ class AttemptStore(KVStore):
 
                 return True
         except (NatsError, OSError, RuntimeError) as error:
-            self.kv = None
+            # Keep the handle: this attempt fails closed, and the next one
+            # retries it. A Core NATS disconnect resets handles properly, and
+            # dropping it here would leave the store unready with nothing
+            # left to reopen it.
             LOGGER.warning(
                 "authentication limit failed; denying: %s",
                 error_label(error),
@@ -270,8 +273,20 @@ class ChannelStore(KVStore):
 
         return revision
 
-    async def put(self, channel: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Store a signed channel record and return the authoritative record."""
+    async def put(
+        self,
+        channel: str,
+        data: dict[str, Any],
+        *,
+        expected: str | None,
+    ) -> dict[str, Any]:
+        """Store a signed channel record and return the authoritative record.
+
+        expected is the revision the record was written after (None when no
+        record was known). The write lands only while that is still the
+        stored record, so a concurrent write from another bot wins cleanly
+        instead of by the random revision suffix.
+        """
         signed = self.sign(data)
         key = self.key(channel)
         revision = self.order(key, signed)
@@ -281,7 +296,7 @@ class ChannelStore(KVStore):
 
         def newer(current: dict[str, Any]) -> bool:
             current_revision = self.order(key, current)
-            return current_revision is None or revision > current_revision
+            return current_revision is None or current_revision == expected
 
         return await self.put_newer(key, signed, newer)
 
@@ -304,7 +319,7 @@ class ClaimStore(KVStore):
         except KeyWrongLastSequenceError:
             return False
         except (NatsError, OSError, RuntimeError) as error:
-            self.kv = None
+            # Keep the handle, as in AttemptStore.allow.
             LOGGER.warning(
                 "TOTP claim failed; denying: %s",
                 error_label(error),
