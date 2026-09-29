@@ -139,10 +139,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             tasks = tuple(bot.tasks)
             await asyncio.gather(*tasks)
 
-        assert fake_irc.sent == [
-            ("WHOIS", ("alpha",)),
-            ("USERHOST", ("alpha",)),
-        ]
+        assert fake_irc.sent == [("USERHOST", ("alpha",))]
         assert fake_irc.reconnects == 1
 
     async def test_identity_fold(self) -> None:
