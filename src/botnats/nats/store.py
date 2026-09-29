@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING, Any
 
 from nats.errors import Error as NatsError
 from nats.js.api import KeyValueConfig, StorageType
-from nats.js.errors import KeyNotFoundError, KeyWrongLastSequenceError
+from nats.js.errors import (
+    BadRequestError,
+    KeyNotFoundError,
+    KeyWrongLastSequenceError,
+)
 from nats.js.kv import KV_DEL, KV_PURGE
 
 from botnats import error_label
@@ -79,21 +83,45 @@ class KVStore:
                 msg = "JetStream is unavailable"
                 raise StoreUnavailableError(msg)
 
-            kv = await context.create_key_value(
-                KeyValueConfig(
-                    bucket=self.bucket,
-                    history=1,
-                    replicas=self.replicas,
-                    storage=StorageType.FILE,
-                    ttl=self.ttl,
-                ),
+            config = KeyValueConfig(
+                bucket=self.bucket,
+                history=1,
+                replicas=self.replicas,
+                storage=StorageType.FILE,
+                ttl=self.ttl,
             )
+            try:
+                kv = await context.create_key_value(config)
+            except BadRequestError:
+                # An earlier configuration may have created it with another TTL.
+                kv = await self.retune(context, config)
+
             if self.js is not context:
                 msg = "JetStream changed while opening a bucket"
                 raise StoreUnavailableError(msg)
 
             self.kv = kv
             return kv
+
+    async def retune(
+        self,
+        context: JetStreamContext,
+        config: KeyValueConfig,
+    ) -> KeyValue:
+        """Apply a changed TTL to an existing bucket, then create it again.
+
+        Creating again succeeds only when nothing else differs; any other
+        difference, such as the replica count, fails as it did the first time.
+        """
+        stream = (await context.stream_info(f"KV_{self.bucket}")).config
+        if stream.max_age != self.ttl:
+            # create_key_value's duplicate window, so creating again matches.
+            await context.update_stream(
+                stream.evolve(max_age=self.ttl, duplicate_window=min(120, self.ttl)),
+            )
+            LOGGER.info("updated %s bucket TTL to %s seconds", self.bucket, self.ttl)
+
+        return await context.create_key_value(config)
 
     @property
     def ready(self) -> bool:

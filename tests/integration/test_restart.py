@@ -7,10 +7,12 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from dataclasses import asdict
 
 import nats
 from nats.errors import Error as NatsError
+from nats.js.errors import BadRequestError
 
 from botnats.channel import ChannelRecord
 from botnats.nats.store import ChannelStore, ClaimStore, SessionStore, session_signature
@@ -25,16 +27,16 @@ SESSION_IDENTITY = "restart!user@host.example"
 SESSION_TTL = 3600.0
 
 
-def session_record() -> dict[str, object]:
-    """Build a signed session record that outlives the cluster restart."""
+def session_record(network: str, ttl: float = SESSION_TTL) -> dict[str, object]:
+    """Build a session record signed for one network's store."""
     record: dict[str, object] = {
-        "expires_at": time.time() + SESSION_TTL / 2,
+        "expires_at": time.time() + ttl / 2,
         "issuer": "restart-test",
         "prefix": SESSION_IDENTITY,
         "revoked": False,
         "version": 1,
     }
-    record["signature"] = session_signature(SECRET, "restart-test", record)
+    record["signature"] = session_signature(SECRET, network, record)
     return record
 
 
@@ -68,7 +70,7 @@ async def mark() -> None:
         stored = await channels.put(CHANNEL, record, expected=None)
         assert stored["key"] == CHANNEL_KEY
         await sessions.open(nc.jetstream())
-        session = await sessions.put(SESSION_IDENTITY, session_record())
+        session = await sessions.put(SESSION_IDENTITY, session_record("restart-test"))
         assert session["prefix"] == SESSION_IDENTITY
     finally:
         await nc.drain()
@@ -114,5 +116,43 @@ async def check() -> None:
         except TimeoutError:
             msg = "durable state missing after NATS restart"
             raise AssertionError(msg) from None
+    finally:
+        await nc.drain()
+
+
+async def ttl_change() -> None:
+    """Reopen session buckets under new TTLs without losing their sessions."""
+    # Below two minutes the TTL also sets the bucket's duplicate window.
+    for old, new in ((SESSION_TTL, SESSION_TTL * 2), (15.0, 30.0)):
+        await reopen_with_ttl(old, new)
+
+
+async def reopen_with_ttl(old: float, new: float) -> None:
+    """Change one bucket's TTL; a replica mismatch must still fail."""
+    network = f"ttl{uuid.uuid4().hex}"
+    nc = await connect()
+    try:
+        before = SessionStore(network, 3, SECRET, old)
+        await before.open(nc.jetstream())
+        await before.put(SESSION_IDENTITY, session_record(network, old))
+
+        after = SessionStore(network, 3, SECRET, new)
+        kv = await after.open(nc.jetstream())
+
+        info = await nc.jetstream().stream_info(f"KV_{after.bucket}")
+        assert info.config.max_age == new
+        entry = await kv.get(after.key(SESSION_IDENTITY))
+        assert entry.value is not None
+        assert json.loads(entry.value)["prefix"] == SESSION_IDENTITY
+
+        # A different replica count is not applied; it fails as before.
+        fewer = SessionStore(network, 1, SECRET, new)
+        try:
+            await fewer.open(nc.jetstream())
+        except BadRequestError:
+            pass
+        else:
+            msg = "a replica mismatch opened the bucket"
+            raise AssertionError(msg)
     finally:
         await nc.drain()
