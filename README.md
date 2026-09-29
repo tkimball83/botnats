@@ -80,7 +80,7 @@ Example `bot.json`:
 
 | Setting                                     | Behavior                                                    |
 | ------------------------------------------- | ----------------------------------------------------------- |
-| `authorization.session_ttl_seconds`         | Authorized session lifetime; maximum 86,400 seconds         |
+| `authorization.session_ttl_seconds`         | Authorized session lifetime; 3,600 seconds by default       |
 | `bot.health_port`                           | HTTP liveness and readiness port; 8080 by default           |
 | `bot.id`                                    | Unique mesh ID; compared case-insensitively                 |
 | `bot.network`                               | One IRC network per process; namespaces shared NATS state   |

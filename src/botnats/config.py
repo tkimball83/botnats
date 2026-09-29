@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+")
 MODE_STRING_RE = re.compile(r"(?:[+-][A-Za-z]+)+")
-MAX_SESSION_TTL = 86400
 MIN_COORDINATION_KEY_BYTES = 32
 NATS_SCHEMES = frozenset({"nats", "tls"})
 NICKNAME_RE = re.compile(r"[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]*")
@@ -115,9 +114,6 @@ class BotConfig:
             "authorization",
             3600,
         )
-        if session_ttl > MAX_SESSION_TTL:
-            msg = f"authorization.session_ttl_seconds must not exceed {MAX_SESSION_TTL}"
-            raise ValueError(msg)
 
         return cls(
             auth_session_ttl=session_ttl,
