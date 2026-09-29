@@ -113,7 +113,7 @@ class CoordinatorProtocol(Protocol):
         ...
 
     async def request_help(self, kind: str, payload: dict[str, Any]) -> None:
-        """Broadcast an op, invite, or unban request to every peer."""
+        """Broadcast an invite, limit, op, or unban request to every peer."""
         ...
 
     async def start(self) -> None:
@@ -141,7 +141,7 @@ def _decode_record(value: bytes | None) -> dict[str, Any] | None:
 
 
 class HelpRequests:
-    """Broadcast op, invite, and unban requests to every peer over Core NATS.
+    """Broadcast invite, limit, op, and unban requests to peers over Core NATS.
 
     Each eligible peer acts on its own after a short random delay, rechecking
     IRC state first, so no peer waits on another. Two peers answering the same
@@ -186,10 +186,10 @@ class HelpRequests:
 
     async def deliver(
         self,
-        callback: Callable[[dict[str, Any]], None],
+        callback: Callable[[str, dict[str, Any]], None],
         message: Msg,
     ) -> None:
-        """Hand a peer's request to the bot; skip it while unready or our own."""
+        """Hand a peer's request and its kind to the bot; skip unready or our own."""
         if not self.coordinator.ready:
             return
 
@@ -198,7 +198,7 @@ class HelpRequests:
             payload is not None
             and payload["presence"]["bot_id"] != self.coordinator.envelope.bot_id
         ):
-            callback(payload)
+            callback(message.subject.rpartition(".")[2], payload)
 
     async def publish(self, suffix: str, payload: dict[str, Any]) -> None:
         """Broadcast a signed message on the given subject suffix."""
@@ -229,16 +229,12 @@ class HelpRequests:
         if nc is None:
             return
 
-        callbacks = self.coordinator.callbacks
-        for kind, callback in (
-            ("invite", callbacks.on_invite),
-            ("op", callbacks.on_op),
-            ("unban", callbacks.on_unban),
-        ):
-            await nc.subscribe(
-                f"{self.coordinator.ns}.{kind}",
-                cb=partial(self.deliver, callback),
-            )
+        # Help requests are the only subjects in the namespace; the last token
+        # names the kind.
+        await nc.subscribe(
+            f"{self.coordinator.ns}.*",
+            cb=partial(self.deliver, self.coordinator.callbacks.on_help),
+        )
 
     def warn_decode(self, kind: str, subject: str, error: Exception) -> None:
         """Rate-limit warnings for malformed NATS messages."""
@@ -467,7 +463,7 @@ class Coordinator:
         return self.ready and await self.claims.claim(counter)
 
     async def request_help(self, kind: str, payload: dict[str, Any]) -> None:
-        """Broadcast an op, invite, or unban request to every peer."""
+        """Broadcast an invite, limit, op, or unban request to every peer."""
         await self.help_requests.request(kind, payload)
 
     def discard_watch_synced(self, name: str, generation: int) -> None:

@@ -216,7 +216,8 @@ async def run() -> None:
         )
 
         for channel, key in CHANNELS:
-            assert await command(session, "alpha", f"JOIN {channel} {key}") == (
+            supplied = f"{key}-supplied"
+            assert await command(session, "alpha", f"JOIN {channel} {supplied}") == (
                 f"Joining {channel}"
             )
             await wait_for_channel(session, channel, key)
@@ -224,9 +225,18 @@ async def run() -> None:
         await wait_for_status(session, "beta")
 
         for channel, key in CHANNELS:
-            reply = await command(session, "gamma", f"GETMODES {channel}")
-            assert key in reply
-            assert "k" in reply
+            # Key the channel with other than the key the admin supplied: later
+            # rejoins need the key the bots saw on IRC and stored.
+            assert await command(session, "alpha", f"OP {channel} owner") == (
+                f"Opped owner on {channel}"
+            )
+            await wait_for_operators(session, channel, present=frozenset({"owner"}))
+            await session.send("MODE", channel, "+k", key)
+            _, tracked, *arguments = (
+                await command(session, "gamma", f"GETMODES {channel}")
+            ).split()
+            assert "k" in tracked
+            assert arguments[-1] == key
             channel_modes = await modes(session, channel)
             assert "m" in channel_modes
             assert "n" in channel_modes
@@ -235,13 +245,9 @@ async def run() -> None:
         first, _ = CHANNELS[0]
         second, second_key = CHANNELS[1]
 
-        # Multiple channels with different modes: op the owner on the first
-        # channel and set an extra mode there. The mesh must keep the modes
-        # isolated per channel and not re-apply the enforced set over +i.
-        assert await command(session, "alpha", f"OP {first} owner") == (
-            f"Opped owner on {first}"
-        )
-        await wait_for_operators(session, first, present=frozenset({"owner"}))
+        # Multiple channels with different modes: set an extra mode on the
+        # first channel. The mesh must keep the modes isolated per channel and
+        # not re-apply the enforced set over +i.
         await session.send("MODE", first, "+i")
         await wait_for_modes(session, first, present="i")
         assert "i" not in await modes(session, second)

@@ -143,14 +143,12 @@ def build_coordinator(
         "NATSCallbackHandler",
         SimpleNamespace(
             on_channel=AsyncMock(),
-            on_invite=noop_callback,
-            on_op=event_callback(fixtures, "op") if is_alpha else noop_callback,
+            on_help=help_callback(fixtures) if is_alpha else noop_help,
             on_presence=noop_presence,
             on_presence_delete=noop_presence_delete,
             on_session_delete=fixtures.sessions.forget,
             on_session_update=fixtures.sessions.observe,
             on_sessions_replayed=fixtures.sessions.replayed,
-            on_unban=event_callback(fixtures, "unban") if is_alpha else noop_callback,
         ),
     )
     return Coordinator(
@@ -169,20 +167,20 @@ def build_coordinator(
     )
 
 
-def event_callback(fixtures: Fixtures, name: str) -> Callable[[dict[str, Any]], None]:
-    """Return a callback that sets the named event."""
+def help_callback(fixtures: Fixtures) -> Callable[[str, dict[str, Any]], None]:
+    """Return a help callback that sets the event named for the request kind."""
 
-    def handler(payload: dict[str, Any]) -> None:
-        """Signal the event."""
+    def handler(kind: str, payload: dict[str, Any]) -> None:
+        """Signal the kind's event."""
         del payload
-        fixtures.events[name].set()
+        fixtures.events[kind].set()
 
     return handler
 
 
-def noop_callback(payload: dict[str, Any]) -> None:
-    """Accept and ignore any payload."""
-    del payload
+def noop_help(kind: str, payload: dict[str, Any]) -> None:
+    """Accept and ignore any help request."""
+    del kind, payload
 
 
 def noop_presence(presence: BotPresence) -> None:
@@ -266,10 +264,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_peer_help_request_reaches_callback(self) -> None:
-        """Hand a peer's signed request to the bot."""
+        """Hand a peer's signed request to the bot with the kind its subject names."""
         coordinator = build_coordinator("alpha", Fixtures())
         callback = MagicMock()
-        subject = f"{coordinator.ns}.op"
+        subject = f"{coordinator.ns}.unban"
         payload = {"channel": "#test", "presence": BETA_PRESENCE}
         message = Msg(
             MagicMock(),
@@ -283,7 +281,17 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(Coordinator, "ready", PropertyMock(return_value=True)):
             await coordinator.help_requests.deliver(callback, message)
 
-        callback.assert_called_once_with(payload)
+        callback.assert_called_once_with("unban", payload)
+
+    async def test_help_subscription_covers_every_kind(self) -> None:
+        """Subscribe once to the namespace, so every help kind is delivered."""
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.nc = AsyncMock()
+
+        await coordinator.help_requests.subscribe()
+
+        coordinator.nc.subscribe.assert_awaited_once()
+        assert coordinator.nc.subscribe.await_args.args == (f"{coordinator.ns}.*",)
 
     async def test_own_help_request_is_skipped(self) -> None:
         """Ignore this bot's own broadcast, which NATS echoes back to it."""
@@ -358,8 +366,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        def fail(payload: dict[str, Any]) -> None:
-            del payload
+        def fail(kind: str, payload: dict[str, Any]) -> None:
+            del kind, payload
             msg = "callback failed"
             raise ValueError(msg)
 

@@ -18,7 +18,6 @@ from botnats.irc.protocol import (
     DEFAULT_CASEMAPPING,
     Prefix,
     casefold,
-    format_message,
     mask_matches,
     mode_requires_argument,
 )
@@ -39,10 +38,9 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# Retry a JOIN that got no reply at all (no echo, no refusal) after this long:
-# a full outbound queue (64 lines at one per second) drains within a minute.
-JOIN_REPLY_TIMEOUT = 96.0
-OP_BATCH_COALESCE_DELAY = 0.05
+# Resend a JOIN that got no reply the bot handles: a lost JOIN, or a refusal
+# such as 477 (registered nicks only). A duplicate JOIN is harmless.
+JOIN_REPLY_TIMEOUT = 60.0
 # Upper bound of the random wait before answering a peer's help request.
 PEER_HELP_DELAY = 1.0
 PEER_REQUEST_COOLDOWN = 0.5
@@ -72,6 +70,13 @@ class ChannelManager:
         # Highest revision this bot has minted: concurrent local changes to
         # one channel (two admin commands, say) get distinct, ordered revisions.
         self.last_revision = 0
+        # Each peer help request kind, and the action that answers it.
+        self.help_actions: dict[str, Callable[[dict[str, Any]], Awaitable[None]]] = {
+            "invite": self.invite_peer,
+            "limit": self.make_room,
+            "op": self.op_peer,
+            "unban": self.unban_peer,
+        }
 
     async def apply_record(self, record: ChannelRecord) -> None:
         """Apply a channel configuration record, joining or parting as needed."""
@@ -151,47 +156,6 @@ class ChannelManager:
                 "cannot enforce modes on %s: %s", channel, error_label(error)
             )
 
-    async def flush_pending_ops(self, folded_channel: str) -> None:
-        """Send batched operator mode grants after a short coalescing delay."""
-        cancelled = False
-        try:
-            await asyncio.sleep(OP_BATCH_COALESCE_DELAY)
-            runtime = self.channels.get(folded_channel)
-            # Drop the batch if we lost op during the coalescing window rather
-            # than re-queue: retrying here would busy-spin while unopped, and
-            # the requesting peer re-asks on its own maintenance tick.
-            if runtime is not None:
-                queued, runtime.pending_ops = runtime.pending_ops, {}
-                if self.is_self_opped(runtime):
-                    targets = [
-                        p.nick
-                        for p in queued.values()
-                        if (m := runtime.members.get(self.bot.caps.fold(p.nick)))
-                        is not None
-                        and not self.bot.caps.is_opped(m.modes)
-                        and m.prefix is not None
-                        and p.matches(m.prefix, self.bot.caps.casemapping)
-                    ]
-                    await self.batch_mode(
-                        runtime.channel,
-                        "+",
-                        self.bot.caps.op_mode,
-                        targets,
-                        "opped",
-                    )
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
-        finally:
-            runtime = self.channels.get(folded_channel)
-            if runtime is not None:
-                runtime.op_flush_scheduled = False
-                if not cancelled and runtime.pending_ops:
-                    runtime.op_flush_scheduled = True
-                    self.bot.tasks.spawn(
-                        self.flush_pending_ops(folded_channel), "op-batch"
-                    )
-
     async def join_desired(self) -> None:
         """Attempt to join all desired channels not yet entered."""
         if self.bot.identity.current is None:
@@ -200,17 +164,6 @@ class ChannelManager:
         for runtime in tuple(self.channels.values()):
             if runtime.join_due():
                 await self.safe_join(runtime)
-
-    def queue_pending_op(self, folded: str, presence: BotPresence) -> None:
-        """Add a peer bot to the channel's pending operator grant batch."""
-        runtime = self.channels.get(folded)
-        if runtime is None:
-            return
-
-        runtime.pending_ops[presence.bot_id.casefold()] = presence
-        if not runtime.op_flush_scheduled:
-            runtime.op_flush_scheduled = True
-            self.bot.tasks.spawn(self.flush_pending_ops(folded), "op-batch")
 
     async def record_key(self, channel: str, key: str | None) -> None:
         """Record and broadcast a versioned channel key update."""
@@ -298,54 +251,6 @@ class ChannelManager:
                 return True
 
         return False
-
-    async def batch_mode(
-        self,
-        channel: str,
-        prefix: str,
-        char: str,
-        targets: list[str],
-        label: str,
-    ) -> None:
-        """Apply mode changes in batches respecting server and IRC limits."""
-        index = 0
-        while index < len(targets):
-            end = min(index + self.bot.caps.mode_limit, len(targets))
-            while end > index:
-                batch = targets[index:end]
-                try:
-                    format_message(
-                        "MODE",
-                        (channel, prefix + (char * len(batch)), *batch),
-                        None,
-                    )
-                except ValueError:
-                    end -= 1
-                else:
-                    break
-
-            if end == index:
-                LOGGER.warning(
-                    "cannot apply %s to %s on %s: IRC MODE exceeds 512 bytes",
-                    label,
-                    targets[index],
-                    channel,
-                )
-                index += 1
-                continue
-
-            try:
-                await self.bot.irc.send(
-                    "MODE",
-                    channel,
-                    prefix + (char * len(batch)),
-                    *batch,
-                )
-            except ConnectionError:
-                return
-
-            LOGGER.info("%s %s on %s", label, ",".join(batch), channel)
-            index = end
 
     def is_self_opped(self, runtime: ChannelRuntime) -> bool:
         """Check whether this bot holds operator status in the channel."""
@@ -462,13 +367,23 @@ class ChannelManager:
         LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
     async def op_peer(self, payload: dict[str, Any]) -> None:
-        """Queue an operator mode grant for a peer bot."""
+        """Grant operator status to a peer bot."""
         parsed = self.help_eligible(payload)
         if parsed is None:
             return
 
         channel, presence, _ = parsed
-        self.queue_pending_op(self.bot.caps.fold(channel), presence)
+        try:
+            await self.bot.irc.send(
+                "MODE",
+                channel,
+                f"+{self.bot.caps.op_mode}",
+                presence.nick,
+            )
+        except ConnectionError:
+            return
+
+        LOGGER.info("opped %s on %s", presence.nick, channel)
 
     async def unban_peer(self, payload: dict[str, Any]) -> None:
         """Remove channel bans matching a peer bot's hostmask."""
@@ -478,25 +393,62 @@ class ChannelManager:
 
         channel, presence, runtime = parsed
         prefix = presence.to_prefix()
-        masks = sorted(
-            mask
-            for mask in runtime.bans.values()
-            if mask_matches(mask, prefix, self.bot.caps.casemapping)
-        )
-        await self.batch_mode(channel, "-", "b", masks, "removed bot ban(s)")
+        for mask in sorted(runtime.bans.values()):
+            if not mask_matches(mask, prefix, self.bot.caps.casemapping):
+                continue
 
-    async def help_after_delay(
-        self,
-        action: Callable[[dict[str, Any]], Awaitable[None]],
-        payload: dict[str, Any],
-    ) -> None:
+            try:
+                await self.bot.irc.send("MODE", channel, "-b", mask)
+            except ConnectionError:
+                return
+
+            LOGGER.info(
+                "removed ban %s for bot %s on %s", mask, presence.bot_id, channel
+            )
+
+    async def help_after_delay(self, kind: str, payload: dict[str, Any]) -> None:
         """Wait a random moment so answering peers spread out, then act.
 
         The action rechecks eligibility against live IRC state, so a peer that
         another peer already helped sends nothing, or a harmless duplicate.
         """
+        action = self.help_actions.get(kind)
+        if action is None:
+            return
+
         await asyncio.sleep(secrets.randbelow(1000) / 1000 * PEER_HELP_DELAY)
         await action(payload)
+
+    async def make_room(self, payload: dict[str, Any]) -> None:
+        """Raise a full channel's limit so every bot left out can join.
+
+        The target is absolute (members plus bots left out), so peers answering
+        at once send the same limit, and a peer that sees it already set skips.
+        """
+        parsed = self.help_eligible(payload, require_member=False)
+        if parsed is None:
+            return
+
+        channel, _, runtime = parsed
+        if runtime.limit is None:
+            return
+
+        own_id = self.bot.config.bot_id.casefold()
+        left_out = sum(
+            peer.bot_id.casefold() != own_id
+            and self.bot.caps.fold(peer.nick) not in runtime.members
+            for peer in self.bot.presence.active()
+        )
+        target = len(runtime.members) + left_out
+        if left_out == 0 or runtime.limit >= target:
+            return
+
+        try:
+            await self.bot.irc.send("MODE", channel, "+l", str(target))
+        except ConnectionError:
+            return
+
+        LOGGER.info("raised limit on %s to %d for %d bot(s)", channel, target, left_out)
 
     async def request_peer(self, kind: str, channel: str) -> None:
         """Send a coordination request to peers, respecting cooldown limits."""
@@ -689,12 +641,13 @@ class ChannelRuntime:
     channel: str = ""
     cooldowns: dict[str, float] = field(default_factory=dict)
     join: JoinState = JoinState.IDLE
+    # The last unhandled refusal logged for a pending JOIN, so it logs once.
+    join_error: str | None = None
     join_sent_at: float = 0.0
     key: str | None = None
+    limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
     modes: str = ""
-    op_flush_scheduled: bool = False
-    pending_ops: dict[str, BotPresence] = field(default_factory=dict)
 
     @property
     def joined(self) -> bool:
@@ -745,19 +698,22 @@ class ChannelRuntime:
         """Delete a ban mask from the channel ban list."""
         self.bans.pop(casefold(mask, self.casemapping), None)
 
-    def clear_requests(self) -> None:
-        """Drop peer request cooldowns and queued operator grants."""
-        self.cooldowns.clear()
-        self.op_flush_scheduled = False
-        self.pending_ops.clear()
-
     def reset(self) -> None:
         """Clear connection-specific channel state."""
         self.bans.clear()
-        self.clear_requests()
+        self.cooldowns.clear()
         self.join = JoinState.IDLE
+        self.join_error = None
+        self.limit = None
         self.members.clear()
         self.modes = ""
+
+    def set_limit(self, value: str | None) -> None:
+        """Record the +l member limit; None or a non-count value clears it."""
+        if value is not None and value.isascii() and value.isdigit():
+            self.limit = int(value)
+        else:
+            self.limit = None
 
     def set_key(self, key: str | None) -> bool:
         """Set the channel key, validating a non-None key.

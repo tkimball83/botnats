@@ -33,6 +33,7 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         """Connect two coordinators wired to shared test fixtures."""
         self.fixtures = Fixtures(
             events={
+                "limit": asyncio.Event(),
                 "op": asyncio.Event(),
                 "unban": asyncio.Event(),
             },
@@ -106,6 +107,16 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
             assert await coordinator.attempts.allow(identity, now=59.9)
 
         assert not await self.beta.attempts.allow(identity, now=60)
+
+    async def test_limit_request_reaches_peer(self) -> None:
+        """Deliver a broadcast limit request from one bot to its peer."""
+        await self.beta.request_help(
+            "limit",
+            {"channel": "#shared", "presence": BETA_PRESENCE},
+        )
+
+        async with asyncio.timeout(GRANT_TIMEOUT):
+            await self.fixtures.events["limit"].wait()
 
     async def test_op_request_reaches_peer(self) -> None:
         """Deliver a broadcast op request from one bot to its peer."""

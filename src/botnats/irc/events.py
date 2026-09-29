@@ -48,7 +48,7 @@ class IRCEventHandler:
             "353": self.handle_names,
             "366": self.handle_end_of_names,
             "367": self.handle_ban_list,
-            "471": self.handle_join_refused,
+            "471": self.handle_channel_full,
             "473": self.handle_invite_only,
             "474": self.handle_banned,
             "475": self.handle_join_refused,
@@ -94,22 +94,38 @@ class IRCEventHandler:
             if mode in channel_modes:
                 self.update_channel_modes(runtime, mode, adding=adding)
 
-            if argument is None:
-                if mode == "k" and not adding and runtime.key is not None:
-                    self.process_key(runtime, channel, "", adding=False)
+            if mode in "kl":
+                self.process_setting(runtime, channel, mode, argument, adding=adding)
+                continue
 
+            if argument is None:
                 continue
 
             if mode == "b":
                 self.process_ban(runtime, channel, argument, adding=adding)
-            elif mode == "k":
-                self.process_key(runtime, channel, argument, adding=adding)
             elif mode in self.bot.caps.operator_modes:
                 self.process_op(runtime, mode, argument, adding=adding)
                 if adding:
                     saw_new_op = True
 
         return lost_enforced, saw_new_op
+
+    def process_setting(
+        self,
+        runtime: ChannelRuntime,
+        channel: str,
+        mode: str,
+        argument: str | None,
+        *,
+        adding: bool,
+    ) -> None:
+        """Track the channel key or member limit from one mode change."""
+        if mode == "l":
+            runtime.set_limit(argument if adding else None)
+        elif argument is not None:
+            self.process_key(runtime, channel, argument, adding=adding)
+        elif not adding and runtime.key is not None:
+            self.process_key(runtime, channel, "", adding=False)
 
     async def handle_ban_list(self, message: IRCMessage) -> None:
         """Record a ban mask from the channel ban list reply."""
@@ -123,14 +139,61 @@ class IRCEventHandler:
             runtime.add_ban(mask)
 
     async def handle_channel_modes(self, message: IRCMessage) -> None:
-        """Store the channel mode string from an RPL_CHANNELMODEIS reply."""
+        """Take the modes, limit, and key from an RPL_CHANNELMODEIS reply.
+
+        The reply is the channel's full state, so a key it lacks is gone and
+        a key it shows replaces the stored one; a hidden key changes nothing.
+        """
         if len(message.params) < 3:
             return
 
         channel = message.params[1]
         runtime = self.bot.channel_mgr.runtime(channel)
-        if runtime is not None:
-            runtime.modes = message.params[2]
+        if runtime is None:
+            return
+
+        runtime.modes = message.params[2]
+        runtime.set_limit(None)
+        key: str | None = None
+        for adding, mode, argument in iter_mode_changes(
+            message.params[2],
+            message.params[3:],
+            self.bot.caps.chanmodes,
+            self.bot.caps.membership_modes,
+        ):
+            if adding and mode == "l":
+                runtime.set_limit(argument)
+            elif adding and mode == "k":
+                # ircu shows other members "*" in place of the key.
+                key = argument or "*"
+
+        if key not in ("*", runtime.key):
+            self.process_key(runtime, channel, key or "", adding=key is not None)
+
+    def log_join_error(self, message: IRCMessage) -> None:
+        """Log, once, an unhandled error naming a channel this bot is joining.
+
+        Refusals such as 477 (registered nicks only) vary by server; the JOIN
+        stays pending and is resent after JOIN_REPLY_TIMEOUT.
+        """
+        if len(message.params) < 3:
+            return
+
+        runtime = self.bot.channel_mgr.runtime(message.params[1])
+        if (
+            runtime is None
+            or runtime.join is not JoinState.JOINING
+            or runtime.join_error == message.command
+        ):
+            return
+
+        runtime.join_error = message.command
+        LOGGER.warning(
+            "cannot join %s: %s %s",
+            runtime.channel,
+            message.command,
+            message.params[-1],
+        )
 
     def join_refused(self, channel: str) -> None:
         """Return a refused JOIN to idle so the next tick tries again."""
@@ -352,8 +415,6 @@ class IRCEventHandler:
                 self.bot.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
             case "CHANMODES":
                 self.bot.caps.chanmodes = DEFAULT_CHANMODES
-            case "MODES":
-                self.bot.caps.mode_limit = 1
             case "MONITOR":
                 self.bot.caps.monitor = False
             case "NICKLEN":
@@ -370,8 +431,6 @@ class IRCEventHandler:
                 self.bot.channel_mgr.set_casemapping(value.lower())
             case "CHANMODES":
                 self.bot.caps.parse_chanmodes(value)
-            case "MODES":
-                self.bot.caps.parse_modes(value)
             case "MONITOR":
                 # The value is only a target limit, and this bot monitors one.
                 self.bot.caps.monitor = True
@@ -435,11 +494,20 @@ class IRCEventHandler:
                 "invite-request",
             )
 
-    async def handle_join_refused(self, message: IRCMessage) -> None:
-        """Retry a JOIN refused for a full channel or a bad key.
+    async def handle_channel_full(self, message: IRCMessage) -> None:
+        """Ask peers to raise the limit of a channel too full to join."""
+        if len(message.params) >= 2:
+            self.join_refused(message.params[1])
+            self.bot.tasks.spawn(
+                self.bot.channel_mgr.request_peer("limit", message.params[1]),
+                "limit-request",
+            )
 
-        An invite gets past neither +l nor +k, so none is requested; the next
-        attempt uses the stored key, which peers in the channel keep current.
+    async def handle_join_refused(self, message: IRCMessage) -> None:
+        """Retry a JOIN refused for a bad key.
+
+        An invite does not get past +k, so none is requested; the next attempt
+        uses the stored key, which peers in the channel keep current.
         """
         if len(message.params) >= 2:
             self.join_refused(message.params[1])
@@ -484,6 +552,11 @@ class IRCEventHandler:
             arguments,
         )
         opped = self.bot.channel_mgr.is_self_opped(runtime)
+        if opped and not was_opped:
+            # Operators see the key that ircu hides from other members.
+            with suppress(ConnectionError):
+                await self.bot.irc.send("MODE", channel)
+
         if opped and (lost_enforced or not was_opped):
             self.bot.tasks.spawn(
                 self.bot.channel_mgr.enforce_modes(channel),
@@ -634,6 +707,8 @@ class IRCEventHandler:
         """Route an IRC message to its registered handler."""
         if handler := self.handlers.get(message.command):
             await handler(message)
+        elif message.command.isdigit() and message.command[0] in "45":
+            self.log_join_error(message)
 
     def process_ban(
         self,

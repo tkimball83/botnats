@@ -6,9 +6,9 @@
 import unittest
 from collections import deque
 from dataclasses import asdict
-from unittest.mock import patch
+from unittest.mock import AsyncMock, call, patch
 
-from botnats.channel import JoinState
+from botnats.channel import ChannelRuntime, JoinState
 from botnats.commands import RateLimiter, parse_command
 from botnats.irc.protocol import Prefix, casefold
 from botnats.presence import BotPresence
@@ -206,9 +206,16 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "#test +nst")]
 
         fake_irc.privmsgs.clear()
+        runtime.modes = "+nstlk"
         runtime.key = "secret"
+        runtime.limit = 5
         await bot.commands.dispatch(OWNER, "GETMODES #test")
-        assert fake_irc.privmsgs == [("owner", "#test +nst secret")]
+        assert fake_irc.privmsgs == [("owner", "#test +nstlk 5 secret")]
+
+        fake_irc.privmsgs.clear()
+        runtime.modes = "+nstkl"
+        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        assert fake_irc.privmsgs == [("owner", "#test +nstkl secret 5")]
 
     async def test_admin_getusers(self) -> None:
         """Verify GETUSERS command lists channel members with op prefixes."""
@@ -227,6 +234,29 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [
             ("owner", "#test @alpha beta @gamma"),
         ]
+
+    async def test_admin_getchans(self) -> None:
+        """List tracked channels, marking opped ones @ and those not joined -."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        bot.channel_mgr.channels.clear()
+
+        await bot.commands.dispatch(OWNER, "GETCHANS")
+        assert fake_irc.privmsgs == [("owner", "No channels tracked")]
+
+        for name, state in (
+            ("#Zeta", JoinState.JOINED),
+            ("#alpha", JoinState.JOINED),
+            ("#beta", JoinState.JOINING),
+            ("#gamma", JoinState.IDLE),
+        ):
+            runtime = ChannelRuntime(channel=name, join=state)
+            bot.channel_mgr.channels[casefold(name)] = runtime
+
+        bot.channel_mgr.channels[casefold("#alpha")].member("alpha").modes.add("o")
+        fake_irc.privmsgs.clear()
+        await bot.commands.dispatch(OWNER, "GETCHANS")
+        assert fake_irc.privmsgs == [("owner", "Channels @#alpha -#beta -#gamma #Zeta")]
 
     async def test_admin_getusers_chunked(self) -> None:
         """Verify GETUSERS splits long nick lists across multiple messages."""
@@ -267,8 +297,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert "*!~beta@beta.host" in runtime.bans.values()
 
-        runtime.pending_ops["beta"] = peer
-        await bot.channel_mgr.flush_pending_ops(casefold("#test"))
+        await bot.channel_mgr.op_peer(action)
         assert "o" not in runtime.member("beta").modes
 
     async def test_admin_deop(self) -> None:
@@ -325,6 +354,34 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("INVITE", ("guest", "#test"))]
         assert fake_irc.privmsgs == [("owner", "Invited guest to #test")]
+
+    async def test_admin_kick(self) -> None:
+        """Kick a member, with or without a reason, only while opped."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.member("Target")
+        bot.authorizer.grant(OWNER.render())
+
+        await bot.commands.dispatch(OWNER, "KICK #test target")
+        assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
+
+        runtime.member("alpha").modes.add("o")
+        fake_irc.privmsgs.clear()
+        with patch.object(fake_irc, "send", AsyncMock(wraps=fake_irc.send)) as send:
+            await bot.commands.dispatch(OWNER, "KICK #test ghost")
+            await bot.commands.dispatch(OWNER, "KICK #test target")
+            await bot.commands.dispatch(OWNER, "KICK #test target go  away")
+
+        kicks = [c for c in send.await_args_list if c.args[0] == "KICK"]
+        assert kicks == [
+            call("KICK", "#test", "Target", trailing=None),
+            call("KICK", "#test", "Target", trailing="go away"),
+        ]
+        assert fake_irc.privmsgs == [
+            ("owner", "ghost not found on #test"),
+            ("owner", "Kicked Target from #test"),
+            ("owner", "Kicked Target from #test"),
+        ]
 
     async def test_admin_op(self) -> None:
         """Verify OP command grants operator mode directly."""

@@ -3,7 +3,6 @@
 
 """Data types, casemapping, message parsing, and server capability state for IRC."""
 
-from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
@@ -108,7 +107,6 @@ class ISupportState:
         default_factory=lambda: dict(DEFAULT_MEMBER_PREFIXES),
     )
     membership_modes: str = DEFAULT_MEMBERSHIP_MODES
-    mode_limit: int = 1
     monitor: bool = False
     op_mode: str = "o"
 
@@ -139,11 +137,6 @@ class ISupportState:
         groups = value.split(",")
         if len(groups) >= 4:
             self.chanmodes = (groups[0], groups[1], groups[2], groups[3])
-
-    def parse_modes(self, value: str) -> None:
-        """Set the per-command mode-change limit from an ISUPPORT value."""
-        with suppress(ValueError):
-            self.mode_limit = max(1, int(value))
 
     def parse_prefix(self, value: str) -> None:
         """Map membership symbols to modes from an ISUPPORT PREFIX value."""
