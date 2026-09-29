@@ -578,6 +578,29 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert runtime.key is None
 
+    async def test_mode_hidden_key_ignored(self) -> None:
+        """Keep the stored key when MODE shows a hidden '*' key, opped or not."""
+        bot, _, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.join = JoinState.JOINED
+        runtime.key = "secret"
+
+        for opped in (False, True):
+            if opped:
+                runtime.member("alpha").modes.add("o")
+
+            await bot.events.on_irc_message(
+                IRCMessage(
+                    "MODE",
+                    ("#test", "+k", "*"),
+                    Prefix("services", "service", "services.host"),
+                ),
+            )
+            await asyncio.gather(*bot.tasks)
+
+            assert runtime.key == "secret"
+            assert coordinator.channel_puts == []
+
     async def test_mode_key_unset_without_argument(self) -> None:
         """Clear the channel key when a server strips the -k argument."""
         bot, _ = bot_with_irc()

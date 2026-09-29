@@ -123,7 +123,10 @@ class IRCEventHandler:
         if mode == "l":
             runtime.set_limit(argument if adding else None)
         elif argument is not None:
-            self.process_key(runtime, channel, argument, adding=adding)
+            # Servers send "*" in place of a hidden key, to operators too
+            # during a netsplit; a literal "*" key is set with JOIN instead.
+            if not adding or argument != "*":
+                self.process_key(runtime, channel, argument, adding=adding)
         elif not adding and runtime.key is not None:
             self.process_key(runtime, channel, "", adding=False)
 
@@ -164,7 +167,7 @@ class IRCEventHandler:
             if adding and mode == "l":
                 runtime.set_limit(argument)
             elif adding and mode == "k":
-                # ircu shows other members "*" in place of the key.
+                # Some servers show members without access "*" for the key.
                 key = argument or "*"
 
         if key not in ("*", runtime.key):
@@ -553,7 +556,7 @@ class IRCEventHandler:
         )
         opped = self.bot.channel_mgr.is_self_opped(runtime)
         if opped and not was_opped:
-            # Operators see the key that ircu hides from other members.
+            # Operators see a key the server hides from other members.
             with suppress(ConnectionError):
                 await self.bot.irc.send("MODE", channel)
 
