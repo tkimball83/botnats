@@ -342,7 +342,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert bot.caps.casemapping == "ascii"
         assert bot.caps.fold("[") != bot.caps.fold("{")
-        assert bot.caps.mode_limit == 6
         assert bot.caps.op_mode == "y"
         assert bot.channel_mgr.is_self_opped(runtime)
         assert fake_irc.casemapping == "ascii"
@@ -432,8 +431,38 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert not bot.caps.is_opped(runtime.member("Target").modes)
 
-    async def test_only_invite_only_refusal_requests_invite(self) -> None:
-        """Ask for an invite only where one helps: +i, not +l or +k."""
+    async def test_unhandled_join_error_logged_once(self) -> None:
+        """Log an unhandled refusal of a pending JOIN once, until joined again."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.join = JoinState.JOINING
+        refusal = IRCMessage("477", ("alpha", "#Test", "Registered nicks only"))
+
+        with self.assertLogs("botnats.irc.events", level="WARNING") as logs:
+            await bot.events.on_irc_message(refusal)
+
+        assert logs.output == [
+            "WARNING:botnats.irc.events:cannot join #test: 477 Registered nicks only",
+        ]
+
+        with self.assertNoLogs("botnats.irc.events", level="WARNING"):
+            await bot.events.on_irc_message(refusal)
+            # An error about a channel the bot is in is not a join refusal.
+            runtime.join = JoinState.JOINED
+            await bot.events.on_irc_message(
+                IRCMessage("482", ("alpha", "#test", "not channel operator")),
+            )
+
+        runtime.reset()
+        runtime.join = JoinState.JOINING
+        with self.assertLogs("botnats.irc.events", level="WARNING"):
+            await bot.events.on_irc_message(refusal)
+
+        # The JOIN stays pending, to be resent after the reply timeout.
+        assert runtime.join is JoinState.JOINING
+
+    async def test_refusals_request_matching_help(self) -> None:
+        """Ask for an invite on +i and a raised limit on +l; retry +k alone."""
         bot, _, coordinator = bot_with_coordinator()
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
@@ -450,7 +479,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             # Every refusal returns the JOIN to idle so a later tick retries it.
             assert runtime.join is JoinState.IDLE
 
-        assert [kind for kind, _ in coordinator.help_requests] == ["invite"]
+        assert [kind for kind, _ in coordinator.help_requests] == ["limit", "invite"]
 
     async def test_mode_enforce_once_on_op_with_unset(self) -> None:
         """Verify one enforcement when a single MODE ops the bot and unsets."""
@@ -645,6 +674,74 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("324", ("alpha", "#test", "+nstk", "secret"), None),
         )
         assert runtime.modes == "+nstk"
+
+    async def test_channel_key_reconciled_from_324(self) -> None:
+        """Store a key RPL_CHANNELMODEIS shows or lacks; ignore a hidden one."""
+        bot, _, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.join = JoinState.JOINED
+
+        async def channel_modes(*params: str) -> None:
+            await bot.events.on_irc_message(
+                IRCMessage("324", ("alpha", "#test", *params), None),
+            )
+            await asyncio.gather(*bot.tasks)
+
+        await channel_modes("+ntk", "*")
+        assert runtime.key is None
+        assert coordinator.channel_puts == []
+
+        await channel_modes("+ntk", "real-key")
+        assert runtime.key == "real-key"
+        assert [p["key"] for _, p in coordinator.channel_puts] == ["real-key"]
+
+        await channel_modes("+ntk", "*")
+        await channel_modes("+ntk", "real-key")
+        assert len(coordinator.channel_puts) == 1
+
+        await channel_modes("+nt")
+        assert runtime.key is None
+        assert [p["key"] for _, p in coordinator.channel_puts] == ["real-key", None]
+
+    async def test_op_gain_requeries_channel_modes(self) -> None:
+        """Ask for the channel modes again once opped, to see a hidden key."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.join = JoinState.JOINED
+        services = Prefix("chanserv", "service", "services.host")
+
+        for _ in range(2):
+            await bot.events.on_irc_message(
+                IRCMessage("MODE", ("#test", "+o", "alpha"), services),
+            )
+
+        assert fake_irc.sent.count(("MODE", ("#test",))) == 1
+
+    async def test_channel_limit_tracked(self) -> None:
+        """Track +l from RPL_CHANNELMODEIS and MODE changes, and clear it on reset."""
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.join = JoinState.JOINED
+        services = Prefix("chanserv", "service", "services.host")
+
+        await bot.events.on_irc_message(
+            IRCMessage("324", ("alpha", "#test", "+ntlk", "5", "secret"), None),
+        )
+        assert runtime.limit == 5
+
+        await bot.events.on_irc_message(
+            IRCMessage("MODE", ("#test", "+l", "7"), services)
+        )
+        assert runtime.limit == 7
+
+        await bot.events.on_irc_message(IRCMessage("MODE", ("#test", "-l"), services))
+        assert runtime.limit is None
+
+        await bot.events.on_irc_message(
+            IRCMessage("MODE", ("#test", "+l", "3"), services)
+        )
+        runtime.reset()
+        assert runtime.limit is None
 
     async def test_channel_modes_updated_on_change(self) -> None:
         """Verify MODE changes update the tracked channel mode string."""

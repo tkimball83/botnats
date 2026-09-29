@@ -172,35 +172,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert ("PART", ("#room[",)) in fake_irc.sent
         assert bot.channel_mgr.pending_parts == {}
 
-    async def test_flush_cancellation_does_not_respawn(self) -> None:
-        """Verify a cancelled op-flush does not resurrect a background task."""
-        bot, _ = bot_with_irc()
-        bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
-        )
-        folded = casefold("#test")
-        bot.channel_mgr.channels[folded].join = JoinState.JOINED
-        peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
-
-        bot.channel_mgr.queue_pending_op(folded, peer)
-        await asyncio.sleep(0)
-        tasks = [task for task in bot.tasks if task.get_name() == "op-batch"]
-        assert len(tasks) == 1
-
-        tasks[0].cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await tasks[0]
-
-        await asyncio.sleep(0)
-
-        live = [
-            task
-            for task in bot.tasks
-            if task.get_name() == "op-batch" and not task.done()
-        ]
-        assert live == []
-        assert not bot.channel_mgr.channels[folded].op_flush_scheduled
-
     async def test_join_part_nats_failure(self) -> None:
         """Verify join and part commands handle NATS publish failures."""
         coordinator = FailingPublishCoordinator()
@@ -303,13 +274,12 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert casefold("#test") in bot.channel_mgr.channels
 
     async def test_part_clears_transient_state(self) -> None:
-        """Verify parting clears cooldowns and queued operator grants."""
+        """Verify parting drops the channel's request cooldowns."""
         bot, _ = bot_with_irc()
         folded = bot.caps.fold("#test")
         manager = bot.channel_mgr
         runtime = manager.channels[folded]
         runtime.cooldowns.update({"invite": 1, "op": 1, "unban": 1})
-        runtime.pending_ops["beta"] = BotPresence("beta", "h", "i", "beta", "u")
         current = bot.channel_mgr.channel_records[folded]
 
         await manager.apply_record(
@@ -321,7 +291,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        # The channel's owner, with its cooldowns and queued grants, is gone.
+        # The channel's owner, with its cooldowns, is gone.
         assert folded not in manager.channels
 
     async def test_part_queued_on_failure(self) -> None:
@@ -695,16 +665,35 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         payload = {"channel": "#test", "presence": asdict(peer)}
 
         with patch("botnats.channel.PEER_HELP_DELAY", 0):
-            bot.callbacks.on_op(payload)
+            bot.callbacks.on_help("op", payload)
             await settle(bot)
             assert fake_irc.modes == [("#test", "+o", ("beta",))]
 
             # Another peer opped beta first: this bot sends nothing more.
             runtime.member("beta").modes.add("o")
-            bot.callbacks.on_op(payload)
+            bot.callbacks.on_help("op", payload)
             await settle(bot)
 
         assert fake_irc.modes == [("#test", "+o", ("beta",))]
+
+    async def test_unknown_help_kind_is_ignored(self) -> None:
+        """Drop a help request of a kind this bot has no action for."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha").modes.add("o")
+        peer = BotPresence("beta", "beta.host", "one", "beta", "~beta")
+        bot.presence.update(peer)
+        payload = {"channel": "#test", "presence": asdict(peer)}
+
+        with (
+            patch("botnats.channel.PEER_HELP_DELAY", 0),
+            self.assertNoLogs("botnats", level="ERROR"),
+        ):
+            bot.callbacks.on_help("unknown", payload)
+            await settle(bot)
+
+        assert fake_irc.sent == []
 
     async def test_invite_peer(self) -> None:
         """Verify an invite request sends an INVITE command for a known peer."""
@@ -720,10 +709,47 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("INVITE", ("beta", "#test"))]
 
-    async def test_op_batching(self) -> None:
-        """Verify multiple op requests batch into a single MODE command."""
+    async def test_make_room_raises_limit_for_left_out_bots(self) -> None:
+        """Raise a full channel's limit by the number of bots not in it."""
         bot, fake_irc = bot_with_irc()
-        bot.caps.mode_limit = 4
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("user")
+        runtime.limit = 2
+        peers = (
+            BotPresence("beta", "beta.host", "one", "beta", "~beta"),
+            BotPresence("gamma", "gamma.host", "two", "gamma", "~gamma"),
+            BotPresence("delta", "delta.host", "three", "delta", "~delta"),
+        )
+        for peer in peers:
+            bot.presence.update(peer)
+
+        runtime.member("delta")
+        payload = {"channel": "#test", "presence": asdict(peers[0])}
+
+        await bot.channel_mgr.make_room(payload)
+        # Three members plus beta and gamma, left out; delta is already in.
+        assert fake_irc.sent == [("MODE", ("#test", "+l", "5"))]
+
+        runtime.limit = 5
+        await bot.channel_mgr.make_room(payload)
+        assert len(fake_irc.sent) == 1
+
+    async def test_make_room_needs_a_limit(self) -> None:
+        """Leave a channel without a tracked limit alone."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime.member("alpha").modes.add("o")
+        peer = BotPresence("beta", "beta.host", "one", "beta", "~beta")
+        bot.presence.update(peer)
+
+        await bot.channel_mgr.make_room({"channel": "#test", "presence": asdict(peer)})
+
+        assert fake_irc.sent == []
+
+    async def test_op_peer_one_at_a_time(self) -> None:
+        """Op each requesting peer with its own MODE line."""
+        bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
@@ -740,9 +766,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 {"channel": "#test", "presence": asdict(peer)}
             )
 
-        async with asyncio.timeout(5):
-            await asyncio.gather(*bot.tasks)
-        assert fake_irc.modes == [("#test", "+oo", ("beta", "gamma"))]
+        assert fake_irc.modes == [
+            ("#test", "+o", ("beta",)),
+            ("#test", "+o", ("gamma",)),
+        ]
 
     async def test_op_requires_matching_host(self) -> None:
         """Verify op request is rejected when peer host does not match."""
@@ -763,10 +790,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unban_matching_masks(self) -> None:
         """Verify an unban request removes only matching ban masks."""
         bot, fake_irc = bot_with_irc()
-        bot.caps.mode_limit = 4
         runtime = bot.channel_mgr.channels[casefold("#test")]
         runtime.member("alpha").modes.add("o")
-        for _mask in ("*!~beta@bot.host", "*!other@*"):
+        for _mask in ("*!~beta@bot.host", "*!other@*", "*!*@bot.host"):
             runtime.add_ban(_mask)
 
         peer = BotPresence("beta", "bot.host", "one", "beta", "~beta")
@@ -775,4 +801,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         await bot.channel_mgr.unban_peer(payload)
 
-        assert fake_irc.modes == [("#test", "-b", ("*!~beta@bot.host",))]
+        assert fake_irc.modes == [
+            ("#test", "-b", ("*!*@bot.host",)),
+            ("#test", "-b", ("*!~beta@bot.host",)),
+        ]

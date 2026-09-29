@@ -221,26 +221,7 @@ class NATSCallbackHandler:
         """Drop sessions a completed watch replay no longer contains."""
         self.bot.sessions.replayed(keys)
 
-    def on_invite(self, payload: dict[str, Any]) -> None:
-        """Schedule a peer's invite request."""
+    def on_help(self, kind: str, payload: dict[str, Any]) -> None:
+        """Schedule a peer's help request."""
         channels = self.bot.channel_mgr
-        self.bot.tasks.spawn(
-            channels.help_after_delay(channels.invite_peer, payload),
-            "peer-invite",
-        )
-
-    def on_op(self, payload: dict[str, Any]) -> None:
-        """Schedule a peer's op request."""
-        channels = self.bot.channel_mgr
-        self.bot.tasks.spawn(
-            channels.help_after_delay(channels.op_peer, payload),
-            "peer-op",
-        )
-
-    def on_unban(self, payload: dict[str, Any]) -> None:
-        """Schedule a peer's unban request."""
-        channels = self.bot.channel_mgr
-        self.bot.tasks.spawn(
-            channels.help_after_delay(channels.unban_peer, payload),
-            "peer-unban",
-        )
+        self.bot.tasks.spawn(channels.help_after_delay(kind, payload), "peer-help")

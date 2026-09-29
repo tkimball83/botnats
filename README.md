@@ -13,8 +13,9 @@ stores shared durable state and atomic authentication controls.
 - Signed, versioned session records make authorization and revocation converge across restarts.
 - Signed NATS messages bind a nonce and timestamp to the exact subject.
 - Automatic op, invite, and unban recovery broadcasts a request; every eligible peer acts
-  after a short random delay, rechecking IRC state first. Admin commands execute directly on
-  the receiving bot.
+  after a short random delay, rechecking IRC state first. A bot refused by a full channel
+  asks peers to raise its limit by the number of bots left out. Admin commands execute
+  directly on the receiving bot.
 - Each bot ID atomically claims a case-insensitive presence key; duplicates remain unready.
 - Authorization binds the visible nick, user, and host. Any identity change,
   NICK included, requires new authentication.
@@ -136,20 +137,22 @@ claimed once.
 Use private messages for every command. All commands except `AUTH` require an
 active session.
 
-| Command    | Arguments          | Action                           |
-| ---------- | ------------------ | -------------------------------- |
-| `AUTH`     | `<totp-code>`      | Authenticate                     |
-| `BAN`      | `<channel> <mask>` | Add a ban                        |
-| `DEOP`     | `<channel> <nick>` | Remove operator status           |
-| `GETBANS`  | `<channel>`        | List tracked bans                |
-| `GETMODES` | `<channel>`        | Show tracked channel modes       |
-| `GETUSERS` | `<channel>`        | List tracked channel members     |
-| `INVITE`   | `<channel> <nick>` | Invite a user                    |
-| `JOIN`     | `<channel> [key]`  | Add a desired channel            |
-| `OP`       | `<channel> <nick>` | Grant operator status            |
-| `PART`     | `<channel>`        | Remove a desired channel         |
-| `STATUS`   |                    | Show bot and NATS status         |
-| `UNBAN`    | `<channel> <mask>` | Remove a tracked ban             |
+| Command    | Arguments                   | Action                       |
+| ---------- | --------------------------- | ---------------------------- |
+| `AUTH`     | `<totp-code>`               | Authenticate                 |
+| `BAN`      | `<channel> <mask>`          | Add a ban                    |
+| `DEOP`     | `<channel> <nick>`          | Remove operator status       |
+| `GETBANS`  | `<channel>`                 | List tracked bans            |
+| `GETCHANS` |                             | List tracked channels        |
+| `GETMODES` | `<channel>`                 | Show tracked channel modes   |
+| `GETUSERS` | `<channel>`                 | List tracked channel members |
+| `INVITE`   | `<channel> <nick>`          | Invite a user                |
+| `JOIN`     | `<channel> [key]`           | Add a desired channel        |
+| `KICK`     | `<channel> <nick> [reason]` | Kick a user                  |
+| `OP`       | `<channel> <nick>`          | Grant operator status        |
+| `PART`     | `<channel>`                 | Remove a desired channel     |
+| `STATUS`   |                             | Show bot and NATS status     |
+| `UNBAN`    | `<channel> <mask>`          | Remove a tracked ban         |
 
 ## Development
 

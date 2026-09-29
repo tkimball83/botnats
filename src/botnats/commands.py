@@ -34,11 +34,13 @@ class CommandHandler:
         self.handlers = {
             "BAN": self.cmd_ban,
             "GETBANS": self.cmd_getbans,
+            "GETCHANS": self.cmd_getchans,
             "GETMODES": self.cmd_getmodes,
             "GETUSERS": self.cmd_getusers,
             "DEOP": self.cmd_deop,
             "INVITE": self.cmd_invite,
             "JOIN": self.cmd_join,
+            "KICK": self.cmd_kick,
             "OP": self.cmd_op,
             "PART": self.cmd_part,
             "STATUS": self.cmd_status,
@@ -57,6 +59,21 @@ class CommandHandler:
             pass
         except ValueError as error:
             LOGGER.warning("dropped PRIVMSG to %s: %s", nickname, error_label(error))
+
+    async def reply_list(self, nickname: str, head: str, items: list[str]) -> None:
+        """Reply with items after head, packed into as few lines as fit."""
+        overhead = len(format_message("PRIVMSG", (nickname,), ""))
+        limit = MAX_IRC_MESSAGE_BYTES - overhead
+        current = head
+        for item in items:
+            candidate = f"{current} {item}"
+            if len(candidate.encode()) > limit:
+                await self.reply(nickname, current)
+                current = f"{head} {item}"
+            else:
+                current = candidate
+
+        await self.reply(nickname, current)
 
     async def channel_update(
         self,
@@ -141,10 +158,11 @@ class CommandHandler:
         if runtime is None:
             await self.reply(prefix.nick, f"No record for {channel}")
         elif runtime.modes:
-            parts = [f"{channel} {runtime.modes}"]
-            if runtime.key:
-                parts.append(runtime.key)
-
+            limit = str(runtime.limit) if runtime.limit is not None else None
+            values = {"k": runtime.key, "l": limit}
+            # Mode arguments follow their letters' order, as in a MODE line.
+            parts = [channel, runtime.modes]
+            parts.extend(value for mode in runtime.modes if (value := values.get(mode)))
             await self.reply(prefix.nick, " ".join(parts))
         else:
             await self.reply(
@@ -170,26 +188,37 @@ class CommandHandler:
                 ),
                 key=lambda n: n.lstrip("@").casefold(),
             )
-            overhead = len(format_message("PRIVMSG", (prefix.nick,), ""))
-            limit = MAX_IRC_MESSAGE_BYTES - overhead
-            lines: list[str] = []
-            current = channel
-            for nick in nicks:
-                candidate = f"{current} {nick}"
-                if len(candidate.encode()) > limit:
-                    lines.append(current)
-                    current = f"{channel} {nick}"
-                else:
-                    current = candidate
-
-            lines.append(current)
-            for line in lines:
-                await self.reply(prefix.nick, line)
+            await self.reply_list(prefix.nick, channel, nicks)
         else:
             await self.reply(
                 prefix.nick,
                 f"No users tracked for {channel}",
             )
+
+    async def cmd_getchans(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
+        """List tracked channels: @ where this bot is opped, - where it is not in."""
+        if arguments:
+            msg = "GETCHANS takes no arguments"
+            raise ValueError(msg)
+
+        channel_mgr = self.bot.channel_mgr
+        if not channel_mgr.channels:
+            await self.reply(prefix.nick, "No channels tracked")
+            return
+
+        channels: list[str] = []
+        for runtime in sorted(
+            channel_mgr.channels.values(),
+            key=lambda r: r.channel.casefold(),
+        ):
+            if not runtime.joined:
+                channels.append(f"-{runtime.channel}")
+            elif channel_mgr.is_self_opped(runtime):
+                channels.append(f"@{runtime.channel}")
+            else:
+                channels.append(runtime.channel)
+
+        await self.reply_list(prefix.nick, "Channels", channels)
 
     async def cmd_deop(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Remove operator status from a user on a channel."""
@@ -241,6 +270,24 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         key = validate_key(arguments[1]) if len(arguments) == 2 else None
         await self.channel_update(prefix, channel, key, present=True)
+
+    async def cmd_kick(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
+        """Kick a user from a channel, with an optional reason."""
+        if len(arguments) < 2:
+            msg = "KICK <channel> <nick> [reason]"
+            raise ValueError(msg)
+
+        channel = validate_channel(arguments[0])
+        target = validate_target(arguments[1])
+        runtime = self.opped_channel(channel)
+        member = runtime.members.get(self.bot.caps.fold(target))
+        if member is None:
+            await self.reply(prefix.nick, f"{target} not found on {channel}")
+            return
+
+        reason = " ".join(arguments[2:]) or None
+        await self.bot.irc.send("KICK", channel, member.nick, trailing=reason)
+        await self.reply(prefix.nick, f"Kicked {member.nick} from {channel}")
 
     async def cmd_op(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Grant operator status to a user on a channel."""

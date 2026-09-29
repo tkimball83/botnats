@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Verify recovery from a ban and kick, and an admin session surviving a restart."""
+"""Verify recovery from a ban, a kick, and a full channel, and a session restart."""
 
 import asyncio
 import base64
@@ -16,6 +16,7 @@ from tests.integration.test_mesh import (
     STARTUP_TIMEOUT,
     IRCSession,
     connect,
+    names,
     private_message,
     wait_for_bots,
     wait_for_names,
@@ -79,6 +80,18 @@ async def rejoin_after_ban(session: IRCSession) -> None:
     )
 
 
+async def rejoin_full_channel(session: IRCSession) -> None:
+    """Kick a bot from a channel limited to those left; peers must make room."""
+    channel, _ = CHANNELS[1]
+    members = await names(session, channel)
+    await session.send("MODE", channel, "+l", str(len(members) - 1))
+    await session.send("KICK", channel, "gamma", trailing="limit test")
+
+    # gamma's JOIN is refused as full until a peer raises the limit for it.
+    await wait_for_names(session, channel, present=frozenset({"gamma"}))
+    await session.send("MODE", channel, "-l")
+
+
 async def session_survives_restart(
     session: IRCSession,
     restart: Callable[[str], Awaitable[None]],
@@ -90,7 +103,7 @@ async def session_survives_restart(
 
 
 async def run(restart: Callable[[str], Awaitable[None]]) -> None:
-    """Authenticate once, then exercise both recovery paths on one connection."""
+    """Authenticate once, then exercise every recovery path on one connection."""
     secret = base64.b32decode(os.environ["BOTNATS_TEST_TOTP_SECRET"])
     session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
     try:
@@ -104,6 +117,7 @@ async def run(restart: Callable[[str], Awaitable[None]]) -> None:
         )
 
         await rejoin_after_ban(session)
+        await rejoin_full_channel(session)
         # Keep this connection open across the restart: closing it would QUIT
         # and revoke the very session under test.
         await session_survives_restart(session, restart)

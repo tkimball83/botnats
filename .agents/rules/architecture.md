@@ -13,9 +13,9 @@ Stateless bots share durable state through JetStream KV.
 - Store auth sessions, channel records, and auth limits in JetStream KV.
 - Represent session revocation as a signed, versioned record; do not delete the durable session key to
   revoke access.
-- Use Core NATS pub/sub only for auto-coordination requests (op, invite, unban). Broadcast a
-  request; every eligible peer acts after a short random delay and rechecks IRC state first.
-  Occasional duplicate idempotent IRC commands are acceptable.
+- Use Core NATS pub/sub only for auto-coordination requests (op, invite, limit, unban).
+  Broadcast a request; every eligible peer acts after a short random delay and rechecks IRC state
+  first. Occasional duplicate idempotent IRC commands are acceptable.
 - Use JetStream KV watches for state convergence; no manual sync protocol.
 - Cache JetStream KV state in bot memory for fast reads.
 - Keep durable keys independent of negotiated IRC casemapping; rekey only in-memory IRC lookups.

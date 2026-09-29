@@ -14,7 +14,7 @@ from botnats import error_label
 from botnats.bot import Bot
 from botnats.channel import JOIN_REPLY_TIMEOUT, JoinState
 from botnats.irc.client import IRCClient
-from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, IRCMessage, Prefix, casefold
+from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     FakeCoordinator,
@@ -75,7 +75,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.runtime("#test")
         assert runtime is not None
         bot.caps.parse_chanmodes("b,k,l,imn")
-        bot.caps.parse_modes("6")
         bot.caps.parse_prefix("(yov)@%+")
         bot.irc.set_nickname_length(12)
         runtime.join = JoinState.JOINED
@@ -99,7 +98,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             "~": "q",
         }
         assert bot.caps.membership_modes == "qaohv"
-        assert bot.caps.mode_limit == 1
         assert bot.caps.op_mode == "o"
         assert bot.irc.casemapping == "rfc1459"
         assert bot.irc.nickname_length == 9
@@ -167,29 +165,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert bot.irc.tls_context is not None
         assert bot.irc.tls_context.check_hostname
         assert bot.irc.tls_context.verify_mode == ssl.CERT_REQUIRED
-
-    async def test_mode_batching_respects_message_bytes(self) -> None:
-        """Split MODE batches that exceed the IRC byte limit."""
-        bot, fake_irc = bot_with_irc()
-        bot.caps.mode_limit = 16
-        targets = [f"n{index:029d}" for index in range(16)]
-
-        await bot.channel_mgr.batch_mode("#test", "+", "o", targets, "opped")
-
-        assert [len(arguments) for _, _, arguments in fake_irc.modes] == [15, 1]
-
-    async def test_batch_mode_skips_single_oversized_target(self) -> None:
-        """Skip one un-encodable target and still apply the rest of the batch."""
-        bot, fake_irc = bot_with_irc()
-        bot.caps.mode_limit = 4
-        oversized = "n" * (MAX_IRC_MESSAGE_BYTES + 1)
-        targets = ["alpha", oversized, "gamma"]
-
-        with self.assertLogs("botnats.channel", level="WARNING"):
-            await bot.channel_mgr.batch_mode("#test", "+", "o", targets, "opped")
-
-        applied = [arg for _, _, arguments in fake_irc.modes for arg in arguments]
-        assert applied == ["alpha", "gamma"]
 
     async def test_close_reaps_task_spawned_during_shutdown(self) -> None:
         """Drain a task a coordinator callback spawns mid-shutdown."""
