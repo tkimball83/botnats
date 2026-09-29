@@ -133,7 +133,8 @@ class SelfIdentity:
                 return
 
             try:
-                await self.irc.send("WHOIS", self.irc.current_nick)
+                # USERHOST alone: its one-line reply carries exactly the user
+                # and visible host peers match against.
                 await self.irc.send("USERHOST", self.irc.current_nick)
             except ConnectionError:
                 return

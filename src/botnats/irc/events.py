@@ -43,16 +43,15 @@ class IRCEventHandler:
             "005": self.handle_isupport,
             "302": self.handle_userhost,
             "303": self.handle_ison_reply,
-            "311": self.handle_whois_user,
             "324": self.handle_channel_modes,
             "352": self.handle_who,
             "353": self.handle_names,
             "366": self.handle_end_of_names,
             "367": self.handle_ban_list,
-            "471": self.handle_join_denied,
-            "473": self.handle_join_denied,
+            "471": self.handle_join_refused,
+            "473": self.handle_invite_only,
             "474": self.handle_banned,
-            "475": self.handle_join_denied,
+            "475": self.handle_join_refused,
             "731": self.handle_monitor_offline,
             "CHGHOST": self.handle_chghost,
             "INVITE": self.handle_invite,
@@ -427,14 +426,23 @@ class IRCEventHandler:
         else:
             runtime.member(message.prefix.nick).prefix = message.prefix
 
-    async def handle_join_denied(self, message: IRCMessage) -> None:
-        """Request a peer invite when a channel refuses a direct join."""
+    async def handle_invite_only(self, message: IRCMessage) -> None:
+        """Request a peer invite when an invite-only channel refuses a JOIN."""
         if len(message.params) >= 2:
             self.join_refused(message.params[1])
             self.bot.tasks.spawn(
                 self.bot.channel_mgr.request_peer("invite", message.params[1]),
                 "invite-request",
             )
+
+    async def handle_join_refused(self, message: IRCMessage) -> None:
+        """Retry a JOIN refused for a full channel or a bad key.
+
+        An invite gets past neither +l nor +k, so none is requested; the next
+        attempt uses the stored key, which peers in the channel keep current.
+        """
+        if len(message.params) >= 2:
+            self.join_refused(message.params[1])
 
     async def handle_kick(self, message: IRCMessage) -> None:
         """Handle a KICK by removing the target or requesting an unban for self."""
@@ -621,13 +629,6 @@ class IRCEventHandler:
         }
         if self.bot.irc.is_self(nick):
             await self.set_identity(member.prefix)
-
-    async def handle_whois_user(self, message: IRCMessage) -> None:
-        """Set the bot's identity from a WHOIS user reply."""
-        if len(message.params) >= 4 and self.bot.irc.is_self(message.params[1]):
-            await self.set_identity(
-                Prefix(message.params[1], message.params[2], message.params[3]),
-            )
 
     async def on_irc_message(self, message: IRCMessage) -> None:
         """Route an IRC message to its registered handler."""

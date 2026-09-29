@@ -432,22 +432,25 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert not bot.caps.is_opped(runtime.member("Target").modes)
 
-    async def test_join_denied_requests_invite(self) -> None:
-        """Verify invite-only, bad-key, and channel-full replies request an invite."""
+    async def test_only_invite_only_refusal_requests_invite(self) -> None:
+        """Ask for an invite only where one helps: +i, not +l or +k."""
         bot, _, coordinator = bot_with_coordinator()
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
+        runtime = bot.channel_mgr.channels[casefold("#test")]
 
         for numeric in ("471", "473", "475"):
-            bot.channel_mgr.channels[casefold("#test")].cooldowns.clear()
+            runtime.join = JoinState.JOINING
+            runtime.cooldowns.clear()
             await bot.events.on_irc_message(
                 IRCMessage(numeric, ("alpha", "#test", "cannot join channel")),
             )
-            await asyncio.sleep(0)
+            await asyncio.gather(*bot.tasks)
+            # Every refusal returns the JOIN to idle so a later tick retries it.
+            assert runtime.join is JoinState.IDLE
 
-        suffixes = [suffix for suffix, _ in coordinator.help_requests]
-        assert suffixes == ["invite", "invite", "invite"]
+        assert [kind for kind, _ in coordinator.help_requests] == ["invite"]
 
     async def test_mode_enforce_once_on_op_with_unset(self) -> None:
         """Verify one enforcement when a single MODE ops the bot and unsets."""
@@ -1281,6 +1284,19 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.identity.current.user == "~user"
         assert bot.identity.current.host == "real.host"
 
+    async def test_userhost_identity_as_away_operator(self) -> None:
+        """Read the identity past the operator (*) and away (-) markers."""
+        fake_irc = FakeIRC()
+        bot = Bot(config(), irc=fake_irc)
+
+        await bot.events.on_irc_message(
+            IRCMessage("302", ("alpha", "other=+x@y alpha*=-bot@cloaked.host")),
+        )
+
+        assert bot.identity.current is not None
+        assert bot.identity.current.user == "bot"
+        assert bot.identity.current.host == "cloaked.host"
+
     async def test_who_reply_updates_member(self) -> None:
         """Verify 352 numeric updates member prefix and modes."""
         bot, _ = bot_with_irc()
@@ -1307,21 +1323,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert member is not None
         assert member.prefix == Prefix("someone", "user", "host.example")
         assert "o" in member.modes
-
-    async def test_whois_sets_identity(self) -> None:
-        """Verify 311 numeric sets the bot's identity."""
-        bot = Bot(config(), irc=FakeIRC())
-
-        await bot.events.on_irc_message(
-            IRCMessage(
-                "311",
-                ("alpha", "alpha", "~user", "real.host", "*", "realname"),
-            ),
-        )
-
-        assert bot.identity.current is not None
-        assert bot.identity.current.user == "~user"
-        assert bot.identity.current.host == "real.host"
 
 
 class NickWatchTests(unittest.IsolatedAsyncioTestCase):
