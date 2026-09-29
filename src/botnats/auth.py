@@ -68,10 +68,13 @@ class AuthFlow:
         # identity that is already gone.
         if counter is not None and claimed and bot.sessions.watched_valid(rendered):
             session = bot.authorizer.grant(rendered)
-            if not await bot.sessions.sync(
-                rendered,
-                asdict(session),
-            ) or not bot.authorizer.authorized(rendered):
+            # The identity must still hold after the write: IRC may have
+            # disconnected while it waited on JetStream.
+            if (
+                not await bot.sessions.sync(rendered, asdict(session))
+                or not bot.authorizer.authorized(rendered)
+                or not bot.sessions.watched_valid(rendered)
+            ):
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
                     await bot.sessions.sync(revoked.prefix, asdict(revoked))
@@ -175,6 +178,16 @@ class SessionSync:
             count, _ = self.watched_identities[key]
             self.watched_identities[key] = (count, True)
 
+    def invalidate_all(self) -> None:
+        """Invalidate every pending command's identity after IRC disconnects.
+
+        This bot can no longer see QUIT or NICK for them, so it cannot vouch
+        that the identity still holds the prefix a pending AUTH would grant.
+        """
+        self.watched_identities = {
+            key: (count, True) for key, (count, _) in self.watched_identities.items()
+        }
+
     def observe(
         self,
         key: str,
@@ -214,9 +227,18 @@ class SessionSync:
         }
 
     def queue(self, identity: str, session: dict[str, object]) -> str:
-        """Queue a mutation, replacing any unwritten one for the identity."""
+        """Queue a mutation unless an unwritten one for the identity outranks it.
+
+        AUTH grants before it waits for the lock, so a revocation queued
+        meanwhile by a QUIT must not be replaced by the older grant.
+        """
         key = casefold(identity, "ascii")
-        self.pending[key] = session
+        now = time.time()
+        incoming = self.authorizer.parse(session, now)
+        queued = self.authorizer.parse(self.pending.get(key), now)
+        if queued is None or (incoming is not None and incoming.order > queued.order):
+            self.pending[key] = session
+
         return key
 
     async def sync(self, identity: str, session: dict[str, object]) -> bool:
@@ -275,9 +297,11 @@ class SessionSync:
                         revoked=True,
                     ),
                 )
+                # The write succeeded; the replacement waits for the next
+                # retry so later identities are not held behind it.
                 self.authorizer.import_session(replacement)
                 self.pending[identity] = replacement
-                return False
+                return True
 
         del self.pending[identity]
         return True

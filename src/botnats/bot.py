@@ -152,6 +152,7 @@ class Bot:
     def on_irc_disconnect(self) -> None:
         """Clear connection-scoped state when the IRC connection drops."""
         self.events.stop_nick_watch()
+        self.sessions.invalidate_all()
         self.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
         self.caps.reset()
         self.irc.reset_caps()
