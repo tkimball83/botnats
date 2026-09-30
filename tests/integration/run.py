@@ -166,6 +166,7 @@ PHASES = (
     ("live coordinator", live_coordinator),
     ("NATS node failover", node_failover),
     ("full NATS restart", cluster_restart),
+    ("session TTL change", test_restart.ttl_change),
     ("three-bot mesh", test_mesh.run),
     ("ban, kick, and restart recovery", recovery),
     ("serial bot replacement", serial_replacement),

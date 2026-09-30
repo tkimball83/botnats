@@ -89,6 +89,36 @@ class ConfigTests(unittest.TestCase):
         assert config.auth_session_ttl == 3600
         assert config.presence_ttl == 15
 
+    def test_session_ttl_has_no_maximum(self) -> None:
+        """Accept a session lifetime longer than a day."""
+        raw = json.loads(CONFIG)
+        raw["authorization"]["session_ttl_seconds"] = 172800
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bot.json")
+            path.write_text(json.dumps(raw))
+            with patch.dict(os.environ, SECRETS):
+                config = BotConfig.load(path)
+
+        assert config.auth_session_ttl == 172800
+
+    def test_session_ttl_must_expire(self) -> None:
+        """Reject a session lifetime of zero or less: sessions always expire."""
+        for ttl in (0, -1):
+            with self.subTest(ttl=ttl):
+                raw = json.loads(CONFIG)
+                raw["authorization"]["session_ttl_seconds"] = ttl
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory, "bot.json")
+                    path.write_text(json.dumps(raw))
+                    with (
+                        patch.dict(os.environ, SECRETS),
+                        self.assertRaisesRegex(
+                            ValueError,
+                            r"authorization\.session_ttl_seconds must be a positive",
+                        ),
+                    ):
+                        BotConfig.load(path)
+
     def test_required_key_errors_name_their_section(self) -> None:
         """Qualify required-key errors with their configuration table."""
         cases = (
