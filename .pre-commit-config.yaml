@@ -31,5 +31,5 @@ repos:
         args: [src, tests]
         pass_filenames: false
         additional_dependencies:
-          - nats-py==2.15.0
+          - nats-py==2.16.0
 ...
