@@ -321,7 +321,7 @@ class FakeKV:
 
 def check_key(key: str) -> None:
     """Reject a key that nats-py rejects before it reaches the bucket."""
-    if VALID_KEY_RE.fullmatch(key) is None or key.startswith(".") or key.endswith("."):
+    if not key or key[0] == "." or key[-1] == "." or not VALID_KEY_RE.match(key):
         raise InvalidKeyError
 
 

@@ -79,7 +79,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         bot, _, _ = bot_with_coordinator(SpawningCoordinator())
 
-        await bot.close()
+        async with asyncio.timeout(5):
+            await bot.close()
 
         assert not bot.tasks
 
@@ -105,7 +106,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(1):
             await running.wait()
 
-        await bot.close()
+        async with asyncio.timeout(5):
+            await bot.close()
 
         assert order == ["task-cancelled", "coordinator-closed"]
         assert not bot.tasks
@@ -119,12 +121,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 raise OSError(msg)
 
         bot, _, _ = bot_with_coordinator(RaisingCoordinator())
-        with (
-            patch.object(bot.irc, "close") as irc_close,
-            patch.object(bot.health_check, "close") as health_close,
-            self.assertRaises(OSError),
-        ):
-            await bot.close()
+        # TimeoutError is an OSError: bound the close outside assertRaises.
+        async with asyncio.timeout(5):
+            with (
+                patch.object(bot.irc, "close") as irc_close,
+                patch.object(bot.health_check, "close") as health_close,
+                self.assertRaises(OSError),
+            ):
+                await bot.close()
 
         irc_close.assert_awaited_once()
         health_close.assert_awaited_once()
@@ -145,7 +149,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             coordinator.connected = False
 
         with patch.object(coordinator, "close", disconnect):
-            await bot.close()
+            async with asyncio.timeout(5):
+                await bot.close()
 
         puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
         assert puts == [(prefix.render(), True)]
@@ -247,7 +252,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot.health_check, "close", AsyncMock()),
         ):
             # run() returns only once run_forever has run beside the blocked start.
-            await asyncio.wait_for(bot.run(), timeout=5)
+            async with asyncio.timeout(5):
+                await bot.run()
 
     async def test_ready(self) -> None:
         """Verify readiness requires IRC registration, connection, and NATS."""
@@ -272,6 +278,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         """Verify the maintenance loop survives a tick exception."""
         bot = Bot(config())
         calls = 0
+        sleeps = 0
 
         async def counting_tick() -> None:
             nonlocal calls
@@ -282,7 +289,11 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
 
         async def immediate(delay: float) -> None:
             del delay
-            if calls >= 2:
+            nonlocal sleeps
+            sleeps += 1
+            # Stop on a sleep count, not a tick count, so a loop that stops
+            # ticking fails the assertion below instead of spinning forever.
+            if sleeps == 3:
                 msg = "stop"
                 raise asyncio.CancelledError(msg)
 
@@ -332,7 +343,8 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(fake_irc, "run_forever", run_until_heartbeats),
             patch("botnats.bot.asyncio.sleep", yield_once),
         ):
-            await bot.run()
+            async with asyncio.timeout(5):
+                await bot.run()
 
     async def test_prunes_expired_sessions_while_disconnected(self) -> None:
         """Remove expired auth sessions even while IRC is disconnected."""
