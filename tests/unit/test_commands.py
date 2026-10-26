@@ -547,6 +547,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
         bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        # A channel still joining is desired but not counted.
+        bot.channel_mgr.channels[casefold("#other", "rfc1459")] = ChannelRuntime(
+            bot.caps, channel="#other", join=JoinState.JOINING
+        )
         bot.presence.update(
             BotPresence("Alpha", "host.example", "inst", "alpha", "~alpha"),
         )
@@ -584,6 +588,20 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             await bot.commands.channel_update(OWNER, "#test", None, present=True)
 
         assert coordinator.channel_puts == []
+
+    async def test_join_without_enforced_modes(self) -> None:
+        """Join under the default config, which enforces no channel modes."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.config = replace(
+            bot.config,
+            channel_modes="",
+            enforced_modes=(frozenset(), frozenset()),
+        )
+
+        await bot.commands.cmd_join(OWNER, ("#new",))
+
+        assert fake_irc.privmsgs == [("owner", "Joining #new")]
+        assert coordinator.channel_puts[-1]["channel"] == "#new"
 
     async def test_join_preserves_live_key(self) -> None:
         """Verify a repeated keyless JOIN retains a key learned from IRC."""

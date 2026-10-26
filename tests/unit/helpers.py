@@ -114,6 +114,9 @@ async def settle(bot: Bot) -> None:
     async with asyncio.timeout(5):
         while bot.tasks:
             await asyncio.gather(*bot.tasks)
+            # Gathering done tasks never yields to their pending done
+            # callbacks, which stop tracking them.
+            await asyncio.sleep(0)
 
 
 def session_record(

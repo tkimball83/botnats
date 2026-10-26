@@ -49,8 +49,9 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(server.close)
         assert server.is_serving()
 
-        await health_check.close()
-        await health_check.close()
+        async with asyncio.timeout(5):
+            await health_check.close()
+            await health_check.close()
 
         assert health_check.server is None
         assert not server.is_serving()

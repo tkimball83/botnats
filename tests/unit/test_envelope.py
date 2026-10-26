@@ -113,6 +113,9 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed"):
             receiver.decode(SUBJECT, forged)
 
+        with self.assertRaisesRegex(TypeError, "not an object"):
+            receiver.decode(SUBJECT, b"[]")
+
         tampered = json.loads(encoded)
         tampered["nonce"] = "f" * 32
         tampered["payload"] = {"channel": "#owned"}

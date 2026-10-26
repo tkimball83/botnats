@@ -59,3 +59,6 @@ class Tasks(set[asyncio.Task[None]]):
                 task.cancel()
 
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Gathering tasks that are already done never yields, so let
+            # their pending done callbacks stop tracking them.
+            await asyncio.sleep(0)
