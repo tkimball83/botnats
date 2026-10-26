@@ -455,6 +455,10 @@ class Coordinator:
     async def start(self) -> None:
         """Connect to NATS, subscribe to subjects, and start KV watches."""
         async with self.start_lock:
+            # A restart queued behind a start that has since connected.
+            if self.nc is not None:
+                return
+
             while self.nc is None:
                 try:
                     nc = await nats.connect(

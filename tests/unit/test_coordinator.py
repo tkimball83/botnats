@@ -8,7 +8,7 @@ import json
 import time
 import unittest
 import uuid
-from dataclasses import asdict, astuple, dataclass, field
+from dataclasses import asdict, astuple
 from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -20,8 +20,6 @@ from nats.errors import Error as NatsError
 from nats.js.errors import KeyWrongLastSequenceError
 from nats.js.kv import KV_DEL
 
-from botnats import Tasks
-from botnats.auth import SessionSync
 from botnats.channel import ChannelRecord
 from botnats.nats.claim import PresenceState
 from botnats.nats.coordinator import Coordinator, NATSConfig
@@ -31,7 +29,6 @@ from botnats.nats.store import (
     ChannelStore,
     ClaimStore,
     PresenceStore,
-    Session,
     SessionStore,
     StoreUnavailableError,
     presence_signature,
@@ -40,7 +37,6 @@ from botnats.presence import BotPresence
 from tests.unit.helpers import (
     COORDINATION_KEY,
     NATS_CREDENTIAL,
-    FakeCoordinator,
     FakeKV,
     session_record,
     session_value,
@@ -51,7 +47,6 @@ if TYPE_CHECKING:
 
     from nats.js.kv import KeyValue
 
-    from botnats.auth import TotpAuthorizer
     from botnats.bot import NATSCallbackHandler
 
 BETA_PRESENCE = {
@@ -66,34 +61,8 @@ NOT_OWNED = "bot ID alpha does not own its presence key"
 SUBJECT = "botnats.v1.efnet.channel"
 
 
-@dataclass
-class Fixtures:
-    """Session watch state recorded by a real SessionSync.
-
-    Its authorizer only records what it is told to keep and drop.
-    """
-
-    session_deletes: list[str] = field(default_factory=list)
-    session_keeps: list[Session] = field(default_factory=list)
-    sessions: SessionSync = field(init=False)
-
-    def __post_init__(self) -> None:
-        """Wire the session owner to the recording authorizer."""
-        authorizer = SimpleNamespace(
-            drop_session=self.session_deletes.append,
-            keep=self.session_keeps.append,
-        )
-        self.sessions = SessionSync(
-            cast("TotpAuthorizer", authorizer), FakeCoordinator(), Tasks()
-        )
-
-
-def build_coordinator(
-    bot_id: str,
-    fixtures: Fixtures,
-    network: str = "efnet",
-) -> Coordinator:
-    """Build a coordinator wired to shared test fixtures."""
+def build_coordinator(bot_id: str, network: str = "efnet") -> Coordinator:
+    """Build a coordinator whose callbacks accept and ignore every event."""
     callbacks = cast(
         "NATSCallbackHandler",
         SimpleNamespace(
@@ -101,9 +70,9 @@ def build_coordinator(
             on_help=noop_help,
             on_presence=noop_presence,
             on_presence_delete=noop_presence_delete,
-            on_session_delete=fixtures.sessions.forget,
-            on_session_update=fixtures.sessions.observe,
-            on_sessions_replayed=fixtures.sessions.replayed,
+            on_session_delete=MagicMock(),
+            on_session_update=MagicMock(),
+            on_sessions_replayed=MagicMock(),
         ),
     )
     return Coordinator(
@@ -217,7 +186,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_help_request_broadcasts_signed_message(self) -> None:
         """Publish one signed request on the kind's subject, with no reply inbox."""
-        coordinator = build_coordinator("beta", Fixtures())
+        coordinator = build_coordinator("beta")
         coordinator.nc = AsyncMock()
         payload = {"channel": "#test", "presence": BETA_PRESENCE}
 
@@ -235,7 +204,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_help_request_publish_failure_is_contained(self) -> None:
         """Drop a request whose publish fails; the next tick asks again."""
-        coordinator = build_coordinator("beta", Fixtures())
+        coordinator = build_coordinator("beta")
         coordinator.nc = AsyncMock()
 
         coordinator.nc.publish.side_effect = NatsError("connection closed")
@@ -250,7 +219,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_peer_help_request_reaches_callback(self) -> None:
         """Hand a peer's signed request to the bot with the kind its subject names."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         callback = MagicMock()
         subject = f"{coordinator.ns}.unban"
         payload = {"channel": "#test", "presence": BETA_PRESENCE}
@@ -273,17 +242,19 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_help_subscription_covers_every_kind(self) -> None:
         """Subscribe once to the namespace, so every help kind is delivered."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         nc = AsyncMock()
 
         await coordinator.subscribe_help(nc)
 
-        nc.subscribe.assert_awaited_once()
-        assert nc.subscribe.await_args.args == (f"{coordinator.ns}.*",)
+        nc.subscribe.assert_awaited_once_with(
+            f"{coordinator.ns}.*",
+            cb=coordinator.deliver_help,
+        )
 
     async def test_own_help_request_is_skipped(self) -> None:
         """Ignore this bot's own broadcast, which NATS echoes back to it."""
-        coordinator = build_coordinator("beta", Fixtures())
+        coordinator = build_coordinator("beta")
         callback = MagicMock()
         subject = f"{coordinator.ns}.op"
         message = Msg(
@@ -309,7 +280,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         def decode(payload: dict[str, object]) -> tuple[str, BotPresence] | None:
             # A fresh coordinator, so no earlier warning throttles this one.
-            coordinator = build_coordinator("alpha", Fixtures())
+            coordinator = build_coordinator("alpha")
             subject = f"{coordinator.ns}.op"
             data = sender.encode(subject, payload)
             return coordinator.decode_help(Msg(MagicMock(), subject=subject, data=data))
@@ -340,7 +311,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_callback_error_surfaces(self) -> None:
         """Verify callback defects are not mislabeled as malformed input."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         subject = f"{coordinator.ns}.op"
         message = Msg(
             MagicMock(),
@@ -364,8 +335,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.deliver_help(message)
 
     async def test_close_releases_connection(self) -> None:
-        """Release owned presence, then KV handles and the connection."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        """Cancel watches and release owned presence, KV handles, and the connection."""
+        coordinator = build_coordinator("alpha")
         nc = MagicMock(is_closed=False)
         nc.close = AsyncMock()
         coordinator.nc = nc
@@ -379,10 +350,14 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         presence_kv = AsyncMock()
         presence_kv.delete = AsyncMock(return_value=True)
         coordinator.presence_store.kv = presence_kv
+        watch = asyncio.create_task(hang())
+        coordinator.watch_tasks.append(watch)
 
-        await coordinator.close()
-        await coordinator.close()
+        async with asyncio.timeout(5):
+            await coordinator.close()
+            await coordinator.close()
 
+        assert watch.cancelled()
         assert coordinator.nc is None
         assert not coordinator.claim.owned
         assert coordinator.claim.revision is None
@@ -396,7 +371,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_completes_when_presence_release_fails(self) -> None:
         """Finish shutdown when deleting the owned presence key fails."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         nc = MagicMock(is_closed=False)
         nc.close = AsyncMock()
         coordinator.nc = nc
@@ -414,7 +389,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deliberate_close_does_not_restart(self) -> None:
         """Leave the client closed when nats-py reports the close close() asked for."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         nc = closing_client(coordinator)
         coordinator.nc = nc
 
@@ -431,7 +406,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_closed_client_restarts(self) -> None:
         """Drop a client nats-py closed for good and connect again in the background."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_closed=True)
         nc = MagicMock(is_connected=True)
         nc.subscribe = AsyncMock()
@@ -458,7 +433,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_survives_closing_its_failed_client(self) -> None:
         """Keep restarting after the restart closes a client whose setup failed."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_closed=True)
         # Closing it runs the disconnect callback, which cancels the resync
         # slot, from inside the restart that slot holds.
@@ -497,7 +472,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         A drop of the new client cancels the restart from nats-py's disconnect
         callback, and the reconnect replays only subscriptions the client holds.
         """
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_closed=True)
         nc = MagicMock(is_connected=True)
         nc.subscribe = AsyncMock()
@@ -523,12 +498,54 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert restart.cancelled()
         assert coordinator.nc is nc
-        nc.subscribe.assert_awaited_once()
-        assert nc.subscribe.await_args.args == (f"{coordinator.ns}.*",)
+        nc.subscribe.assert_awaited_once_with(
+            f"{coordinator.ns}.*",
+            cb=coordinator.deliver_help,
+        )
+
+    async def test_restart_behind_connected_start_does_nothing(self) -> None:
+        """Leave the watches to a start that reconnected while a restart waited.
+
+        nats-py closed the start's first client while its stores opened; the
+        start connects again itself and the restart queues on its lock.
+        """
+        coordinator = build_coordinator("alpha")
+        first = MagicMock(is_closed=False, is_connected=True, subscribe=AsyncMock())
+        second = MagicMock(is_closed=False, is_connected=True, subscribe=AsyncMock())
+        connect = AsyncMock(side_effect=[first, second])
+        opening = asyncio.Event()
+        replaced = asyncio.Event()
+
+        async def open_stores() -> None:
+            # init_stores returns once its client is no longer the current one.
+            if coordinator.nc is first:
+                opening.set()
+                await replaced.wait()
+
+        with (
+            patch("botnats.nats.coordinator.nats.connect", connect),
+            patch.object(coordinator, "init_stores", open_stores),
+            patch.object(coordinator, "start_watches", AsyncMock()) as start_watches,
+        ):
+            initial = asyncio.create_task(coordinator.start())
+            async with asyncio.timeout(5):
+                await opening.wait()
+                first.is_closed = True
+                first.is_connected = False
+                await coordinator.on_closed()
+                restart = coordinator.resync_task
+                assert restart is not None
+                replaced.set()
+                await initial
+                await restart
+
+        assert coordinator.nc is second
+        assert connect.await_count == 2
+        start_watches.assert_awaited_once_with()
 
     async def test_close_cancels_restart(self) -> None:
         """Stop a restart that is still connecting when the bot shuts down."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_closed=True)
         connecting = asyncio.Event()
 
@@ -551,14 +568,19 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.resync_task is None
 
     async def test_disconnect_resets_stores(self) -> None:
-        """Verify a Core NATS disconnect clears all store readiness."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        """Verify a Core NATS disconnect cancels watches and clears store readiness."""
+        coordinator = build_coordinator("alpha")
         for store in coordinator.stores:
             store.js = MagicMock()
             store.kv = MagicMock()
 
-        await coordinator.on_disconnected()
+        watch = asyncio.create_task(hang())
+        coordinator.watch_tasks.append(watch)
+        async with asyncio.timeout(5):
+            await coordinator.on_disconnected()
 
+        assert watch.cancelled()
+        assert not coordinator.watch_tasks
         assert not coordinator.attempts.ready
         assert coordinator.attempts.js is None
         assert not coordinator.channels_store.ready
@@ -572,7 +594,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_and_claim_fail_closed_when_not_ready(self) -> None:
         """Deny attempts and claims whenever the coordinator is not ready."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         allow = AsyncMock(return_value=True)
         claim = AsyncMock(return_value=True)
 
@@ -589,7 +611,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_transient_warnings_are_rate_limited_per_context(self) -> None:
         """Throttle each context independently so a second failure still logs."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
 
         with self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs:
             coordinator.warn_transient("watch watch-channels failed", OSError("a"))
@@ -612,7 +634,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nats_errors_are_rate_limited(self) -> None:
         """Log one warning for transport errors that repeat during an outage."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
 
         with self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs:
             await coordinator.on_error(OSError("connection reset"))
@@ -624,7 +646,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_bot_id_blocks_coordination(self) -> None:
         """Prevent a conflicting bot ID from publishing or acting on requests."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         nc = connect_owned(coordinator)
         coordinator.synced_watches.update(coordinator.watches())
         callback = MagicMock()
@@ -654,7 +676,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_init_stores_generation_guard(self) -> None:
         """Verify a newer init_stores call cancels the previous retry loop."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         nc = MagicMock(is_connected=True)
         nc.jetstream.return_value = MagicMock()
         coordinator.nc = nc
@@ -683,7 +705,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_init_stores_does_not_abandon_recovery(self) -> None:
         """Keep retrying JetStream initialization for as long as it fails."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         coordinator.nc.jetstream.return_value = MagicMock()
         failures = [OSError("unavailable")] * 11
@@ -706,7 +728,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_init_stores_surfaces_programming_errors(self) -> None:
         """Do not retry a programming error as though it were an outage."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         coordinator.nc.jetstream.return_value = MagicMock()
         open_store = AsyncMock()
@@ -729,7 +751,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_message_is_ignored(self) -> None:
         """Verify malformed wire data never reaches its callback."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         callback = MagicMock()
         message = Msg(MagicMock(), subject="bad", data=b"not-json")
 
@@ -744,7 +766,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_warning_is_throttled(self) -> None:
         """Verify malformed traffic cannot flood the warning log."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
 
         # The module's binding only: time.monotonic itself drives the loop.
         with (
@@ -763,8 +785,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_network_namespaces(self) -> None:
         """Verify separate network groups share no subjects or KV buckets."""
-        first = build_coordinator("alpha", Fixtures(), "efnet")
-        second = build_coordinator("alpha", Fixtures(), "undernet")
+        first = build_coordinator("alpha", "efnet")
+        second = build_coordinator("alpha", "undernet")
 
         assert first.ns != second.ns
         assert {store.bucket for store in first.stores}.isdisjoint(
@@ -773,7 +795,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconnect_retries_stores(self) -> None:
         """Verify reconnect restores all stores before starting watches."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock()
         steps: list[str] = []
 
@@ -822,7 +844,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resync_failure_is_logged(self) -> None:
         """Log a failed resynchronization instead of losing it to GC."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock()
 
         resync = AsyncMock(side_effect=TypeError("bug"))
@@ -836,14 +858,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(5):
                 await asyncio.gather(task, return_exceptions=True)
 
-            await asyncio.sleep(0)
-
         assert coordinator.resync_task is None
         assert any("resynchronization failed" in line for line in logs.output)
 
     async def test_crash_logs_are_rate_limited(self) -> None:
         """Throttle repeated crash tracebacks from one watch."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         crashes = [ValueError("boom"), ValueError("boom")]
         recovered = asyncio.Event()
@@ -878,7 +898,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_replaced_resync_keeps_new_task(self) -> None:
         """Keep the new resync task when a superseded one finishes after it."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock()
         stopping = asyncio.Event()
         release = asyncio.Event()
@@ -912,7 +932,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_cancels_resync(self) -> None:
         """Cancel an in-flight resynchronization when Core NATS drops."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock()
         hang = asyncio.Event()
 
@@ -933,8 +953,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ready_waits_for_watch_replay(self) -> None:
         """Keep readiness false until every KV watch reaches its sentinel."""
-        coordinator = build_coordinator("alpha", Fixtures())
-        connect_owned(coordinator)
+        coordinator = build_coordinator("alpha")
+        nc = connect_owned(coordinator)
         *replayed, last = sorted(coordinator.watches())
 
         coordinator.synced_watches.update(replayed)
@@ -943,9 +963,17 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.synced_watches.add(last)
         assert coordinator.ready
 
+        # A closed store or a dropped connection still withholds it.
+        coordinator.attempts.kv = None
+        assert not coordinator.ready
+
+        coordinator.attempts.kv = MagicMock()
+        nc.is_connected = False
+        assert not coordinator.ready
+
     async def test_watch_channel_applies_valid_record(self) -> None:
         """Hand a signed, key-bound channel record to the bot as a ChannelRecord."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         callback = MagicMock()
         record = ChannelRecord.new("#test", "key", present=True)
         signed = coordinator.channels_store.sign(astuple(record))
@@ -964,7 +992,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_channel_rejects_mismatched_key(self) -> None:
         """Ignore a valid channel record stored under the wrong opaque key."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         callback = MagicMock()
         record = ChannelRecord.new("#test", None, present=True)
         signed = coordinator.channels_store.sign(astuple(record))
@@ -983,26 +1011,27 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_channel_ignores_deeply_nested_json(self) -> None:
         """Skip malformed JSON without trapping the channel watch in replay."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         entry = SimpleNamespace(operation="PUT", value=b"[[]]")
         kv, _ = watcher(entry, None)
         coordinator.channels_store.kv = kv
         synced = MagicMock()
 
         # The parser overflows only past the native stack, a depth that varies
-        # by platform, so raise its RecursionError directly.
-        with patch(
-            "botnats.nats.store.json.loads",
-            side_effect=RecursionError("maximum recursion depth exceeded"),
-        ) as loads:
+        # by platform, so raise its RecursionError directly. Only the store's
+        # binding is patched, not the process-wide json.loads.
+        with patch("botnats.nats.store.json") as parser:
+            parser.loads.side_effect = RecursionError(
+                "maximum recursion depth exceeded"
+            )
             await coordinator.watch_channels(synced)
 
-        loads.assert_called_once_with(b"[[]]")
+        parser.loads.assert_called_once_with(b"[[]]")
         synced.assert_called_once_with()
 
     async def test_watch_presence_binds_key_and_applies_delete(self) -> None:
         """Reject misplaced presence values; a peer's delete keeps this bot's claim."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.claim.adopt(5)
         update = MagicMock()
         delete = MagicMock()
@@ -1031,7 +1060,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_applies_valid_peer_record(self) -> None:
         """Hand a peer's signed, key-bound presence record to the bot."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         update = MagicMock()
         record: dict[str, object] = {**BETA_PRESENCE, "timestamp": int(time.time())}
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
@@ -1053,7 +1082,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_detects_starting_duplicate(self) -> None:
         """Yield to another instance's placeholder claim, which is not yet a peer."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         update = MagicMock()
         # A starting process claims its key before it knows its IRC identity.
         record: dict[str, object] = {
@@ -1085,7 +1114,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_ignores_record_copied_to_own_key(self) -> None:
         """Ignore a peer's signed record copied onto this bot's presence key."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         update = MagicMock()
         record: dict[str, object] = {**BETA_PRESENCE, "timestamp": int(time.time())}
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
@@ -1107,7 +1136,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_survives_lost_reclaim_races(self) -> None:
         """Contain reclaim exhaustion to the key instead of the whole watch."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         entry = SimpleNamespace(key="alpha", operation=KV_DEL, value=None)
         kv, _ = watcher(entry, None)
         coordinator.presence_store.kv = kv
@@ -1125,48 +1154,42 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         synced.assert_called_once_with()
 
-    async def test_session_delete_event_drops_watched_session(self) -> None:
-        """Drop the session a live delete removes, by the prefix it mapped to."""
-        fixtures = Fixtures()
-        coordinator = build_coordinator("alpha", fixtures)
+    async def test_session_delete_event_reports_key(self) -> None:
+        """Report a live session delete by its opaque key."""
+        coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
-        # Replayed first so the replay keeps it; the delete then arrives live.
-        replayed = SimpleNamespace(
-            key=key,
-            operation="PUT",
-            value=json.dumps(session_record(time.time() + 60)).encode(),
-        )
         deleted = SimpleNamespace(key=key, operation=KV_DEL, value=None)
-        kv, _ = watcher(replayed, None, deleted)
+        kv, _ = watcher(None, deleted)
         coordinator.sessions.kv = kv
+        delete = MagicMock()
 
-        await coordinator.watch_sessions(MagicMock())
+        with patch.object(coordinator.callbacks, "on_session_delete", delete):
+            await coordinator.watch_sessions(MagicMock())
 
-        assert fixtures.session_deletes == ["owner!user@host"]
-        assert not fixtures.sessions.watched
+        delete.assert_called_once_with(key)
 
-    async def test_expired_session_update_fires_delete_only(self) -> None:
-        """Drop, and do not import, a session whose record has already expired."""
-        fixtures = Fixtures()
-        coordinator = build_coordinator("alpha", fixtures)
+    async def test_expired_session_update_reaches_owner(self) -> None:
+        """Hand an expired session record to its owner, which drops it."""
+        coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
-        fixtures.sessions.watched[key] = ("owner!user@host", time.time() + 60)
+        expiry = time.time() - 1
         entry = SimpleNamespace(
             key=key,
             operation="PUT",
-            value=json.dumps(session_record(time.time() - 1)).encode(),
+            value=json.dumps(session_record(expiry)).encode(),
         )
         kv, _ = watcher(entry, None)
         coordinator.sessions.kv = kv
+        update = MagicMock()
 
-        await coordinator.watch_sessions(MagicMock())
+        with patch.object(coordinator.callbacks, "on_session_update", update):
+            await coordinator.watch_sessions(MagicMock())
 
-        assert fixtures.session_deletes == ["owner!user@host"]
-        assert fixtures.session_keeps == []
+        update.assert_called_once_with(key, session_value(expiry), replaying=True)
 
     async def test_live_session_update_is_not_replaying(self) -> None:
         """Report records after the replay sentinel as live, not replayed."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
         expiry = time.time() + 60
         entry = SimpleNamespace(
@@ -1189,7 +1212,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_help_ignored_until_watches_replay(self) -> None:
         """Ignore peer requests while watches replay, even with presence owned."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         connect_owned(coordinator)
         callback = MagicMock()
         subject = f"{coordinator.ns}.op"
@@ -1212,7 +1235,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_does_not_wait_for_presence_write(self) -> None:
         """Reset at once during a slow write, which then records no ownership."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.claim.adopt(1)
         presence = {"bot_id": "alpha", "instance_id": coordinator.claim.instance_id}
         writing = asyncio.Event()
@@ -1235,23 +1258,23 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.claim.state is PresenceState.UNCLAIMED
         assert coordinator.claim.revision is None
 
-    async def test_session_replay_removes_missing_cached_session(self) -> None:
-        """Remove a cached session absent from a restarted watch replay."""
-        fixtures = Fixtures()
-        coordinator = build_coordinator("alpha", fixtures)
-        fixtures.sessions.watched["opaque"] = ("owner!user@host", time.time() + 60)
+    async def test_empty_session_replay_reports_no_keys(self) -> None:
+        """Report an empty replay, so the owner drops every cached session."""
+        coordinator = build_coordinator("alpha")
         kv, _ = watcher(None)
         coordinator.sessions.kv = kv
+        replayed = MagicMock()
+        synced = MagicMock()
 
-        await coordinator.watch_sessions(MagicMock())
+        with patch.object(coordinator.callbacks, "on_sessions_replayed", replayed):
+            await coordinator.watch_sessions(synced)
 
-        assert fixtures.session_deletes == ["owner!user@host"]
-        assert not fixtures.sessions.watched
+        replayed.assert_called_once_with(set())
+        synced.assert_called_once_with()
 
-    async def test_session_identity_cache_validates_before_updates(self) -> None:
-        """Skip a session record that fails validation before it changes any state."""
-        fixtures = Fixtures()
-        coordinator = build_coordinator("alpha", fixtures)
+    async def test_session_watch_skips_misplaced_record(self) -> None:
+        """Skip a session record that fails validation before it reaches the owner."""
+        coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
         expiry = time.time() + 60
         valid = session_record(expiry)
@@ -1267,18 +1290,21 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         ]
         kv, _ = watcher(*entries, None)
         coordinator.sessions.kv = kv
+        update = MagicMock()
+        replayed = MagicMock()
 
-        await coordinator.watch_sessions(MagicMock())
+        with (
+            patch.object(coordinator.callbacks, "on_session_update", update),
+            patch.object(coordinator.callbacks, "on_sessions_replayed", replayed),
+        ):
+            await coordinator.watch_sessions(MagicMock())
 
-        assert fixtures.sessions.watched == {
-            key: ("owner!user@host", valid["expires_at"]),
-        }
-        assert fixtures.session_keeps == [session_value(expiry)]
-        assert not fixtures.session_deletes
+        update.assert_called_once_with(key, session_value(expiry), replaying=True)
+        replayed.assert_called_once_with({key})
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         kv, _ = watcher(presence_entry(), None)
         coordinator.presence_store.kv = kv
 
@@ -1289,7 +1315,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_ignores_unsigned_record(self) -> None:
         """Verify an unsigned presence record cannot demote the owner."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.claim.state = PresenceState.OWNED
         kv, _ = watcher(presence_entry(signed=False), None)
         coordinator.presence_store.kv = kv
@@ -1300,7 +1326,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_reclaim_loser_stays_conflicted(self) -> None:
         """Verify the loser of atomic presence reclaim stays a duplicate."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         delete_entry = SimpleNamespace(
             key="alpha",
             operation="DEL",
@@ -1324,7 +1350,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_resolves_absent_conflict(self) -> None:
         """Verify a conflict is resolved when the duplicate is gone on replay."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.claim.state = PresenceState.DUPLICATE
         kv, _ = watcher(None)
         coordinator.presence_store.kv = kv
@@ -1336,7 +1362,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_resolves_on_delete(self) -> None:
         """Verify a live conflict resolves when the presence entry expires."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         delete_entry = SimpleNamespace(
             key="alpha",
             operation="DEL",
@@ -1353,7 +1379,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_restarts_on_transient_error(self) -> None:
         """Restart a watch after a transient JetStream error, requiring a new replay."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         failures = {
             "watch-channels": OSError("transient"),
@@ -1396,7 +1422,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 for event in restarted.values():
                     await event.wait()
 
-            await coordinator.cancel_watches()
+                await coordinator.cancel_watches()
 
         # A restarted watch must replay again before readiness returns.
         assert stale_markers == {"watch-channels": False, "watch-presence": False}
@@ -1408,7 +1434,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_start_watches_keeps_single_watcher_set(self) -> None:
         """Verify overlapping start_watches calls leave exactly one watcher set."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
 
         with (
@@ -1430,14 +1456,13 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_superseded_watcher_surviving_cancellation_exits(self) -> None:
         """Eject a watcher whose cleanup replaced its CancelledError."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         watch_count = len(coordinator.watches())
         started = asyncio.Event()
         runs = 0
 
-        async def swallow_cancel(*arguments: object) -> None:
-            del arguments
+        async def swallow_cancel(synced: Callable[[], None]) -> None:
             nonlocal runs
             runs += 1
             if runs > watch_count:
@@ -1445,6 +1470,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 # end it so the regression fails below instead of hanging.
                 raise asyncio.CancelledError
 
+            synced()
             if runs == watch_count:
                 started.set()
 
@@ -1482,7 +1508,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_watcher_cancellation_keeps_new_sync_markers(self) -> None:
         """Verify a slowly dying superseded watcher cannot wedge readiness."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         names = coordinator.watches().keys()
         started = asyncio.Event()
@@ -1538,7 +1564,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_stops_watcher_on_error(self) -> None:
         """Verify a crashed watch coroutine stops its KV watcher subscription."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         kv, subscription = watcher(OSError("disconnected"))
         coordinator.channels_store.kv = kv
 
@@ -1553,7 +1579,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         nats-py subscribes before its setup round trip and keeps the
         subscription if cancelled there; the watch must not wait for it either.
         """
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         kv, subscription = watcher()
         setting_up = asyncio.Event()
         release = asyncio.Event()
@@ -1580,7 +1606,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_surfaces_programming_errors(self) -> None:
         """Verify a programming error in a watch is logged at ERROR and retried."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         # A bare RuntimeError is a programming failure, unlike the
         # StoreUnavailableError watches treat as transient.
@@ -1605,14 +1631,13 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.start_watches()
             async with asyncio.timeout(5):
                 await retried.wait()
-
-            await coordinator.cancel_watches()
+                await coordinator.cancel_watches()
 
         assert any("watch watch-channels crashed" in line for line in logs.output)
 
     async def test_durable_writes_require_owned_presence(self) -> None:
         """Refuse channel and session writes until this process owns its bot ID."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         channels = FakeKV()
         sessions = FakeKV()
         coordinator.channels_store.kv = cast("KeyValue", channels)
@@ -1642,7 +1667,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_retries_failed_connection(self) -> None:
         """Close and retry a connection whose setup failed, then start watches."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         steps: list[str] = []
 
         def step(name: str, error: Exception | None = None) -> AsyncMock:
@@ -1699,7 +1724,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_start_closes_client_without_restart(self) -> None:
         """Drop a half-open client before closing it, so its close starts nothing."""
-        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator = build_coordinator("alpha")
         half_open = closing_client(coordinator)
         half_open.subscribe = AsyncMock(side_effect=ConnectionClosedError)
         nc = MagicMock(is_connected=True)
