@@ -38,6 +38,9 @@ LOGGER = logging.getLogger(__name__)
 # Resend a JOIN that got no reply the bot handles: a lost JOIN, or a refusal
 # such as 477 (registered nicks only). A duplicate JOIN is harmless.
 JOIN_REPLY_TIMEOUT = 60.0
+# Resend a JOIN refused as full, invite-only, banned, or keyed this long
+# after the refusal: soon after a peer's help, but not on every tick.
+JOIN_RETRY_DELAY = 10.0
 # Upper bound of the random wait before answering a peer's help request.
 PEER_HELP_DELAY = 1.0
 PEER_REQUEST_COOLDOWN = 0.5
@@ -700,7 +703,8 @@ class ChannelRuntime:
     join: JoinState = JoinState.IDLE
     # The last unhandled refusal logged for a pending JOIN, so it logs once.
     join_error: str | None = None
-    join_sent_at: float = 0.0
+    # When a pending JOIN, unanswered or refused, is due to be sent again.
+    join_retry_at: float = 0.0
     key: str | None = None
     limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
@@ -715,25 +719,28 @@ class ChannelRuntime:
         return self.join is JoinState.JOINED
 
     def join_due(self) -> bool:
-        """Return whether to send JOIN: idle, or a JOIN that got no reply."""
+        """Return whether to send JOIN: idle, or pending past its retry time."""
         if self.join is JoinState.IDLE:
             return True
 
         return (
             self.join is JoinState.JOINING
-            and asyncio.get_running_loop().time() - self.join_sent_at
-            >= JOIN_REPLY_TIMEOUT
+            and asyncio.get_running_loop().time() >= self.join_retry_at
         )
 
     def start_join(self) -> None:
         """Record a JOIN queued for the server."""
         self.join = JoinState.JOINING
-        self.join_sent_at = asyncio.get_running_loop().time()
+        self.join_retry_at = asyncio.get_running_loop().time() + JOIN_REPLY_TIMEOUT
 
     def refuse_join(self) -> None:
-        """Record a refused JOIN so the next tick may try again."""
+        """Keep a refused JOIN pending until JOIN_RETRY_DELAY has passed.
+
+        A refusal comes back at once, so a JOIN retried on every tick would be
+        refused, and ask peers for help, on every tick.
+        """
         if self.join is JoinState.JOINING:
-            self.join = JoinState.IDLE
+            self.join_retry_at = asyncio.get_running_loop().time() + JOIN_RETRY_DELAY
 
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""

@@ -202,10 +202,10 @@ class IRCEventHandler:
         )
 
     def handle_join_refusal(self, message: IRCMessage) -> None:
-        """Return a refused JOIN to idle and ask peers for the help it needs.
+        """Pace a refused JOIN's retry and ask peers for the help it needs.
 
-        The next tick tries the JOIN again: after the help, or with the
-        stored key.
+        A tick after JOIN_RETRY_DELAY tries the JOIN again: after the help,
+        or with the stored key. An INVITE retries it at once.
         """
         if len(message.params) < 2:
             return

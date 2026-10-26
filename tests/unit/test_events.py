@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 from botnats.auth import totp
-from botnats.channel import ChannelRuntime, JoinState
+from botnats.channel import JOIN_RETRY_DELAY, ChannelRuntime, JoinState
 from botnats.config import mode_intent
 from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
 from botnats.presence import BotPresence
@@ -567,21 +567,56 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
 
         for numeric in ("471", "473", "474", "475"):
+            # A pending JOIN already due for a resend.
             runtime.join = JoinState.JOINING
+            runtime.join_retry_at = 0.0
             bot.events.on_irc_message(
                 IRCMessage(numeric, ("alpha", "#test", "cannot join channel")),
             )
             async with asyncio.timeout(5):
                 await asyncio.gather(*bot.tasks)
 
-            # Every refusal returns the JOIN to idle so a later tick retries it.
-            assert runtime.join is JoinState.IDLE
+            # Every refusal paces the JOIN: the next tick does not resend it.
+            assert not runtime.join_due()
 
         assert [kind for kind, _ in coordinator.help_requests] == [
             "limit",
             "invite",
             "unban",
         ]
+
+    async def test_refused_join_retried_after_delay(self) -> None:
+        """Resend a refused JOIN once the retry delay passes, not every tick.
+
+        An INVITE resends it at once.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        join = ("JOIN", ("#test",))
+
+        bot.channel_mgr.join_desired()
+        bot.events.on_irc_message(
+            IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
+        )
+        bot.channel_mgr.join_desired()
+        assert fake_irc.sent == [join]
+
+        runtime.join_retry_at -= JOIN_RETRY_DELAY
+        bot.channel_mgr.join_desired()
+        assert fake_irc.sent == [join, join]
+
+        bot.events.on_irc_message(
+            IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
+        )
+        bot.events.on_irc_message(
+            IRCMessage("INVITE", ("alpha", "#test"), Prefix("op", "u", "h")),
+        )
+        assert fake_irc.sent == [join, join, join]
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
 
     async def test_mode_enforce_once_on_op_with_unset(self) -> None:
         """Verify one enforcement when a single MODE ops the bot and unsets."""
@@ -1579,9 +1614,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.set_identity(prefix)
         assert fake_irc.sent == [join]
 
-        # The server refuses the JOIN. A burst of WHO and USERHOST replies
-        # about this bot must not resend it; the next tick retries it.
-        runtime.refuse_join()
+        # The channel goes idle again, as after a kick. A burst of WHO and
+        # USERHOST replies about this bot must not resend the JOIN; the next
+        # tick retries it.
+        runtime.reset()
         bot.events.set_identity(prefix)
         assert fake_irc.sent == [join]
 
