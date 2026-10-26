@@ -127,7 +127,7 @@ class IRCEventHandler:
             # Servers send "*" in place of a hidden key, to operators too
             # during a netsplit; a literal "*" key is set with JOIN instead.
             if adding and argument == "*":
-                self.bot.channel_mgr.hide_key(runtime)
+                runtime.hide_key()
             else:
                 self.process_key(runtime, argument if adding else None)
         elif not adding and runtime.key is not None:
@@ -214,6 +214,8 @@ class IRCEventHandler:
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is not None:
             runtime.refuse_join()
+            if message.command == "475":
+                self.bot.channel_mgr.refuse_key(runtime)
 
         kind = REFUSAL_HELP.get(message.command)
         if kind is not None:

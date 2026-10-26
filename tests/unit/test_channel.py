@@ -676,7 +676,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             revision=f"{revision_number(base.revision) + 2:020d}-{'0' * 32}",
         )
 
-        bot.channel_mgr.hide_key(runtime)
+        runtime.hide_key()
         bot.channel_mgr.apply_record(newer)
         coordinator.failing = False
         await bot.channel_mgr.retry_pending_keys()
@@ -920,33 +920,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.channel_puts == []
         assert not runtime.key_pending
 
-    async def test_hidden_key_takes_a_record_held_back_while_pending(self) -> None:
-        """Take the key of a peer's record held back for a pending key.
-
-        Once IRC hides the key, the record is the newest key this bot knows,
-        and no later record need arrive to set it.
-        """
-        coordinator = FailingWriteCoordinator()
-        bot = bot_with_channel(coordinator=coordinator)
-        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
-        runtime = mgr.channels[folded]
-        runtime.join = JoinState.JOINED
-        await see_key(bot, runtime, "A")
-        assert runtime.key_pending
-        mgr.apply_record(
-            mgr.new_record(
-                "#test", "B", present=True, after=mgr.channel_records[folded].revision
-            ),
-        )
-        assert runtime.key == "A"
-
-        mgr.hide_key(runtime)
-
-        assert not runtime.key_pending
-        assert runtime.key == "B"
-
-    async def test_hidden_key_keeps_the_key_seen_since_the_last_record(self) -> None:
-        """Keep the key IRC last showed when no record has arrived since.
+    async def test_hidden_key_keeps_the_key_seen(self) -> None:
+        """Keep the key IRC last showed when it hides the key.
 
         A netsplit can resend an unchanged key as "*" while NATS is down.
         """
@@ -958,21 +933,83 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         await see_key(bot, runtime, "A")
         assert runtime.key_pending
 
-        mgr.hide_key(runtime)
+        runtime.hide_key()
+
         assert not runtime.key_pending
         assert runtime.key == "A"
 
-        # A peer's record is held back, then IRC shows this bot a newer key.
-        await see_key(bot, runtime, "B")
+    async def test_hidden_key_outlasts_a_late_write(self) -> None:
+        """Keep the key IRC last showed past this bot's late write of an older one."""
+        coordinator = FakeCoordinator()
+        bot = bot_with_channel(coordinator=coordinator)
+        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+        runtime = mgr.channels[folded]
+        runtime.join = JoinState.JOINED
+        record_put = coordinator.put_channel
+        in_flight = asyncio.Event()
+        release = asyncio.Event()
+
+        async def put_channel(
+            record: dict[str, Any],
+            *,
+            expected: str | None,
+        ) -> ChannelFields:
+            if record["key"] == "B":
+                msg = "NATS disconnected"
+                raise NatsError(msg)
+
+            in_flight.set()
+            await release.wait()
+            return await record_put(record, expected=expected)
+
+        with patch.object(coordinator, "put_channel", put_channel):
+            async with asyncio.timeout(5):
+                bot.events.process_key(runtime, "A")
+                await in_flight.wait()
+                # IRC shows B while the write of A is in flight.
+                bot.events.process_key(runtime, "B")
+                release.set()
+                await settle(bot)
+
+        assert mgr.channel_records[folded].key == "A"
+        assert runtime.key_pending
+        # A netsplit resends the unchanged B as "*".
+        runtime.hide_key()
+
+        assert runtime.key == "B"
+
+    async def test_refused_key_takes_the_stored_key(self) -> None:
+        """Take the stored key after a bad-key refusal; keep one it matches.
+
+        A peer's record held back while this bot had a key pending is not
+        applied again, so the refusal is what replaces the key it kept.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot, fake_irc, _ = bot_with_coordinator(coordinator)
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+        runtime = mgr.channels[folded]
+        runtime.join = JoinState.JOINED
+        await see_key(bot, runtime, "A")
         mgr.apply_record(
             mgr.new_record(
-                "#test", "C", present=True, after=mgr.channel_records[folded].revision
+                "#test", "B", present=True, after=mgr.channel_records[folded].revision
             ),
         )
-        await see_key(bot, runtime, "D")
-        mgr.hide_key(runtime)
+        runtime.hide_key()
+        runtime.reset()  # kicked
+        assert runtime.key == "A"
 
-        assert runtime.key == "D"
+        mgr.refuse_key(runtime)
+        assert runtime.key == "B"
+        mgr.safe_join(runtime)
+        assert fake_irc.sent == [("JOIN", ("#test", "B"))]
+
+        # Refused again with the stored key, it keeps that key.
+        mgr.refuse_key(runtime)
+        assert runtime.key == "B"
 
     async def test_unjoined_channel_takes_the_recorded_key(self) -> None:
         """Take a record's key in a channel this bot has left.
@@ -1040,7 +1077,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(5):
                 retry = asyncio.create_task(mgr.retry_pending_keys())
                 await in_flight.wait()
-                mgr.hide_key(runtimes[1])
+                runtimes[1].hide_key()
                 mgr.apply_record(
                     mgr.new_record(
                         "#parted",
