@@ -9,7 +9,7 @@ import time
 import unittest
 from dataclasses import asdict
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from nats.errors import Error as NatsError
 
@@ -221,6 +221,39 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         bot.auth_flow.auto_op(OWNER)
 
         assert fake_irc.modes == []
+
+    async def test_auth_auto_op_skips_channels_without_identity(self) -> None:
+        """Op in #test though channels before it lack the user or their userhost."""
+        fake_irc = FakeIRC()
+        bot = make_bot(irc=fake_irc)
+        runtimes = {}
+        for channel in ("#absent", "#names", "#test"):
+            record = bot.channel_mgr.new_record(channel, None, present=True)
+            bot.channel_mgr.apply_record(record)
+            runtime = bot.channel_mgr.channels[casefold(channel, "rfc1459")]
+            runtime.member("alpha").modes.add("o")
+            runtimes[channel] = runtime
+
+        # NAMES without userhost-in-names lists a nickname alone.
+        runtimes["#names"].member("owner")
+        runtimes["#test"].member("owner").prefix = OWNER
+
+        bot.auth_flow.auto_op(OWNER)
+
+        assert fake_irc.modes == [("#test", "+o", ("owner",))]
+
+    async def test_auth_auto_op_survives_disconnect(self) -> None:
+        """Attempt the MODE, and raise nothing, once IRC has disconnected."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("owner").prefix = OWNER
+        fake_irc.connected = False
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            bot.auth_flow.auto_op(OWNER)
+
+        assert send.call_args_list == [call("MODE", "#test", "+o", "owner")]
 
     async def test_auth_auto_op_skips_when_not_opped(self) -> None:
         """Verify auto-op skips channels where bot is not opped."""
@@ -1161,6 +1194,23 @@ class SessionSyncWatchTests(unittest.TestCase):
             sessions.observe("opaque", record, replaying=True)
 
         prune.assert_not_called()
+
+    def test_equivalent_identity_record_is_not_written_back(self) -> None:
+        """Leave an IRC-equivalent identity's lower record under its own key.
+
+        foo[ and foo{ fold together under rfc1459, so the held grant outranks
+        the observed record, but each has its own durable key: writing the
+        grant back would not restore the key the record came from.
+        """
+        bot, _ = bot_with_irc()
+        held = bot.authorizer.grant("foo[!u@h")
+        lower = bot.authorizer.create("foo{!u@h", held.expires_at - 60, "beta")
+
+        bot.sessions.observe("foo{-key", lower, replaying=False)
+
+        assert not bot.sessions.pending
+        assert not bot.sessions.restoring
+        assert not bot.tasks
 
     def test_session_delete_keeps_colliding_live_identity(self) -> None:
         """Delete only the ASCII durable identity represented by a KV key."""
