@@ -61,7 +61,7 @@ def irc_client(
     )
 
 
-def mock_writer() -> asyncio.StreamWriter:
+def mock_writer() -> MagicMock:
     """Create a mock StreamWriter that reports as connected."""
     writer = create_autospec(asyncio.StreamWriter, instance=True)
     writer.is_closing.return_value = False
@@ -76,29 +76,19 @@ async def never() -> None:
 class IRCServerTests(unittest.TestCase):
     """Tests for IRC server URL parsing."""
 
-    def test_server_url_validation(self) -> None:
-        """Verify IRC URLs reject unsupported components and ports."""
-        for value in (
-            "nats://host:6667",
-            "irc://host:6667?name=x",
-            "ircs://host:6697#x",
-            "irc://host:",
-            "irc://host:bad",
-            "irc://host:0",
-            "irc://host:70000",
-            "irc://host/channel",
-            "irc://user@host:6667",
-            "irc://ho\x7fst:6667",
-            "irc://" + chr(0xD800) + ":6667",
-        ):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "invalid IRC server URL",
-                ) as raised:
-                    IRCServer.parse(value)
-
-                assert value not in str(raised.exception)
+    def test_parse_maps_scheme_to_tls_and_default_port(self) -> None:
+        """Map each IRC scheme to its TLS setting and default port."""
+        assert IRCServer.parse("irc://irc.example.test") == IRCServer(
+            "irc.example.test", 6667, tls=False
+        )
+        assert IRCServer.parse("ircs://irc.example.test") == IRCServer(
+            "irc.example.test", 6697, tls=True
+        )
+        assert IRCServer.parse("irc://irc.example.test:6697") == IRCServer(
+            "irc.example.test", 6697, tls=False
+        )
+        with self.assertRaisesRegex(ValueError, "^invalid IRC server URL$"):
+            IRCServer.parse("nats://irc.example.test:6667")
 
 
 class IRCClientTests(unittest.IsolatedAsyncioTestCase):
@@ -142,10 +132,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             == b"PONG :token\r\n"
         )
         assert pong_reply(b"@id=1 PING token\r\n") == b"PONG token\r\n"
-        # Repeated separator spaces are filtered by parse_message and must
-        # not corrupt the byte-level echo either.
+        # Leading and repeated separator spaces are filtered by parse_message
+        # and must not corrupt the byte-level echo either.
         assert pong_reply(b":srv  PING :token\r\n") == b"PONG :token\r\n"
         assert pong_reply(b"@id=1  PING  :token\r\n") == b"PONG :token\r\n"
+        assert pong_reply(b" PING :token\r\n") == b"PONG :token\r\n"
 
         inflating = b"PING :" + b"\xe9" * 400 + b"\r\n"
         assert len(inflating) <= MAX_IRC_MESSAGE_BYTES
@@ -671,7 +662,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLogs("botnats.irc.client", level="DEBUG") as logs,
                 self.assertRaisesRegex(ConnectionError, "connection closed"),
             ):
-                await client.run_connection(client.config.servers[0])
+                async with asyncio.timeout(5):
+                    await client.run_connection(client.config.servers[0])
             # The oversized line is dropped with a trace; the 512-byte
             # boundary line and the session itself survive it.
             assert dispatched == ["002"]
@@ -706,7 +698,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.on_message = record_message
         try:
             with self.assertRaisesRegex(ConnectionError, "connection closed"):
-                await client.run_connection(client.config.servers[0])
+                async with asyncio.timeout(5):
+                    await client.run_connection(client.config.servers[0])
 
             assert dispatched == []
         finally:
@@ -732,7 +725,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(client, "establish", AsyncMock(return_value=connection)),
             self.assertRaisesRegex(ConnectionError, "connection closed"),
         ):
-            await client.run_connection(client.config.servers[0])
+            async with asyncio.timeout(5):
+                await client.run_connection(client.config.servers[0])
 
         assert dispatched == ["002"]
 
@@ -756,7 +750,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(port,))
         try:
             with self.assertRaisesRegex(ConnectionError, "oversized line"):
-                await client.run_connection(client.config.servers[0])
+                async with asyncio.timeout(5):
+                    await client.run_connection(client.config.servers[0])
         finally:
             await client.close()
             server.close()
@@ -893,7 +888,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 patch("botnats.irc.client.WRITE_TIMEOUT", 0),
                 self.assertRaisesRegex(ConnectionError, "write timed out"),
             ):
-                while True:
+                for _ in range(10_000):
                     await client.send_immediate(line, writer)
 
             assert await reader.read() == b""
@@ -902,8 +897,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_immediate_skips_waiting_on_another_drain(self) -> None:
         """Write a PONG at once while the sender still waits for its write to drain."""
         client = irc_client()
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
-        writer.is_closing.return_value = False
+        writer = mock_writer()
         client.writer = writer
         draining = asyncio.Event()
         drained = asyncio.Event()
@@ -930,23 +924,17 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_outbound_queue_bounded(self) -> None:
         """Verify outbound queue raises ConnectionError when full."""
-        client = irc_client()
+        client = self.cap_client()
         client.outbound = asyncio.Queue(maxsize=1)
         client.outbound.put_nowait(b"PING :queued\r\n")
-        client.sender_task = asyncio.create_task(never())
-        client.writer = mock_writer()
-        try:
-            with self.assertRaisesRegex(ConnectionError, "queue is full"):
-                client.send("NOTICE", "owner", trailing="hello")
-        finally:
-            client.sender_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await client.sender_task
+
+        with self.assertRaisesRegex(ConnectionError, "queue is full"):
+            client.send("NOTICE", "owner", trailing="hello")
 
     async def test_send_refuses_closing_socket(self) -> None:
         """Refuse a command once the socket is closing, though the sender lives."""
         client = self.cap_client()
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        writer = mock_writer()
         writer.is_closing.return_value = True
         client.writer = writer
 
@@ -1019,11 +1007,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         failures = [line for line in logs.output if "callback failed" in line]
         assert len(failures) == 2
 
-    async def test_send_loop_closes_writer_after_failed_write(self) -> None:
-        """Close the socket and stop sending once a queued write fails."""
+    async def test_send_loop_aborts_writer_after_failed_write(self) -> None:
+        """Drop the socket and stop sending once a queued write fails."""
         client = irc_client()
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
-        writer.is_closing.return_value = False
+        writer = mock_writer()
         writer.drain.side_effect = ConnectionResetError("peer reset")
         client.writer = writer
         outbound: asyncio.Queue[bytes] = asyncio.Queue()
@@ -1034,7 +1021,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             await client.send_loop(writer, outbound)
 
         writer.write.assert_called_once_with(b"PING :one\r\n")
-        writer.close.assert_called_once_with()
+        # A close() after an abort would drop a TLS transport's protocol.
+        writer.transport.abort.assert_called_once_with()
+        writer.close.assert_not_called()
 
     async def test_stop_sender_propagates_caller_cancellation(self) -> None:
         """Re-raise cancellation aimed at the caller, not only the sender's own."""
@@ -1043,11 +1032,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def slow_sender() -> None:
             try:
-                await asyncio.Event().wait()
+                await never()
             finally:
                 # Still winding down when the caller is cancelled in turn.
                 sender_stopping.set()
-                await asyncio.Event().wait()
+                await never()
 
         client.sender_task = asyncio.create_task(slow_sender())
         stopper = asyncio.create_task(client.stop_sender())

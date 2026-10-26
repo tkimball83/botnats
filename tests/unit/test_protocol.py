@@ -3,7 +3,9 @@
 
 """Tests for IRC protocol parsing, formatting, casemapping, and ISUPPORT state."""
 
+import sys
 import unittest
+from typing import TYPE_CHECKING
 
 from botnats.irc.protocol import (
     DEFAULT_CHANMODES,
@@ -19,6 +21,14 @@ from botnats.irc.protocol import (
     parse_message,
 )
 
+if TYPE_CHECKING:
+    from types import FrameType
+
+    from _typeshed import TraceFunction
+
+# The linear matcher runs a few hundred lines on the adversarial mask.
+MASK_MATCH_LINE_BUDGET = 10_000
+
 
 class IRCProtocolTests(unittest.TestCase):
     """Tests for prefix matching, message parsing, modes, and ISUPPORT state."""
@@ -32,15 +42,32 @@ class IRCProtocolTests(unittest.TestCase):
         assert not mask_matches("*!other@*", prefix, "rfc1459")
 
     def test_ban_mask_many_wildcards(self) -> None:
-        """Match a mask of many wildcards, the input that blows up backtracking.
+        """Fail a mask of many wildcards within a line budget, without backtracking.
 
-        Backtracking matchers, recursive or regex, spend from about a second
-        to tens of seconds failing this nick; the linear matcher needs
-        microseconds.
+        A recursive backtracking matcher runs millions of lines failing this
+        nick, so it trips the budget long before it would finish.
         """
         prefix = Prefix("a" * 28, "user", "host")
+        lines = 0
 
-        assert not mask_matches("*a" * 13 + "b!*@*", prefix, "rfc1459")
+        def count_lines(frame: FrameType, event: str, arg: object) -> TraceFunction:
+            nonlocal lines
+            del frame, arg
+            if event == "line":
+                lines += 1
+                if lines > MASK_MATCH_LINE_BUDGET:
+                    msg = "mask matching ran past its line budget"
+                    raise AssertionError(msg)
+
+            return count_lines
+
+        sys.settrace(count_lines)
+        try:
+            matched = mask_matches("*a" * 13 + "b!*@*", prefix, "rfc1459")
+        finally:
+            sys.settrace(None)
+
+        assert not matched
         assert mask_matches("*a" * 13 + "!*@*", prefix, "rfc1459")
 
     def test_ban_mask_host_folding_uses_ascii(self) -> None:
@@ -77,6 +104,8 @@ class IRCProtocolTests(unittest.TestCase):
             ("JOIN", ("#safe\r\nOPER root password",), None),
             ("JOIN", ("#safe", "key with space"), None),
             ("NOTICE", ("owner",), "safe\nQUIT"),
+            # A leading colon would turn a middle parameter into the trailing one.
+            ("INVITE", (":owner", "#safe"), None),
         )
 
         for command, params, trailing in unsafe:

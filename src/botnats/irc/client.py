@@ -402,18 +402,16 @@ class IRCClient:
     ) -> None:
         """Drain the outbound queue at the configured send rate."""
         loop = asyncio.get_running_loop()
-        burst = SEND_BURST
-        rate = SEND_RATE
-        tokens = burst
+        tokens = SEND_BURST
         updated = loop.time()
         try:
             while True:
                 encoded = await outbound.get()
                 now = loop.time()
-                tokens = min(burst, tokens + (now - updated) * rate)
+                tokens = min(SEND_BURST, tokens + (now - updated) * SEND_RATE)
                 updated = now
                 if tokens < 1.0:
-                    await asyncio.sleep((1.0 - tokens) / rate)
+                    await asyncio.sleep((1.0 - tokens) / SEND_RATE)
                     updated = loop.time()
                     tokens = 0.0
                 else:
@@ -421,7 +419,9 @@ class IRCClient:
 
                 await self.send_immediate(encoded, writer)
         except OSError, RuntimeError:
-            writer.close()
+            # Abort: a close() after an abort drops a TLS transport's protocol,
+            # and the reader's next resume_reading() would then crash.
+            writer.transport.abort()
 
     async def stop_sender(self) -> None:
         """Cancel the sender task and discard pending messages."""
@@ -491,7 +491,7 @@ def pong_reply(line: bytes) -> bytes:
         rest = rest.lstrip(b" ")
 
     head, trailing_sep, trailing = rest.partition(b" :")
-    tokens = [token for token in head.split(b" ")[1:] if token]
+    tokens = [token for token in head.split(b" ") if token][1:]
     reply = b" ".join([b"PONG", *tokens])
     if trailing_sep:
         return reply + b" :" + trailing + b"\r\n"

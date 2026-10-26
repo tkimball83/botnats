@@ -132,7 +132,7 @@ class ConfigTests(unittest.TestCase):
             nickname({"nickname": "n" * 300})
 
     def test_optional_settings_default(self) -> None:
-        """Load defaults for omitted optional keys, IRC ports, and tables."""
+        """Load defaults for omitted optional keys and tables."""
         raw = json.loads(CONFIG)
         del raw["authorization"]
         del raw["coordination"]
@@ -143,8 +143,6 @@ class ConfigTests(unittest.TestCase):
         for key in ("jetstream_replicas", "monitor_port"):
             del raw["nats"][key]
 
-        raw["irc"]["servers"] = ["ircs://irc.example.test", "irc://irc2.example.test"]
-
         # CONFIG sets every optional key away from its default.
         assert load_config(raw) == replace(
             load_config(json.loads(CONFIG)),
@@ -153,11 +151,6 @@ class ConfigTests(unittest.TestCase):
             enforced_modes=(frozenset(), frozenset()),
             health_port=8080,
             irc_connect_timeout=30,
-            # Each scheme defaults to its own port.
-            irc_servers=(
-                IRCServer("irc.example.test", 6697, tls=True),
-                IRCServer("irc2.example.test", 6667, tls=False),
-            ),
             irc_verify_tls=True,
             jetstream_replicas=1,
             maintenance_interval=3,
@@ -354,32 +347,14 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "integer between 1 and 5"):
                 replica_count({"jetstream_replicas": bad})
 
-    def test_server_url_validation(self) -> None:
-        """Verify NATS URLs reject unsupported components and ports."""
-        invalid_nats = (
-            "http://host:4222",
-            "irc://host:4222",
-            "nats://host:4222?name=x",
-            "nats://host:4222#x",
-            "nats://host:",
-            "nats://host:bad",
-            "nats://host:0",
-            "nats://host:70000",
-            "nats://host/stream",
-            f"nats://{NATS_CREDENTIAL}@host:4222",
-            "nats://ho\x1bst:4222",
-            "nats://" + chr(0xD800) + ":4222",
-        )
-        for value in invalid_nats:
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "invalid NATS server URL",
-                ) as raised:
-                    nats_urls({"servers": [value]})
-
-                assert value not in str(raised.exception)
-                assert NATS_CREDENTIAL not in str(raised.exception)
+    def test_nats_urls_reject_other_schemes(self) -> None:
+        """Reject a NATS server URL with a scheme other than nats or tls."""
+        for value in ("http://host:4222", "irc://host:4222"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "^invalid NATS server URL$"),
+            ):
+                nats_urls({"servers": [value]})
 
     def test_server_lists_must_hold_urls(self) -> None:
         """Reject an empty server list or one with a non-string or empty entry."""

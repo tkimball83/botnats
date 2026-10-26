@@ -354,6 +354,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await bot.commands.dispatch(OWNER, "DEOP #test Target")
 
         assert fake_irc.modes == [("#test", "-o", ("Target",))]
+        assert fake_irc.privmsgs == [("owner", "Deopped Target on #test")]
 
     async def test_admin_deop_removes_hidden_lower_modes(self) -> None:
         """Verify DEOP removes lower operator modes hidden by the highest one."""
@@ -441,6 +442,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await bot.commands.dispatch(OWNER, "OP #test Target")
 
         assert fake_irc.modes == [("#test", "+o", ("Target",))]
+        assert fake_irc.privmsgs == [("owner", "Opped Target on #test")]
 
     async def test_admin_op_already_opped(self) -> None:
         """Verify OP reports when target is already opped."""
