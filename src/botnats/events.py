@@ -358,19 +358,20 @@ class IRCEventHandler:
                 return
 
     def try_nick_reclaim(self) -> None:
-        """Send a NICK command to reclaim the desired nickname.
+        """Send a NICK command to reclaim the desired nickname, then poll ISON.
 
-        MONITOR reports the nick offline only once, so a refused NICK falls
-        back to polling ISON.
+        MONITOR reports the nick offline only once, and the send queue or the
+        server (433, or 437 for a nick delay) may refuse the NICK, so the poll
+        retries it until the nick is ours.
         """
         desired = self.bot.config.nickname
         if self.bot.irc.is_self(desired):
             return
 
-        try:
+        with suppress(ConnectionError):
             self.bot.irc.send("NICK", desired)
-        except ConnectionError:
-            self.poll_ison()
+
+        self.poll_ison()
 
     def start_nick_watch(self) -> None:
         """Begin watching for the desired nickname to become available."""

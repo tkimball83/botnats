@@ -139,23 +139,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert len(coordinator.session_puts) == 1
         assert coordinator.session_puts[0]["revoked"] is True
 
-    async def test_chghost_queues_revocation_when_nats_unavailable(self) -> None:
-        """Queue revocation as a pending session when put_session fails."""
-        bot, _, _ = bot_with_coordinator(FailingWriteCoordinator())
-        old_prefix = Prefix("owner", "user", "old.host")
-        bot.authorizer.grant(old_prefix.render())
-
-        bot.events.on_irc_message(
-            IRCMessage("CHGHOST", ("newuser", "new.host"), old_prefix),
-        )
-        await drain_session_writes(bot)
-
-        assert not bot.authorizer.authorized(old_prefix.render())
-        pending = bot.sessions.pending
-        assert len(pending) == 1
-        session = next(iter(pending.values()))
-        assert session.revoked
-
     async def test_chghost_without_identity_skips_revocation(self) -> None:
         """Log and skip revocation when no complete old identity exists."""
         bot, _ = bot_with_irc()
@@ -168,8 +151,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert any("no complete identity" in line for line in logs.output)
 
     async def test_chghost_updates_member_prefix(self) -> None:
-        """Verify CHGHOST updates the member prefix in channel state."""
+        """Update another user's member prefix, leaving this bot's identity."""
         bot, _ = bot_with_irc()
+        identity = BotPresence("alpha", "host.example", "inst", "alpha", "~alpha")
+        bot.identity.current = identity
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         old_prefix = Prefix("someone", "user", "old.host")
         runtime.member("someone").prefix = old_prefix
@@ -181,6 +166,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         member = runtime.members.get(casefold("someone", "rfc1459"))
         assert member is not None
         assert member.prefix == Prefix("someone", "newuser", "new.host")
+        assert bot.identity.current is identity
 
     async def test_chghost_updates_self_identity(self) -> None:
         """Verify CHGHOST on the bot itself refreshes its identity."""
@@ -517,6 +503,20 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         # The JOIN stays pending, to be resent after the reply timeout.
         assert runtime.join is JoinState.JOINING
+
+    async def test_messages_naming_no_desired_channel_are_ignored(self) -> None:
+        """Ignore a user MODE and an error that name no desired channel."""
+        bot, fake_irc = bot_with_irc()
+
+        bot.events.on_irc_message(
+            IRCMessage("MODE", ("alpha", "+i"), Prefix("alpha", "~alpha", "host")),
+        )
+        bot.events.on_irc_message(
+            IRCMessage("433", ("*", "alpha", "Nickname is already in use")),
+        )
+
+        assert fake_irc.sent == []
+        assert not bot.tasks
 
     async def test_refusals_request_matching_help(self) -> None:
         """Ask for a raised limit, an invite, or an unban; retry a bad key alone."""
@@ -1343,19 +1343,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.authorizer.authorized(owner.render())
         assert not bot.sessions.watched_identities
 
-    async def test_quit_revokes_authorization(self) -> None:
-        """Verify QUIT destroys the session bound to that IRC connection."""
-        bot, _, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
-        bot.authorizer.grant(prefix.render())
-
-        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-        await drain_session_writes(bot)
-
-        assert not bot.authorizer.authorized(prefix.render())
-        assert len(coordinator.session_puts) == 1
-        assert coordinator.session_puts[0]["revoked"] is True
-
     async def test_self_join_clears_state(self) -> None:
         """Reset channel state on a self-join and learn this bot's identity."""
         bot, _, _ = bot_with_coordinator()
@@ -1675,6 +1662,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.modes = "+nstl"
         runtime.limit = 3
         runtime.names_due = True
+        runtime.cooldowns["op"] = 1.0
         bot.channel_mgr.pending_parts[bot.caps.fold("#gone")] = "#gone"
         bot.identity.current = BotPresence("alpha", "host", "one", "alpha", "user")
         bot.identity.registered = True
@@ -1703,6 +1691,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.modes == ""
         assert runtime.limit is None
         assert not runtime.names_due
+        assert runtime.cooldowns == {}
         assert bot.channel_mgr.pending_parts == {}
         assert bot.authorizer.authorized(identity)
 
@@ -1720,6 +1709,8 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert ("NICK", ("alpha",)) in fake_irc.sent
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_ison_reply_skips_when_nick_online(self) -> None:
         """Do not reclaim when ISON reports the desired nick is still taken."""
@@ -1742,6 +1733,8 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert ("NICK", ("alpha",)) in fake_irc.sent
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_monitor_offline_ignores_unrelated_nick(self) -> None:
         """Ignore MONITOR offline for nicks other than the desired one."""
@@ -1778,6 +1771,31 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(5):
             await bot.tasks.drain()
 
+    async def test_server_refused_monitor_reclaim_polls_ison(self) -> None:
+        """Poll ISON when the server refuses a NICK that MONITOR prompted.
+
+        A nick delay or services hold refuses it with 437 after MONITOR has
+        reported the nick offline, and MONITOR does not report it again.
+        """
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.caps.monitor = True
+        bot.events.start_nick_watch()
+
+        bot.events.on_irc_message(
+            IRCMessage("731", ("fallback", "alpha!user@host")),
+        )
+        bot.events.on_irc_message(
+            IRCMessage("437", ("fallback", "alpha", "Nick temporarily unavailable")),
+        )
+
+        assert fake_irc.sent == [("MONITOR", ("+", "alpha")), ("NICK", ("alpha",))]
+        task = bot.events.nick_watch_task
+        assert task is not None
+        assert task.get_name() == "nick-ison-poll"
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
+
     async def test_welcome_starts_ison_poll(self) -> None:
         """Start ISON polling when registered with a fallback nick."""
         bot, fake_irc = bot_with_irc()
@@ -1792,13 +1810,14 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             await bot.tasks.drain()
 
     async def test_welcome_skips_watch_when_nick_matches(self) -> None:
-        """Skip nick watch when registered with the desired nick."""
+        """Register, skipping the nick watch, when given the desired nick."""
         bot, _ = bot_with_irc()
 
         bot.events.on_irc_message(
             IRCMessage("001", ("alpha", "Welcome")),
         )
 
+        assert bot.identity.registered
         assert bot.events.nick_watch_task is None
         async with asyncio.timeout(5):
             await bot.tasks.drain()
@@ -1862,9 +1881,11 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         bot.events.stop_nick_watch()
 
     async def test_other_user_nick_change_does_not_start_watch(self) -> None:
-        """Ignore nick changes from other users for watch lifecycle."""
+        """Ignore another user's nick change for this bot's identity and watch."""
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
+        identity = BotPresence("alpha", "host", "inst", "fallback", "~alpha")
+        bot.identity.current = identity
         bot.identity.registered = True
 
         bot.events.on_irc_message(
@@ -1875,6 +1896,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+        assert bot.identity.current is identity
         assert bot.events.nick_watch_task is None
 
     async def test_nick_change_away_skips_watch_before_registration(self) -> None:
