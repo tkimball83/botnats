@@ -34,6 +34,9 @@ LOGGER = logging.getLogger(__name__)
 # Resend a JOIN that got no reply the bot handles: a lost JOIN, or a refusal
 # such as 477 (registered nicks only). A duplicate JOIN is harmless.
 JOIN_REPLY_TIMEOUT = 60.0
+# Resend a JOIN refused as full, invite-only, banned, or keyed this long
+# after the refusal: soon after a peer's help, but not on every tick.
+JOIN_RETRY_DELAY = 10.0
 # Upper bound of the random wait before answering a peer's help request.
 PEER_HELP_DELAY = 1.0
 PEER_REQUEST_COOLDOWN = 0.5
@@ -108,7 +111,7 @@ class ChannelManager:
         if dropped is not None and dropped.joined:
             self.part(record.channel)
 
-    def enforce_modes(self, channel: str) -> None:
+    def enforce_modes(self, runtime: ChannelRuntime) -> None:
         """Set the configured channel modes when the bot has operator status."""
         if not self.bot.config.channel_modes:
             return
@@ -127,25 +130,26 @@ class ChannelManager:
         ):
             LOGGER.warning(
                 "cannot enforce modes on %s: configured mode requires an argument",
-                channel,
+                runtime.channel,
             )
             return
 
         try:
             self.bot.irc.send(
                 "MODE",
-                channel,
+                runtime.channel,
                 self.bot.config.channel_modes,
             )
         except ConnectionError:
-            return
+            # The next tick resends NAMES, whose end reply enforces again.
+            runtime.names_due = True
         except ValueError as error:
             LOGGER.warning(
-                "cannot enforce modes on %s: %s", channel, error_label(error)
+                "cannot enforce modes on %s: %s", runtime.channel, error_label(error)
             )
 
     def join_desired(self) -> None:
-        """Join desired channels not yet entered; resend a rejoin's NAMES."""
+        """Join desired channels not yet entered; resend NAMES where due."""
         if self.bot.identity.current is None:
             return
 
@@ -680,7 +684,8 @@ class ChannelRuntime:
     join: JoinState = JoinState.IDLE
     # The last unhandled refusal logged for a pending JOIN, so it logs once.
     join_error: str | None = None
-    join_sent_at: float = 0.0
+    # When a pending JOIN, unanswered or refused, is due to be sent again.
+    join_retry_at: float = 0.0
     key: str | None = None
     # A key seen on IRC that this bot has yet to record: its write is queued,
     # in flight, or failed. Each write takes the key seen at that moment, so
@@ -689,7 +694,8 @@ class ChannelRuntime:
     limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
     modes: str = ""
-    # A rejoin whose NAMES could not be sent yet; the next tick resends it.
+    # A NAMES, or a query or enforcement its end reply sends, that could not
+    # be sent; the next tick resends NAMES, and its end reply the rest.
     names_due: bool = False
 
     @property
@@ -698,25 +704,28 @@ class ChannelRuntime:
         return self.join is JoinState.JOINED
 
     def join_due(self) -> bool:
-        """Return whether to send JOIN: idle, or a JOIN that got no reply."""
+        """Return whether to send JOIN: idle, or pending past its retry time."""
         if self.join is JoinState.IDLE:
             return True
 
         return (
             self.join is JoinState.JOINING
-            and asyncio.get_running_loop().time() - self.join_sent_at
-            >= JOIN_REPLY_TIMEOUT
+            and asyncio.get_running_loop().time() >= self.join_retry_at
         )
 
     def start_join(self) -> None:
         """Record a JOIN queued for the server."""
         self.join = JoinState.JOINING
-        self.join_sent_at = asyncio.get_running_loop().time()
+        self.join_retry_at = asyncio.get_running_loop().time() + JOIN_REPLY_TIMEOUT
 
     def refuse_join(self) -> None:
-        """Record a refused JOIN so the next tick may try again."""
+        """Keep a refused JOIN pending until JOIN_RETRY_DELAY has passed.
+
+        A refusal comes back at once, so a JOIN retried on every tick would be
+        refused, and ask peers for help, on every tick.
+        """
         if self.join is JoinState.JOINING:
-            self.join = JoinState.IDLE
+            self.join_retry_at = asyncio.get_running_loop().time() + JOIN_RETRY_DELAY
 
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""

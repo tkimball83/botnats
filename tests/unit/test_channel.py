@@ -16,6 +16,7 @@ from nats.errors import Error as NatsError
 from botnats.bot import Bot
 from botnats.channel import (
     JOIN_REPLY_TIMEOUT,
+    JOIN_RETRY_DELAY,
     ChannelRecord,
     ChannelRuntime,
     JoinState,
@@ -84,7 +85,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ) as send,
             self.assertLogs("botnats.channel", level="WARNING") as logs,
         ):
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
 
         send.assert_called_once_with("MODE", "#test", "+npst")
         assert logs.output == [
@@ -102,7 +105,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.caps.chanmodes = ("beI", "kx", "l", "imnst")
 
         with self.assertLogs("botnats.channel", level="WARNING"):
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
 
         assert fake_irc.modes == []
 
@@ -120,12 +125,16 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send,
             self.assertNoLogs("botnats.channel", level="WARNING"),
         ):
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
             assert send.call_args_list == []
 
             bot.config = configured
             fake_irc.connected = False
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
 
         send.assert_called_once_with("MODE", "#test", "+npst")
 
@@ -1337,7 +1346,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_join_state_transitions(self) -> None:
-        """Send JOIN only when idle: not while in flight, again after refusal."""
+        """Send JOIN when idle; resend one in flight or refused once it is due."""
         bot, fake_irc, _ = bot_with_coordinator()
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
@@ -1352,7 +1361,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
         )
-        assert runtime.join is JoinState.IDLE
+        bot.channel_mgr.join_desired()
+        assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 1
+        runtime.join_retry_at -= JOIN_RETRY_DELAY
         bot.channel_mgr.join_desired()
         assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 2
 
@@ -1370,7 +1381,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
 
         bot.channel_mgr.join_desired()
-        runtime.join_sent_at -= JOIN_REPLY_TIMEOUT
+        runtime.join_retry_at -= JOIN_REPLY_TIMEOUT
         bot.channel_mgr.join_desired()
 
         assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 2
@@ -1560,16 +1571,13 @@ class ChannelStateTests(unittest.TestCase):
         assert runtime.set_key(None)
         assert runtime.key is None
 
-    def test_refuse_join_ends_only_a_pending_join(self) -> None:
-        """Return a pending JOIN to idle; leave a joined or idle channel alone."""
+    def test_refuse_join_leaves_joined_and_idle_alone(self) -> None:
+        """Pace only a pending JOIN; leave a joined or idle channel alone."""
         runtime = ChannelRuntime(ISupportState(), channel="#test")
 
-        for state, after in (
-            (JoinState.JOINING, JoinState.IDLE),
-            (JoinState.JOINED, JoinState.JOINED),
-            (JoinState.IDLE, JoinState.IDLE),
-        ):
+        for state in (JoinState.JOINED, JoinState.IDLE):
             with self.subTest(state=state):
                 runtime.join = state
                 runtime.refuse_join()
-                assert runtime.join is after
+                assert runtime.join is state
+                assert runtime.join_retry_at == 0.0
