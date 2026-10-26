@@ -10,7 +10,6 @@ Update every Python pin; `{{ patch }}` is the newest patch release of `{{ versio
 | File              | Pattern                                        |
 | ----------------- | ---------------------------------------------- |
 | `.python-version` | `{{ version }}`                                |
-| `Makefile`        | `PYTHON ?= python{{ version }}`                |
 | `pyproject.toml`  | `requires-python = ">={{ version }}"`          |
 | `Dockerfile`      | `FROM python:{{ version }}.{{ patch }}-alpine` |
 

@@ -1,7 +1,4 @@
 ---
-default_stages:
-  - pre-commit
-
 repos:
   # The Python tools run from the project venv (make install), so
   # pyproject.toml pins each of them once.
@@ -34,6 +31,5 @@ repos:
     rev: v1.38.0
     hooks:
       - id: yamllint
-        types: [file, yaml]
         entry: yamllint --strict
 ...
