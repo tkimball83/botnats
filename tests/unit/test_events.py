@@ -1354,6 +1354,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.join = JoinState.JOINED
         runtime.add_ban("*!*@old.ban")
         runtime.member("alpha").modes.add("o")
+        runtime.names_due = True
         bot.channel_mgr.pending_parts[casefold("#gone", "rfc1459")] = "#gone"
 
         bot.events.on_irc_message(IRCMessage("001", ("alpha", "Welcome")))
@@ -1363,6 +1364,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.join is JoinState.IDLE
         assert runtime.bans == {}
         assert runtime.members == {}
+        assert not runtime.names_due
         assert bot.channel_mgr.pending_parts == {}
 
     async def test_userhost_identity(self) -> None:

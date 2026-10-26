@@ -162,6 +162,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         peer = ChannelRecord.new("#test", None, present=True, floor=1_000)
         await coordinator.channels.put(asdict(peer), expected=None)
         bot.channel_mgr.apply_record(peer)
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
         assert bot.channel_mgr.last_revision < revision_number(peer.revision)
 
         await bot.commands.dispatch(OWNER, "PART #test")

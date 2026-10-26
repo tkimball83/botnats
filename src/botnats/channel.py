@@ -7,7 +7,6 @@ import asyncio
 import logging
 import secrets
 import uuid
-from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING
@@ -106,14 +105,16 @@ class ChannelManager:
                 # Wanted again before its PART went out, so never left: the
                 # server would ignore a JOIN, and NAMES relearns its state.
                 runtime.join = JoinState.JOINED
-                with suppress(ConnectionError):
-                    self.bot.irc.send("NAMES", runtime.channel)
+                self.refresh_names(runtime)
             elif self.bot.identity.current is not None and runtime.join_due():
                 self.safe_join(runtime)
 
             return
 
-        if self.channels.pop(folded, None) is not None:
+        dropped = self.channels.pop(folded, None)
+        # A JOIN still in flight is left when its echo arrives: only a joined
+        # channel needs a PART, so a pending PART always means membership.
+        if dropped is not None and dropped.joined:
             self.part(record.channel)
 
     def enforce_modes(self, channel: str) -> None:
@@ -153,13 +154,15 @@ class ChannelManager:
             )
 
     def join_desired(self) -> None:
-        """Attempt to join all desired channels not yet entered."""
+        """Join desired channels not yet entered; resend a rejoin's NAMES."""
         if self.bot.identity.current is None:
             return
 
         for runtime in tuple(self.channels.values()):
             if runtime.join_due():
                 self.safe_join(runtime)
+            elif runtime.names_due:
+                self.refresh_names(runtime)
 
     async def record_key(self, channel: str, key: str | None) -> None:
         """Record a channel key change in its durable channel record."""
@@ -526,6 +529,16 @@ class ChannelManager:
         """Drop a pending PART for a channel this bot has left anyway."""
         self.pending_parts.pop(self.bot.caps.fold(channel), None)
 
+    def refresh_names(self, runtime: ChannelRuntime) -> None:
+        """Send NAMES to relearn a channel, or keep it due for the next tick."""
+        try:
+            self.bot.irc.send("NAMES", runtime.channel)
+        except ConnectionError:
+            runtime.names_due = True
+            return
+
+        runtime.names_due = False
+
     def reset(self) -> None:
         """Clear all runtime state and cooldowns after a reconnection."""
         for runtime in self.channels.values():
@@ -691,6 +704,8 @@ class ChannelRuntime:
     limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
     modes: str = ""
+    # A rejoin whose NAMES could not be sent yet; the next tick resends it.
+    names_due: bool = False
 
     @property
     def joined(self) -> bool:
@@ -765,6 +780,7 @@ class ChannelRuntime:
         self.limit = None
         self.members.clear()
         self.modes = ""
+        self.names_due = False
 
     def set_limit(self, value: str | None) -> None:
         """Record the +l member limit; None or a non-count value clears it."""

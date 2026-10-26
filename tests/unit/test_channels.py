@@ -278,17 +278,54 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert second_runtime.joined
         assert second_runtime.key == "second-key"
 
-    async def test_part_before_join_echoed(self) -> None:
-        """Verify part is sent even when channel was never fully joined."""
+    async def test_part_waits_for_join_echo(self) -> None:
+        """Leave a channel whose JOIN was in flight once its echo arrives."""
         bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        assert not runtime.joined
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        bot.channel_mgr.join_desired()
 
         tombstone = bot.channel_mgr.new_record("#test", None, present=False)
         bot.channel_mgr.apply_record(tombstone)
 
         assert casefold("#test", "rfc1459") not in bot.channel_mgr.channels
-        assert ("PART", ("#test",)) in fake_irc.sent
+        assert fake_irc.sent == [("JOIN", ("#test",))]
+
+        bot.events.on_irc_message(
+            IRCMessage("JOIN", ("#test",), Prefix("alpha", "~alpha", "alpha.host")),
+        )
+        assert fake_irc.sent == [("JOIN", ("#test",)), ("PART", ("#test",))]
+
+    async def test_unconfirmed_channel_is_joined_again(self) -> None:
+        """Join a channel wanted again whose JOIN the server never confirmed.
+
+        Only a joined channel gets a PART, so a full send queue leaves no
+        pending PART to mistake for membership.
+        """
+        for join in (JoinState.IDLE, JoinState.JOINING):
+            with self.subTest(join=join):
+                fake_irc = FailingPartIRC()
+                bot = bot_with_channel(irc=fake_irc)
+                bot.identity.current = BotPresence(
+                    "alpha", "alpha.host", "inst", "alpha", "~alpha"
+                )
+                mgr = bot.channel_mgr
+                mgr.channels[casefold("#test", "rfc1459")].join = join
+                tombstone = mgr.new_record("#test", None, present=False)
+                mgr.apply_record(tombstone)
+                assert mgr.pending_parts == {}
+
+                mgr.apply_record(
+                    mgr.new_record(
+                        "#test", None, present=True, after=tombstone.revision
+                    ),
+                )
+
+                runtime = mgr.runtime("#test")
+                assert runtime is not None
+                assert runtime.join is JoinState.JOINING
+                assert fake_irc.sent == [("JOIN", ("#test",))]
 
     async def test_part_cleared_on_re_desired(self) -> None:
         """Relearn a channel wanted again before its PART goes out.
@@ -355,6 +392,35 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ("MODE", ("#test", "+npst")),
         ]
 
+    async def test_rejoin_names_waits_for_send_queue(self) -> None:
+        """Resend a rejoin's NAMES, once, after a full send queue drains.
+
+        Without NAMES the channel would stay joined with no members or ops.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        bot.identity.registered = True
+        mgr = bot.channel_mgr
+        mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        tombstone = mgr.new_record("#test", None, present=False)
+        full = ConnectionError("IRC outbound queue is full")
+        with patch.object(fake_irc, "send", side_effect=full):
+            mgr.apply_record(tombstone)
+            mgr.apply_record(
+                mgr.new_record("#test", None, present=True, after=tombstone.revision),
+            )
+
+        runtime = mgr.runtime("#test")
+        assert runtime is not None
+        assert runtime.joined
+        assert fake_irc.sent == []
+
+        await bot.maintenance_tick()
+        await bot.maintenance_tick()
+        assert fake_irc.sent == [("NAMES", ("#test",))]
+
     async def test_rejoin_after_part_starts_fresh(self) -> None:
         """Verify a channel joined again after a PART keeps none of its old state."""
         bot, fake_irc = bot_with_irc()
@@ -392,6 +458,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         fake_irc = FailingPartIRC()
         bot = bot_with_channel(irc=fake_irc)
         bot.identity.registered = True
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
 
         tombstone = bot.channel_mgr.new_record("#test", None, present=False)
         bot.channel_mgr.apply_record(tombstone)
@@ -431,8 +498,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         # The stale join does not displace the durable copy a write names.
         assert bot.channel_mgr.durable_revision("#test") == tombstone.revision
-        # The stale join does not rejoin the parted channel.
-        assert fake_irc.sent == [("JOIN", ("#test",)), ("PART", ("#test",))]
+        # The stale join does not rejoin the parted channel; the JOIN still in
+        # flight is left when its echo arrives.
+        assert fake_irc.sent == [("JOIN", ("#test",))]
 
     async def test_record_key_is_versioned(self) -> None:
         """Verify a newer record that changes the key updates it authoritatively."""
