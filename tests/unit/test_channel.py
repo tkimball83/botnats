@@ -38,6 +38,7 @@ from tests.unit.helpers import (
     bot_with_irc,
     config,
     make_bot,
+    settle,
 )
 
 if TYPE_CHECKING:
@@ -49,13 +50,6 @@ if TYPE_CHECKING:
 INVITEE = BotPresence("beta", "beta.host", "one", "beta", "~beta")
 OP_REQUESTER = BotPresence("gamma", "gamma.host", "two", "gamma", "~gamma")
 HELP_GIVEN = [("INVITE", ("beta", "#test")), ("MODE", ("#test", "+o", "gamma"))]
-
-
-async def settle(bot: Bot) -> None:
-    """Wait for background tasks, including any the finished ones spawned."""
-    async with asyncio.timeout(5):
-        while bot.tasks:
-            await asyncio.gather(*bot.tasks)
 
 
 async def see_key(bot: Bot, runtime: ChannelRuntime, key: str | None) -> None:
@@ -137,6 +131,20 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         send.assert_called_once_with("MODE", "#test", "+npst")
+
+    async def test_enforce_modes_refused_is_due_again(self) -> None:
+        """Keep NAMES due when the send queue refuses enforcement.
+
+        The next tick resends NAMES, whose end reply enforces again.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        # A full send queue refuses commands as a dropped connection does.
+        fake_irc.connected = False
+
+        bot.channel_mgr.enforce_modes(runtime)
+
+        assert runtime.names_due
 
     async def test_new_record_orders_local_changes(self) -> None:
         """Order a bot's own changes without a shared process-wide counter."""
@@ -241,22 +249,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.retry_pending_parts()
         assert ("PART", ("#room[",)) in fake_irc.sent
         assert bot.channel_mgr.pending_parts == {}
-
-    async def test_join_part_nats_failure(self) -> None:
-        """Verify join and part commands report NATS write failures."""
-        bot, fake_irc, _ = bot_with_coordinator(FailingWriteCoordinator())
-        bot.authorizer.grant(OWNER.render())
-
-        await bot.commands.dispatch(OWNER, "JOIN #new")
-        await bot.commands.dispatch(OWNER, "PART #test")
-
-        assert casefold("#new", "rfc1459") not in bot.channel_mgr.channels
-        assert casefold("#test", "rfc1459") in bot.channel_mgr.channels
-        # Each reply is the write's own error, so each command attempted one.
-        assert fake_irc.privmsgs == [
-            ("owner", "NATS disconnected: channel #new"),
-            ("owner", "NATS disconnected: channel #test"),
-        ]
 
     async def test_channel_record_injection(self) -> None:
         """Store and join no channel whose name or key would inject a command."""
@@ -569,7 +561,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         record = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
         assert record.key == "recordkey"
         assert coordinator.channel_puts == [asdict(record)]
-        assert coordinator.channel_expected == [base]
+        assert coordinator.channel_after == [base]
 
     async def test_record_key_skips_unchanged_value(self) -> None:
         """Avoid a new durable revision when the key is unchanged."""
@@ -719,7 +711,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         # ...and a command the spelling it was given.
         await bot.commands.cmd_join(OWNER, ("#room{", "other"))
 
-        assert coordinator.channel_expected == [bracket.revision, brace.revision]
+        assert coordinator.channel_after == [bracket.revision, brace.revision]
 
     async def test_unrelated_newer_record_keeps_observed_key(self) -> None:
         """Keep an observed key and its pending write past an unrelated record."""
@@ -762,7 +754,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         async def put_channel(
             record: dict[str, Any],
             *,
-            expected: str | None,
+            after: str | None,
         ) -> ChannelFields:
             if record["key"] == "B":
                 msg = "NATS disconnected"
@@ -770,7 +762,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
             in_flight.set()
             await release.wait()
-            return await record_put(record, expected=expected)
+            return await record_put(record, after=after)
 
         op = Prefix("op", "~op", "op.host")
         with patch.object(coordinator, "put_channel", put_channel):
@@ -882,7 +874,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         keyed = mgr.new_record(
             "#test", "A", present=True, after=mgr.channel_records[folded].revision
         )
-        await coordinator.channels.put(asdict(keyed), expected=None)
+        await coordinator.channels.put(asdict(keyed), after=None)
         mgr.apply_record(keyed)
         runtime = mgr.channels[folded]
         runtime.join = JoinState.JOINED
@@ -891,14 +883,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         async def racing_put(
             record: dict[str, Any],
             *,
-            expected: str | None,
+            after: str | None,
         ) -> ChannelFields:
             # Another bot's JOIN #test, carrying its stored key A, lands first.
             competing = ChannelRecord.new(
                 "#test", "A", present=True, after=keyed.revision
             )
-            await coordinator.channels.put(asdict(competing), expected=keyed.revision)
-            return await record_put(record, expected=expected)
+            await coordinator.channels.put(asdict(competing), after=keyed.revision)
+            return await record_put(record, after=after)
 
         with patch.object(coordinator, "put_channel", racing_put):
             await see_key(bot, runtime, "B")  # MODE #test +k B, seen on IRC
@@ -985,11 +977,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         async def slow_put(
             record: dict[str, Any],
             *,
-            expected: str | None,
+            after: str | None,
         ) -> ChannelFields:
             in_flight.set()
             await release.wait()
-            return await record_put(record, expected=expected)
+            return await record_put(record, after=after)
 
         with patch.object(coordinator, "put_channel", slow_put):
             async with asyncio.timeout(5):
@@ -1026,11 +1018,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         async def slow_put(
             record: dict[str, Any],
             *,
-            expected: str | None,
+            after: str | None,
         ) -> ChannelFields:
             in_flight.set()
             await release.wait()
-            return await record_put(record, expected=expected)
+            return await record_put(record, after=after)
 
         with patch.object(coordinator, "put_channel", slow_put):
             async with asyncio.timeout(5):
@@ -1044,7 +1036,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         puts = coordinator.channel_puts
         assert [record["key"] for record in puts] == ["k", None, "k"]
         # Each write names the record the previous one stored as its base.
-        assert coordinator.channel_expected == [
+        assert coordinator.channel_after == [
             base,
             *(record["revision"] for record in puts[:2]),
         ]
@@ -1063,9 +1055,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         async def put_channel(
             record: dict[str, Any],
             *,
-            expected: str | None,
+            after: str | None,
         ) -> ChannelFields:
-            del expected
+            del after
             seen.append(bot.channel_mgr.channel_records[folded])
             return parse_channel_record(record)
 
@@ -1077,6 +1069,43 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert seen == [before]
         assert bot.channel_mgr.channel_records[folded].key == "recordkey"
 
+    async def test_write_record_orders_after_current_record(self) -> None:
+        """Mint a write after a peer's record whose revision outruns this bot's.
+
+        A record numbered from this bot's own counter alone would sort before
+        the peer's: the store would accept it, yet every bot, this one
+        included, would ignore it as stale.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        mgr = bot.channel_mgr
+        peer = ChannelRecord.new("#test", None, present=True, floor=1_000)
+        await coordinator.channels.put(asdict(peer), after=None)
+        mgr.apply_record(peer)
+        mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        assert mgr.last_revision < revision_number(peer.revision)
+
+        assert await mgr.write_record("#test", None, present=False)
+
+        assert fake_irc.sent == [("PART", ("#test",))]
+        assert mgr.runtime("#test") is None
+        record = mgr.channel_records[casefold("#test", "rfc1459")]
+        assert not record.present
+        assert record.revision > peer.revision
+
+    async def test_write_record_reports_a_lost_write(self) -> None:
+        """Apply the stored winner, never the attempt, and report losing to it."""
+        bot, _, coordinator = bot_with_coordinator()
+        mgr = bot.channel_mgr
+        # Stored by a peer, but not yet watched here.
+        winner = ChannelRecord.new("#new", None, present=False, floor=1_000)
+        await coordinator.channels.put(asdict(winner), after=None)
+
+        assert not await mgr.write_record("#new", None, present=True)
+
+        assert [put["present"] for put in coordinator.channel_puts] == [True]
+        assert mgr.runtime("#new") is None
+        assert mgr.channel_records[casefold("#new", "rfc1459")] == winner
+
     async def test_write_applies_authoritative_winner(self) -> None:
         """Converge local channel state when a newer durable mutation wins."""
         coordinator = FakeCoordinator()
@@ -1086,9 +1115,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         async def put_channel(
             record: dict[str, Any],
             *,
-            expected: str | None,
+            after: str | None,
         ) -> ChannelFields:
-            del expected
+            del after
             nonlocal winner
             incoming = ChannelRecord(*parse_channel_record(record))
             winner = bot.channel_mgr.new_record(

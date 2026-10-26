@@ -8,17 +8,13 @@ from collections import deque
 from dataclasses import asdict, replace
 from unittest.mock import MagicMock, call, patch
 
-from botnats.channel import (
-    ChannelRecord,
-    ChannelRuntime,
-    JoinState,
-    revision_number,
-)
+from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
 from botnats.commands import RELAY_SOURCE_BYTES, RateLimiter, parse_command
 from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     OWNER,
+    FailingWriteCoordinator,
     FakeIRC,
     bot_with_coordinator,
     bot_with_irc,
@@ -123,44 +119,42 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ("owner", "Banned *!*@bad.host on #test"),
         ]
 
+    async def test_join_part_nats_failure(self) -> None:
+        """Verify join and part commands report NATS write failures."""
+        bot, fake_irc, _ = bot_with_coordinator(FailingWriteCoordinator())
+        bot.authorizer.grant(OWNER.render())
+
+        await bot.commands.dispatch(OWNER, "JOIN #new")
+        await bot.commands.dispatch(OWNER, "PART #test")
+
+        assert casefold("#new", "rfc1459") not in bot.channel_mgr.channels
+        assert casefold("#test", "rfc1459") in bot.channel_mgr.channels
+        # Each reply is the write's own error, so each command attempted one.
+        assert fake_irc.privmsgs == [
+            ("owner", "NATS disconnected: channel #new"),
+            ("owner", "NATS disconnected: channel #test"),
+        ]
+
     async def test_join_reports_superseded_update(self) -> None:
         """Tell the admin when another bot's newer record wins the write."""
         bot, fake_irc, coordinator = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
         # Stored by a peer, but not yet watched here.
         winner = ChannelRecord.new("#new", None, present=False, floor=1_000)
-        await coordinator.channels.put(asdict(winner), expected=None)
+        await coordinator.channels.put(asdict(winner), after=None)
 
         await bot.commands.dispatch(OWNER, "JOIN #new")
 
-        assert [put["present"] for put in coordinator.channel_puts] == [True]
         assert fake_irc.privmsgs == [("owner", "Update superseded for #new")]
-        assert bot.channel_mgr.runtime("#new") is None
-        assert bot.channel_mgr.channel_records[casefold("#new", "rfc1459")] == winner
 
-    async def test_part_orders_after_peer_record(self) -> None:
-        """Mint a PART after a peer's record whose revision outruns this bot's.
-
-        A record numbered from this bot's own counter alone would sort before
-        the peer's: the store would accept it, yet every bot, this one
-        included, would ignore it as stale.
-        """
-        bot, fake_irc, coordinator = bot_with_coordinator()
+    async def test_part_reports_parting(self) -> None:
+        """Tell the admin a PART whose write won is under way."""
+        bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
-        peer = ChannelRecord.new("#test", None, present=True, floor=1_000)
-        await coordinator.channels.put(asdict(peer), expected=None)
-        bot.channel_mgr.apply_record(peer)
-        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
-        assert bot.channel_mgr.last_revision < revision_number(peer.revision)
 
         await bot.commands.dispatch(OWNER, "PART #test")
 
         assert fake_irc.privmsgs == [("owner", "Parting #test")]
-        assert fake_irc.sent == [("PART", ("#test",))]
-        assert bot.channel_mgr.runtime("#test") is None
-        record = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
-        assert not record.present
-        assert record.revision > peer.revision
 
     async def test_parse_error_reaches_authenticated_admin(self) -> None:
         """Explain an unparseable command to a sender who is authenticated."""
@@ -605,4 +599,4 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert payload["key"] == "live-key"
         assert runtime.key == "live-key"
         # Written against the record it replaces, so a concurrent write wins cleanly.
-        assert coordinator.channel_expected == [base]
+        assert coordinator.channel_after == [base]

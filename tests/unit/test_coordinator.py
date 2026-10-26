@@ -38,6 +38,7 @@ from tests.unit.helpers import (
     COORDINATION_KEY,
     NATS_CREDENTIAL,
     FakeKV,
+    hang,
     session_record,
     session_value,
 )
@@ -137,12 +138,6 @@ def closing_client(coordinator: Coordinator) -> MagicMock:
 
     nc.close = AsyncMock(side_effect=close)
     return nc
-
-
-async def hang(*arguments: object) -> None:
-    """Block like a healthy watch until cancelled."""
-    del arguments
-    await asyncio.Event().wait()
 
 
 def presence_entry(*, signed: bool = True) -> SimpleNamespace:
@@ -934,12 +929,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Cancel an in-flight resynchronization when Core NATS drops."""
         coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock()
-        hang = asyncio.Event()
 
-        async def hang_resync() -> None:
-            await hang.wait()
-
-        with patch.object(coordinator, "resync", hang_resync):
+        with patch.object(coordinator, "resync", hang):
             await coordinator.on_reconnected()
             task = coordinator.resync_task
             assert task is not None
@@ -1649,7 +1640,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             coordinator.claim.state = state
             with self.subTest(state=state):
                 with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
-                    await coordinator.put_channel(channel, expected=None)
+                    await coordinator.put_channel(channel, after=None)
 
                 with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
                     await coordinator.put_session(session)
@@ -1659,7 +1650,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         # The same writes land once the claim is owned.
         coordinator.claim.state = PresenceState.OWNED
-        await coordinator.put_channel(channel, expected=None)
+        await coordinator.put_channel(channel, after=None)
         await coordinator.put_session(session)
 
         assert len(channels.entries) == 1

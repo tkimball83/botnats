@@ -160,8 +160,8 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         first = asdict(ChannelRecord.new("#shared", "first", present=True))
         second = asdict(ChannelRecord.new("#shared", "second", present=True))
 
-        stored_first = await self.alpha.put_channel(first, expected=None)
-        stored_second = await self.beta.put_channel(second, expected=None)
+        stored_first = await self.alpha.put_channel(first, after=None)
+        stored_second = await self.beta.put_channel(second, after=None)
 
         _, stored_key, _, _ = stored_first
         assert stored_key == "first"

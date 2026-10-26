@@ -5,18 +5,13 @@
 
 import asyncio
 import unittest
-from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
-from nats.js.errors import BadRequestError
 
 from botnats.nats.claim import PresenceClaim, PresenceState
 from botnats.nats.store import PresenceStore, StoreUnavailableError
-from tests.unit.helpers import COORDINATION_KEY, FakeKV
-
-if TYPE_CHECKING:
-    from nats.js.kv import KeyValue
+from tests.unit.helpers import COORDINATION_KEY
 
 INSTANCE_ID = "instance"
 NOT_OWNED = "bot ID alpha does not own its presence key"
@@ -27,33 +22,6 @@ def build_claim() -> PresenceClaim:
     """Build an unclaimed presence claim over an unopened store."""
     store = PresenceStore("efnet", 1, 15.0, COORDINATION_KEY)
     return PresenceClaim(store, "alpha", INSTANCE_ID)
-
-
-class DeletableKV(FakeKV):
-    """In-memory bucket whose delete checks the last revision as nats-py does."""
-
-    async def delete(self, key: str, last: int) -> bool:
-        """Delete a key at its revision; nats-py raises a bare BadRequestError."""
-        if self.entries[key][0] != last:
-            raise BadRequestError(code=400, err_code=10071)
-
-        del self.entries[key]
-        return True
-
-
-async def stale_claim(instance_id: str) -> tuple[PresenceClaim, DeletableKV]:
-    """Own revision 1 of a key whose newer record, by instance_id, it never saw.
-
-    A heartbeat cancelled after its write reached the server leaves it so.
-    """
-    claim = build_claim()
-    kv = DeletableKV()
-    claim.store.kv = cast("KeyValue", kv)
-    revision = await kv.create(claim.key, claim.store.sign(claim.last))
-    newer = {**claim.last, "instance_id": instance_id}
-    await kv.update(claim.key, claim.store.sign(newer), last=revision)
-    claim.adopt(revision)
-    return claim, kv
 
 
 class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
@@ -268,20 +236,15 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         assert claim.owned
         assert claim.revision == reclaimed_revision
 
-    async def test_release_deletes_record_a_cancelled_heartbeat_wrote(self) -> None:
-        """Delete this instance's newer record when the claim missed its revision."""
-        claim, kv = await stale_claim(INSTANCE_ID)
+    async def test_release_deletes_owned_revision_of_this_instance(self) -> None:
+        """Delete the owned revision of this instance's record, then stop owning it."""
+        claim = build_claim()
+        claim.adopt(3)
+        delete = AsyncMock(return_value=None)
 
-        await claim.release()
+        with patch.object(claim.store, "delete", delete):
+            await claim.release()
 
-        assert not kv.entries
+        delete.assert_awaited_once_with("alpha", 3, INSTANCE_ID)
         assert not claim.owned
-
-    async def test_release_keeps_record_of_another_instance(self) -> None:
-        """Leave the key to another instance whose record replaced this one."""
-        claim, kv = await stale_claim("other-instance")
-
-        await claim.release()
-
-        assert claim.key in kv.entries
-        assert not claim.owned
+        assert claim.revision is None

@@ -235,6 +235,38 @@ class IRCProtocolTests(unittest.TestCase):
             "rfc1459",
         )
 
+    def test_isupport_chanmodes_extra_groups(self) -> None:
+        """Verify CHANMODES with more than four groups keeps the first four."""
+        caps = ISupportState()
+
+        caps.apply("CHANMODES", "beIq,kf,lj,imnstC,X")
+
+        assert caps.chanmodes == ("beIq", "kf", "lj", "imnstC")
+
+    def test_isupport_empty_prefix_clears_membership_modes(self) -> None:
+        """Track no membership prefixes when PREFIX advertises none."""
+        for value in ("", "()"):
+            with self.subTest(value=value):
+                caps = ISupportState()
+
+                caps.apply("PREFIX", value)
+
+                assert caps.member_prefixes == {}
+                assert caps.membership_modes == ""
+
+    def test_isupport_malformed_prefix_ignored(self) -> None:
+        """Keep the advertised membership prefixes when PREFIX is malformed."""
+        for value in ("(ov", "(ov)@", "(ov)@+%"):
+            with self.subTest(value=value):
+                caps = ISupportState()
+                caps.apply("PREFIX", "(yov)@%+")
+
+                caps.apply("PREFIX", value)
+
+                assert caps.member_prefixes == {"@": "y", "%": "o", "+": "v"}
+                assert caps.membership_modes == "yov"
+                assert caps.op_mode == "y"
+
     def test_identity_fold(self) -> None:
         """Fold only protocol-defined identity equivalents."""
         caps = ISupportState()

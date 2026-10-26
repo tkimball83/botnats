@@ -303,11 +303,11 @@ class ChannelStore(KVStore):
         self,
         data: dict[str, Any],
         *,
-        expected: str | None,
+        after: str | None,
     ) -> ChannelFields:
         """Store a signed channel record and return the authoritative fields.
 
-        expected is the revision the record was written after (None when no
+        after is the revision the record was written after (None when no
         record was known). The write lands only while the stored record is
         no newer than that, so a concurrent write from another bot wins
         cleanly instead of by the random revision suffix. An older stored
@@ -321,7 +321,7 @@ class ChannelStore(KVStore):
         def standing(current: dict[str, Any]) -> ChannelFields | None:
             stored = self.parse(key, current)
             # Revisions are fixed-width, so string order is revision order.
-            if stored is None or (expected is not None and stored[3] <= expected):
+            if stored is None or (after is not None and stored[3] <= after):
                 return None
 
             return stored
@@ -384,10 +384,23 @@ class PresenceStore(KVStore):
         except KeyWrongLastSequenceError:
             return None
 
-    async def delete(self, bot_id: str, revision: int) -> None:
-        """Delete the presence key only while its owned revision still matches."""
+    async def delete(self, bot_id: str, revision: int, instance_id: str) -> None:
+        """Delete the presence key at its owned revision, if still this instance's.
+
+        A heartbeat cancelled after its write reached the server leaves the
+        owned revision stale. nats-py reports that delete's revision mismatch
+        as a bare BadRequestError; the record is then deleted at its current
+        revision if it is still this instance's.
+        """
         kv = await self.open()
-        await kv.delete(self.key(bot_id), last=revision)
+        key = self.key(bot_id)
+        try:
+            await kv.delete(key, last=revision)
+        except BadRequestError:
+            entry = await kv.get(key)
+            record = decode_record(entry.value)
+            if record and record.get("instance_id") == instance_id:
+                await kv.delete(key, last=entry.revision)
 
     async def reclaim(
         self,

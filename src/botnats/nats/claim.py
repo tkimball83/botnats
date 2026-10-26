@@ -9,9 +9,7 @@ from contextlib import suppress
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
-from nats.js.errors import BadRequestError
-
-from botnats.nats.store import PUBLISH_ERRORS, StoreUnavailableError, decode_record
+from botnats.nats.store import PUBLISH_ERRORS, StoreUnavailableError
 
 if TYPE_CHECKING:
     from botnats.nats.store import PresenceStore
@@ -134,25 +132,12 @@ class PresenceClaim:
         return False
 
     async def release(self) -> None:
-        """Delete the owned key on shutdown so a replacement can claim it.
-
-        A heartbeat cancelled after its write reached the server leaves the
-        revision stale. nats-py reports that delete's revision mismatch as a
-        bare BadRequestError; the record is then deleted at its current
-        revision if it is still this instance's.
-        """
+        """Delete the owned key on shutdown so a replacement can claim it."""
         async with self.lock:
             revision = self.revision
             if self.owned and revision is not None:
                 with suppress(*PUBLISH_ERRORS):
-                    try:
-                        await self.store.delete(self.bot_id, revision)
-                    except BadRequestError:
-                        kv = await self.store.open()
-                        entry = await kv.get(self.key)
-                        record = decode_record(entry.value)
-                        if record and record.get("instance_id") == self.instance_id:
-                            await kv.delete(self.key, last=entry.revision)
+                    await self.store.delete(self.bot_id, revision, self.instance_id)
 
             self.reset()
 

@@ -92,9 +92,9 @@ class CoordinatorProtocol(PresenceWriter, SessionWriter, Protocol):
         self,
         record: dict[str, Any],
         *,
-        expected: str | None,
+        after: str | None,
     ) -> ChannelFields:
-        """Store a channel record written after expected; return the winner."""
+        """Store a channel record written after a revision; return the winner."""
         ...
 
     @property
@@ -308,11 +308,11 @@ class Coordinator:
         self,
         record: dict[str, Any],
         *,
-        expected: str | None,
+        after: str | None,
     ) -> ChannelFields:
-        """Store a channel record written after expected; return the winner."""
+        """Store a channel record written after a revision; return the winner."""
         self.claim.require()
-        return await self.channels_store.put(record, expected=expected)
+        return await self.channels_store.put(record, after=after)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
         """Store or refresh bot presence in JetStream KV."""

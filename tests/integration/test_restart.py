@@ -68,7 +68,7 @@ async def mark() -> None:
         assert await claims.claim(COUNTER)
         await channels.open(nc.jetstream())
         record = asdict(ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True))
-        _, stored_key, _, _ = await channels.put(record, expected=None)
+        _, stored_key, _, _ = await channels.put(record, after=None)
         assert stored_key == CHANNEL_KEY
         await sessions.open(nc.jetstream())
         expires_at = time.time() + SESSION_TTL / 2

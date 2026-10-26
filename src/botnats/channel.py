@@ -222,7 +222,7 @@ class ChannelManager:
         )
         stored = await self.bot.coordinator.put_channel(
             asdict(record),
-            expected=self.durable_revision(channel),
+            after=self.durable_revision(channel),
         )
         authoritative = ChannelRecord(*stored)
         self.apply_record(authoritative)
@@ -232,7 +232,7 @@ class ChannelManager:
         """Return the stored revision of this exact channel name, if any.
 
         The store keys records by ASCII fold, while the local view merges
-        IRC-equivalent names (#a[ and #a{ under rfc1459); a write must name
+        IRC-equivalent names (#a[ and #a{ under rfc1459); a write must follow
         the record under its own key, or the store can never accept it.
         """
         record = self.source_records.get(casefold(channel, "ascii"))

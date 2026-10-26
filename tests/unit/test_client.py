@@ -28,6 +28,7 @@ from botnats.irc.protocol import (
     format_message,
     parse_message,
 )
+from tests.unit.helpers import hang
 
 
 def fill_send_buffer(writer: asyncio.StreamWriter) -> None:
@@ -68,11 +69,6 @@ def mock_writer() -> MagicMock:
     return writer
 
 
-async def never() -> None:
-    """Wait until cancelled, standing in for a live sender."""
-    await asyncio.Event().wait()
-
-
 class IRCServerTests(unittest.TestCase):
     """Tests for IRC server URL parsing."""
 
@@ -99,7 +95,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client()
         client.cap_negotiating = negotiating
         client.outbound = asyncio.Queue(maxsize=64)
-        client.sender_task = asyncio.create_task(never())
+        client.sender_task = asyncio.create_task(hang())
         client.writer = mock_writer()
         self.addAsyncCleanup(client.stop_sender)
         return client
@@ -1032,11 +1028,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def slow_sender() -> None:
             try:
-                await never()
+                await hang()
             finally:
                 # Still winding down when the caller is cancelled in turn.
                 sender_stopping.set()
-                await never()
+                await hang()
 
         client.sender_task = asyncio.create_task(slow_sender())
         stopper = asyncio.create_task(client.stop_sender())
@@ -1051,7 +1047,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_sender_absorbs_sender_cancellation(self) -> None:
         """Absorb the sender's own cancellation when the caller is not cancelled."""
         client = irc_client()
-        client.sender_task = asyncio.create_task(never())
+        client.sender_task = asyncio.create_task(hang())
         client.outbound = asyncio.Queue()
 
         async with asyncio.timeout(5):

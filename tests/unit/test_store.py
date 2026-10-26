@@ -67,6 +67,33 @@ def signed_presence(instance_id: str) -> dict[str, object]:
     return data
 
 
+class DeletableKV(FakeKV):
+    """In-memory bucket whose delete checks the last revision as nats-py does."""
+
+    async def delete(self, key: str, last: int) -> bool:
+        """Delete a key at its revision; nats-py raises a bare BadRequestError."""
+        if self.entries[key][0] != last:
+            raise BadRequestError(code=400, err_code=10071)
+
+        del self.entries[key]
+        return True
+
+
+async def stale_presence(instance_id: str) -> tuple[PresenceStore, DeletableKV]:
+    """Store alpha's presence at revision 1, then a newer record by instance_id.
+
+    A heartbeat cancelled after its write reached the server leaves its owner
+    holding revision 1.
+    """
+    store = PresenceStore("efnet", 1, 15.0, SECRET)
+    kv = DeletableKV()
+    store.kv = cast("KeyValue", kv)
+    revision = await kv.create("alpha", json.dumps(signed_presence("inst")).encode())
+    newer = json.dumps(signed_presence(instance_id)).encode()
+    await kv.update("alpha", newer, last=revision)
+    return store, kv
+
+
 class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
     """Tests for reclaiming an occupied presence key after reconnect."""
 
@@ -570,9 +597,25 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         presence.kv = AsyncMock()
         presence.kv.delete.return_value = True
 
-        await presence.delete("Alpha", 8)
+        await presence.delete("Alpha", 8, "one")
 
         presence.kv.delete.assert_awaited_once_with("alpha", last=8)
+
+    async def test_presence_delete_retries_at_current_revision(self) -> None:
+        """Delete this instance's newer record when the owned revision is stale."""
+        presence, kv = await stale_presence("inst")
+
+        await presence.delete("Alpha", 1, "inst")
+
+        assert not kv.entries
+
+    async def test_presence_delete_keeps_another_instance(self) -> None:
+        """Leave the key to another instance whose record replaced this one."""
+        presence, kv = await stale_presence("other")
+
+        await presence.delete("Alpha", 1, "inst")
+
+        assert "alpha" in kv.entries
 
     async def test_presence_update_uses_owned_revision(self) -> None:
         """Refresh presence under its owned revision and report a lost race."""
@@ -604,7 +647,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.create.return_value = 1
         record = channel_record(1)
 
-        assert await channels.put(record, expected=None) == channel_fields(1)
+        assert await channels.put(record, after=None) == channel_fields(1)
         key, value = channels.kv.create.await_args.args
         assert key == channels.key("#test")
         assert json.loads(value) == record
@@ -626,7 +669,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         }
         for label, change in injected.items():
             with self.subTest(label), self.assertRaises(ValueError):
-                await channels.put({**channel_record(1), **change}, expected=None)
+                await channels.put({**channel_record(1), **change}, after=None)
 
         assert kv.entries == {}
 
@@ -724,7 +767,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         stored = await channels.put(
             channel_record(3),
-            expected=channel_revision(1),
+            after=channel_revision(1),
         )
 
         assert stored == channel_fields(2)
@@ -741,7 +784,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         channels.kv.create.side_effect = KeyWrongLastSequenceError()
 
-        stored = await channels.put(channel_record(2), expected=None)
+        stored = await channels.put(channel_record(2), after=None)
 
         assert stored == channel_fields(1)
         channels.kv.create.assert_awaited_once()
@@ -762,7 +805,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         stored = await channels.put(
             ours,
-            expected=channel_revision(1),
+            after=channel_revision(1),
         )
 
         assert stored == channel_fields(2)
@@ -780,7 +823,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         key = channels.key("#test")
         kv.store(key, json.dumps(channel_record(1)).encode())
 
-        stored = await channels.put(channel_record(3), expected=channel_revision(2))
+        stored = await channels.put(channel_record(3), after=channel_revision(2))
 
         assert stored == channel_fields(3)
         assert json.loads(kv.entries[key][1]) == channel_record(3)
@@ -793,7 +836,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.create.side_effect = KeyWrongLastSequenceError()
 
         with self.assertRaisesRegex(NatsError, "update races"):
-            await channels.put(channel_record(1), expected=None)
+            await channels.put(channel_record(1), after=None)
 
         assert channels.kv.create.await_count == CAS_ATTEMPT_LIMIT
 
@@ -810,7 +853,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(NatsError, "update races"):
             await channels.put(
                 channel_record(2),
-                expected=channel_revision(1),
+                after=channel_revision(1),
             )
 
         assert channels.kv.update.await_count == CAS_ATTEMPT_LIMIT
@@ -956,7 +999,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.update.return_value = 2
 
         valid_channel = channel_record(2)
-        assert await channels.put(valid_channel, expected=None) == channel_fields(2)
+        assert await channels.put(valid_channel, after=None) == channel_fields(2)
         channels.kv.update.assert_awaited_once()
 
         sessions = SessionStore("efnet", 1, SECRET, 60)
@@ -983,7 +1026,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.update.return_value = 2
 
         valid_channel = channel_record(2)
-        assert await channels.put(valid_channel, expected=None) == channel_fields(2)
+        assert await channels.put(valid_channel, after=None) == channel_fields(2)
         channels.kv.update.assert_awaited_once()
 
     async def test_state_keys_do_not_depend_on_irc_casemapping(self) -> None:

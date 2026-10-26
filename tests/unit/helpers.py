@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Shared fakes and factories for bot-level tests."""
+"""Shared fakes, factories, and waits for unit tests."""
 
 import asyncio
 import base64
@@ -94,6 +94,12 @@ async def drain_session_writes(bot: Bot) -> None:
         )
 
 
+async def hang(*arguments: object) -> None:
+    """Block like a live task or watch until cancelled."""
+    del arguments
+    await asyncio.Event().wait()
+
+
 async def send_command(bot: Bot, prefix: Prefix, text: str) -> None:
     """Queue a private-message command as IRC delivers it and wait for it."""
     bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
@@ -101,6 +107,13 @@ async def send_command(bot: Bot, prefix: Prefix, text: str) -> None:
         await asyncio.gather(
             *(task for task in tuple(bot.tasks) if task.get_name() == "admin-command"),
         )
+
+
+async def settle(bot: Bot) -> None:
+    """Wait for background tasks, including any the finished ones spawned."""
+    async with asyncio.timeout(5):
+        while bot.tasks:
+            await asyncio.gather(*bot.tasks)
 
 
 def session_record(
@@ -348,7 +361,7 @@ class FakeCoordinator:
             store.kv = cast("KeyValue", FakeKV())
 
         self.bot_id = "alpha"
-        self.channel_expected: list[str | None] = []
+        self.channel_after: list[str | None] = []
         self.channel_puts: list[dict[str, Any]] = []
         self.claim_requests: list[int] = []
         self.connected = True
@@ -371,13 +384,13 @@ class FakeCoordinator:
         self,
         record: dict[str, Any],
         *,
-        expected: str | None,
+        after: str | None,
     ) -> ChannelFields:
         """Record a channel write and store it as ChannelStore would."""
         self.require_writable()
         self.channel_puts.append(record)
-        self.channel_expected.append(expected)
-        return await self.channels.put(record, expected=expected)
+        self.channel_after.append(after)
+        return await self.channels.put(record, after=after)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
         """Record a presence write."""
@@ -442,14 +455,14 @@ class FailingWriteCoordinator(FakeCoordinator):
         self,
         record: dict[str, Any],
         *,
-        expected: str | None,
+        after: str | None,
     ) -> ChannelFields:
         """Raise NatsError while failing, to simulate a NATS disconnect."""
         if self.failing:
             msg = f"NATS disconnected: channel {record['channel']}"
             raise NatsError(msg)
 
-        return await super().put_channel(record, expected=expected)
+        return await super().put_channel(record, after=after)
 
     async def put_session(self, session: dict[str, Any]) -> Session:
         """Raise NatsError while failing, to simulate a NATS disconnect."""
