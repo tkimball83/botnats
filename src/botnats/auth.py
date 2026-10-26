@@ -4,21 +4,18 @@
 """TOTP authentication, signed sessions, and their mesh-wide synchronization."""
 
 import asyncio
-import base64
-import binascii
 import hmac
 import time
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from botnats.config import MIN_COORDINATION_KEY_BYTES
 from botnats.irc.protocol import casefold
 from botnats.nats.store import (
     PUBLISH_ERRORS,
-    SESSION_EXPIRY_GRACE,
     Session,
     parse_session_record,
     session_signature,
+    within_horizon,
 )
 
 if TYPE_CHECKING:
@@ -29,7 +26,6 @@ if TYPE_CHECKING:
     from botnats.irc.protocol import Prefix
     from botnats.nats.coordinator import CoordinatorProtocol
 
-MIN_TOTP_SECRET_BYTES = 20
 TOTP_CODE_LENGTH = 6
 TOTP_PERIOD = 30
 TOTP_WINDOW = 1
@@ -43,18 +39,18 @@ class AuthFlow:
 
     async def authenticate(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Validate a TOTP code and establish an authorized session."""
-        if not prefix.complete:
-            return
-
         bot = self.bot
         coordinator = bot.coordinator
-        if len(arguments) != 1:
-            await bot.commands.reply(prefix.nick, "AUTH <totp-code>")
-            return
-
         rendered = prefix.render()
         identity = limit_identity(prefix)
+        # Over the attempt limit, or without NATS to enforce it, AUTH stays
+        # silent, even malformed: a reply would only tell a guesser that the
+        # bot is listening.
         if not await coordinator.request_auth(identity):
+            return
+
+        if len(arguments) != 1:
+            bot.commands.reply(prefix.nick, "AUTH <totp-code>")
             return
 
         counter = bot.authorizer.match(arguments[0])
@@ -71,23 +67,23 @@ class AuthFlow:
             # The identity must still hold after the write: IRC may have
             # disconnected while it waited on JetStream.
             if (
-                not await bot.sessions.sync(rendered, asdict(session))
+                not await bot.sessions.sync(rendered, session)
                 or not bot.authorizer.authorized(rendered)
                 or not bot.sessions.watched_valid(rendered)
             ):
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
-                    await bot.sessions.sync(revoked.prefix, asdict(revoked))
+                    await bot.sessions.sync(revoked.prefix, revoked)
 
-                await bot.commands.reply(prefix.nick, "Authorization failed")
+                bot.commands.reply(prefix.nick, "Authorization failed")
                 return
 
-            await bot.commands.reply(prefix.nick, "Authorized")
-            bot.tasks.spawn(self.auto_op(prefix), "admin-auto-op")
+            bot.commands.reply(prefix.nick, "Authorized")
+            self.auto_op(prefix)
         else:
-            await bot.commands.reply(prefix.nick, "Authorization failed")
+            bot.commands.reply(prefix.nick, "Authorization failed")
 
-    async def auto_op(self, prefix: Prefix) -> None:
+    def auto_op(self, prefix: Prefix) -> None:
         """Grant operator status on all channels where this bot is opped."""
         bot = self.bot
         for runtime in tuple(bot.channel_mgr.channels.values()):
@@ -105,7 +101,7 @@ class AuthFlow:
                 continue
 
             try:
-                await bot.irc.send(
+                bot.irc.send(
                     "MODE",
                     channel,
                     f"+{bot.caps.op_mode}",
@@ -137,7 +133,7 @@ class SessionSync:
         self.authorizer = authorizer
         self.coordinator = coordinator
         self.lock = asyncio.Lock()
-        self.pending: dict[str, dict[str, object]] = {}
+        self.pending: dict[str, Session] = {}
         # KV key -> (prefix, expiry) for each unexpired watched session.
         self.watched: dict[str, tuple[str, float]] = {}
         # ASCII-folded identity -> (commands in flight, invalidated since the
@@ -188,22 +184,15 @@ class SessionSync:
             key: (count, True) for key, (count, _) in self.watched_identities.items()
         }
 
-    def observe(
-        self,
-        key: str,
-        record: dict[str, Any],
-        *,
-        replaying: bool,
-    ) -> None:
-        """Apply a validated watched record: import it, or drop it if expired."""
+    def observe(self, key: str, session: Session, *, replaying: bool) -> None:
+        """Apply a validated watched record: keep it, or drop it if expired."""
         now = time.time()
         if not replaying:
             self.prune(now)
 
-        expiry = float(record["expires_at"])
-        if expiry > now:
-            self.watched[key] = (record["prefix"], expiry)
-            self.authorizer.import_session(record)
+        if session.expires_at > now:
+            self.watched[key] = (session.prefix, session.expires_at)
+            self.authorizer.keep(session)
         else:
             self.forget(key)
 
@@ -222,11 +211,10 @@ class SessionSync:
     def prune(self, now: float | None = None) -> None:
         """Discard expired key mappings, which receive no TTL delete event."""
         current = time.time() if now is None else now
-        self.watched = {
-            key: mapped for key, mapped in self.watched.items() if mapped[1] > current
-        }
+        for key in [k for k, mapped in self.watched.items() if mapped[1] <= current]:
+            del self.watched[key]
 
-    def queue(self, identity: str, session: dict[str, object]) -> str:
+    def queue(self, identity: str, session: Session) -> str:
         """Queue a mutation unless an unwritten one for the identity outranks it.
 
         AUTH grants before it waits for the lock, so a revocation queued
@@ -234,14 +222,17 @@ class SessionSync:
         """
         key = casefold(identity, "ascii")
         now = time.time()
-        incoming = self.authorizer.parse(session, now)
-        queued = self.authorizer.parse(self.pending.get(key), now)
-        if queued is None or (incoming is not None and incoming.order > queued.order):
+        queued = self.pending.get(key)
+        if (
+            queued is None
+            or queued.expires_at <= now
+            or (session.expires_at > now and session.order > queued.order)
+        ):
             self.pending[key] = session
 
         return key
 
-    async def sync(self, identity: str, session: dict[str, object]) -> bool:
+    async def sync(self, identity: str, session: Session) -> bool:
         """Queue and write one mutation now; report whether it was written."""
         async with self.lock:
             key = self.queue(identity, session)
@@ -262,7 +253,7 @@ class SessionSync:
             # File it under the session's own prefix: the observed prefix can
             # differ in IRC-case-equivalent characters, and the store keys and
             # validates sessions by their own prefix.
-            self.queue(revoked.prefix, asdict(revoked))
+            self.queue(revoked.prefix, revoked)
             self.tasks.spawn(self.retry(), "session-sync")
 
     async def drain(self) -> None:
@@ -271,37 +262,33 @@ class SessionSync:
             if not await self.write(identity, session):
                 return
 
-    async def write(self, identity: str, session: dict[str, object]) -> bool:
+    async def write(self, identity: str, session: Session) -> bool:
         """Write one queued mutation; re-queue a revocation that met a newer grant."""
         try:
-            stored = await self.coordinator.put_session(identity, session)
+            stored = await self.coordinator.put_session(asdict(session))
         except PUBLISH_ERRORS:
             return False
 
-        self.authorizer.import_session(stored)
+        winner = self.authorizer.import_session(stored)
         # revoke() queues without the lock, so a newer mutation for
         # this identity may have replaced this entry during the write; it is
         # still unwritten and must stay queued for its own drain.
         if self.pending.get(identity) is not session:
             return True
 
-        if session.get("revoked") is True:
-            winner = self.authorizer.parse(stored, time.time())
-            if winner is not None and not winner.revoked:
-                replacement = asdict(
-                    self.authorizer.create(
-                        winner.prefix,
-                        winner.expires_at,
-                        winner.issuer,
-                        winner.version + 1,
-                        revoked=True,
-                    ),
-                )
-                # The write succeeded; the replacement waits for the next
-                # retry so later identities are not held behind it.
-                self.authorizer.import_session(replacement)
-                self.pending[identity] = replacement
-                return True
+        if session.revoked and winner is not None and not winner.revoked:
+            replacement = self.authorizer.create(
+                winner.prefix,
+                winner.expires_at,
+                winner.issuer,
+                winner.version + 1,
+                revoked=True,
+            )
+            # The write succeeded; the replacement waits for the next
+            # retry so later identities are not held behind it.
+            self.authorizer.keep(replacement)
+            self.pending[identity] = replacement
+            return True
 
         del self.pending[identity]
         return True
@@ -312,50 +299,34 @@ class TotpAuthorizer:
 
     def __init__(
         self,
-        secret: str,
+        secret: bytes,
         *,
         coordination_secret: bytes,
         identity_fold: Callable[[str], str],
         scope: tuple[str, str],
         session_ttl: float,
     ) -> None:
-        normalized = "".join(secret.split()).upper()
-        try:
-            padding = "=" * (-len(normalized) % 8)
-            decoded = base64.b32decode(normalized + padding, casefold=True)
-        except (binascii.Error, ValueError) as error:
-            msg = "TOTP secret must be valid base32"
-            raise ValueError(msg) from error
-
-        if len(decoded) < MIN_TOTP_SECRET_BYTES:
-            msg = "TOTP secret must contain at least 160 bits"
-            raise ValueError(msg)
-
-        if len(coordination_secret) < MIN_COORDINATION_KEY_BYTES:
-            msg = "coordination secret must contain at least 32 bytes"
-            raise ValueError(msg)
-
-        issuer, network = scope
-        if not issuer:
-            msg = "authorization issuer must not be empty"
-            raise ValueError(msg)
-
-        if not network:
-            msg = "authorization network must not be empty"
-            raise ValueError(msg)
-
         self.coordination_key = coordination_secret
         self.identity_fold = identity_fold
-        self.issuer = issuer
-        self.network = network
-        self.secret = decoded
+        self.issuer, self.network = scope
+        self.secret = secret
         # The highest-ranked session or revocation per identity.
         self.records: dict[str, Session] = {}
         self.session_ttl = session_ttl
 
     def authorized(self, prefix: str, *, now: float | None = None) -> bool:
-        """Return whether the prefix has a valid, unexpired session."""
-        return self.get(prefix, now) is not None
+        """Return whether the prefix has a valid, unexpired session.
+
+        An expired record is pruned on the way.
+        """
+        key = self.identity_fold(prefix)
+        record = self.records.get(key)
+        current = time.time() if now is None else now
+        if record is None or record.expires_at <= current:
+            self.records.pop(key, None)
+            return False
+
+        return not record.revoked
 
     def create(
         self,
@@ -394,17 +365,6 @@ class TotpAuthorizer:
         ):
             del self.records[key]
 
-    def get(self, prefix: str, now: float | None = None) -> Session | None:
-        """Return an active session, pruning the record when expired."""
-        key = self.identity_fold(prefix)
-        record = self.records.get(key)
-        current = time.time() if now is None else now
-        if record is None or record.expires_at <= current:
-            self.records.pop(key, None)
-            return None
-
-        return None if record.revoked else record
-
     def grant(
         self,
         prefix: str,
@@ -423,15 +383,19 @@ class TotpAuthorizer:
 
         return session
 
-    def import_session(self, value: object, *, now: float | None = None) -> None:
-        """Import a single session from a KV watch update into local cache."""
-        if not isinstance(value, dict):
-            return
-
+    def import_session(
+        self,
+        value: object,
+        *,
+        now: float | None = None,
+    ) -> Session | None:
+        """Import a remotely supplied session into local cache and return it."""
         current = time.time() if now is None else now
         incoming = self.parse(value, current)
         if incoming is not None:
             self.keep(incoming)
+
+        return incoming
 
     def keep(self, incoming: Session) -> None:
         """Keep a session or revocation if it outranks the identity's record."""
@@ -463,10 +427,10 @@ class TotpAuthorizer:
             return None
 
         parsed = parse_session_record(self.coordination_key, self.network, value)
-        if parsed is None or not (
-            current
-            < parsed.expires_at
-            <= current + self.session_ttl + SESSION_EXPIRY_GRACE
+        if (
+            parsed is None
+            or parsed.expires_at <= current
+            or not within_horizon(parsed, self.session_ttl, current)
         ):
             return None
 
@@ -475,7 +439,8 @@ class TotpAuthorizer:
     def prune(self, current: float | None = None) -> None:
         """Remove expired sessions and revocations."""
         cutoff = time.time() if current is None else current
-        self.records = {k: r for k, r in self.records.items() if r.expires_at > cutoff}
+        for key in [k for k, r in self.records.items() if r.expires_at <= cutoff]:
+            del self.records[key]
 
     def rekey(self, *, now: float | None = None) -> None:
         """Collapse records onto a new identity fold, keeping the highest rank."""

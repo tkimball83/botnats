@@ -4,31 +4,28 @@
 """Core NATS messaging and JetStream-backed state coordination."""
 
 import asyncio
-import json
 import logging
 import time
 from contextlib import suppress
-from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
 import nats
 
 from botnats import error_label, log_task_failure
-from botnats.config import IDENTIFIER_RE
 from botnats.nats.claim import PresenceClaim
 from botnats.nats.status import NATSStatus, collect
 from botnats.nats.store import (
     CONNECT_ERRORS,
+    DECODE_ERRORS,
     PUBLISH_ERRORS,
-    SESSION_EXPIRY_GRACE,
     AttemptStore,
     ChannelStore,
     ClaimStore,
     PresenceStore,
     SessionStore,
     StoreUnavailableError,
+    decode_record,
     is_delete,
 )
 from botnats.presence import BotPresence
@@ -43,17 +40,10 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-DECODE_ERRORS = (RecursionError, TypeError, ValueError)
 DECODE_WARNING_INTERVAL = 5.0
 TRANSIENT_WARNING_INTERVAL = 60.0
 RECONNECT_WAIT = 1
 WATCH_NAMES = frozenset({"watch-channels", "watch-presence", "watch-sessions"})
-
-# Task-local generation of the running watch, None outside watch tasks.
-WATCH_GENERATION: ContextVar[int | None] = ContextVar(
-    "WATCH_GENERATION",
-    default=None,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +69,6 @@ class CoordinatorProtocol(Protocol):
 
     async def put_channel(
         self,
-        channel: str,
         record: dict[str, Any],
         *,
         expected: str | None,
@@ -91,17 +80,13 @@ class CoordinatorProtocol(Protocol):
         """Store or refresh bot presence in JetStream KV."""
         ...
 
-    async def put_session(
-        self,
-        identity: str,
-        session: dict[str, Any],
-    ) -> dict[str, Any]:
+    async def put_session(self, session: dict[str, Any]) -> dict[str, Any]:
         """Store an auth session and return the authoritative record."""
         ...
 
     @property
     def ready(self) -> bool:
-        """Return whether Core NATS and JetStream stores are ready."""
+        """Return whether this bot may act on and write coordination state."""
         ...
 
     async def request_auth(self, identity: str) -> bool:
@@ -129,124 +114,6 @@ def sender_owns_presence(sender: str, payload: dict[str, Any]) -> bool:
     """Return whether an action payload's presence belongs to its sender."""
     presence = payload.get("presence")
     return isinstance(presence, dict) and presence.get("bot_id") == sender
-
-
-def _decode_record(value: bytes | None) -> dict[str, Any] | None:
-    try:
-        data = json.loads(value) if value is not None else None
-    except DECODE_ERRORS:
-        return None
-
-    return data if isinstance(data, dict) else None
-
-
-class HelpRequests:
-    """Broadcast invite, limit, op, and unban requests to peers over Core NATS.
-
-    Each eligible peer acts on its own after a short random delay, rechecking
-    IRC state first, so no peer waits on another. Two peers answering the same
-    request send a duplicate MODE or INVITE, which IRC servers treat as a no-op.
-    """
-
-    def __init__(self, coordinator: Coordinator) -> None:
-        self.coordinator = coordinator
-
-    def decode(
-        self,
-        message: Msg,
-        kind: str = "NATS message",
-    ) -> tuple[str, dict[str, Any]] | None:
-        """Decode a signed message, logging malformed input consistently."""
-        try:
-            return self.coordinator.envelope.decode(message.subject, message.data)
-        except DECODE_ERRORS as error:
-            self.warn_decode(kind, message.subject, error)
-            return None
-
-    def decode_action(
-        self,
-        message: Msg,
-        kind: str = "NATS message",
-    ) -> dict[str, Any] | None:
-        """Decode an action whose signed sender owns its presence identity."""
-        decoded = self.decode(message, kind)
-        if decoded is None:
-            return None
-
-        sender, payload = decoded
-        if not sender_owns_presence(sender, payload):
-            self.warn_decode(
-                kind,
-                message.subject,
-                ValueError("sender does not match presence"),
-            )
-            return None
-
-        return payload
-
-    async def deliver(
-        self,
-        callback: Callable[[str, dict[str, Any]], None],
-        message: Msg,
-    ) -> None:
-        """Hand a peer's request and its kind to the bot; skip unready or our own."""
-        if not self.coordinator.ready:
-            return
-
-        payload = self.decode_action(message, "help request")
-        if (
-            payload is not None
-            and payload["presence"]["bot_id"] != self.coordinator.envelope.bot_id
-        ):
-            callback(message.subject.rpartition(".")[2], payload)
-
-    async def publish(self, suffix: str, payload: dict[str, Any]) -> None:
-        """Broadcast a signed message on the given subject suffix."""
-        self.coordinator.claim.require()
-        if self.coordinator.nc is None:
-            msg = "NATS is unavailable"
-            raise RuntimeError(msg)
-
-        subject = f"{self.coordinator.ns}.{suffix}"
-        await self.coordinator.nc.publish(
-            subject, self.coordinator.envelope.encode(subject, payload)
-        )
-
-    async def request(self, kind: str, payload: dict[str, Any]) -> None:
-        """Broadcast a help request from this bot; a lost one is asked again."""
-        if not self.coordinator.ready or not sender_owns_presence(
-            self.coordinator.envelope.bot_id,
-            payload,
-        ):
-            return
-
-        with suppress(*PUBLISH_ERRORS):
-            await self.publish(kind, payload)
-
-    async def subscribe(self) -> None:
-        """Subscribe to help requests on the active connection."""
-        nc = self.coordinator.nc
-        if nc is None:
-            return
-
-        # Help requests are the only subjects in the namespace; the last token
-        # names the kind.
-        await nc.subscribe(
-            f"{self.coordinator.ns}.*",
-            cb=partial(self.deliver, self.coordinator.callbacks.on_help),
-        )
-
-    def warn_decode(self, kind: str, subject: str, error: Exception) -> None:
-        """Rate-limit warnings for malformed NATS messages."""
-        suffix = self.coordinator.should_warn("decode", DECODE_WARNING_INTERVAL)
-        if suffix is not None:
-            LOGGER.warning(
-                "ignored malformed %s on %s: %s%s",
-                kind,
-                subject,
-                error_label(error),
-                suffix,
-            )
 
 
 class Coordinator:
@@ -277,9 +144,7 @@ class Coordinator:
             coordination_key,
         )
         self.envelope = envelope
-        self.monitor_port = config.monitor_port
-        self.nats_servers = config.servers
-        self.nats_token = config.token
+        self.config = config
         self.nc: nats.NATS | None = None
         self.ns = f"botnats.v1.{config.network}"
         self.transient_warnings: dict[str, tuple[float, int]] = {}
@@ -302,7 +167,6 @@ class Coordinator:
             self.presence_store,
             self.sessions,
         )
-        self.help_requests = HelpRequests(self)
         self.claim = PresenceClaim(
             self.presence_store,
             envelope.bot_id,
@@ -410,31 +274,30 @@ class Coordinator:
 
     async def put_channel(
         self,
-        channel: str,
         record: dict[str, Any],
         *,
         expected: str | None,
     ) -> dict[str, Any]:
         """Store a channel record written after expected; return the winner."""
         self.claim.require()
-        return await self.channels_store.put(channel, record, expected=expected)
+        return await self.channels_store.put(record, expected=expected)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
         """Store or refresh bot presence in JetStream KV."""
         await self.claim.put(presence)
 
-    async def put_session(
-        self,
-        identity: str,
-        session: dict[str, Any],
-    ) -> dict[str, Any]:
+    async def put_session(self, session: dict[str, Any]) -> dict[str, Any]:
         """Store an auth session and return the authoritative record."""
         self.claim.require()
-        return await self.sessions.put(identity, session)
+        return await self.sessions.put(session)
 
     @property
     def ready(self) -> bool:
-        """Return whether Core NATS and JetStream stores are ready."""
+        """Return whether this bot may act on and write coordination state.
+
+        Core NATS is connected, every store is open, every watch has replayed
+        in full, and this process owns its bot ID's presence key.
+        """
         return (
             self.connected
             and all(store.ready for store in self.stores)
@@ -463,8 +326,70 @@ class Coordinator:
         return self.ready and await self.claims.claim(counter)
 
     async def request_help(self, kind: str, payload: dict[str, Any]) -> None:
-        """Broadcast an invite, limit, op, or unban request to every peer."""
-        await self.help_requests.request(kind, payload)
+        """Broadcast an invite, limit, op, or unban request to every peer.
+
+        Each eligible peer acts on its own after a short random delay,
+        rechecking IRC state first, so no peer waits on another. Two peers
+        answering one request send a duplicate MODE or INVITE, which IRC
+        servers treat as a no-op. A lost request is asked again next tick.
+        """
+        nc = self.nc
+        if nc is None or not self.ready:
+            return
+
+        subject = f"{self.ns}.{kind}"
+        with suppress(*PUBLISH_ERRORS):
+            await nc.publish(subject, self.envelope.encode(subject, payload))
+
+    def decode_help(self, message: Msg) -> dict[str, Any] | None:
+        """Decode a request whose signed sender owns its presence identity."""
+        try:
+            sender, payload = self.envelope.decode(message.subject, message.data)
+        except DECODE_ERRORS as error:
+            self.warn_decode(message.subject, error)
+            return None
+
+        if not sender_owns_presence(sender, payload):
+            self.warn_decode(
+                message.subject,
+                ValueError("sender does not match presence"),
+            )
+            return None
+
+        return payload
+
+    async def deliver_help(self, message: Msg) -> None:
+        """Hand a peer's request and its kind to the bot; skip unready or our own."""
+        if not self.ready:
+            return
+
+        payload = self.decode_help(message)
+        if (
+            payload is not None
+            and payload["presence"]["bot_id"] != self.envelope.bot_id
+        ):
+            self.callbacks.on_help(message.subject.rpartition(".")[2], payload)
+
+    async def subscribe_help(self) -> None:
+        """Subscribe to help requests on the active connection."""
+        nc = self.nc
+        if nc is None:
+            return
+
+        # Help requests are the only subjects in the namespace; the last token
+        # names the kind.
+        await nc.subscribe(f"{self.ns}.*", cb=self.deliver_help)
+
+    def warn_decode(self, subject: str, error: Exception) -> None:
+        """Rate-limit warnings for malformed help requests."""
+        suffix = self.should_warn("decode", DECODE_WARNING_INTERVAL)
+        if suffix is not None:
+            LOGGER.warning(
+                "ignored malformed help request on %s: %s%s",
+                subject,
+                error_label(error),
+                suffix,
+            )
 
     def discard_watch_synced(self, name: str, generation: int) -> None:
         """Invalidate one watch's replay marker unless it was superseded."""
@@ -477,15 +402,13 @@ class Coordinator:
         watch_fn: Callable[[], Awaitable[None]],
         generation: int,
     ) -> None:
-        """Run a watch coroutine, retrying on errors with backoff.
+        """Run a watch coroutine, retrying on errors after a fixed wait.
 
         The generation check ejects a superseded task that survived
         cancellation because a CancelledError was replaced by a transport
         error raised from the watch body's cleanup.
         """
-        WATCH_GENERATION.set(generation)
         while self.connected and generation == self.watch_generation:
-            self.discard_watch_synced(name, generation)
             try:
                 await watch_fn()
             except asyncio.CancelledError:
@@ -512,8 +435,8 @@ class Coordinator:
         while self.nc is None:
             try:
                 nc = await nats.connect(
-                    servers=list(self.nats_servers),
-                    token=self.nats_token,
+                    servers=list(self.config.servers),
+                    token=self.config.token,
                     name=f"botnats-{self.envelope.bot_id}",
                     allow_reconnect=True,
                     max_reconnect_attempts=-1,
@@ -524,7 +447,7 @@ class Coordinator:
                 )
                 self.nc = nc
                 await self.init_stores()
-                await self.help_requests.subscribe()
+                await self.subscribe_help()
             except CONNECT_ERRORS as error:
                 LOGGER.warning(
                     "NATS connection failed; retrying: %s",
@@ -563,10 +486,8 @@ class Coordinator:
             self.watch_tasks.append(task)
 
     def mark_watch_synced(self, name: str) -> None:
-        """Record one completed watch replay unless the watch is superseded."""
-        generation = WATCH_GENERATION.get()
-        if generation is None or generation == self.watch_generation:
-            self.synced_watches.add(name)
+        """Record one completed watch replay."""
+        self.synced_watches.add(name)
 
     async def status(self) -> NATSStatus:
         """Return Core NATS and JetStream cluster status."""
@@ -574,7 +495,7 @@ class Coordinator:
             self.nc,
             self.claims.kv,
             self.claims.replicas,
-            self.monitor_port,
+            self.config.monitor_port,
         )
 
     def should_warn(
@@ -617,12 +538,14 @@ class Coordinator:
                 if is_delete(entry.operation):
                     continue
 
-                data = _decode_record(entry.value)
-                if (
-                    data is not None
-                    and self.channels_store.order(entry.key, data) is not None
-                ):
-                    await self.callbacks.on_channel(data)
+                data = decode_record(entry.value)
+                fields = (
+                    self.channels_store.parse(entry.key, data)
+                    if data is not None
+                    else None
+                )
+                if fields is not None:
+                    self.callbacks.on_channel(fields)
         finally:
             await watcher.stop()
 
@@ -647,7 +570,7 @@ class Coordinator:
 
                     continue
 
-                data = _decode_record(entry.value)
+                data = decode_record(entry.value)
                 if data is not None and self.observe_presence(
                     entry.key,
                     data,
@@ -664,36 +587,22 @@ class Coordinator:
         revision: int,
     ) -> bool:
         """Apply one presence update and report a duplicate identity."""
+        if not self.presence_store.valid(key, data):
+            return False
+
+        duplicate = key == self.claim.key and self.claim.observe(
+            data["instance_id"],
+            revision,
+        )
         try:
             presence = BotPresence.from_dict(data)
         except TypeError, ValueError:
-            return False
-
-        if (
-            not IDENTIFIER_RE.fullmatch(presence.bot_id)
-            or presence.bot_id.casefold() != key
-            or not self.presence_store.valid(data)
-        ):
-            return False
+            # A starting process claims its key before it knows its IRC
+            # identity: a duplicate to detect, not yet a peer to record.
+            return duplicate
 
         self.callbacks.on_presence(presence)
-        if key != self.claim.key:
-            return False
-
-        return self.claim.observe(presence.instance_id, revision)
-
-    def valid_session(self, key: str, data: dict[str, Any]) -> bool:
-        """Return whether a watched record is signed, key-bound, and in horizon."""
-        prefix = data.get("prefix")
-        if not isinstance(prefix, str):
-            return False
-
-        order = self.sessions.order(prefix, data)
-        return (
-            order is not None
-            and self.sessions.key(prefix) == key
-            and order[0] <= time.time() + self.sessions.ttl + SESSION_EXPIRY_GRACE
-        )
+        return duplicate
 
     async def watch_sessions(self) -> None:
         """Watch the sessions KV bucket and report validated records by key."""
@@ -714,8 +623,11 @@ class Coordinator:
                     self.callbacks.on_session_delete(entry.key)
                     continue
 
-                data = _decode_record(entry.value)
-                if data is None or not self.valid_session(entry.key, data):
+                data = decode_record(entry.value)
+                session = (
+                    self.sessions.parse(entry.key, data) if data is not None else None
+                )
+                if session is None:
                     continue
 
                 if replayed is not None:
@@ -723,7 +635,7 @@ class Coordinator:
 
                 self.callbacks.on_session_update(
                     entry.key,
-                    data,
+                    session,
                     replaying=replayed is not None,
                 )
         finally:

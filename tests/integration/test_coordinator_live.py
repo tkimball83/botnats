@@ -1,87 +1,141 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Live NATS tests for coordinator state exchange and help requests."""
+"""Live NATS tests for coordinator state exchange, conflicts, and help requests."""
 
 import asyncio
+import os
 import time
 import unittest
 import uuid
 from contextlib import suppress
-from functools import partial
-from typing import TYPE_CHECKING
-from unittest.mock import patch
+from dataclasses import asdict
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
+from nats.errors import Error as NatsError
+
+from botnats.channel import ChannelRecord
+from botnats.nats.coordinator import Coordinator, NATSConfig
+from botnats.nats.envelope import Envelope
 from botnats.nats.store import ATTEMPT_LIMIT
-from tests.unit.test_coordinator import (
-    BETA_PRESENCE,
+from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
-    Fixtures,
-    build_coordinator,
+    coordination_key,
+    nats_urls,
 )
+from tests.integration.test_mesh import poll_until
+from tests.integration.test_restart import session_record
 
 if TYPE_CHECKING:
-    from botnats.nats.coordinator import Coordinator
+    from botnats.bot import NATSCallbackHandler
 
-GRANT_TIMEOUT = 5
+EVENT_TIMEOUT = 5.0
+HELP_KINDS = ("invite", "limit", "op", "unban")
+SESSION_TTL = 300.0
+START_TIMEOUT = 30.0
 
 
+def presence(bot_id: str) -> dict[str, str]:
+    """Return a presence payload that a help request carries."""
+    return {
+        "bot_id": bot_id,
+        "host": "host",
+        "instance_id": "instance",
+        "nick": bot_id,
+        "user": "user",
+    }
+
+
+def ignore(*arguments: object, **keywords: object) -> None:
+    """Accept and ignore a coordinator callback."""
+    del arguments, keywords
+
+
+def build_coordinator(
+    bot_id: str,
+    network: str,
+    events: dict[str, asyncio.Event],
+) -> Coordinator:
+    """Build a coordinator whose help requests set the event for their kind."""
+
+    def on_help(kind: str, payload: dict[str, Any]) -> None:
+        del payload
+        if kind in events:
+            events[kind].set()
+
+    callbacks = SimpleNamespace(
+        on_channel=ignore,
+        on_help=on_help,
+        on_presence=ignore,
+        on_presence_delete=ignore,
+        on_session_delete=ignore,
+        on_session_update=ignore,
+        on_sessions_replayed=ignore,
+    )
+    return Coordinator(
+        callbacks=cast("NATSCallbackHandler", callbacks),
+        config=NATSConfig(
+            instance_id=uuid.uuid4().hex,
+            monitor_port=8222,
+            network=network,
+            presence_ttl=15.0,
+            replicas=JETSTREAM_REPLICAS,
+            servers=tuple(nats_urls()),
+            session_ttl=SESSION_TTL,
+            token=os.environ["BOTNATS_TEST_NATS_TOKEN"],
+        ),
+        envelope=Envelope(bot_id, coordination_key()),
+    )
+
+
+async def wait_until_ready(*coordinators: Coordinator) -> None:
+    """Wait until every coordinator has replayed its watches and owns its ID."""
+
+    async def ready() -> bool:
+        return all(coordinator.ready for coordinator in coordinators)
+
+    await poll_until(ready, wait_seconds=START_TIMEOUT, interval=0.05)
+
+
+@unittest.skipUnless(
+    os.environ.get("BOTNATS_TEST_NATS_URLS"),
+    "needs the Docker integration mesh (make integration)",
+)
 class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for live NATS state exchange and help requests."""
+    """Tests for live NATS state exchange, conflicts, and help requests."""
 
     async def asyncSetUp(self) -> None:
-        """Connect two coordinators wired to shared test fixtures."""
-        self.fixtures = Fixtures(
-            events={
-                "limit": asyncio.Event(),
-                "op": asyncio.Event(),
-                "unban": asyncio.Event(),
-            },
-        )
-        network = f"test{uuid.uuid4().hex}"
-        self.alpha = build_coordinator("alpha", self.fixtures, network)
-        self.beta = build_coordinator("beta", self.fixtures, network)
-        ready = asyncio.Event()
-
-        def mark_synced(coordinator: Coordinator, name: str) -> None:
-            coordinator.synced_watches.add(name)
-            if self.alpha.ready and self.beta.ready:
-                ready.set()
-
-        with (
-            patch.object(
-                self.alpha,
-                "mark_watch_synced",
-                partial(mark_synced, self.alpha),
-            ),
-            patch.object(
-                self.beta,
-                "mark_watch_synced",
-                partial(mark_synced, self.beta),
-            ),
-        ):
+        """Start two coordinators on a fresh network and clean them up after."""
+        self.events = {kind: asyncio.Event() for kind in HELP_KINDS}
+        self.network = f"test{uuid.uuid4().hex}"
+        self.alpha = build_coordinator("alpha", self.network, self.events)
+        self.beta = build_coordinator("beta", self.network, {})
+        # Cleanups run last-registered first: buckets go before connections.
+        self.addAsyncCleanup(self.alpha.close)
+        self.addAsyncCleanup(self.beta.close)
+        self.addAsyncCleanup(self.delete_buckets)
+        async with asyncio.timeout(START_TIMEOUT):
             await self.alpha.start()
             await self.beta.start()
-            async with asyncio.timeout(GRANT_TIMEOUT):
-                await ready.wait()
 
-        assert self.alpha.ready
-        assert self.beta.ready
+        await wait_until_ready(self.alpha, self.beta)
 
-    async def asyncTearDown(self) -> None:
-        """Close both coordinators."""
-        await self.beta.close()
-        await self.alpha.close()
+    async def delete_buckets(self) -> None:
+        """Delete this test's buckets so they don't load later phases."""
+        nc = self.alpha.nc
+        if nc is None:
+            return
+
+        js = nc.jetstream()
+        for store in self.alpha.stores:
+            with suppress(NatsError):
+                await js.delete_key_value(store.bucket)
 
     async def test_auth_claim_dedup(self) -> None:
         """Verify a TOTP counter can be claimed once across the whole mesh."""
-        counter = 123
-        assert self.alpha.claims.kv is not None
-        with suppress(Exception):
-            await self.alpha.claims.kv.delete(self.alpha.claims.key(counter))
-
-        assert await self.alpha.request_claim(counter)
-        assert not await self.beta.request_claim(counter)
+        assert await self.alpha.request_claim(123)
+        assert not await self.beta.request_claim(123)
 
     async def test_auth_claim_replica_count(self) -> None:
         """Verify the claim bucket uses the configured replica count."""
@@ -92,48 +146,75 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_rate_limit(self) -> None:
         """Verify authentication attempts are limited across the mesh."""
-        identity = f"rate-{time.time_ns()}.example"
+        coordinators = (self.alpha, self.beta)
         attempts = [
-            await coordinator.request_auth(identity)
-            for coordinator in (self.alpha, self.beta, self.alpha, self.beta)
+            await coordinators[attempt % 2].request_auth("rate.example")
+            for attempt in range(ATTEMPT_LIMIT + 1)
         ]
 
         assert attempts == [True] * ATTEMPT_LIMIT + [False]
 
     async def test_auth_rate_limit_boundary(self) -> None:
         """Verify the mesh limit does not reset at a fixed-window boundary."""
-        identity = f"boundary-{time.time_ns()}.example"
-        for coordinator in (self.alpha, self.beta, self.alpha):
-            assert await coordinator.attempts.allow(identity, now=59.9)
+        coordinators = (self.alpha, self.beta)
+        for attempt in range(ATTEMPT_LIMIT):
+            allowed = await coordinators[attempt % 2].attempts.allow(
+                "boundary.example",
+                now=59.9,
+            )
+            assert allowed
 
-        assert not await self.beta.attempts.allow(identity, now=60)
+        assert not await self.beta.attempts.allow("boundary.example", now=60)
 
-    async def test_limit_request_reaches_peer(self) -> None:
-        """Deliver a broadcast limit request from one bot to its peer."""
-        await self.beta.request_help(
-            "limit",
-            {"channel": "#shared", "presence": BETA_PRESENCE},
+    async def test_help_requests_reach_peer(self) -> None:
+        """Deliver every kind of broadcast help request from one bot to its peer."""
+        for kind in HELP_KINDS:
+            with self.subTest(kind=kind):
+                await self.beta.request_help(
+                    kind,
+                    {"channel": "#shared", "presence": presence("beta")},
+                )
+                async with asyncio.timeout(EVENT_TIMEOUT):
+                    await self.events[kind].wait()
+
+    async def test_channel_write_conflict_has_one_winner(self) -> None:
+        """Hand a writer that raced on a stale base the record that won instead."""
+        first = asdict(ChannelRecord.new("#shared", "first", present=True))
+        second = asdict(ChannelRecord.new("#shared", "second", present=True))
+
+        stored_first = await self.alpha.put_channel(first, expected=None)
+        stored_second = await self.beta.put_channel(second, expected=None)
+
+        assert stored_first["key"] == "first"
+        assert stored_second == stored_first
+
+    async def test_session_write_keeps_highest_order(self) -> None:
+        """Keep the newest session or revocation when bots write concurrently."""
+        expires_at = time.time() + 120
+        active = session_record(self.network, expires_at)
+        stale = session_record(self.network, expires_at - 60)
+        revocation = session_record(
+            self.network,
+            expires_at,
+            revoked=True,
+            version=1,
         )
 
-        async with asyncio.timeout(GRANT_TIMEOUT):
-            await self.fixtures.events["limit"].wait()
+        assert await self.alpha.put_session(active) == active
+        assert await self.beta.put_session(stale) == active
+        assert await self.beta.put_session(revocation) == revocation
 
-    async def test_op_request_reaches_peer(self) -> None:
-        """Deliver a broadcast op request from one bot to its peer."""
-        await self.beta.request_help(
-            "op",
-            {"channel": "#shared", "presence": BETA_PRESENCE},
-        )
+    async def test_duplicate_bot_id_stays_unready(self) -> None:
+        """Keep a second process with a live bot's ID unready; the owner stays ready."""
+        duplicate = build_coordinator("alpha", self.network, {})
+        self.addAsyncCleanup(duplicate.close)
+        async with asyncio.timeout(START_TIMEOUT):
+            await duplicate.start()
 
-        async with asyncio.timeout(GRANT_TIMEOUT):
-            await self.fixtures.events["op"].wait()
+        async def yielded() -> bool:
+            return duplicate.claim.duplicate
 
-    async def test_unban_request_reaches_peer(self) -> None:
-        """Deliver a broadcast unban request from one bot to its peer."""
-        await self.beta.request_help(
-            "unban",
-            {"channel": "#shared", "presence": BETA_PRESENCE},
-        )
+        await poll_until(yielded, wait_seconds=START_TIMEOUT, interval=0.05)
 
-        async with asyncio.timeout(GRANT_TIMEOUT):
-            await self.fixtures.events["unban"].wait()
+        assert not duplicate.ready
+        assert self.alpha.ready

@@ -3,14 +3,21 @@
 
 """Tests for NATS route and JetStream replica status."""
 
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
+from nats.errors import Error as NatsError
 from nats.js.api import ClusterInfo, PeerInfo
 
-from botnats.nats.status import NATSStatus, collect, route_count, stream_info
+from botnats.nats.status import (
+    MAX_RESPONSE_BYTES,
+    collect,
+    route_count,
+    stream_info,
+)
 
 
 class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
@@ -119,26 +126,25 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "nats connection=up routes=? jetstream=unknown leader=? replicas=?/3 lag=?"
         )
 
-    def test_render_healthy(self) -> None:
-        """Render a compact healthy status line."""
-        status = NATSStatus(
-            connection=True,
-            jetstream="up",
-            lag=0,
-            leader="nats-1",
-            offline=(),
-            replicas_current=3,
-            replicas_total=3,
-            routes=2,
-        )
+    async def test_collect_keeps_routes_without_stream_info(self) -> None:
+        """Report the route count even when stream information is unavailable."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.side_effect = NatsError("timeout")
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await collect(nc, kv, 3, 8222)
 
         assert status.render() == (
-            "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=3/3 lag=0"
+            "nats connection=up routes=2 jetstream=unknown leader=? replicas=?/3 lag=?"
         )
 
     async def test_route_count(self) -> None:
         """Parse the route count and connect to the given host and port."""
-        for host in ("nats-1", "::1"):
+        for host, location in (("nats-1", "nats-1"), ("::1", "[::1]")):
             with self.subTest(host=host):
                 reader = AsyncMock()
                 reader.read.side_effect = [
@@ -155,6 +161,8 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 assert routes == 2
                 assert connect.await_args is not None
                 assert connect.await_args.args == (host, 8222)
+                request = writer.write.call_args.args[0]
+                assert f"\r\nHost: {location}\r\n".encode() in request
                 writer.close.assert_called_once_with()
 
     async def test_route_count_refuses_redirects(self) -> None:
@@ -177,8 +185,12 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_route_count_rejects_oversized_response(self) -> None:
         """Refuse a monitoring response that exceeds the size limit."""
+        # Valid up to the limit: only the size check can reject it.
+        response = io.BytesIO(
+            b'HTTP/1.0 200 OK\r\n\r\n{"num_routes": 3}' + b" " * MAX_RESPONSE_BYTES,
+        )
         reader = AsyncMock()
-        reader.read.side_effect = lambda n: b"x" * n
+        reader.read.side_effect = response.read
         writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
 
         with patch(
@@ -197,13 +209,35 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             await stream_info(kv)
 
+    async def test_route_count_rejects_deeply_nested_json(self) -> None:
+        """Treat a monitoring payload too deep to parse as an unknown count."""
+        reader = AsyncMock()
+        reader.read.side_effect = [b"HTTP/1.0 200 OK\r\n\r\n", b"[[]]", b""]
+        writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+
+        # The parser overflows only past the native stack, a depth that varies
+        # by platform, so raise its RecursionError directly.
+        with (
+            patch(
+                "botnats.nats.status.asyncio.open_connection",
+                AsyncMock(return_value=(reader, writer)),
+            ),
+            patch(
+                "botnats.nats.status.json.loads",
+                side_effect=RecursionError("maximum recursion depth exceeded"),
+            ) as loads,
+        ):
+            routes = await route_count("nats-1", 8222)
+
+        assert routes is None
+        loads.assert_called_once_with(b"[[]]")
+
     async def test_route_count_rejects_invalid_payloads(self) -> None:
         """Reject malformed monitoring payloads and impossible route counts."""
         for body in (
             b"[]",
             b'{"num_routes":-1}',
             b'{"num_routes":true}',
-            b"[" * 2_000 + b"]" * 2_000,
             b'{"num_routes":' + b"9" * 5_000 + b"}",
         ):
             with self.subTest(body=body):

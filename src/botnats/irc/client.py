@@ -13,11 +13,9 @@ from typing import TYPE_CHECKING
 
 from botnats import error_label, log_task_failure
 from botnats.irc.protocol import (
-    CASEMAPPINGS,
-    DEFAULT_CASEMAPPING,
     MAX_IRC_MESSAGE_BYTES,
     IRCMessage,
-    casefold,
+    ISupportState,
     format_message,
     parse_message,
 )
@@ -28,12 +26,16 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_NICK_LENGTH = 9
 DESIRED_CAPS = frozenset({"chghost", "multi-prefix"})
+# RFC 1459's NICKLEN: a collision happens during registration, before the
+# server advertises its own limit.
+FALLBACK_NICK_LENGTH = 9
 IRC_SCHEMES = frozenset({"irc", "ircs"})
 NICK_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 NICK_COLLISION_LIMIT = 20
-OUTBOUND_LIMIT = 64
+# Room for a full join burst: a JOIN and the WHO, MODE, and ban list queries
+# that follow it, for a few hundred channels.
+OUTBOUND_LIMIT = 1024
 REGISTRATION_TIMEOUT = 60.0
 SEND_BURST = 4.0
 SEND_RATE = 1.0
@@ -71,27 +73,6 @@ class IRCClientConfig:
     idle_timeout: float = 120.0
     pong_timeout: float = 30.0
 
-    def __post_init__(self) -> None:
-        """Validate timing and server parameters."""
-        if (
-            self.connect_timeout <= 0
-            or self.idle_timeout <= 0
-            or self.pong_timeout <= 0
-        ):
-            msg = "IRC timeouts must be positive"
-            raise ValueError(msg)
-
-        if not self.servers:
-            msg = "IRC servers must not be empty"
-            raise ValueError(msg)
-
-        format_message("NICK", (self.nickname,), None)
-        format_message(
-            "USER",
-            (self.nickname, "0", "*"),
-            self.nickname,
-        )
-
 
 class IRCClient:
     """Reconnectable IRC socket with serialized writes."""
@@ -99,6 +80,7 @@ class IRCClient:
     def __init__(
         self,
         *,
+        caps: ISupportState,
         config: IRCClientConfig,
         on_disconnect: Callable[[], None],
         on_message: Callable[[IRCMessage], Awaitable[None]],
@@ -106,12 +88,10 @@ class IRCClient:
         self.cap_available: set[str] = set()
         self.cap_negotiating = False
         self.cap_ls_done = False
-        self.casemapping = DEFAULT_CASEMAPPING
+        self.caps = caps
         self.config = config
         self.current_nick = config.nickname
-        self.desired_nick = config.nickname
         self.nickname_attempts = 0
-        self.nickname_length = DEFAULT_NICK_LENGTH
         self.on_disconnect = on_disconnect
         self.on_message = on_message
         self.outbound: asyncio.Queue[bytes] | None = None
@@ -128,8 +108,17 @@ class IRCClient:
         self.write_lock = asyncio.Lock()
 
     async def close(self) -> None:
-        """Shut down the sender and close the socket."""
+        """Stop reconnecting, then shut down the sender and close the socket."""
         self.stopping = True
+        await self.disconnect()
+
+    @property
+    def connected(self) -> bool:
+        """Return whether the underlying socket is open."""
+        return self.writer is not None and not self.writer.is_closing()
+
+    async def disconnect(self) -> None:
+        """Shut down the sender and close the socket."""
         try:
             await self.stop_sender()
         finally:
@@ -139,11 +128,6 @@ class IRCClient:
                 writer.close()
                 with suppress(OSError):
                     await writer.wait_closed()
-
-    @property
-    def connected(self) -> bool:
-        """Return whether the underlying socket is open."""
-        return self.writer is not None and not self.writer.is_closing()
 
     async def dispatch_line(
         self,
@@ -171,11 +155,11 @@ class IRCClient:
             message.command in {"432", "433", "436", "437"}
             and not self.registered_with_server
         ):
-            await self.nick_collision()
+            self.nick_collision()
             return ping_token
 
         if message.command == "CAP":
-            await self.handle_cap(message)
+            self.handle_cap(message)
             return ping_token
 
         self.track_registration(message)
@@ -211,12 +195,12 @@ class IRCClient:
         self.cap_available = set()
         self.cap_negotiating = True
         self.cap_ls_done = False
-        self.current_nick = self.desired_nick
+        self.current_nick = self.config.nickname
         self.nickname_attempts = 0
         LOGGER.info("connected to IRC server %s:%s", server.host, server.port)
-        await self.send("CAP", "LS", "302")
-        await self.send("NICK", self.current_nick)
-        await self.send(
+        self.send("CAP", "LS", "302")
+        self.send("NICK", self.current_nick)
+        self.send(
             "USER",
             self.config.nickname,
             "0",
@@ -225,7 +209,7 @@ class IRCClient:
         )
         return reader, writer
 
-    async def handle_cap(self, message: IRCMessage) -> None:
+    def handle_cap(self, message: IRCMessage) -> None:
         """Process CAP subcommands during capability negotiation."""
         if len(message.params) < 3:
             return
@@ -243,28 +227,25 @@ class IRCClient:
             self.cap_ls_done = True
             wanted = DESIRED_CAPS & self.cap_available
             if wanted:
-                await self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
+                self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
             else:
-                await self.send("CAP", "END")
+                self.send("CAP", "END")
                 self.cap_negotiating = False
         elif subcommand == "NEW":
             wanted = DESIRED_CAPS & caps
             if wanted:
-                await self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
+                self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
         elif subcommand in {"ACK", "NAK"} and self.cap_negotiating and self.cap_ls_done:
             # End only once the LS phase has issued its REQ; a NEW-triggered
             # ACK arriving mid-LS must not cut the initial exchange short.
-            await self.send("CAP", "END")
+            self.send("CAP", "END")
             self.cap_negotiating = False
 
     def is_self(self, nickname: str) -> bool:
         """Return whether a nickname identifies this client."""
-        return casefold(nickname, self.casemapping) == casefold(
-            self.current_nick,
-            self.casemapping,
-        )
+        return self.caps.fold(nickname) == self.caps.fold(self.current_nick)
 
-    async def nick_collision(self) -> None:
+    def nick_collision(self) -> None:
         """Pick a random fallback nickname after registration rejects one."""
         self.nickname_attempts += 1
         if self.nickname_attempts > NICK_COLLISION_LIMIT:
@@ -272,18 +253,14 @@ class IRCClient:
             raise ConnectionError(msg)
 
         self.current_nick = next_nickname(
-            min(len(self.desired_nick), self.nickname_length),
+            min(len(self.config.nickname), FALLBACK_NICK_LENGTH),
         )
-        await self.send("NICK", self.current_nick)
+        self.send("NICK", self.current_nick)
 
-    async def reconnect(self) -> None:
+    def reconnect(self) -> None:
         """Force a reconnection by closing the current socket."""
         if self.writer is not None:
             self.writer.close()
-
-    def reset_caps(self) -> None:
-        """Reset capabilities learned from the previous server connection."""
-        self.nickname_length = DEFAULT_NICK_LENGTH
 
     async def run_connection(self, server: IRCServer) -> None:
         """Read and dispatch messages from a single server session."""
@@ -362,15 +339,7 @@ class IRCClient:
                 except Exception:
                     LOGGER.exception("IRC disconnect callback failed")
 
-                try:
-                    await self.stop_sender()
-                finally:
-                    if self.writer is not None:
-                        self.writer.close()
-                        with suppress(OSError):
-                            await self.writer.wait_closed()
-
-                        self.writer = None
+                await self.disconnect()
 
             if self.stopping:
                 break
@@ -382,10 +351,10 @@ class IRCClient:
                 index += 1
                 backoff = min(backoff + 1, 8)
 
-            delay = min(30.0, 1.5**backoff) + secrets.randbelow(1000) / 1000
+            delay = 1.5**backoff + secrets.randbelow(1000) / 1000
             await asyncio.sleep(delay)
 
-    async def send(
+    def send(
         self,
         command: str,
         *params: str,
@@ -462,16 +431,6 @@ class IRCClient:
         """Log unexpected sender task failures."""
         log_task_failure(task, LOGGER, "IRC sender")
 
-    def set_casemapping(self, casemapping: str) -> None:
-        """Apply the server-advertised case-folding rule."""
-        if casemapping in CASEMAPPINGS:
-            self.casemapping = casemapping
-
-    def set_nickname_length(self, length: int) -> None:
-        """Record the server-advertised maximum nickname length."""
-        if length > 0:
-            self.nickname_length = length
-
     async def stop_sender(self) -> None:
         """Cancel the sender task and discard pending messages."""
         task = self.sender_task
@@ -491,15 +450,13 @@ class IRCClient:
         if message.command == "001":
             self.cap_negotiating = False
             self.registered_with_server = True
-            self.nickname_attempts = 0
             if message.params:
                 self.current_nick = message.params[0]
         elif (
             message.command == "NICK"
             and message.prefix is not None
             and message.params
-            and casefold(message.prefix.nick, self.casemapping)
-            == casefold(self.current_nick, self.casemapping)
+            and self.is_self(message.prefix.nick)
         ):
             self.current_nick = message.params[-1]
 
@@ -513,7 +470,7 @@ def check_line(raw: bytes) -> bool:
     skipped: disconnecting would turn one bad line into reconnect churn.
     """
     if not raw.endswith(b"\n"):
-        msg = "IRC server closed the connection"
+        msg = "IRC connection closed"
         raise ConnectionError(msg)
 
     if len(raw) > MAX_IRC_MESSAGE_BYTES:
@@ -526,16 +483,15 @@ def check_line(raw: bytes) -> bool:
 def pong_reply(line: bytes) -> bytes:
     """Build a PONG that echoes a PING's raw token bytes.
 
-    Tags and prefix are dropped first, mirroring parse_message, so a leading
-    prefix's space-colon is not mistaken for the trailing-parameter marker.
+    Tags and prefix, with any repeated separators after them, are dropped
+    first, mirroring parse_message, so a leading prefix's space-colon is not
+    mistaken for the trailing-parameter marker.
     The token is kept verbatim, so the reply never exceeds the wire length of
     the PING that parse_message already accepted.
     """
     rest = line.rstrip(b"\r\n")
     if rest.startswith(b"@"):
         _, _, rest = rest.partition(b" ")
-        # parse_message filters empty words, so repeated separators leave a
-        # leading space here that must not survive into token extraction.
         rest = rest.lstrip(b" ")
 
     if rest.startswith(b":"):
@@ -553,4 +509,4 @@ def pong_reply(line: bytes) -> bytes:
 
 def next_nickname(length: int) -> str:
     """Generate a random alphabetic nickname of the given length."""
-    return "".join(secrets.choice(NICK_ALPHABET) for _ in range(max(1, length)))
+    return "".join(secrets.choice(NICK_ALPHABET) for _ in range(length))

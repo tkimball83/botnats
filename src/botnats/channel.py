@@ -12,10 +12,9 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
 from botnats import error_label
-from botnats.config import mode_intent
 from botnats.irc.protocol import (
     CASEMAPPINGS,
-    DEFAULT_CASEMAPPING,
+    ISupportState,
     Prefix,
     casefold,
     mask_matches,
@@ -32,7 +31,7 @@ from botnats.validators import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Callable
 
     from botnats.bot import Bot
 
@@ -57,7 +56,6 @@ class ChannelManager:
         self.source_records: dict[str, ChannelRecord] = {}
         # One live owner per desired channel: its state, joins, and requests.
         self.channels: dict[str, ChannelRuntime] = {}
-        self.mode_intent = mode_intent(bot.config.channel_modes)
         # Channels no longer desired whose PART could not be sent yet.
         self.pending_parts: dict[str, str] = {}
         # ASCII-folded channel -> channel whose key write failed. A retry
@@ -71,14 +69,14 @@ class ChannelManager:
         # one channel (two admin commands, say) get distinct, ordered revisions.
         self.last_revision = 0
         # Each peer help request kind, and the action that answers it.
-        self.help_actions: dict[str, Callable[[dict[str, Any]], Awaitable[None]]] = {
+        self.help_actions: dict[str, Callable[[dict[str, Any]], None]] = {
             "invite": self.invite_peer,
             "limit": self.make_room,
             "op": self.op_peer,
             "unban": self.unban_peer,
         }
 
-    async def apply_record(self, record: ChannelRecord) -> None:
+    def apply_record(self, record: ChannelRecord) -> None:
         """Apply a channel configuration record, joining or parting as needed."""
         source_key = casefold(record.channel, "ascii")
         source = self.source_records.get(source_key)
@@ -95,7 +93,7 @@ class ChannelManager:
         if record.present:
             self.pending_parts.pop(folded, None)
             existing = self.channels.get(folded)
-            runtime = existing or ChannelRuntime(casemapping=self.bot.caps.casemapping)
+            runtime = existing or ChannelRuntime(caps=self.bot.caps)
             self.channels[folded] = runtime
             runtime.channel = record.channel
             # Take the key only from a record that changes it: a record that
@@ -104,28 +102,20 @@ class ChannelManager:
             if existing is None or current is None or current.key != record.key:
                 runtime.key = record.key
 
-            if (
-                self.bot.identity.registered
-                and self.bot.identity.current is not None
-                and runtime.join_due()
-            ):
-                await self.safe_join(runtime)
+            if self.bot.identity.current is not None and runtime.join_due():
+                self.safe_join(runtime)
 
             return
 
-        parted = self.channels.pop(folded, None)
-        if parted is not None:
-            try:
-                await self.bot.irc.send("PART", record.channel)
-            except ConnectionError:
-                self.pending_parts[folded] = record.channel
+        if self.channels.pop(folded, None) is not None:
+            self.part(record.channel)
 
-    async def enforce_modes(self, channel: str) -> None:
+    def enforce_modes(self, channel: str) -> None:
         """Set the configured channel modes when the bot has operator status."""
         if not self.bot.config.channel_modes:
             return
 
-        required, forbidden = self.mode_intent
+        required, forbidden = self.bot.config.enforced_modes
         caps = self.bot.caps
         if any(
             mode_requires_argument(
@@ -144,7 +134,7 @@ class ChannelManager:
             return
 
         try:
-            await self.bot.irc.send(
+            self.bot.irc.send(
                 "MODE",
                 channel,
                 self.bot.config.channel_modes,
@@ -156,17 +146,17 @@ class ChannelManager:
                 "cannot enforce modes on %s: %s", channel, error_label(error)
             )
 
-    async def join_desired(self) -> None:
+    def join_desired(self) -> None:
         """Attempt to join all desired channels not yet entered."""
         if self.bot.identity.current is None:
             return
 
         for runtime in tuple(self.channels.values()):
             if runtime.join_due():
-                await self.safe_join(runtime)
+                self.safe_join(runtime)
 
     async def record_key(self, channel: str, key: str | None) -> None:
-        """Record and broadcast a versioned channel key update."""
+        """Record a channel key change in its durable channel record."""
         async with self.key_lock:
             await self.write_key(channel, key)
 
@@ -182,25 +172,42 @@ class ChannelManager:
             self.pending_keys.pop(source_key, None)
             return True
 
-        record = self.new_record(
-            channel,
-            key,
-            present=True,
-            after=current.revision,
-        )
         try:
-            stored = await self.bot.coordinator.put_channel(
-                channel,
-                asdict(record),
-                expected=self.durable_revision(channel),
-            )
+            await self.write_record(channel, key, present=True)
         except PUBLISH_ERRORS:
             self.pending_keys[source_key] = channel
             return False
 
         self.pending_keys.pop(source_key, None)
-        await self.apply_record(ChannelRecord.from_dict(stored))
         return True
+
+    async def write_record(
+        self,
+        channel: str,
+        key: str | None,
+        *,
+        present: bool,
+    ) -> bool:
+        """Write a record after the current one; return whether it won.
+
+        The stored winner is applied, never the attempt: a concurrent write
+        from another bot can win instead. A failed write raises and applies
+        nothing.
+        """
+        current = self.channel_records.get(self.bot.caps.fold(channel))
+        record = self.new_record(
+            channel,
+            key,
+            present=present,
+            after=current.revision if current is not None else None,
+        )
+        stored = await self.bot.coordinator.put_channel(
+            asdict(record),
+            expected=self.durable_revision(channel),
+        )
+        authoritative = ChannelRecord.from_dict(stored)
+        self.apply_record(authoritative)
+        return authoritative == record
 
     def durable_revision(self, channel: str) -> str | None:
         """Return the stored revision of this exact channel name, if any.
@@ -261,10 +268,25 @@ class ChannelManager:
         """Return the live owner of a desired channel, by IRC case folding."""
         return self.channels.get(self.bot.caps.fold(channel))
 
-    def forget_member(self, nick: str) -> None:
-        """Remove a user who quit IRC from every channel."""
+    def forget_member(self, prefix: Prefix) -> Prefix:
+        """Remove a user who quit IRC from every channel; return their full prefix.
+
+        A QUIT prefix lacking a user or host is completed from member state
+        before the members are removed, since that would lose the only copy.
+        """
+        folded = self.bot.caps.fold(prefix.nick)
+        full_prefix = prefix
         for runtime in self.channels.values():
-            runtime.remove(nick)
+            member = runtime.members.pop(folded, None)
+            if (
+                member is not None
+                and not full_prefix.complete
+                and member.prefix is not None
+                and member.prefix.complete
+            ):
+                full_prefix = member.prefix
+
+        return full_prefix
 
     def rename_member(self, prefix: Prefix, new_nick: str) -> Prefix:
         """Rekey a user's membership after NICK; return their full old prefix.
@@ -335,7 +357,6 @@ class ChannelManager:
         if (
             runtime is None
             or not self.bot.presence.has(presence)
-            or not self.bot.irc.connected
             or not self.is_self_opped(runtime)
         ):
             return None
@@ -352,21 +373,24 @@ class ChannelManager:
 
         return channel, presence, runtime
 
-    async def invite_peer(self, payload: dict[str, Any]) -> None:
+    def invite_peer(self, payload: dict[str, Any]) -> None:
         """Invite a peer bot into a channel this bot holds operator status in."""
         parsed = self.help_eligible(payload, require_member=False)
         if parsed is None:
             return
 
-        channel, presence, _ = parsed
+        channel, presence, runtime = parsed
+        if self.bot.caps.fold(presence.nick) in runtime.members:
+            return
+
         try:
-            await self.bot.irc.send("INVITE", presence.nick, channel)
+            self.bot.irc.send("INVITE", presence.nick, channel)
         except ConnectionError:
             return
 
         LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
-    async def op_peer(self, payload: dict[str, Any]) -> None:
+    def op_peer(self, payload: dict[str, Any]) -> None:
         """Grant operator status to a peer bot."""
         parsed = self.help_eligible(payload)
         if parsed is None:
@@ -374,7 +398,7 @@ class ChannelManager:
 
         channel, presence, _ = parsed
         try:
-            await self.bot.irc.send(
+            self.bot.irc.send(
                 "MODE",
                 channel,
                 f"+{self.bot.caps.op_mode}",
@@ -385,7 +409,7 @@ class ChannelManager:
 
         LOGGER.info("opped %s on %s", presence.nick, channel)
 
-    async def unban_peer(self, payload: dict[str, Any]) -> None:
+    def unban_peer(self, payload: dict[str, Any]) -> None:
         """Remove channel bans matching a peer bot's hostmask."""
         parsed = self.help_eligible(payload, require_member=False)
         if parsed is None:
@@ -398,7 +422,7 @@ class ChannelManager:
                 continue
 
             try:
-                await self.bot.irc.send("MODE", channel, "-b", mask)
+                self.bot.irc.send("MODE", channel, "-b", mask)
             except ConnectionError:
                 return
 
@@ -417,9 +441,9 @@ class ChannelManager:
             return
 
         await asyncio.sleep(secrets.randbelow(1000) / 1000 * PEER_HELP_DELAY)
-        await action(payload)
+        action(payload)
 
-    async def make_room(self, payload: dict[str, Any]) -> None:
+    def make_room(self, payload: dict[str, Any]) -> None:
         """Raise a full channel's limit so every bot left out can join.
 
         The target is absolute (members plus bots left out), so peers answering
@@ -433,18 +457,16 @@ class ChannelManager:
         if runtime.limit is None:
             return
 
-        own_id = self.bot.config.bot_id.casefold()
         left_out = sum(
-            peer.bot_id.casefold() != own_id
-            and self.bot.caps.fold(peer.nick) not in runtime.members
-            for peer in self.bot.presence.active()
+            self.bot.caps.fold(peer.nick) not in runtime.members
+            for peer in self.bot.presence.peers(self.bot.config.bot_id)
         )
         target = len(runtime.members) + left_out
         if left_out == 0 or runtime.limit >= target:
             return
 
         try:
-            await self.bot.irc.send("MODE", channel, "+l", str(target))
+            self.bot.irc.send("MODE", channel, "+l", str(target))
         except ConnectionError:
             return
 
@@ -456,8 +478,7 @@ class ChannelManager:
         if identity is None:
             return
 
-        folded = self.bot.caps.fold(channel)
-        runtime = self.channels.get(folded)
+        runtime = self.runtime(channel)
         if runtime is None or (runtime.joined and not self.any_peer_opped(runtime)):
             return
 
@@ -470,6 +491,12 @@ class ChannelManager:
             kind,
             {"channel": channel, "presence": asdict(identity)},
         )
+
+    async def request_ops(self) -> None:
+        """Ask peers for op in every joined channel where this bot lacks it."""
+        for runtime in tuple(self.channels.values()):
+            if runtime.joined and not self.is_self_opped(runtime):
+                await self.request_peer("op", runtime.channel)
 
     async def retry_pending_keys(self) -> None:
         """Retry failed key writes with the key this bot sees on IRC now.
@@ -485,6 +512,13 @@ class ChannelManager:
                 elif not await self.write_key(channel, runtime.key):
                     return
 
+    def part(self, channel: str) -> None:
+        """Send PART, or keep it pending for the next tick while IRC is down."""
+        try:
+            self.bot.irc.send("PART", channel)
+        except ConnectionError:
+            self.pending_parts[self.bot.caps.fold(channel)] = channel
+
     def reset(self) -> None:
         """Clear all runtime state and cooldowns after a reconnection."""
         for runtime in self.channels.values():
@@ -492,7 +526,7 @@ class ChannelManager:
 
         self.pending_parts.clear()
 
-    async def retry_pending_parts(self) -> None:
+    def retry_pending_parts(self) -> None:
         """Reattempt PART for channels that failed to leave previously."""
         for folded, channel in tuple(self.pending_parts.items()):
             if folded in self.channels:
@@ -500,19 +534,19 @@ class ChannelManager:
                 continue
 
             try:
-                await self.bot.irc.send("PART", channel)
+                self.bot.irc.send("PART", channel)
             except ConnectionError:
                 continue
 
             self.pending_parts.pop(folded, None)
 
-    async def safe_join(self, runtime: ChannelRuntime) -> None:
+    def safe_join(self, runtime: ChannelRuntime) -> None:
         """Send JOIN, silently handling connection and validation errors."""
         try:
             params = (
                 (runtime.channel, runtime.key) if runtime.key else (runtime.channel,)
             )
-            await self.bot.irc.send("JOIN", *params)
+            self.bot.irc.send("JOIN", *params)
         except ConnectionError:
             return
         except ValueError as error:
@@ -526,18 +560,17 @@ class ChannelManager:
         runtime.start_join()
 
     def set_casemapping(self, casemapping: str) -> None:
-        """Rebuild channel lookups under a new casemapping.
+        """Rekey channel lookups under a new casemapping.
 
-        Servers advertise CASEMAPPING while registering, before this bot joins
-        anything, and a disconnect resets channel state anyway; so live state
-        is rebuilt from the durable records rather than rekeyed.
+        Records are regrouped from their ASCII-keyed durable copies. A desired
+        channel keeps its live runtime: the server sends no JOIN for a channel
+        this bot is already in, so a fresh runtime would never become joined.
         """
         if casemapping not in CASEMAPPINGS or casemapping == self.bot.caps.casemapping:
             return
 
         self.bot.caps.casemapping = casemapping
         self.bot.authorizer.rekey()
-        self.bot.irc.set_casemapping(casemapping)
 
         records: dict[str, ChannelRecord] = {}
         for record in self.source_records.values():
@@ -546,19 +579,26 @@ class ChannelManager:
             if current is None or record.revision > current.revision:
                 records[folded] = record
 
-        joined = [
-            runtime.channel for runtime in self.channels.values() if runtime.joined
-        ]
+        previous = {runtime.channel: runtime for runtime in self.channels.values()}
         self.channel_records = records
-        self.channels = {
-            folded: ChannelRuntime(
-                casemapping=casemapping,
-                channel=record.channel,
-                key=record.key,
-            )
-            for folded, record in records.items()
-            if record.present
-        }
+        self.channels = {}
+        for folded, record in records.items():
+            if not record.present:
+                continue
+
+            runtime = previous.pop(record.channel, None)
+            if runtime is None:
+                runtime = ChannelRuntime(
+                    caps=self.bot.caps,
+                    channel=record.channel,
+                    key=record.key,
+                )
+            else:
+                runtime.rekey()
+
+            self.channels[folded] = runtime
+
+        joined = [runtime.channel for runtime in previous.values() if runtime.joined]
         # Leave any joined channel that no longer folds onto a desired one.
         self.pending_parts = {
             self.bot.caps.fold(channel): channel
@@ -636,8 +676,8 @@ class JoinState(Enum):
 class ChannelRuntime:
     """Own one desired channel: live state, joining, and peer requests."""
 
+    caps: ISupportState
     bans: dict[str, str] = field(default_factory=dict)
-    casemapping: str = DEFAULT_CASEMAPPING
     channel: str = ""
     cooldowns: dict[str, float] = field(default_factory=dict)
     join: JoinState = JoinState.IDLE
@@ -677,11 +717,11 @@ class ChannelRuntime:
 
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""
-        self.bans[casefold(mask, self.casemapping)] = mask
+        self.bans[self.caps.fold(mask)] = mask
 
     def member(self, nickname: str) -> ChannelMember:
         """Return the member for a nickname, creating one if absent."""
-        folded = casefold(nickname, self.casemapping)
+        folded = self.caps.fold(nickname)
         member = self.members.get(folded)
         if member is None:
             member = ChannelMember(nickname)
@@ -692,11 +732,26 @@ class ChannelRuntime:
 
     def remove(self, nickname: str) -> None:
         """Drop a member from the channel by nickname."""
-        self.members.pop(casefold(nickname, self.casemapping), None)
+        self.members.pop(self.caps.fold(nickname), None)
 
     def remove_ban(self, mask: str) -> None:
         """Delete a ban mask from the channel ban list."""
-        self.bans.pop(casefold(mask, self.casemapping), None)
+        self.bans.pop(self.caps.fold(mask), None)
+
+    def update_mode(self, mode: str, *, adding: bool) -> None:
+        """Add or remove a mode letter from the channel mode string."""
+        current = self.modes.lstrip("+")
+        if adding:
+            if mode not in current:
+                self.modes = f"+{current}{mode}"
+        elif mode in current:
+            remaining = current.replace(mode, "")
+            self.modes = f"+{remaining}" if remaining else ""
+
+    def rekey(self) -> None:
+        """Refold member and ban lookups after the casemapping changes."""
+        self.members = {self.caps.fold(m.nick): m for m in self.members.values()}
+        self.bans = {self.caps.fold(mask): mask for mask in self.bans.values()}
 
     def reset(self) -> None:
         """Clear connection-specific channel state."""

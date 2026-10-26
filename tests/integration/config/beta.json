@@ -16,8 +16,7 @@
     "connect_timeout_seconds": 5,
     "servers": [
       "irc://irc:6667"
-    ],
-    "verify_tls": false
+    ]
   },
   "nats": {
     "jetstream_replicas": 3,

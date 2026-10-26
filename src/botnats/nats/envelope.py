@@ -155,16 +155,15 @@ class Envelope:
         """Return the hexadecimal HMAC for canonical envelope bytes."""
         return hmac.digest(self.coordination_key, value, "sha256").hex()
 
-    def prune_nonces(self, now: float | None = None) -> None:
+    def prune_nonces(self, now: float) -> None:
         """Remove expired nonces from the replay-detection cache."""
         # Entries are inserted in expiry order, so expired nonces sit at the
         # front. OrderedDict's linked list keeps front peek-and-delete O(1);
         # plain-dict iteration would rescan tombstoned slots on every call.
         # Clock regressions only delay pruning, never drop live nonces.
-        current = time.time() if now is None else now
         while self.seen_nonces:
             nonce, expiry = next(iter(self.seen_nonces.items()))
-            if expiry > current:
+            if expiry > now:
                 break
 
             del self.seen_nonces[nonce]

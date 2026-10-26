@@ -27,6 +27,7 @@ CASEMAPPINGS = frozenset(CASEMAP_TABLES)
 DEFAULT_CASEMAPPING = "rfc1459"
 DEFAULT_CHANMODES = ("beI", "k", "l", "imnst")
 DEFAULT_MEMBERSHIP_MODES = "qaohv"
+DEFAULT_OP_MODE = "o"
 DEFAULT_MEMBER_PREFIXES = {
     "%": "h",
     "&": "a",
@@ -52,7 +53,6 @@ class IRCProtocol(Protocol):
     """Interface for IRC client implementations."""
 
     current_nick: str
-    desired_nick: str
 
     async def close(self) -> None:
         """Close the connection."""
@@ -67,33 +67,21 @@ class IRCProtocol(Protocol):
         """Return whether a nickname identifies this client."""
         ...
 
-    async def reconnect(self) -> None:
+    def reconnect(self) -> None:
         """Force a reconnection."""
-        ...
-
-    def reset_caps(self) -> None:
-        """Reset server capabilities."""
         ...
 
     async def run_forever(self) -> None:
         """Maintain a persistent connection."""
         ...
 
-    async def send(
+    def send(
         self,
         command: str,
         *params: str,
         trailing: str | None = None,
     ) -> None:
         """Enqueue an IRC command."""
-        ...
-
-    def set_casemapping(self, casemapping: str) -> None:
-        """Apply a casemapping."""
-        ...
-
-    def set_nickname_length(self, length: int) -> None:
-        """Record the nickname length limit."""
         ...
 
 
@@ -108,13 +96,37 @@ class ISupportState:
     )
     membership_modes: str = DEFAULT_MEMBERSHIP_MODES
     monitor: bool = False
-    op_mode: str = "o"
+    op_mode: str = DEFAULT_OP_MODE
 
     @property
     def operator_modes(self) -> str:
         """Return membership modes with at least channel operator privileges."""
         op_index = self.membership_modes.find(self.op_mode)
         return self.membership_modes[: op_index + 1] if op_index >= 0 else self.op_mode
+
+    def apply(self, name: str, value: str) -> None:
+        """Apply one advertised ISUPPORT token other than CASEMAPPING."""
+        match name:
+            case "CHANMODES":
+                self.parse_chanmodes(value)
+            case "MONITOR":
+                # The value is only a target limit, and this bot monitors one.
+                self.monitor = True
+            case "PREFIX":
+                self.parse_prefix(value)
+
+    def forget(self, name: str) -> None:
+        """Restore the default for one withdrawn ISUPPORT token."""
+        default = ISupportState()
+        match name:
+            case "CHANMODES":
+                self.chanmodes = default.chanmodes
+            case "MONITOR":
+                self.monitor = default.monitor
+            case "PREFIX":
+                self.member_prefixes = default.member_prefixes
+                self.membership_modes = default.membership_modes
+                self.op_mode = default.op_mode
 
     def fold(self, value: str) -> str:
         """Normalize a string using the server's casemapping rules."""
@@ -143,7 +155,7 @@ class ISupportState:
         if value in {"", "()"}:
             self.member_prefixes = {}
             self.membership_modes = ""
-            self.op_mode = "o"
+            self.op_mode = DEFAULT_OP_MODE
             return
 
         if not value.startswith("(") or ")" not in value:
@@ -158,7 +170,10 @@ class ISupportState:
         # Without "@" fall back through the conventional operator tiers; a
         # PREFIX advertising only sub-operator modes (e.g. "(v)+") must not
         # count its highest rank as opped.
-        fallback = next((mode for mode in ("o", "a", "q") if mode in modes), "o")
+        fallback = next(
+            (mode for mode in (DEFAULT_OP_MODE, "a", "q") if mode in modes),
+            DEFAULT_OP_MODE,
+        )
         self.op_mode = self.member_prefixes.get("@", fallback)
 
     def reset(self) -> None:
@@ -179,7 +194,7 @@ class Prefix:
         """Return whether nick, user, and host are all present."""
         return self.user is not None and self.host is not None
 
-    def matches(self, other: Prefix, casemapping: str = DEFAULT_CASEMAPPING) -> bool:
+    def matches(self, other: Prefix, casemapping: str) -> bool:
         """Check whether two complete prefixes identify the same user."""
         s_user = self.user
         s_host = self.host
@@ -199,11 +214,11 @@ class Prefix:
         """Construct a Prefix from a nick!user@host string."""
         nick, bang, remainder = value.partition("!")
         if not bang:
-            nick, at, host = value.partition("@")
-            return cls(nick=nick, host=(host or None) if at else None)
+            nick, _, host = value.partition("@")
+            return cls(nick=nick, host=host or None)
 
-        user, at, host = remainder.partition("@")
-        return cls(nick=nick, user=user or None, host=(host or None) if at else None)
+        user, _, host = remainder.partition("@")
+        return cls(nick=nick, user=user or None, host=host or None)
 
     def render(self) -> str:
         """Format the prefix as a nick!user@host string."""
@@ -213,7 +228,7 @@ class Prefix:
         return f"{self.nick}!{self.user}@{self.host}"
 
 
-def casefold(value: str, casemapping: str = DEFAULT_CASEMAPPING) -> str:
+def casefold(value: str, casemapping: str) -> str:
     """Fold an IRC identifier using a server-advertised casemapping."""
     table = CASEMAP_TABLES.get(casemapping)
     if table is None:
@@ -261,16 +276,18 @@ def _glob_matches(pattern: str, value: str) -> bool:
     star_index = -1
     star_value_index = 0
     while value_index < len(value):
-        if pattern_index < len(pattern) and pattern[pattern_index] in (
+        # A wildcard is tried first, so a literal "*" in the value cannot
+        # consume it as a plain character and lose the backtrack point.
+        if pattern_index < len(pattern) and pattern[pattern_index] == "*":
+            star_index = pattern_index
+            star_value_index = value_index
+            pattern_index += 1
+        elif pattern_index < len(pattern) and pattern[pattern_index] in (
             value[value_index],
             "?",
         ):
             pattern_index += 1
             value_index += 1
-        elif pattern_index < len(pattern) and pattern[pattern_index] == "*":
-            star_index = pattern_index
-            star_value_index = value_index
-            pattern_index += 1
         elif star_index >= 0:
             pattern_index = star_index + 1
             star_value_index += 1
@@ -287,8 +304,8 @@ def _glob_matches(pattern: str, value: str) -> bool:
 def iter_mode_changes(
     modes: str,
     arguments: tuple[str, ...],
-    chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES,
-    membership: str = DEFAULT_MEMBERSHIP_MODES,
+    chanmodes: tuple[str, str, str, str],
+    membership: str,
 ) -> Iterator[tuple[bool, str, str | None]]:
     """Yield channel mode changes with their consumed arguments."""
     adding = True
@@ -348,7 +365,7 @@ def mode_requires_argument(
 def mask_matches(
     mask: str,
     prefix: Prefix,
-    casemapping: str = DEFAULT_CASEMAPPING,
+    casemapping: str,
 ) -> bool:
     """Match a standard IRC nick!user@host mask using only * and ? wildcards."""
     mask_prefix = Prefix.parse(mask)
@@ -379,6 +396,8 @@ def parse_message(line: str) -> IRCMessage:
         if not separator:
             msg = "IRC tags were not followed by a command"
             raise ValueError(msg)
+
+        rest = rest.lstrip(" ")
 
     if rest.startswith(":"):
         raw_prefix, separator, rest = rest[1:].partition(" ")

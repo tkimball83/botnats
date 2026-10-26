@@ -9,6 +9,7 @@ import signal
 import sys
 import unittest
 from asyncio.subprocess import DEVNULL, PIPE
+from functools import partial
 
 from tests.integration import (
     test_bot_restart,
@@ -16,28 +17,35 @@ from tests.integration import (
     test_mesh,
     test_recovery,
     test_restart,
+    test_ttl_change,
 )
 
 BOTS = ("alpha", "beta", "gamma")
-COMPOSE_FILE = "tests/integration/compose.yml"
+COMPOSE = (
+    "docker",
+    "compose",
+    "--file",
+    "tests/integration/compose.yml",
+    "--project-name",
+    "botnats-test",
+)
 NATS_NODES = ("nats-1", "nats-2", "nats-3")
-PROJECT = os.environ.get("BOTNATS_COMPOSE_PROJECT", "botnats-test")
+# One phase taking longer than this has hung, not just slowed down.
+PHASE_TIMEOUT = 600.0
 READY_ATTEMPTS = 60
 STABLE_READY_CHECKS = 3
+# The only copy of the test secrets: compose.yml reads them from here.
+TEST_ENVIRONMENT = {
+    "BOTNATS_TEST_COORDINATION_SECRET": "coordination-secret-used-only-for-tests",
+    "BOTNATS_TEST_NATS_TOKEN": "integration-token",
+    "BOTNATS_TEST_TOTP_SECRET": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+}
 UP = ("up", "--detach", "--no-build", "--wait", "--wait-timeout", "120")
 
 
 async def compose(*arguments: str, check: bool = True) -> None:
     """Run one docker compose command, streaming its output."""
-    process = await asyncio.create_subprocess_exec(
-        "docker",
-        "compose",
-        "--file",
-        COMPOSE_FILE,
-        "--project-name",
-        PROJECT,
-        *arguments,
-    )
+    process = await asyncio.create_subprocess_exec(*COMPOSE, *arguments)
     if await process.wait() != 0 and check:
         msg = f"docker compose {' '.join(arguments)} failed"
         raise AssertionError(msg)
@@ -46,12 +54,7 @@ async def compose(*arguments: str, check: bool = True) -> None:
 async def compose_output(*arguments: str) -> str | None:
     """Run one docker compose command; return its output, or None on failure."""
     process = await asyncio.create_subprocess_exec(
-        "docker",
-        "compose",
-        "--file",
-        COMPOSE_FILE,
-        "--project-name",
-        PROJECT,
+        *COMPOSE,
         *arguments,
         stdout=PIPE,
         stderr=DEVNULL,
@@ -73,7 +76,6 @@ async def published_address(service: str, port: str) -> str:
 async def publish_nats_addresses() -> None:
     """Export NATS addresses; container restarts remap the published ports."""
     urls = [f"nats://{await published_address(node, '4222')}" for node in NATS_NODES]
-    os.environ["BOTNATS_TEST_NATS_URL"] = urls[0]
     os.environ["BOTNATS_TEST_NATS_URLS"] = ",".join(urls)
 
 
@@ -105,11 +107,6 @@ async def wait_all_ready() -> None:
         await wait_ready(bot)
 
 
-async def restart_bot(bot: str) -> None:
-    """Restart one bot container."""
-    await compose("restart", bot)
-
-
 async def live_coordinator() -> None:
     """Run the live-NATS coordinator tests against the running cluster."""
     suite = unittest.defaultTestLoader.loadTestsFromName(
@@ -117,7 +114,8 @@ async def live_coordinator() -> None:
     )
     # IsolatedAsyncioTestCase starts its own event loop, so it runs off this one.
     result = await asyncio.to_thread(unittest.TextTestRunner(verbosity=2).run, suite)
-    if not result.wasSuccessful():
+    # A test skipped for want of the mesh's environment proved nothing.
+    if result.skipped or not result.wasSuccessful():
         msg = "live coordinator tests failed"
         raise AssertionError(msg)
 
@@ -149,26 +147,42 @@ async def cluster_restart() -> None:
 
 
 async def recovery() -> None:
-    """Recover from a ban and kick, and keep an admin session across a restart."""
-    await test_recovery.run(restart_bot)
+    """Recover from a ban, a kick, and limits, and keep a session across a restart."""
+    await test_recovery.run(partial(compose, "restart"))
     await wait_ready("alpha")
 
 
 async def serial_replacement() -> None:
-    """Replace each bot in turn without losing channels, keys, or ops."""
-    for bot in BOTS:
-        await restart_bot(bot)
+    """Replace each bot in turn without losing channels, keys, or ops.
+
+    The last bot is killed, not stopped, so its replacement must outlast the
+    presence the dead process left behind; and a key change made while it is
+    down must reach it through JetStream.
+    """
+    *restarted, killed = BOTS
+    for bot in restarted:
+        await compose("restart", bot)
         await wait_ready(bot)
-        await test_bot_restart.run(bot)
+        await test_bot_restart.run()
+
+    new_key = "rotated-key"
+    await compose("kill", killed)
+    await test_bot_restart.change_key(new_key)
+    await compose(*UP, killed)
+    await wait_ready(killed)
+    await test_bot_restart.run(new_key)
 
 
+# The mesh runs before the NATS phases so they put the bots' own durable
+# channels and keys at risk; serial replacement then proves the bots rebuild
+# that state from JetStream.
 PHASES = (
     ("live coordinator", live_coordinator),
+    ("three-bot mesh", test_mesh.run),
     ("NATS node failover", node_failover),
     ("full NATS restart", cluster_restart),
-    ("session TTL change", test_restart.ttl_change),
-    ("three-bot mesh", test_mesh.run),
-    ("ban, kick, and restart recovery", recovery),
+    ("session TTL change", test_ttl_change.ttl_change),
+    ("ban, kick, limit, invite, and restart recovery", recovery),
     ("serial bot replacement", serial_replacement),
 )
 
@@ -181,13 +195,7 @@ async def main() -> None:
     if task is not None:
         asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
 
-    os.environ.update(
-        {
-            "BOTNATS_TEST_JETSTREAM_REPLICAS": "3",
-            "BOTNATS_TEST_NATS_TOKEN": "integration-token",
-            "BOTNATS_TEST_TOTP_SECRET": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
-        },
-    )
+    os.environ.update(TEST_ENVIRONMENT)
     await compose("down", "--volumes", "--remove-orphans")
     try:
         await compose("build", "alpha")
@@ -198,7 +206,8 @@ async def main() -> None:
             sys.stdout.write(f"\n== {name}\n")
             sys.stdout.flush()
             try:
-                await phase()
+                async with asyncio.timeout(PHASE_TIMEOUT):
+                    await phase()
             except BaseException:
                 sys.stdout.write(f"\n== FAILED: {name}\n")
                 raise

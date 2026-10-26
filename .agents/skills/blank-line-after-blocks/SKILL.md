@@ -17,7 +17,8 @@ venv/bin/blank-line-after-blocks src/botnats/{{ file }}.py
   run exits 0. Investigate tracebacks and other errors.
 - Use the `unit` skill afterward; `ruff format` must accept the result unchanged.
 - The formatter does not infer boundaries between consecutive simple statements.
-- CI enforces spacing through pre-commit, pinned to the version in `pyproject.toml`.
+- `make unit`, and so CI, fails when spacing changes; pre-commit runs it too, pinned to the
+  version in `pyproject.toml`.
 
 ## Dependencies
 

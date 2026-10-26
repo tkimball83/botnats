@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING
 
 from botnats.auth import totp
 from botnats.irc.protocol import IRCMessage, format_message, parse_message
+from tests.integration.test_failover import JETSTREAM_REPLICAS
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
 BOTS = frozenset({"alpha", "beta", "gamma"})
 CHANNELS = (
@@ -21,8 +22,11 @@ CHANNELS = (
     ("#botnats-second", "second-key"),
 )
 COMMAND_TIMEOUT = 15.0
+POLL_INTERVAL = 0.25
 STARTUP_TIMEOUT = 45.0
 TEST_BAN = "*!*@blocked.example"
+# TOTP counters this run has spent: each counter authenticates only once.
+USED_COUNTERS: set[int] = set()
 
 
 class IRCSession:
@@ -39,9 +43,10 @@ class IRCSession:
         self.writer = writer
 
     async def close(self) -> None:
-        """Close the IRC connection."""
+        """Close the IRC connection without waiting on a stuck peer."""
         self.writer.close()
-        await self.writer.wait_closed()
+        async with asyncio.timeout(COMMAND_TIMEOUT):
+            await self.writer.wait_closed()
 
     async def read_until(
         self,
@@ -49,14 +54,19 @@ class IRCSession:
         *,
         wait_seconds: float,
     ) -> IRCMessage:
-        """Read through IRC traffic until a matching message arrives."""
+        """Read until a matching message arrives.
+
+        Raises TimeoutError when none arrives in time, and ConnectionError when
+        the server closes the connection, so a polling caller can retry the
+        first and stop on the second.
+        """
         try:
             async with asyncio.timeout(wait_seconds):
                 while True:
                     raw = await self.reader.readline()
                     if not raw:
                         msg = "IRC server closed the integration-test connection"
-                        raise AssertionError(msg)
+                        raise ConnectionError(msg)
 
                     line = raw.decode(errors="replace").rstrip("\r\n")
                     self.transcript.append(line)
@@ -71,7 +81,7 @@ class IRCSession:
 
         recent = "\n".join(self.transcript[-20:])
         msg = f"timed out waiting for IRC response; recent traffic:\n{recent}"
-        raise AssertionError(msg)
+        raise TimeoutError(msg)
 
     async def send(
         self,
@@ -82,6 +92,20 @@ class IRCSession:
         """Write one IRC protocol message."""
         self.writer.write(format_message(command, params, trailing))
         await self.writer.drain()
+
+
+async def authenticate(
+    session: IRCSession,
+    bot: str,
+    code: str,
+    expected: str = "Authorized",
+) -> None:
+    """Send AUTH with a code and wait for the bot's exact reply."""
+    await session.send("PRIVMSG", bot, trailing=f"AUTH {code}")
+    await session.read_until(
+        private_message(bot, expected),
+        wait_seconds=COMMAND_TIMEOUT,
+    )
 
 
 async def command(session: IRCSession, bot: str, text: str) -> str:
@@ -103,13 +127,39 @@ async def connect(address: str) -> IRCSession:
 
     reader, writer = await asyncio.open_connection(host, int(raw_port))
     session = IRCSession(reader, writer)
-    await session.send("NICK", "owner")
-    await session.send("USER", "owner", "0", "*", trailing="BotNATS test owner")
-    await session.read_until(
-        lambda message: message.command == "001",
-        wait_seconds=COMMAND_TIMEOUT,
-    )
+    try:
+        await session.send("NICK", "owner")
+        await session.send("USER", "owner", "0", "*", trailing="BotNATS test owner")
+        await session.read_until(
+            lambda message: message.command == "001",
+            wait_seconds=COMMAND_TIMEOUT,
+        )
+    except BaseException:
+        await session.close()
+        raise
+
     return session
+
+
+def fresh_code() -> str:
+    """Return a currently valid TOTP code whose counter this run has not spent."""
+    secret = base64.b32decode(os.environ["BOTNATS_TEST_TOTP_SECRET"])
+    current = int(time.time() // 30)
+    # The bots accept one counter either side of the current one.
+    counter = next(
+        counter for counter in (current, current + 1) if counter not in USED_COUNTERS
+    )
+    USED_COUNTERS.add(counter)
+    return totp(secret, counter)
+
+
+async def join_as_operator(session: IRCSession, channel: str, key: str) -> None:
+    """Join a channel and wait until alpha has opped the owner there."""
+    await session.send("JOIN", channel, key)
+    await wait_for_reply(
+        session, "alpha", f"OP {channel} owner", f"Opped owner on {channel}"
+    )
+    await wait_for_operators(session, channel, present=frozenset({"owner"}))
 
 
 async def modes(session: IRCSession, channel: str) -> str:
@@ -193,27 +243,31 @@ def private_message(
     return matches
 
 
+async def poll_until(
+    check: Callable[[], Awaitable[bool]],
+    *,
+    wait_seconds: float = STARTUP_TIMEOUT,
+    interval: float = POLL_INTERVAL,
+) -> None:
+    """Re-run an async check until it passes or the wait expires."""
+    async with asyncio.timeout(wait_seconds):
+        while True:
+            if await check():
+                return
+
+            await asyncio.sleep(interval)
+
+
 async def run() -> None:
     """Exercise auth deduplication, session propagation, and channel convergence."""
-    address = os.environ["BOTNATS_TEST_IRC_ADDRESS"]
-    encoded_secret = os.environ["BOTNATS_TEST_TOTP_SECRET"]
-    secret = base64.b32decode(encoded_secret)
-    session = await connect(address)
+    session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
     try:
         await wait_for_bots(session)
 
-        code = totp(secret, int(time.time() // 30))
-        await session.send("PRIVMSG", "alpha", trailing=f"AUTH {code}")
-        await session.read_until(
-            private_message("alpha", "Authorized"),
-            wait_seconds=COMMAND_TIMEOUT,
-        )
-
-        await session.send("PRIVMSG", "gamma", trailing=f"AUTH {code}")
-        await session.read_until(
-            private_message("gamma", "Authorization failed"),
-            wait_seconds=COMMAND_TIMEOUT,
-        )
+        # One code authenticates once across the whole mesh.
+        code = fresh_code()
+        await authenticate(session, "alpha", code)
+        await authenticate(session, "gamma", code, "Authorization failed")
 
         for channel, key in CHANNELS:
             supplied = f"{key}-supplied"
@@ -246,10 +300,14 @@ async def run() -> None:
         second, second_key = CHANNELS[1]
 
         # Multiple channels with different modes: set an extra mode on the
-        # first channel. The mesh must keep the modes isolated per channel and
-        # not re-apply the enforced set over +i.
+        # first channel, then remove an enforced one. The bots must restore
+        # the enforced +m without touching +i, and the second channel must
+        # keep its own modes.
         await session.send("MODE", first, "+i")
         await wait_for_modes(session, first, present="i")
+        await session.send("MODE", first, "-m")
+        await wait_for_modes(session, first, present="m")
+        assert "i" in await modes(session, first)
         assert "i" not in await modes(session, second)
 
         await wait_for_operators(session, first, present=frozenset({"alpha"}))
@@ -278,18 +336,16 @@ async def run() -> None:
 
 async def wait_for_bots(session: IRCSession) -> None:
     """Wait until all three bot nicknames are registered on IRC."""
-    async with asyncio.timeout(STARTUP_TIMEOUT):
-        while True:
-            await session.send("ISON", *sorted(BOTS))
-            response = await session.read_until(
-                lambda message: message.command == "303",
-                wait_seconds=COMMAND_TIMEOUT,
-            )
-            online = set(response.params[-1].casefold().split())
-            if online == BOTS:
-                return
 
-            await asyncio.sleep(0.25)
+    async def online() -> bool:
+        await session.send("ISON", *sorted(BOTS))
+        response = await session.read_until(
+            lambda message: message.command == "303",
+            wait_seconds=COMMAND_TIMEOUT,
+        )
+        return set(response.params[-1].casefold().split()) == BOTS
+
+    await poll_until(online)
 
 
 async def wait_for_channel(session: IRCSession, channel: str, key: str) -> None:
@@ -306,13 +362,12 @@ async def wait_for_names(
     present: frozenset[str] = frozenset(),
 ) -> None:
     """Wait until required nicks are present and forbidden nicks are absent."""
-    async with asyncio.timeout(STARTUP_TIMEOUT):
-        while True:
-            current = await names(session, channel)
-            if current >= present and current.isdisjoint(absent):
-                return
 
-            await asyncio.sleep(0.25)
+    async def converged() -> bool:
+        current = await names(session, channel)
+        return current >= present and current.isdisjoint(absent)
+
+    await poll_until(converged)
 
 
 async def wait_for_modes(
@@ -322,12 +377,11 @@ async def wait_for_modes(
     present: str,
 ) -> None:
     """Wait until a channel's mode string contains the required flag."""
-    async with asyncio.timeout(STARTUP_TIMEOUT):
-        while True:
-            if present in await modes(session, channel):
-                return
 
-            await asyncio.sleep(0.25)
+    async def has_mode() -> bool:
+        return present in await modes(session, channel)
+
+    await poll_until(has_mode)
 
 
 async def wait_for_operators(
@@ -337,44 +391,45 @@ async def wait_for_operators(
     present: frozenset[str],
 ) -> None:
     """Wait until the required members hold operator status in one channel."""
-    async with asyncio.timeout(STARTUP_TIMEOUT):
-        while True:
-            if await operators(session, channel) >= present:
-                return
 
-            await asyncio.sleep(0.25)
+    async def opped() -> bool:
+        return await operators(session, channel) >= present
+
+    await poll_until(opped)
 
 
 async def wait_for_status(session: IRCSession, bot: str) -> None:
     """Poll STATUS until the bot reports the expected mesh state."""
-    async with asyncio.timeout(STARTUP_TIMEOUT):
-        while True:
-            await session.send("PRIVMSG", bot, trailing="STATUS")
-            local_status = await session.read_until(
-                private_message(bot),
-                wait_seconds=COMMAND_TIMEOUT,
-            )
-            nats_status = await session.read_until(
-                private_message(bot),
-                wait_seconds=COMMAND_TIMEOUT,
-            )
-            local_text = local_status.params[-1]
-            if "peers=2" not in local_text or "channels=2" not in local_text:
-                await asyncio.sleep(2.0)
-                continue
 
-            nats_fields = dict(
-                field.split("=", 1) for field in nats_status.params[-1].split()[1:]
-            )
-            if (
-                nats_fields.get("connection") == "up"
-                and int(nats_fields.get("routes", "0")) >= 2
-                and nats_fields.get("jetstream") == "up"
-                and nats_fields.get("replicas") == "3/3"
-            ):
-                return
+    async def healthy() -> bool:
+        await session.send("PRIVMSG", bot, trailing="STATUS")
+        local_status = await session.read_until(
+            private_message(bot),
+            wait_seconds=COMMAND_TIMEOUT,
+        )
+        nats_status = await session.read_until(
+            private_message(bot),
+            wait_seconds=COMMAND_TIMEOUT,
+        )
+        local_text = local_status.params[-1]
+        if "peers=2" not in local_text or "channels=2" not in local_text:
+            return False
 
-            await asyncio.sleep(2.0)
+        nats_fields = dict(
+            field.split("=", 1) for field in nats_status.params[-1].split()[1:]
+        )
+        # STATUS shows "?" for a route count it could not read; keep polling.
+        routes = nats_fields.get("routes", "")
+        return (
+            nats_fields.get("connection") == "up"
+            and routes.isdigit()
+            and int(routes) >= 2
+            and nats_fields.get("jetstream") == "up"
+            and nats_fields.get("replicas")
+            == f"{JETSTREAM_REPLICAS}/{JETSTREAM_REPLICAS}"
+        )
+
+    await poll_until(healthy, interval=2.0)
 
 
 async def wait_for_reply(
@@ -384,9 +439,8 @@ async def wait_for_reply(
     expected: str,
 ) -> None:
     """Poll a bot command until replicated state produces the expected reply."""
-    async with asyncio.timeout(STARTUP_TIMEOUT):
-        while True:
-            if await command(session, bot, command_text) == expected:
-                return
 
-            await asyncio.sleep(2.0)
+    async def replied() -> bool:
+        return await command(session, bot, command_text) == expected
+
+    await poll_until(replied, interval=2.0)

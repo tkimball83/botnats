@@ -35,13 +35,13 @@ bot and NATS restarts; sessions and presence still expire at their configured TT
 
 ## Configuration
 
-| Variable                      | Purpose                                                      |
-| ----------------------------- | ------------------------------------------------------------ |
-| `BOTNATS_CONFIG`              | JSON config path; defaults to `/etc/botnats/bot.json`        |
-| `BOTNATS_COORDINATION_SECRET` | HMAC key; at least 32 bytes                                  |
-| `BOTNATS_LOG_LEVEL`           | Python log level; defaults to `INFO`                         |
-| `BOTNATS_NATS_TOKEN`          | NATS client token                                            |
-| `BOTNATS_TOTP_SECRET`         | Base32 TOTP seed; at least 160 bits                          |
+| Variable                      | Purpose                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `BOTNATS_CONFIG`              | JSON config path; `--config` overrides it; defaults to `/etc/botnats/bot.json` |
+| `BOTNATS_COORDINATION_SECRET` | HMAC key; at least 32 bytes                                                    |
+| `BOTNATS_LOG_LEVEL`           | Python log level; defaults to `INFO`                                           |
+| `BOTNATS_NATS_TOKEN`          | NATS client token                                                              |
+| `BOTNATS_TOTP_SECRET`         | Base32 TOTP seed; at least 160 bits                                            |
 
 Example `bot.json`:
 
@@ -65,8 +65,7 @@ Example `bot.json`:
     "connect_timeout_seconds": 30,
     "servers": [
       "irc://us.undernet.org:6667"
-    ],
-    "verify_tls": false
+    ]
   },
   "nats": {
     "jetstream_replicas": 3,
@@ -85,7 +84,7 @@ Example `bot.json`:
 | `bot.id`                                    | Unique mesh ID; compared case-insensitively                 |
 | `bot.network`                               | One IRC network per process; namespaces shared NATS state   |
 | `bot.nickname`                              | IRC nickname and connection identity                        |
-| `coordination.maintenance_interval_seconds` | Seconds between maintenance cycles                          |
+| `coordination.maintenance_interval_seconds` | Seconds between maintenance cycles and presence heartbeats  |
 | `coordination.presence_ttl_seconds`         | Must exceed the maintenance interval                        |
 | `irc.channel_modes`                         | Required (`+`) and forbidden (`-`) modes; empty by default  |
 | `irc.connect_timeout_seconds`               | Per-server connection timeout                               |
@@ -132,7 +131,8 @@ Enroll the TOTP seed with SHA-1, six digits, and a 30-second period. Then send:
 
 Authentication allows three attempts per host in a mesh-wide sliding 60-second
 window; users sharing a hostname share that budget. Each TOTP counter can be
-claimed once.
+claimed once. An attempt over the limit, or made while NATS is unavailable, gets
+no reply.
 
 Use private messages for every command. All commands except `AUTH` require an
 active session.
@@ -162,9 +162,9 @@ make integration
 make test
 ```
 
-`make integration` runs three NATS nodes, one IRC server, and three bots. It
-covers coordination, authentication, failover, restarts, and channel
-convergence. It removes its containers and volumes afterward.
+`make integration` runs three NATS nodes, one IRC server, and three bots, one of
+them over `ircs://`. It covers coordination, authentication, failover, restarts,
+and channel convergence. It removes its containers and volumes afterward.
 
 Install the pre-commit hook with `make hooks`. Build the amd64 image with:
 

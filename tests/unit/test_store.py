@@ -5,17 +5,27 @@
 
 import asyncio
 import json
+import math
 import time
 import unittest
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from nats.errors import Error as NatsError
-from nats.js.errors import KeyNotFoundError, KeyWrongLastSequenceError
+from nats.js.api import StreamConfig
+from nats.js.errors import (
+    BadRequestError,
+    KeyNotFoundError,
+    KeyWrongLastSequenceError,
+    NotFoundError,
+)
 
 from botnats.nats.store import (
     ATTEMPT_LIMIT,
+    ATTEMPT_WINDOW,
     CAS_ATTEMPT_LIMIT,
+    SESSION_EXPIRY_GRACE,
     AttemptStore,
     ChannelStore,
     ClaimStore,
@@ -26,8 +36,12 @@ from botnats.nats.store import (
     presence_signature,
 )
 from tests.unit.helpers import COORDINATION_KEY as SECRET
-from tests.unit.helpers import session_record
+from tests.unit.helpers import FakeKV, session_record
 
+if TYPE_CHECKING:
+    from nats.js.kv import KeyValue
+
+OTHER_SECRET = b"a-different-coordination-secret!"
 SHA256_HEX_LENGTH = 64
 
 
@@ -80,7 +94,7 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         kv.update.assert_not_awaited()
 
     async def test_reclaim_overwrites_forged_or_absent(self) -> None:
-        """Overwrite an unsigned clobber; claim when the key is already gone."""
+        """Overwrite a forged or misplaced clobber; claim when the key is gone."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
         data = signed_presence("inst")
         reclaimed_revision = 6
@@ -100,6 +114,18 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         )
         kv.update = AsyncMock(return_value=reclaimed_revision)
         assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
+
+        # Another bot's validly signed record, copied onto this bot's key, is
+        # a clobber to overwrite, not a duplicate to yield to.
+        copied: dict[str, object] = {**data, "bot_id": "beta", "instance_id": "other"}
+        copied["signature"] = presence_signature(SECRET, "efnet", copied)
+        assert store.valid("beta", copied)
+        kv.get = AsyncMock(
+            return_value=SimpleNamespace(revision=5, value=json.dumps(copied).encode()),
+        )
+        kv.update = AsyncMock(return_value=reclaimed_revision)
+        assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
+        kv.update.assert_awaited_once()
 
         kv.get = AsyncMock(side_effect=KeyNotFoundError())
         kv.create = AsyncMock(return_value=reclaimed_revision)
@@ -135,8 +161,33 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(NatsError, "repeated update races"):
             await store.reclaim("Alpha", data, "inst")
 
+    def test_valid_binds_record_to_key(self) -> None:
+        """Accept a signed record only under its own bot ID's key."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        now = 1_000_000.0
+
+        def signed(bot_id: str) -> dict[str, object]:
+            data: dict[str, object] = {
+                "bot_id": bot_id,
+                "host": "host",
+                "instance_id": "inst",
+                "nick": "nick",
+                "user": "user",
+                "timestamp": int(now),
+            }
+            data["signature"] = presence_signature(SECRET, "efnet", data)
+            return data
+
+        beta = signed("Beta")
+        assert store.valid("beta", beta, now=now)
+        assert not store.valid("alpha", beta, now=now)
+
+        # A key the record names exactly is still refused for a bot ID that
+        # is not an identifier.
+        assert not store.valid("be.ta", signed("be.ta"), now=now)
+
     def test_valid_rejects_stale_and_uncrashable(self) -> None:
-        """Reject stale replays and surrogate injection without raising."""
+        """Reject stale and future-dated replays, and surrogates without raising."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
         now = 1_000_000.0
 
@@ -154,12 +205,17 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
                 "timestamp": int(now),
             },
         )
-        assert store.valid(fresh, now=now)
+        assert store.valid("alpha", fresh, now=now)
 
         stale = dict(fresh)
         stale["timestamp"] = int(now - 1000)
         stale["signature"] = presence_signature(SECRET, "efnet", stale)
-        assert not store.valid(stale, now=now)
+        assert not store.valid("alpha", stale, now=now)
+
+        future = dict(fresh)
+        future["timestamp"] = int(now + 1000)
+        future["signature"] = presence_signature(SECRET, "efnet", future)
+        assert not store.valid("alpha", future, now=now)
 
         surrogate = {
             "bot_id": "alpha",
@@ -170,10 +226,10 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
             "timestamp": int(now),
             "signature": "0" * SHA256_HEX_LENGTH,
         }
-        assert not store.valid(surrogate, now=now)
+        assert not store.valid("alpha", surrogate, now=now)
 
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
-        assert not store.valid(non_ascii_signature, now=now)
+        assert not store.valid("alpha", non_ascii_signature, now=now)
 
 
 def channel_revision(number: int) -> str:
@@ -234,20 +290,23 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.create.side_effect = None
         assert await attempts.allow("host.example", now=61)
 
-    async def test_keys_hide_identity(self) -> None:
-        """Verify persisted attempt keys do not expose the IRC identity."""
+    async def test_keys_are_secret_derived(self) -> None:
+        """Derive attempt keys from the coordination secret, not the identity alone."""
         attempts = AttemptStore("efnet", 3, SECRET)
 
         key = attempts.key("host.example", 0)
 
-        assert "host" not in key
+        assert key == AttemptStore("efnet", 3, SECRET).key("host.example", 0)
+        assert key != AttemptStore("efnet", 3, OTHER_SECRET).key("host.example", 0)
+        assert key != attempts.key("host.example", 1)
         assert len(key) == SHA256_HEX_LENGTH
 
     async def test_missing_store_fails_closed(self) -> None:
         """Verify authentication is denied until the bucket is open."""
         attempts = AttemptStore("efnet", 3, SECRET)
 
-        assert not await attempts.allow("host.example", now=60)
+        with self.assertLogs("botnats.nats.store", level="WARNING"):
+            assert not await attempts.allow("host.example", now=60)
 
     async def test_sliding_window_reuses_expired_slot(self) -> None:
         """Verify an expired slot is atomically reused."""
@@ -264,6 +323,35 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             float(61).hex().encode(),
             last=7,
         )
+
+    async def test_sliding_window_reuses_slot_at_cutoff(self) -> None:
+        """Reuse a slot whose attempt sits exactly one window before now."""
+        attempts = AttemptStore("efnet", 3, SECRET)
+        attempts.kv = AsyncMock()
+        now = 1_000.0
+        attempts.kv.get.return_value = MagicMock(
+            revision=7,
+            value=(now - ATTEMPT_WINDOW).hex().encode(),
+        )
+
+        assert await attempts.allow("host.example", now=now)
+        attempts.kv.update.assert_awaited_once_with(
+            attempts.key("host.example", 0),
+            now.hex().encode(),
+            last=7,
+        )
+
+    async def test_unreadable_attempts_fail_closed(self) -> None:
+        """Count slots holding no value, non-hex, or non-UTF-8 bytes as taken."""
+        attempts = AttemptStore("efnet", 3, SECRET)
+        attempts.kv = AsyncMock()
+        attempts.kv.get.side_effect = [
+            MagicMock(revision=1, value=None),
+            MagicMock(revision=2, value=b"not-a-timestamp"),
+            MagicMock(revision=3, value=b"\xff\xfe"),
+        ]
+
+        assert not await attempts.allow("host.example", now=60)
 
     async def test_sliding_window_update_conflict_does_not_overbook(self) -> None:
         """Deny when a peer claims the only expired slot first."""
@@ -290,7 +378,6 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         assert not await attempts.allow("host.example", now=60)
-        attempts.kv.create.assert_not_awaited()
 
     async def test_clock_skew_counts_future_bucket(self) -> None:
         """Verify attempts by a faster peer count for a slower peer."""
@@ -303,7 +390,6 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         assert not await attempts.allow("host.example", now=59)
-        attempts.kv.create.assert_not_awaited()
 
     async def test_non_finite_attempts_fail_closed(self) -> None:
         """Verify non-finite stored timestamps consume attempt slots."""
@@ -316,7 +402,6 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         assert not await attempts.allow("host.example", now=60)
-        attempts.kv.create.assert_not_awaited()
 
 
 class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -330,7 +415,8 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await claims.claim(42)
 
         key = claims.key(42)
-        assert key != "42"
+        assert key == ClaimStore("efnet", 3, SECRET).key(42)
+        assert key != ClaimStore("efnet", 3, OTHER_SECRET).key(42)
         assert len(key) == SHA256_HEX_LENGTH
         assert claims.ready
         claims.kv.create.assert_awaited_once_with(key, b"1")
@@ -361,7 +447,9 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         """Verify a claim is denied until the bucket is open."""
         claims = ClaimStore("efnet", 3, SECRET)
 
-        assert not await claims.claim(42)
+        with self.assertLogs("botnats.nats.store", level="WARNING"):
+            assert not await claims.claim(42)
+
         assert not claims.ready
 
     async def test_reopen_after_error(self) -> None:
@@ -390,7 +478,7 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KVStoreTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for KV handle reuse and disconnect races."""
+    """Tests for bucket handles and the channel, presence, and session stores."""
 
     async def test_open_reuses_bucket(self) -> None:
         """Reuse an open bucket when the JetStream context is unchanged."""
@@ -403,6 +491,36 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await store.open(js) is kv
         js.create_key_value.assert_awaited_once()
 
+    async def test_retune_without_ttl_keeps_default_duplicate_window(self) -> None:
+        """Retune a TTL-less bucket to the duplicate window nats-py creates it with."""
+        store = KVStore("test", 1, 0)
+        js = AsyncMock()
+        kv = AsyncMock()
+        js.create_key_value.side_effect = [BadRequestError(), kv]
+        js.stream_info.return_value = SimpleNamespace(
+            config=StreamConfig(name="KV_test", max_age=3600, duplicate_window=60),
+        )
+
+        assert await store.open(js) is kv
+        updated = js.update_stream.await_args.args[0]
+        assert updated.max_age == 0
+        assert updated.duplicate_window == 120
+
+    async def test_open_reports_create_failure_without_bucket(self) -> None:
+        """Raise the creation error, not the lookup's, when no bucket exists."""
+        store = KVStore("test", 1, 60)
+        js = AsyncMock()
+        error = BadRequestError(description="invalid stream configuration")
+        js.create_key_value.side_effect = error
+        js.stream_info.side_effect = NotFoundError()
+
+        with self.assertRaises(BadRequestError) as raised:
+            await store.open(js)
+
+        assert raised.exception is error
+        js.stream_info.assert_awaited_once_with("KV_test")
+        assert not store.ready
+
     async def test_presence_delete_uses_owned_revision(self) -> None:
         """Delete only the case-insensitive presence revision this process owns."""
         presence = PresenceStore("efnet", 1, 15, SECRET)
@@ -412,44 +530,64 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         presence.kv.delete.assert_awaited_once_with("alpha", last=8)
 
-    async def test_channel_put_keeps_highest_revision(self) -> None:
-        """Prevent a delayed channel write from replacing newer durable state."""
+    async def test_presence_update_uses_owned_revision(self) -> None:
+        """Refresh presence under its owned revision and report a lost race."""
+        presence = PresenceStore("efnet", 1, 15, SECRET)
+        presence.kv = AsyncMock()
+        presence.kv.update.return_value = 9
+        data = {
+            "bot_id": "Alpha",
+            "host": "host",
+            "instance_id": "one",
+            "nick": "Alpha",
+            "user": "user",
+        }
+
+        assert await presence.update("Alpha", data, 8) == 9
+        key, value = presence.kv.update.await_args.args
+        assert key == "alpha"
+        assert presence.kv.update.await_args.kwargs == {"last": 8}
+        assert presence.valid("alpha", json.loads(value))
+
+        presence.kv.update.side_effect = KeyWrongLastSequenceError()
+        assert await presence.update("Alpha", data, 8) is None
+
+    async def test_channel_put_creates_missing_record(self) -> None:
+        """Create the first record for a channel and return it as written."""
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
-        current = channel_record(2)
-        channels.kv.get.return_value = SimpleNamespace(
-            revision=7,
-            value=json.dumps(current).encode(),
-        )
+        channels.kv.get.side_effect = KeyNotFoundError()
+        record = channel_record(1)
 
-        stored = await channels.put(
-            "#test",
-            channel_record(1),
-            expected=channel_revision(0),
-        )
+        assert await channels.put(record, expected=None) == record
+        key, value = channels.kv.create.await_args.args
+        assert key == channels.key("#test")
+        assert json.loads(value) == record
 
-        assert stored == current
-        channels.kv.update.assert_not_awaited()
-
-    async def test_channel_order_binds_record_to_key(self) -> None:
+    async def test_channel_parse_binds_record_to_key(self) -> None:
         """Reject a valid channel record stored under another channel's key."""
         channels = ChannelStore("efnet", 1, SECRET)
         record = channel_record(1)
 
-        assert channels.order(channels.key("#test"), record) is not None
-        assert channels.order(channels.key("#other"), record) is None
+        assert channels.parse(channels.key("#test"), record) is not None
+        assert channels.parse(channels.key("#other"), record) is None
 
-    async def test_channel_order_rejects_forged_and_unsigned(self) -> None:
+    async def test_channel_parse_rejects_forged_and_unsigned(self) -> None:
         """Reject channel records lacking a valid coordination-secret signature."""
         channels = ChannelStore("efnet", 1, SECRET)
         key = channels.key("#test")
         record = channel_record(1)
 
         unsigned = {k: v for k, v in record.items() if k != "signature"}
-        assert channels.order(key, unsigned) is None
+        assert channels.parse(key, unsigned) is None
 
         forged = {**record, "signature": "0" * SHA256_HEX_LENGTH}
-        assert channels.order(key, forged) is None
+        assert channels.parse(key, forged) is None
+
+        # Rejected by shape, before a non-ASCII signature can reach the digest
+        # comparison, which raises on one.
+        non_ascii = {**record, "signature": "é" * SHA256_HEX_LENGTH}
+        assert channels.parse(key, non_ascii) is None
 
         # A record signed with a different coordination secret is rejected.
         attacker_record: dict[str, object] = {
@@ -459,11 +597,44 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             "revision": f"{9:020d}-{'0' * 32}",
         }
         attacker_record["signature"] = channel_signature(
-            b"a-different-coordination-secret!",
+            OTHER_SECRET,
             "efnet",
             attacker_record,
         )
-        assert channels.order(key, attacker_record) is None
+        assert channels.parse(key, attacker_record) is None
+
+    async def test_channel_parse_rejects_malformed_records(self) -> None:
+        """Reject, without raising, records whose fields have the wrong shape."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        key = channels.key("#test")
+        # Signed with no key and present=True, so a dropped field or a 1 for
+        # True would still match the signature.
+        record = channel_record(1)
+        assert channels.parse(key, record) is not None
+
+        malformed: dict[str, object] = {
+            "not an object": ["#test"],
+            "non-string channel": {**record, "channel": ["#test", "#other"]},
+            "missing key": {k: v for k, v in record.items() if k != "key"},
+            "non-string key": {**record, "key": 5},
+            "non-boolean presence": {**record, "present": 1},
+        }
+        for label, value in malformed.items():
+            with self.subTest(label):
+                assert channels.parse(key, cast("dict[str, Any]", value)) is None
+
+    async def test_channel_parse_rejects_unusable_key(self) -> None:
+        """Reject a correctly signed record whose channel key IRC cannot use."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        record: dict[str, object] = {
+            "channel": "#test",
+            "key": "bad key",
+            "present": True,
+            "revision": f"{1:020d}-{'0' * 32}",
+        }
+        record["signature"] = channel_signature(SECRET, "efnet", record)
+
+        assert channels.parse(channels.key("#test"), record) is None
 
     async def test_channel_signature_covers_key_and_present(self) -> None:
         """Detect tampering with the key or presence flag after signing."""
@@ -477,9 +648,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
                 "revision": f"{1:020d}-{'0' * 32}",
             },
         )
-        assert channels.order(key, signed) is not None
-        assert channels.order(key, {**signed, "key": "swapped"}) is None
-        assert channels.order(key, {**signed, "present": False}) is None
+        assert channels.parse(key, signed) is not None
+        assert channels.parse(key, {**signed, "key": "swapped"}) is None
+        assert channels.parse(key, {**signed, "present": False}) is None
 
     async def test_channel_put_yields_to_concurrent_writer(self) -> None:
         """Return another bot's record when it lands between our read and write."""
@@ -493,7 +664,6 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.update.side_effect = (KeyWrongLastSequenceError(), None)
 
         stored = await channels.put(
-            "#test",
             channel_record(3),
             expected=channel_revision(1),
         )
@@ -512,7 +682,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         channels.kv.create.side_effect = KeyWrongLastSequenceError()
 
-        stored = await channels.put("#test", channel_record(2), expected=None)
+        stored = await channels.put(channel_record(2), expected=None)
 
         assert stored == racer
         channels.kv.create.assert_awaited_once()
@@ -522,8 +692,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         """Keep another bot's same-numbered record whatever the random suffix."""
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
-        theirs = {**channel_record(2), "revision": f"{2:020d}-{'0' * 32}"}
-        theirs["signature"] = channel_signature(SECRET, "efnet", theirs)
+        theirs = channel_record(2)
         channels.kv.get.return_value = SimpleNamespace(
             revision=7,
             value=json.dumps(theirs).encode(),
@@ -533,7 +702,6 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         ours = {**channel_record(2), "revision": f"{2:020d}-{'f' * 32}"}
 
         stored = await channels.put(
-            "#test",
             ours,
             expected=channel_revision(1),
         )
@@ -549,7 +717,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.create.side_effect = KeyWrongLastSequenceError()
 
         with self.assertRaisesRegex(NatsError, "update races"):
-            await channels.put("#test", channel_record(1), expected=None)
+            await channels.put(channel_record(1), expected=None)
 
         assert channels.kv.create.await_count == CAS_ATTEMPT_LIMIT
 
@@ -565,40 +733,73 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(NatsError, "update races"):
             await channels.put(
-                "#test",
                 channel_record(2),
                 expected=channel_revision(1),
             )
 
         assert channels.kv.update.await_count == CAS_ATTEMPT_LIMIT
 
-    async def test_session_revocation_wins_equal_expiry(self) -> None:
-        """Prevent a delayed active session from replacing its revocation."""
+    async def test_session_revocation_wins_equal_expiry_and_version(self) -> None:
+        """Order a revocation over an active session that ties on everything else."""
         sessions = SessionStore("efnet", 1, SECRET, 60)
         sessions.kv = AsyncMock()
         expires_at = time.time() + 40
         revocation = session_record(expires_at, 1, revoked=True)
+        active = session_record(expires_at, 1, revoked=False)
         sessions.kv.get.return_value = SimpleNamespace(
             revision=7,
             value=json.dumps(revocation).encode(),
         )
 
-        stored = await sessions.put(
-            "owner!user@host",
-            session_record(expires_at, 0, revoked=False),
-        )
-
-        assert stored == revocation
+        assert await sessions.put(active) == revocation
         sessions.kv.update.assert_not_awaited()
-        active = session_record(expires_at, 0, revoked=False)
+
         sessions.kv.get.return_value = SimpleNamespace(
             revision=8,
             value=json.dumps(active).encode(),
         )
 
-        assert await sessions.put("owner!user@host", revocation) == revocation
+        assert await sessions.put(revocation) == revocation
 
         sessions.kv.update.assert_awaited_once()
+
+    async def test_session_put_rejects_future_dated_record(self) -> None:
+        """Refuse a signed record expiring beyond one TTL plus grace from now."""
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+        kv = FakeKV()
+        sessions.kv = cast("KeyValue", kv)
+        future = session_record(time.time() + 60 + SESSION_EXPIRY_GRACE + 60)
+
+        with self.assertRaisesRegex(ValueError, "session record is invalid"):
+            await sessions.put(future)
+
+        assert kv.entries == {}
+        current = session_record(time.time() + 60)
+        assert await sessions.put(current) == current
+
+    async def test_session_parse_binds_record_to_key_and_horizon(self) -> None:
+        """Reject a signed session under another identity's key or past the TTL."""
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+        key = sessions.key("owner!user@host")
+        current = session_record(time.time() + 60)
+
+        assert sessions.parse(key, current) is not None
+        assert sessions.parse(sessions.key("other!user@host"), current) is None
+
+        future = session_record(time.time() + 60 + SESSION_EXPIRY_GRACE + 60)
+        assert sessions.parse(key, future) is None
+
+    async def test_session_parse_rejects_non_finite_expiry(self) -> None:
+        """Reject a correctly signed record whose expiry is NaN or infinite."""
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+
+        for expiry in (math.nan, math.inf, -math.inf):
+            with self.subTest(expiry=expiry):
+                record = session_record(expiry)
+                assert sessions.parse(sessions.key("owner!user@host"), record) is None
+
+        record = session_record(time.time() + 30)
+        assert sessions.parse(sessions.key("owner!user@host"), record) is not None
 
     async def test_malformed_ordering_records_are_replaced(self) -> None:
         """Prevent malformed durable values from blocking valid replacements."""
@@ -611,9 +812,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_channel = channel_record(2)
-        assert (
-            await channels.put("#test", valid_channel, expected=None) == valid_channel
-        )
+        assert await channels.put(valid_channel, expected=None) == valid_channel
         channels.kv.update.assert_awaited_once()
 
         sessions = SessionStore("efnet", 1, SECRET, 60)
@@ -625,7 +824,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_session = session_record(time.time() + 40, 0, revoked=False)
-        assert await sessions.put("owner!user@host", valid_session) == valid_session
+        assert await sessions.put(valid_session) == valid_session
         sessions.kv.update.assert_awaited_once()
 
     async def test_oversized_json_integer_is_replaced(self) -> None:
@@ -638,9 +837,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_channel = channel_record(2)
-        assert (
-            await channels.put("#test", valid_channel, expected=None) == valid_channel
-        )
+        assert await channels.put(valid_channel, expected=None) == valid_channel
         channels.kv.update.assert_awaited_once()
 
     async def test_state_keys_do_not_depend_on_irc_casemapping(self) -> None:
@@ -657,8 +854,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             "strasse!user@host",
         )
 
-    async def test_session_order_rejects_unencodable_identity(self) -> None:
-        """Reject malformed Unicode before deriving its durable session key."""
+    async def test_session_parse_rejects_unencodable_identity(self) -> None:
+        """Reject, without raising, a record whose prefix cannot be encoded."""
         sessions = SessionStore("efnet", 1, SECRET, 60)
         prefix = "owner!user@" + chr(0xD800)
         record = {
@@ -670,7 +867,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             "version": 0,
         }
 
-        assert sessions.order(prefix, record) is None
+        assert sessions.parse("opaque", record) is None
 
     async def test_reset_during_open(self) -> None:
         """Do not restore a stale bucket handle after a disconnect."""
@@ -687,7 +884,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         js = AsyncMock()
         js.create_key_value.side_effect = create_key_value
         task = asyncio.create_task(store.open(js))
-        await started.wait()
+        async with asyncio.timeout(1):
+            await started.wait()
 
         store.reset()
         release.set()

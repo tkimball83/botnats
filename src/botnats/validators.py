@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""IRC names, keys, targets, and server URL validation."""
+"""Validation of IRC names and keys, server URLs, and durable channel records."""
 
 import re
 from typing import TYPE_CHECKING
@@ -12,11 +12,15 @@ from botnats.irc.protocol import format_message
 if TYPE_CHECKING:
     from collections.abc import Collection
 
+IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+")
 MAX_CHANNEL_REVISION = (1 << 63) - 1
 CHANNEL_REVISION_RE = re.compile(r"[0-9]{20}-[0-9a-f]{32}")
 
+# A durable channel record's channel, key, presence flag, and revision.
+type ChannelFields = tuple[str, str | None, bool, str]
 
-def _has_control_chars(value: str) -> bool:
+
+def _has_space_or_nul(value: str) -> bool:
     return any(c.isspace() or c == "\x00" for c in value)
 
 
@@ -26,7 +30,7 @@ def validate_channel(value: str) -> str:
         msg = "channel must start with #, &, +, or !"
         raise ValueError(msg)
 
-    if "," in value or "\x07" in value or _has_control_chars(value):
+    if "," in value or "\x07" in value or _has_space_or_nul(value):
         msg = "channel contains unsupported characters"
         raise ValueError(msg)
 
@@ -39,7 +43,7 @@ def validate_key(value: str) -> str:
         msg = "channel key must not be empty"
         raise ValueError(msg)
 
-    if value.startswith(":") or "," in value or _has_control_chars(value):
+    if value.startswith(":") or "," in value or _has_space_or_nul(value):
         msg = "channel key contains unsupported characters"
         raise ValueError(msg)
 
@@ -47,7 +51,7 @@ def validate_key(value: str) -> str:
 
 
 def validate_join(channel: str, key: str | None) -> tuple[str, str | None]:
-    """Validate a channel JOIN and return its normalized parameters."""
+    """Validate a channel JOIN that fits one IRC line; return channel and key."""
     channel = validate_channel(channel)
     key = validate_key(key) if key is not None else None
     format_message("JOIN", (channel, key) if key is not None else (channel,), None)
@@ -67,7 +71,7 @@ def validate_channel_revision(value: object) -> str:
     return value
 
 
-def parse_channel_record(value: object) -> tuple[str, str | None, bool, str]:
+def parse_channel_record(value: object) -> ChannelFields:
     """Validate and extract a durable channel record."""
     if not isinstance(value, dict):
         msg = "channel record must be an object"
@@ -135,7 +139,7 @@ def validate_target(value: str) -> str:
         msg = "target must not be empty"
         raise ValueError(msg)
 
-    if value.startswith(":") or _has_control_chars(value):
+    if value.startswith(":") or _has_space_or_nul(value):
         msg = "target contains unsupported characters"
         raise ValueError(msg)
 

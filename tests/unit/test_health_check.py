@@ -6,6 +6,7 @@
 import asyncio
 import socket
 import unittest
+from unittest.mock import create_autospec, patch
 
 from botnats.health_check import HealthCheck
 
@@ -34,14 +35,53 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
             await health_check.close()
 
     async def test_close_is_idempotent(self) -> None:
-        """Verify repeated shutdown releases the listening server."""
+        """Verify repeated shutdown stops and releases the listening server."""
         health_check = HealthCheck(ready=lambda: True, port=0)
         await health_check.start()
+        server = health_check.server
+        assert server is not None
+        self.addAsyncCleanup(server.wait_closed)
+        self.addCleanup(server.close)
+        assert server.is_serving()
 
         await health_check.close()
         await health_check.close()
 
         assert health_check.server is None
+        assert not server.is_serving()
+
+    async def test_request_timeout_closes_connection(self) -> None:
+        """Close a connection that sends no request line within the timeout."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        real_timeout = asyncio.timeout
+        delays: list[float | None] = []
+
+        def short_timeout(delay: float | None) -> asyncio.Timeout:
+            delays.append(delay)
+            return real_timeout(0)
+
+        async with real_timeout(5):
+            with patch("botnats.health_check.asyncio.timeout", short_timeout):
+                await health_check.handle(asyncio.StreamReader(), writer)
+
+        assert delays == [5.0]
+        writer.write.assert_not_called()
+        writer.close.assert_called_once_with()
+
+    async def test_overlong_request_line_closes_connection(self) -> None:
+        """Close a connection whose request line overflows the reader limit."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        reader = asyncio.StreamReader(limit=64)
+        reader.feed_data(b"GET /" + b"x" * 128 + b" HTTP/1.0\r\n\r\n")
+        reader.feed_eof()
+
+        async with asyncio.timeout(5):
+            await health_check.handle(reader, writer)
+
+        writer.write.assert_not_called()
+        writer.close.assert_called_once_with()
 
     async def test_liveness_ignores_dependencies(self) -> None:
         """Verify dependency loss does not fail the liveness endpoint."""

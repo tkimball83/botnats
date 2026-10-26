@@ -8,7 +8,7 @@ PYTHON ?= python3.14
 all: test
 
 clean:
-	$(RM) -r .mypy_cache .pytest_cache .ruff_cache build dist \
+	$(RM) -r .mypy_cache .ruff_cache build dist \
 		src/*.egg-info venv
 	find src tests -type d -name __pycache__ -prune -exec $(RM) -r {} +
 
@@ -16,10 +16,10 @@ install: venv
 	venv/bin/pip install -e '.[dev]'
 
 hooks: install
-	venv/bin/pip install pre-commit==4.6.1
 	venv/bin/pre-commit install
 
 unit: install
+	venv/bin/blank-line-after-blocks src tests
 	venv/bin/ruff check src tests
 	venv/bin/ruff format --check src tests
 	venv/bin/mypy src tests

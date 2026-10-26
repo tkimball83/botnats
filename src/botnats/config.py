@@ -3,6 +3,7 @@
 
 """Immutable application configuration."""
 
+import base64
 import json
 import math
 import os
@@ -13,14 +14,14 @@ from typing import TYPE_CHECKING, Any
 
 from botnats.irc.client import IRCServer
 from botnats.irc.protocol import format_message, mode_requires_argument
-from botnats.validators import validate_server_url
+from botnats.validators import IDENTIFIER_RE, validate_server_url
 
 if TYPE_CHECKING:
     from collections.abc import Collection
 
-IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+")
 MODE_STRING_RE = re.compile(r"(?:[+-][A-Za-z]+)+")
 MIN_COORDINATION_KEY_BYTES = 32
+MIN_TOTP_SECRET_BYTES = 20
 NATS_SCHEMES = frozenset({"nats", "tls"})
 NICKNAME_RE = re.compile(r"[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]*")
 
@@ -33,6 +34,8 @@ class BotConfig:
     bot_id: str
     channel_modes: str
     coordination_secret: str = field(repr=False)
+    # The channel modes to keep set and to keep unset.
+    enforced_modes: tuple[frozenset[str], frozenset[str]]
     health_port: int
     irc_connect_timeout: float
     irc_servers: tuple[IRCServer, ...]
@@ -45,7 +48,7 @@ class BotConfig:
     network: str
     nickname: str
     presence_ttl: float
-    totp_secret: str = field(repr=False)
+    totp_secret: bytes = field(repr=False)
 
     @classmethod
     def load(cls, path: str | Path) -> BotConfig:
@@ -82,13 +85,12 @@ class BotConfig:
         )
         unsupported(raw, "root")
 
-        bot_id = identifier(bot, "id", "bot")
-        network = identifier(bot, "network", "bot")
-        nickname = nick(bot, "nickname", "bot")
+        bot_id = identifier(bot, "id")
+        network = identifier(bot, "network")
         servers = irc_servers(irc)
         nats_servers = nats_urls(nats_section)
         totp_secret, nats_token, coordination_secret = load_secrets()
-        channel_modes = mode_string(irc, "channel_modes", "irc", "")
+        channel_modes = mode_string(irc)
         maintenance_interval = positive_float(
             coordination,
             "maintenance_interval_seconds",
@@ -120,6 +122,7 @@ class BotConfig:
             bot_id=bot_id,
             channel_modes=channel_modes,
             coordination_secret=coordination_secret,
+            enforced_modes=mode_intent(channel_modes),
             health_port=port(bot, "health_port", "bot", 8080),
             irc_connect_timeout=positive_float(
                 irc,
@@ -128,34 +131,34 @@ class BotConfig:
                 30,
             ),
             irc_servers=servers,
-            irc_verify_tls=boolean(irc, "verify_tls", "irc", default=True),
+            irc_verify_tls=verify_tls(irc),
             jetstream_replicas=replica_count(nats_section),
             maintenance_interval=maintenance_interval,
             nats_monitor_port=port(nats_section, "monitor_port", "nats", 8222),
             nats_servers=nats_servers,
             nats_token=nats_token,
             network=network,
-            nickname=nickname,
+            nickname=nickname(bot),
             presence_ttl=presence_ttl,
             totp_secret=totp_secret,
         )
 
 
-def boolean(section: dict[str, Any], key: str, label: str, *, default: bool) -> bool:
-    """Extract a boolean value from a config section."""
-    value = section.get(key, default)
-    if not isinstance(value, bool):
-        msg = f"{label}.{key} must be a boolean"
-        raise TypeError(msg)
+def bot_text(section: dict[str, Any], key: str) -> str:
+    """Extract a required non-empty string from the bot section."""
+    value = section.get(key)
+    if not isinstance(value, str) or not value:
+        msg = f"bot.{key} must be a non-empty string"
+        raise ValueError(msg)
 
     return value
 
 
-def identifier(section: dict[str, Any], key: str, label: str) -> str:
-    """Extract and validate an identifier from a config section."""
-    value = text(section, key, label)
+def identifier(section: dict[str, Any], key: str) -> str:
+    """Extract and validate an identifier from the bot section."""
+    value = bot_text(section, key)
     if not IDENTIFIER_RE.fullmatch(value):
-        msg = f"{label}.{key} contains unsupported characters"
+        msg = f"bot.{key} contains unsupported characters"
         raise ValueError(msg)
 
     return value
@@ -163,9 +166,7 @@ def identifier(section: dict[str, Any], key: str, label: str) -> str:
 
 def irc_servers(section: dict[str, Any]) -> tuple[IRCServer, ...]:
     """Parse and validate the IRC server list from a config section."""
-    servers = tuple(
-        IRCServer.parse(value) for value in text_list(section, "servers", "irc")
-    )
+    servers = tuple(IRCServer.parse(value) for value in server_list(section, "irc"))
     if not servers:
         msg = "irc.servers must not be empty"
         raise ValueError(msg)
@@ -173,15 +174,11 @@ def irc_servers(section: dict[str, Any]) -> tuple[IRCServer, ...]:
     return servers
 
 
-def load_secrets() -> tuple[str, str, str]:
+def load_secrets() -> tuple[bytes, str, str]:
     """Load and validate required secrets from environment variables."""
-    totp_secret = os.environ.get("BOTNATS_TOTP_SECRET", "")
+    totp_secret = totp_key(os.environ.get("BOTNATS_TOTP_SECRET", ""))
     nats_token = os.environ.get("BOTNATS_NATS_TOKEN", "")
     coordination_secret = os.environ.get("BOTNATS_COORDINATION_SECRET", "")
-    if not totp_secret:
-        msg = "BOTNATS_TOTP_SECRET is required"
-        raise ValueError(msg)
-
     if not nats_token:
         msg = "BOTNATS_NATS_TOKEN is required"
         raise ValueError(msg)
@@ -193,23 +190,18 @@ def load_secrets() -> tuple[str, str, str]:
     return totp_secret, nats_token, coordination_secret
 
 
-def mode_string(
-    section: dict[str, Any],
-    key: str,
-    label: str,
-    default: str,
-) -> str:
-    """Extract and validate a channel mode string from a config section."""
-    value = section.get(key, default)
+def mode_string(section: dict[str, Any]) -> str:
+    """Extract and validate the enforced channel modes from the irc section."""
+    value = section.get("channel_modes", "")
     if not isinstance(value, str):
-        msg = f"{label}.{key} must be a string"
+        msg = "irc.channel_modes must be a string"
         raise TypeError(msg)
 
     required, forbidden = mode_intent(value)
     if any(mode_requires_argument(mode, adding=True) for mode in required) or any(
         mode_requires_argument(mode, adding=False) for mode in forbidden
     ):
-        msg = f"{label}.{key} contains a mode that requires an argument"
+        msg = "irc.channel_modes contains a mode that requires an argument"
         raise ValueError(msg)
 
     if value:
@@ -236,7 +228,7 @@ def mode_intent(value: str) -> tuple[frozenset[str], frozenset[str]]:
             (required if adding else forbidden).add(character)
 
     if required & forbidden:
-        msg = "channel_modes cannot require and forbid the same mode"
+        msg = "irc.channel_modes cannot require and forbid the same mode"
         raise ValueError(msg)
 
     return frozenset(required), frozenset(forbidden)
@@ -244,7 +236,7 @@ def mode_intent(value: str) -> tuple[frozenset[str], frozenset[str]]:
 
 def nats_urls(section: dict[str, Any]) -> tuple[str, ...]:
     """Parse and validate the NATS server list from a config section."""
-    servers = text_list(section, "servers", "nats")
+    servers = server_list(section, "nats")
     if not servers:
         msg = "nats.servers must not be empty"
         raise ValueError(msg)
@@ -255,13 +247,15 @@ def nats_urls(section: dict[str, Any]) -> tuple[str, ...]:
     return servers
 
 
-def nick(section: dict[str, Any], key: str, label: str) -> str:
-    """Extract and validate an IRC nickname from a config section."""
-    value = text(section, key, label)
+def nickname(section: dict[str, Any]) -> str:
+    """Extract and validate the IRC nickname from the bot section."""
+    value = bot_text(section, "nickname")
     if not NICKNAME_RE.fullmatch(value):
-        msg = f"{label}.{key} is not a valid IRC nickname"
+        msg = "bot.nickname is not a valid IRC nickname"
         raise ValueError(msg)
 
+    # The nickname also fills the USER line, which must fit in 512 bytes.
+    format_message("USER", (value, "0", "*"), value)
     return value
 
 
@@ -308,6 +302,18 @@ def replica_count(section: dict[str, Any]) -> int:
     return value
 
 
+def server_list(section: dict[str, Any], label: str) -> tuple[str, ...]:
+    """Extract a section's servers: a required list of non-empty strings."""
+    value = section.get("servers")
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        msg = f"{label}.servers must be a list of non-empty strings"
+        raise ValueError(msg)
+
+    return tuple(value)
+
+
 def table(raw: dict[str, Any], key: str, *allowed: str) -> dict[str, Any]:
     """Extract a configuration section and reject unsupported fields.
 
@@ -323,26 +329,25 @@ def table(raw: dict[str, Any], key: str, *allowed: str) -> dict[str, Any]:
     return value
 
 
-def text(section: dict[str, Any], key: str, label: str) -> str:
-    """Extract a required non-empty string from a config section."""
-    value = section.get(key)
-    if not isinstance(value, str) or not value:
-        msg = f"{label}.{key} must be a non-empty string"
+def totp_key(value: str) -> bytes:
+    """Decode the base32 TOTP secret and require at least 160 bits."""
+    if not value:
+        msg = "BOTNATS_TOTP_SECRET is required"
         raise ValueError(msg)
 
-    return value
+    normalized = "".join(value.split()).upper()
+    padding = "=" * (-len(normalized) % 8)
+    try:
+        decoded = base64.b32decode(normalized + padding)
+    except ValueError as error:
+        msg = "BOTNATS_TOTP_SECRET must be valid base32"
+        raise ValueError(msg) from error
 
-
-def text_list(section: dict[str, Any], key: str, label: str) -> tuple[str, ...]:
-    """Extract a required list of non-empty strings from a config section."""
-    value = section.get(key)
-    if not isinstance(value, list) or any(
-        not isinstance(item, str) or not item for item in value
-    ):
-        msg = f"{label}.{key} must be a list of non-empty strings"
+    if len(decoded) < MIN_TOTP_SECRET_BYTES:
+        msg = "BOTNATS_TOTP_SECRET must contain at least 160 bits"
         raise ValueError(msg)
 
-    return tuple(value)
+    return decoded
 
 
 def unsupported(fields: Collection[str], label: str) -> None:
@@ -351,3 +356,13 @@ def unsupported(fields: Collection[str], label: str) -> None:
         names = ", ".join(sorted(fields))
         msg = f"unsupported {label} configuration key(s): {names}"
         raise ValueError(msg)
+
+
+def verify_tls(section: dict[str, Any]) -> bool:
+    """Extract irc.verify_tls, which defaults to verifying certificates."""
+    value = section.get("verify_tls", True)
+    if not isinstance(value, bool):
+        msg = "irc.verify_tls must be a boolean"
+        raise TypeError(msg)
+
+    return value

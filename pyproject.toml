@@ -16,6 +16,7 @@ dependencies = [
 dev = [
   "blank-line-after-blocks==0.1.4",
   "mypy==2.3.1",
+  "pre-commit==4.6.1",
   "ruff==0.16.9",
 ]
 
@@ -29,9 +30,6 @@ where = ["src"]
 disallow_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
-
-[tool.ruff]
-target-version = "py314"
 
 [tool.ruff.lint]
 ignore = ["COM812", "D107", "PLR2004", "PT027"]

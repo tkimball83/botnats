@@ -7,6 +7,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from nats.errors import Error as NatsError
+
 from botnats.nats.claim import PresenceClaim, PresenceState
 from botnats.nats.store import PresenceStore
 from tests.unit.helpers import COORDINATION_KEY
@@ -45,7 +47,6 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 "create",
                 AsyncMock(side_effect=(None, 1)),
             ) as create,
-            patch.object(claim.store, "update", AsyncMock(return_value=2)) as update,
             patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
         ):
             with self.assertRaisesRegex(RuntimeError, "duplicate bot ID"):
@@ -55,7 +56,6 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
         assert not claim.duplicate
         assert create.await_count == 2
-        update.assert_not_awaited()
 
     async def test_reclaim_claims_occupied_key(self) -> None:
         """Claim an occupied key via a single reclaim on the heartbeat path."""
@@ -149,8 +149,55 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         ):
             await claim.put(PRESENCE)
 
-        assert not claim.owned
         assert claim.duplicate
+
+    async def test_heartbeat_refreshes_owned_revision(self) -> None:
+        """Refresh an owned key in place under its last revision."""
+        claim = build_claim()
+        claim.adopt(1)
+        refreshed_revision = 2
+
+        with (
+            patch.object(
+                claim.store,
+                "update",
+                AsyncMock(return_value=refreshed_revision),
+            ) as update,
+            patch.object(claim.store, "create", AsyncMock()) as create,
+        ):
+            await claim.put(PRESENCE)
+
+        update.assert_awaited_once_with("alpha", PRESENCE, 1)
+        create.assert_not_awaited()
+        assert claim.owned
+        assert claim.revision == refreshed_revision
+
+    async def test_deleted_key_drops_ownership_before_reclaim(self) -> None:
+        """Stop owning a deleted key even when reclaiming it fails."""
+        claim = build_claim()
+        claim.adopt(1)
+
+        with (
+            patch.object(
+                claim.store, "create", AsyncMock(side_effect=NatsError("down"))
+            ),
+            self.assertRaises(NatsError),
+        ):
+            await claim.expired()
+
+        assert not claim.owned
+        assert claim.revision is None
+
+    def test_observe_own_record_adopts_newest_revision(self) -> None:
+        """Adopt this instance's own watched record, never moving backwards."""
+        claim = build_claim()
+
+        assert not claim.observe(INSTANCE_ID, 6)
+        assert claim.owned
+        assert claim.revision == 6
+
+        assert not claim.observe(INSTANCE_ID, 5)
+        assert claim.revision == 6
 
     async def test_expired_owner_reclaims_id(self) -> None:
         """Reclaim an expired owned key without reporting a duplicate."""
@@ -169,5 +216,4 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             await claim.put(PRESENCE)
 
         assert claim.owned
-        assert not claim.duplicate
         assert claim.revision == reclaimed_revision

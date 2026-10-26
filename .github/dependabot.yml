@@ -16,6 +16,20 @@ updates:
     commit-message:
       prefix: chore
       include: scope
+    # The python-version skill moves the image's Python with the project's.
+    ignore:
+      - dependency-name: python
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+
+  - package-ecosystem: docker-compose
+    directory: /tests/integration
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
+      include: scope
 
   - package-ecosystem: pip
     directory: /

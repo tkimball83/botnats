@@ -1,34 +1,64 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Verify a restarted bot rebuilds ephemeral state from its peers."""
+"""Verify a restarted bot rebuilds its channels, keys, and ops from the mesh."""
 
-import asyncio
 import os
 
 from tests.integration.test_mesh import (
     BOTS,
     CHANNELS,
-    COMMAND_TIMEOUT,
+    authenticate,
+    command,
     connect,
+    fresh_code,
+    join_as_operator,
+    modes,
+    poll_until,
     wait_for_bots,
     wait_for_names,
     wait_for_operators,
 )
 
 
-async def run(restarted: str) -> None:
-    """Check desired channels and keys after a bot restart."""
-    restarted_bot = frozenset({restarted})
+async def change_key(new_key: str) -> None:
+    """Change the keyed channel's key while a bot is down.
+
+    The running bots must record the new key in JetStream, where the missing
+    bot finds it once it is back.
+    """
+    channel, old_key = CHANNELS[1]
+    session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
+    try:
+        await authenticate(session, "alpha", fresh_code())
+        await join_as_operator(session, channel, old_key)
+        await session.send("MODE", channel, "-k", old_key)
+        await session.send("MODE", channel, "+k", new_key)
+
+        async def recorded() -> bool:
+            reply = await command(session, "beta", f"GETMODES {channel}")
+            return new_key in reply.split()
+
+        await poll_until(recorded, interval=2.0)
+    finally:
+        await session.close()
+
+
+async def run(key: str = CHANNELS[1][1]) -> None:
+    """Check the bots hold the keyed channel with ops and stay out of the parted one."""
+    first, _ = CHANNELS[0]
+    second, _ = CHANNELS[1]
     session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
     try:
         await wait_for_bots(session)
-        first, _ = CHANNELS[0]
-        second, second_key = CHANNELS[1]
-
-        await wait_for_names(session, first, absent=restarted_bot)
-        await session.send("JOIN", second, second_key)
-        await wait_for_names(session, second, present=BOTS)
+        # Joining with the key proves the channel still has it; a restarted
+        # bot back inside that keyed channel proves it knew the key too.
+        await session.send("JOIN", second, key)
+        await wait_for_names(session, second, present=BOTS | {"owner"})
+        mode_string = await modes(session, second)
+        assert "k" in mode_string, mode_string
         await wait_for_operators(session, second, present=BOTS)
+        # Checked once every bot is back, so a late rejoin is caught too.
+        await wait_for_names(session, first, absent=BOTS)
     finally:
-        await asyncio.wait_for(session.close(), timeout=COMMAND_TIMEOUT)
+        await session.close()

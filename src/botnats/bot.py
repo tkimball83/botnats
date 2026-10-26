@@ -25,7 +25,11 @@ from botnats.nats.envelope import Envelope
 from botnats.presence import BotPresence, PresenceRegistry, SelfIdentity
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from botnats.config import BotConfig
+    from botnats.nats.store import Session
+    from botnats.validators import ChannelFields
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,14 +55,14 @@ class Bot:
             scope=(config.bot_id, config.network),
             session_ttl=config.auth_session_ttl,
         )
-        self.instance_id = uuid.uuid4().hex
+        instance_id = uuid.uuid4().hex
         self.presence = PresenceRegistry(config.presence_ttl)
         self.tasks = Tasks()
         self.callbacks = NATSCallbackHandler(self)
-        self._coordinator: CoordinatorProtocol = coordinator or Coordinator(
+        self.coordinator: CoordinatorProtocol = coordinator or Coordinator(
             callbacks=self.callbacks,
             config=NATSConfig(
-                instance_id=self.instance_id,
+                instance_id=instance_id,
                 monitor_port=config.nats_monitor_port,
                 network=config.network,
                 presence_ttl=config.presence_ttl,
@@ -75,7 +79,8 @@ class Bot:
         self.auth_flow = AuthFlow(self)
         self.health_check = HealthCheck(ready=self.ready, port=config.health_port)
         self.events = IRCEventHandler(self)
-        self._irc: IRCProtocol = irc or IRCClient(
+        self.irc: IRCProtocol = irc or IRCClient(
+            caps=self.caps,
             config=IRCClientConfig(
                 connect_timeout=config.irc_connect_timeout,
                 nickname=config.nickname,
@@ -88,20 +93,9 @@ class Bot:
         self.identity = SelfIdentity(
             bot_id=config.bot_id,
             coordinator=self.coordinator,
-            instance_id=self.instance_id,
+            instance_id=instance_id,
             irc=self.irc,
-            registry=self.presence,
         )
-
-    @property
-    def coordinator(self) -> CoordinatorProtocol:
-        """Return the NATS coordinator; fixed at construction for every owner."""
-        return self._coordinator
-
-    @property
-    def irc(self) -> IRCProtocol:
-        """Return the IRC client; fixed at construction for every owner."""
-        return self._irc
 
     async def close(self) -> None:
         """Cancel background tasks and shut down all connections."""
@@ -119,35 +113,35 @@ class Bot:
             await self.health_check.close()
             await self.irc.close()
 
-    async def maintenance_loop(self) -> None:
-        """Run the maintenance tick on a recurring interval."""
+    async def maintenance_loop(
+        self,
+        tick: Callable[[], Awaitable[None]],
+        label: str,
+    ) -> None:
+        """Run a tick on the maintenance interval, surviving its failures."""
         while True:
             await asyncio.sleep(self.config.maintenance_interval)
             try:
-                await self.maintenance_tick()
+                await tick()
             except Exception:
-                LOGGER.exception("maintenance tick failed")
+                LOGGER.exception("%s failed", label)
 
     async def maintenance_tick(self) -> None:
-        """Execute one round of presence, nick, and channel upkeep."""
+        """Execute one round of session, channel, and op upkeep.
+
+        The presence heartbeat runs in its own loop: a slow durable retry
+        here must not delay it past the presence TTL.
+        """
         self.authorizer.prune()
         self.presence.prune()
         if self.identity.registered:
-            await self.channel_mgr.retry_pending_parts()
-            if self.identity.current is not None:
-                await self.identity.announce()
-                await self.channel_mgr.join_desired()
+            self.channel_mgr.retry_pending_parts()
+            self.channel_mgr.join_desired()
+            await self.channel_mgr.request_ops()
 
         if self.coordinator.ready:
             await self.sessions.retry()
             await self.channel_mgr.retry_pending_keys()
-
-        if not self.identity.registered:
-            return
-
-        for runtime in tuple(self.channel_mgr.channels.values()):
-            if runtime.joined and not self.channel_mgr.is_self_opped(runtime):
-                await self.channel_mgr.request_peer("op", runtime.channel)
 
     def on_irc_disconnect(self) -> None:
         """Clear connection-scoped state when the IRC connection drops."""
@@ -155,7 +149,6 @@ class Bot:
         self.sessions.invalidate_all()
         self.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
         self.caps.reset()
-        self.irc.reset_caps()
         self.channel_mgr.reset()
         self.identity.reset()
 
@@ -175,7 +168,14 @@ class Bot:
         await self.health_check.start()
         try:
             self.tasks.spawn(self.coordinator.start(), "coordinator-start")
-            self.tasks.spawn(self.maintenance_loop(), "maintenance")
+            self.tasks.spawn(
+                self.maintenance_loop(self.identity.announce, "presence heartbeat"),
+                "presence-heartbeat",
+            )
+            self.tasks.spawn(
+                self.maintenance_loop(self.maintenance_tick, "maintenance tick"),
+                "maintenance",
+            )
             await self.irc.run_forever()
         finally:
             await self.close()
@@ -187,14 +187,9 @@ class NATSCallbackHandler:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
 
-    async def on_channel(self, payload: dict[str, Any]) -> None:
-        """Apply a channel configuration record from a KV watch update."""
-        try:
-            record = ChannelRecord.from_dict(payload)
-        except TypeError, ValueError:
-            return
-
-        await self.bot.channel_mgr.apply_record(record)
+    def on_channel(self, fields: ChannelFields) -> None:
+        """Apply a validated channel configuration record from the KV watch."""
+        self.bot.channel_mgr.apply_record(ChannelRecord(*fields))
 
     def on_presence(self, presence: BotPresence) -> None:
         """Register or refresh a peer bot's presence record from KV watch."""
@@ -211,12 +206,12 @@ class NATSCallbackHandler:
     def on_session_update(
         self,
         key: str,
-        record: dict[str, Any],
+        session: Session,
         *,
         replaying: bool,
     ) -> None:
         """Apply a validated session record from the KV watch."""
-        self.bot.sessions.observe(key, record, replaying=replaying)
+        self.bot.sessions.observe(key, session, replaying=replaying)
 
     def on_sessions_replayed(self, keys: set[str]) -> None:
         """Drop sessions a completed watch replay no longer contains."""

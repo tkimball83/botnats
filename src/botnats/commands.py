@@ -6,12 +6,10 @@
 import asyncio
 import logging
 from collections import OrderedDict, deque
-from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 from botnats import error_label
 from botnats.auth import limit_identity
-from botnats.channel import ChannelRecord
 from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, format_message
 from botnats.nats.store import PUBLISH_ERRORS
 from botnats.validators import validate_channel, validate_key, validate_target
@@ -23,6 +21,9 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 MAX_RATE_BUCKETS = 8192
+# Room for the ":nick!user@host " source a server puts in front of each line
+# it relays, which counts toward the recipient's 512-byte limit.
+RELAY_SOURCE_BYTES = 128
 
 
 class CommandHandler:
@@ -51,29 +52,31 @@ class CommandHandler:
         """Record one command from a sender and return whether it is within limits."""
         return self.command_limiter.check(limit_identity(prefix))
 
-    async def reply(self, nickname: str, message: str) -> None:
+    def reply(self, nickname: str, message: str) -> None:
         """Send a private message, dropping unsendable or undeliverable lines."""
         try:
-            await self.bot.irc.send("PRIVMSG", nickname, trailing=message)
+            self.bot.irc.send("PRIVMSG", nickname, trailing=message)
         except ConnectionError:
             pass
         except ValueError as error:
             LOGGER.warning("dropped PRIVMSG to %s: %s", nickname, error_label(error))
 
-    async def reply_list(self, nickname: str, head: str, items: list[str]) -> None:
+    def reply_list(self, nickname: str, head: str, items: list[str]) -> None:
         """Reply with items after head, packed into as few lines as fit."""
         overhead = len(format_message("PRIVMSG", (nickname,), ""))
-        limit = MAX_IRC_MESSAGE_BYTES - overhead
+        limit = MAX_IRC_MESSAGE_BYTES - RELAY_SOURCE_BYTES - overhead
         current = head
         for item in items:
             candidate = f"{current} {item}"
-            if len(candidate.encode()) > limit:
-                await self.reply(nickname, current)
+            # A header alone is never sent; an item too long for any line is
+            # dropped by reply() with a warning.
+            if len(candidate.encode()) > limit and current != head:
+                self.reply(nickname, current)
                 current = f"{head} {item}"
             else:
                 current = candidate
 
-        await self.reply(nickname, current)
+        self.reply(nickname, current)
 
     async def channel_update(
         self,
@@ -93,31 +96,17 @@ class CommandHandler:
                 None,
             )
 
-        current = self.bot.channel_mgr.channel_records.get(self.bot.caps.fold(channel))
         if present and key is None:
             runtime = self.bot.channel_mgr.runtime(channel)
             if runtime is not None:
                 key = runtime.key
 
-        record = self.bot.channel_mgr.new_record(
-            channel,
-            key,
-            present=present,
-            after=current.revision if current else None,
-        )
-        stored = await self.bot.coordinator.put_channel(
-            channel,
-            asdict(record),
-            expected=self.bot.channel_mgr.durable_revision(channel),
-        )
-        authoritative = ChannelRecord.from_dict(stored)
-        await self.bot.channel_mgr.apply_record(authoritative)
-        if authoritative != record:
-            await self.reply(prefix.nick, f"Update superseded for {channel}")
+        if not await self.bot.channel_mgr.write_record(channel, key, present=present):
+            self.reply(prefix.nick, f"Update superseded for {channel}")
             return
 
         action = "Joining" if present else "Parting"
-        await self.reply(prefix.nick, f"{action} {channel}")
+        self.reply(prefix.nick, f"{action} {channel}")
 
     async def cmd_ban(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Set a ban mask on a channel."""
@@ -128,8 +117,8 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         mask = validate_target(arguments[1])
         self.opped_channel(channel)
-        await self.bot.irc.send("MODE", channel, "+b", mask)
-        await self.reply(prefix.nick, f"Banned {mask} on {channel}")
+        self.bot.irc.send("MODE", channel, "+b", mask)
+        self.reply(prefix.nick, f"Banned {mask} on {channel}")
 
     async def cmd_getbans(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """List all tracked ban masks for a channel."""
@@ -140,12 +129,13 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is None:
-            await self.reply(prefix.nick, f"No record for {channel}")
+            self.reply(prefix.nick, f"No record for {channel}")
         elif runtime.bans:
-            for mask in sorted(runtime.bans.values()):
-                await self.reply(prefix.nick, f"{channel} +b {mask}")
+            # Packed like the other lists: one line per ban could fill the
+            # outbound queue and crowd out the bot's own commands.
+            self.reply_list(prefix.nick, f"{channel} +b", sorted(runtime.bans.values()))
         else:
-            await self.reply(prefix.nick, f"No bans tracked for {channel}")
+            self.reply(prefix.nick, f"No bans tracked for {channel}")
 
     async def cmd_getmodes(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Display the tracked channel modes."""
@@ -156,16 +146,16 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is None:
-            await self.reply(prefix.nick, f"No record for {channel}")
+            self.reply(prefix.nick, f"No record for {channel}")
         elif runtime.modes:
             limit = str(runtime.limit) if runtime.limit is not None else None
             values = {"k": runtime.key, "l": limit}
             # Mode arguments follow their letters' order, as in a MODE line.
             parts = [channel, runtime.modes]
             parts.extend(value for mode in runtime.modes if (value := values.get(mode)))
-            await self.reply(prefix.nick, " ".join(parts))
+            self.reply(prefix.nick, " ".join(parts))
         else:
-            await self.reply(
+            self.reply(
                 prefix.nick,
                 f"No modes tracked for {channel}",
             )
@@ -179,7 +169,7 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is None:
-            await self.reply(prefix.nick, f"No record for {channel}")
+            self.reply(prefix.nick, f"No record for {channel}")
         elif runtime.members:
             nicks = sorted(
                 (
@@ -188,9 +178,9 @@ class CommandHandler:
                 ),
                 key=lambda n: n.lstrip("@").casefold(),
             )
-            await self.reply_list(prefix.nick, channel, nicks)
+            self.reply_list(prefix.nick, channel, nicks)
         else:
-            await self.reply(
+            self.reply(
                 prefix.nick,
                 f"No users tracked for {channel}",
             )
@@ -203,7 +193,7 @@ class CommandHandler:
 
         channel_mgr = self.bot.channel_mgr
         if not channel_mgr.channels:
-            await self.reply(prefix.nick, "No channels tracked")
+            self.reply(prefix.nick, "No channels tracked")
             return
 
         channels: list[str] = []
@@ -218,7 +208,7 @@ class CommandHandler:
             else:
                 channels.append(runtime.channel)
 
-        await self.reply_list(prefix.nick, "Channels", channels)
+        self.reply_list(prefix.nick, "Channels", channels)
 
     async def cmd_deop(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Remove operator status from a user on a channel."""
@@ -231,7 +221,7 @@ class CommandHandler:
         runtime = self.opped_channel(channel)
         member = runtime.members.get(self.bot.caps.fold(target))
         if member is None or not self.bot.caps.is_opped(member.modes):
-            await self.reply(
+            self.reply(
                 prefix.nick,
                 f"{target} is not opped on {channel}",
             )
@@ -242,9 +232,9 @@ class CommandHandler:
             index for index, mode in enumerate(operator_modes) if mode in member.modes
         )
         for mode in operator_modes[highest:]:
-            await self.bot.irc.send("MODE", channel, f"-{mode}", member.nick)
+            self.bot.irc.send("MODE", channel, f"-{mode}", member.nick)
 
-        await self.reply(
+        self.reply(
             prefix.nick,
             f"Deopped {member.nick} on {channel}",
         )
@@ -258,8 +248,8 @@ class CommandHandler:
         channel = validate_channel(arguments[0])
         target = validate_target(arguments[1])
         self.opped_channel(channel)
-        await self.bot.irc.send("INVITE", target, channel)
-        await self.reply(prefix.nick, f"Invited {target} to {channel}")
+        self.bot.irc.send("INVITE", target, channel)
+        self.reply(prefix.nick, f"Invited {target} to {channel}")
 
     async def cmd_join(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Add a channel to the desired set and begin joining it."""
@@ -282,12 +272,12 @@ class CommandHandler:
         runtime = self.opped_channel(channel)
         member = runtime.members.get(self.bot.caps.fold(target))
         if member is None:
-            await self.reply(prefix.nick, f"{target} not found on {channel}")
+            self.reply(prefix.nick, f"{target} not found on {channel}")
             return
 
         reason = " ".join(arguments[2:]) or None
-        await self.bot.irc.send("KICK", channel, member.nick, trailing=reason)
-        await self.reply(prefix.nick, f"Kicked {member.nick} from {channel}")
+        self.bot.irc.send("KICK", channel, member.nick, trailing=reason)
+        self.reply(prefix.nick, f"Kicked {member.nick} from {channel}")
 
     async def cmd_op(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Grant operator status to a user on a channel."""
@@ -300,26 +290,26 @@ class CommandHandler:
         runtime = self.opped_channel(channel)
         member = runtime.members.get(self.bot.caps.fold(target))
         if member is None or member.prefix is None or not member.prefix.complete:
-            await self.reply(
+            self.reply(
                 prefix.nick,
                 f"{target} not found on {channel}",
             )
             return
 
         if self.bot.caps.is_opped(member.modes):
-            await self.reply(
+            self.reply(
                 prefix.nick,
                 f"{member.nick} is already opped on {channel}",
             )
             return
 
-        await self.bot.irc.send(
+        self.bot.irc.send(
             "MODE",
             channel,
             f"+{self.bot.caps.op_mode}",
             member.nick,
         )
-        await self.reply(
+        self.reply(
             prefix.nick,
             f"Opped {member.nick} on {channel}",
         )
@@ -342,17 +332,14 @@ class CommandHandler:
         joined = sum(
             runtime.joined for runtime in self.bot.channel_mgr.channels.values()
         )
-        own_id = self.bot.config.bot_id.casefold()
-        peers = sum(
-            peer.bot_id.casefold() != own_id for peer in self.bot.presence.active()
-        )
-        await self.reply(
+        peers = len(self.bot.presence.peers(self.bot.config.bot_id))
+        self.reply(
             prefix.nick,
             f"bot id={self.bot.config.bot_id} nick={self.bot.irc.current_nick} "
             f"peers={peers} channels={joined}",
         )
         status = await self.bot.coordinator.status()
-        await self.reply(prefix.nick, status.render())
+        self.reply(prefix.nick, status.render())
 
     async def cmd_unban(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Remove a ban mask from a channel."""
@@ -365,14 +352,14 @@ class CommandHandler:
         runtime = self.opped_channel(channel)
         stored = runtime.bans.get(self.bot.caps.fold(mask))
         if stored is None:
-            await self.reply(
+            self.reply(
                 prefix.nick,
                 f"No matching ban for {mask} on {channel}",
             )
             return
 
-        await self.bot.irc.send("MODE", channel, "-b", stored)
-        await self.reply(prefix.nick, f"Unbanned {stored} on {channel}")
+        self.bot.irc.send("MODE", channel, "-b", stored)
+        self.reply(prefix.nick, f"Unbanned {stored} on {channel}")
 
     async def dispatch(self, prefix: Prefix, text: str) -> None:
         """Route an incoming private message to the appropriate command handler."""
@@ -383,10 +370,7 @@ class CommandHandler:
             # that would confirm a bot is listening.
             rendered = prefix.render()
             if self.bot.authorizer.authorized(rendered):
-                await self.reply(
-                    prefix.nick,
-                    str(error) or "Command failed",
-                )
+                self.reply(prefix.nick, str(error))
 
             return
 
@@ -400,13 +384,13 @@ class CommandHandler:
 
         handler = self.handlers.get(name)
         if handler is None:
-            await self.reply(prefix.nick, "Unknown command")
+            self.reply(prefix.nick, "Unknown command")
             return
 
         try:
             await handler(prefix, arguments)
         except (*PUBLISH_ERRORS, ValueError) as error:
-            await self.reply(prefix.nick, str(error) or "Command failed")
+            self.reply(prefix.nick, str(error) or "Command failed")
 
     def opped_channel(self, channel: str) -> ChannelRuntime:
         """Return a tracked channel where this bot has operator status."""

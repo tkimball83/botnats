@@ -6,24 +6,34 @@
 import json
 import time
 import unittest
+from unittest.mock import patch
 
 from botnats.nats.envelope import Envelope
 from tests.unit.helpers import COORDINATION_KEY
 
-JSON_NESTING_DEPTH = 100_000
 OVERSIZED_TIMESTAMP = 10**400
 SUBJECT = "botnats.v1.efnet.channel"
 
 
 class EnvelopeTests(unittest.TestCase):
-    """Tests for envelope decoding safety."""
+    """Tests for envelope signing, replay protection, and decoding safety."""
 
     def test_decode_rejects_deeply_nested_json(self) -> None:
         """Verify deeply nested JSON is rejected as a value error, not a crash."""
         envelope = Envelope("alpha", COORDINATION_KEY)
 
-        with self.assertRaises(ValueError):
-            envelope.decode(SUBJECT, b"[" * JSON_NESTING_DEPTH)
+        # The parser overflows only past the native stack, a depth that varies
+        # by platform, so raise its RecursionError directly.
+        with (
+            patch(
+                "botnats.nats.envelope.json.loads",
+                side_effect=RecursionError("maximum recursion depth exceeded"),
+            ) as loads,
+            self.assertRaisesRegex(ValueError, "too deeply nested"),
+        ):
+            envelope.decode(SUBJECT, b"[[]]")
+
+        loads.assert_called_once_with(b"[[]]")
 
     def test_decode_rejects_large_payload(self) -> None:
         """Verify oversized envelopes are rejected before JSON parsing."""
@@ -102,3 +112,49 @@ class EnvelopeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "reserved"):
             envelope.encode(SUBJECT, {"_botnats_subject": "spoofed"})
+
+    def test_envelope_security(self) -> None:
+        """Verify envelope signing, replay rejection, and tamper detection."""
+        key = COORDINATION_KEY
+        sender = Envelope("alpha", key)
+        receiver = Envelope("beta", key)
+
+        encoded = sender.encode(SUBJECT, {"channel": "#test"})
+        assert receiver.decode(SUBJECT, encoded) == (
+            "alpha",
+            {"channel": "#test"},
+        )
+        with self.assertRaisesRegex(ValueError, "replayed"):
+            receiver.decode(SUBJECT, encoded)
+
+        forged = json.dumps({"payload": {"channel": "#owned"}}).encode()
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            receiver.decode(SUBJECT, forged)
+
+        tampered = json.loads(encoded)
+        tampered["nonce"] = "f" * 32
+        tampered["payload"] = {"channel": "#owned"}
+        with self.assertRaisesRegex(ValueError, "signature"):
+            receiver.decode(SUBJECT, json.dumps(tampered).encode())
+
+    def test_decode_prunes_expired_nonces(self) -> None:
+        """Prune expired nonces on decode, which keeps the replay cache bounded."""
+        receiver = Envelope("beta", COORDINATION_KEY)
+        receiver.seen_nonces["a" * 32] = 1.0
+        receiver.seen_nonces["b" * 32] = 2.0
+        receiver.seen_nonces["c" * 32] = time.time() + 60
+        encoded = Envelope("alpha", COORDINATION_KEY).encode(SUBJECT, {})
+
+        receiver.decode(SUBJECT, encoded)
+
+        assert list(receiver.seen_nonces) == ["c" * 32, json.loads(encoded)["nonce"]]
+
+    def test_subject_substitution(self) -> None:
+        """Verify a signed message cannot be moved to another NATS subject."""
+        key = COORDINATION_KEY
+        sender = Envelope("alpha", key)
+        receiver = Envelope("beta", key)
+        encoded = sender.encode(SUBJECT, {"channel": "#test"})
+
+        with self.assertRaisesRegex(ValueError, "subject is invalid"):
+            receiver.decode("botnats.v1.efnet.auth.session", encoded)
