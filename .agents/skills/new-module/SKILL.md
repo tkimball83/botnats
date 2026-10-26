@@ -5,7 +5,7 @@ description: Create a new Python source module.
 
 # new-module
 
-Every source file starts with:
+Start every source file with:
 
 ```python
 # Copyright (C) 2026 Taylor Kimball
@@ -14,11 +14,11 @@ Every source file starts with:
 """One-line module docstring."""
 ```
 
-Place IRC and NATS modules in their existing subpackages. Place other modules at
-the package root unless a genuine domain boundary requires a new subpackage.
-
-Add `tests/unit/test_{{ name }}.py` with `unittest.TestCase`. Prefer fakes for
-focused behavior and standard-library mocks at external boundaries.
+- IRC transport and protocol code goes in `irc/`, NATS code in `nats/`.
+- Modules that coordinate owners through `Bot` (events, commands, channels) go at the package
+  root.
+- Add `tests/unit/test_{{ name }}.py`: `unittest.TestCase`, or `IsolatedAsyncioTestCase` for
+  async code.
 
 ## Dependencies
 

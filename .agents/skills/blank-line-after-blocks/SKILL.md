@@ -5,20 +5,14 @@ description: Add blank lines after Python control-flow blocks.
 
 # blank-line-after-blocks
 
-Separate completed `if`, `for`, `while`, `with`, and `try` blocks from the statement that
-follows. Run from the repository root on `src` and `tests`, or on selected files:
+Separate each completed `if`, `for`, `while`, `with`, or `try` block from the next statement:
 
 ```sh
 venv/bin/blank-line-after-blocks src tests
-venv/bin/blank-line-after-blocks src/botnats/{{ file }}.py
 ```
 
-- Exit code 1 with `Rewriting` messages means files changed. Review the diff and rerun; a clean
-  run exits 0. Investigate tracebacks and other errors.
-- Use the `unit` skill afterward; `ruff format` must accept the result unchanged.
-- The formatter does not infer boundaries between consecutive simple statements.
-- `make unit`, and so CI, fails when spacing changes; pre-commit runs it too, pinned to the
-  version in `pyproject.toml`.
+Exit 1 with `Rewriting` means files changed: review the diff and rerun until it exits 0.
+`ruff format` must accept the result unchanged. `make unit` and pre-commit run it too.
 
 ## Dependencies
 
