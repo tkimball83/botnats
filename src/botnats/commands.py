@@ -67,16 +67,21 @@ class CommandHandler:
         limit = MAX_IRC_MESSAGE_BYTES - RELAY_SOURCE_BYTES - overhead
         current = head
         for item in items:
+            # An item too long for any line would be cut off in relay.
+            if len(f"{head} {item}".encode()) > limit:
+                LOGGER.warning("dropped a list item too long to send to %s", nickname)
+                continue
+
             candidate = f"{current} {item}"
-            # A header alone is never sent; an item too long for any line is
-            # dropped by reply() with a warning.
-            if len(candidate.encode()) > limit and current != head:
+            if len(candidate.encode()) > limit:
                 self.reply(nickname, current)
                 current = f"{head} {item}"
             else:
                 current = candidate
 
-        self.reply(nickname, current)
+        # A header alone is never sent.
+        if current != head:
+            self.reply(nickname, current)
 
     async def channel_update(
         self,

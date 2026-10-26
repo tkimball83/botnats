@@ -1,11 +1,11 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for IRC protocol parsing, formatting, and client behavior."""
+"""Tests for the IRC client's connection, dispatch, and sending."""
 
 import asyncio
+import socket
 import ssl
-import time
 import unittest
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
@@ -22,20 +22,18 @@ from botnats.irc.client import (
     pong_reply,
 )
 from botnats.irc.protocol import (
-    DEFAULT_CHANMODES,
-    DEFAULT_MEMBERSHIP_MODES,
     MAX_IRC_MESSAGE_BYTES,
     IRCMessage,
     ISupportState,
-    Prefix,
-    casefold,
     format_message,
-    iter_mode_changes,
-    mask_matches,
     parse_message,
 )
 
-MASK_MATCH_BUDGET_SECONDS = 0.5
+
+def fill_send_buffer(writer: asyncio.StreamWriter) -> None:
+    """Write until the socket buffers are full and bytes wait unsent."""
+    while not writer.transport.get_write_buffer_size():
+        writer.write(b"x" * 65536)
 
 
 def ignore_message(message: object) -> None:
@@ -70,228 +68,37 @@ def mock_writer() -> asyncio.StreamWriter:
     return writer
 
 
-class IRCProtocolTests(unittest.TestCase):
-    """Tests for prefix matching, message parsing, modes, and ISUPPORT state."""
+async def never() -> None:
+    """Wait until cancelled, standing in for a live sender."""
+    await asyncio.Event().wait()
 
-    def test_ban_mask_matching(self) -> None:
-        """Verify ban mask matching against IRC prefixes."""
-        prefix = Prefix("Bot[One]", "~user", "2001:db8::1")
 
-        assert mask_matches("bot[one]!*@2001:db8::*", prefix, "rfc1459")
-        assert mask_matches("*!~user@*", prefix, "rfc1459")
-        assert not mask_matches("*!other@*", prefix, "rfc1459")
+class IRCServerTests(unittest.TestCase):
+    """Tests for IRC server URL parsing."""
 
-    def test_ban_mask_no_backtracking(self) -> None:
-        """Reject an adversarial mask without catastrophic backtracking.
-
-        Backtracking matchers, recursive or regex, spend from about a second
-        to tens of seconds failing this nick; the linear matcher needs
-        microseconds, far inside the budget.
-        """
-        prefix = Prefix("a" * 28, "user", "host")
-
-        start = time.perf_counter()
-        matched = mask_matches("*a" * 13 + "b!*@*", prefix, "rfc1459")
-        elapsed = time.perf_counter() - start
-
-        assert not matched
-        assert elapsed < MASK_MATCH_BUDGET_SECONDS
-        assert mask_matches("*a" * 13 + "!*@*", prefix, "rfc1459")
-
-    def test_ban_mask_host_folding_uses_ascii(self) -> None:
-        """Verify mask_matches folds user/host with ascii, not server casemapping."""
-        prefix = Prefix("nick", "user[1]", "host[2]")
-
-        assert mask_matches("nick!user[1]@host[2]", prefix, "rfc1459")
-        assert not mask_matches("nick!user{1}@host{2}", prefix, "rfc1459")
-        assert mask_matches("NICK!*@*", prefix, "rfc1459")
-        assert not mask_matches("nick!user{1}@*", prefix, "rfc1459")
-
-    def test_ban_mask_wildcards(self) -> None:
-        """Verify single- and multi-character wildcards and non-matches."""
-        prefix = Prefix("alice", "~alice", "host.example")
-
-        assert mask_matches("a????!*@*", prefix, "rfc1459")
-        assert mask_matches("*!*@host.example", prefix, "rfc1459")
-        assert mask_matches("*", prefix, "rfc1459")
-        assert not mask_matches("a???!*@*", prefix, "rfc1459")
-        assert not mask_matches("bob!*@*", prefix, "rfc1459")
-        # A literal "*" in an ident must not consume the mask's wildcard.
-        assert mask_matches("*!*b@*", Prefix("alice", "*ab", "h"), "rfc1459")
-        assert mask_matches("*!a*b@*", Prefix("alice", "a*xb", "h"), "rfc1459")
-
-    def test_casefold(self) -> None:
-        """Verify casefold applies correct mapping for each mode."""
-        assert casefold("Nick[\\]^", "rfc1459") == "nick{|}~"
-        assert casefold("Nick[\\]^", "strict-rfc1459") == "nick{|}^"
-        assert casefold("Nick[\\]^", "ascii") == "nick[\\]^"
-        with self.assertRaisesRegex(ValueError, "unsupported casemapping"):
-            casefold("Nick", "utf8")
-
-    def test_format_injection(self) -> None:
-        """Verify format_message rejects parameter injection attempts."""
-        unsafe = (
-            ("JOIN", ("#safe\r\nOPER root password",), None),
-            ("JOIN", ("#safe", "key with space"), None),
-            ("NOTICE", ("owner",), "safe\nQUIT"),
-        )
-
-        for command, params, trailing in unsafe:
-            with (
-                self.subTest(
-                    params=params,
-                    trailing=trailing,
-                ),
-                self.assertRaisesRegex(ValueError, "unsupported characters"),
-            ):
-                format_message(command, params, trailing)
-
-    def test_mode_parser(self) -> None:
-        """Verify mode string parsing yields correct add/remove tuples."""
-        changes = list(
-            iter_mode_changes(
-                "+koo-v",
-                ("key", "one", "two", "voice"),
-                DEFAULT_CHANMODES,
-                DEFAULT_MEMBERSHIP_MODES,
-            ),
-        )
-
-        assert changes == [
-            (True, "k", "key"),
-            (True, "o", "one"),
-            (True, "o", "two"),
-            (False, "v", "voice"),
-        ]
-
-    def test_mode_parser_bare_unset_key_keeps_pairing(self) -> None:
-        """Verify a stripped -k argument does not steal later arguments."""
-        defaults = (DEFAULT_CHANMODES, DEFAULT_MEMBERSHIP_MODES)
-        assert list(iter_mode_changes("-k+o", ("alpha",), *defaults)) == [
-            (False, "k", None),
-            (True, "o", "alpha"),
-        ]
-        # A conforming batch with the key present pairs exactly as before.
-        assert list(iter_mode_changes("-k+o", ("key", "alpha"), *defaults)) == [
-            (False, "k", "key"),
-            (True, "o", "alpha"),
-        ]
-
-    def test_mode_parser_custom_modes(self) -> None:
-        """Verify mode parser pairs arguments by the server's mode groups."""
-        # Unlike the defaults, x takes an argument (type B), e takes none
-        # (type D), and y is a membership mode.
-        changes = list(
-            iter_mode_changes(
-                "+yxe-k",
-                ("target", "xarg", "key"),
-                ("b", "kx", "l", "eimn"),
-                "oyv",
-            ),
-        )
-
-        assert changes == [
-            (True, "y", "target"),
-            (True, "x", "xarg"),
-            (True, "e", None),
-            (False, "k", "key"),
-        ]
-
-    def test_parse_rejects_control_chars_in_params(self) -> None:
-        """Verify inbound controls are rejected throughout the message."""
-        for line in (
-            "PING :tok\x00en\r\n",
-            "PRIVMSG bot :a\rb\r\n",
-            ":nick!user@ho\x00st PING :token\r\n",
-            "@account=ba\x00d PING :token\r\n",
-            "PI\x00NG :token\r\n",
+    def test_server_url_validation(self) -> None:
+        """Verify IRC URLs reject unsupported components and ports."""
+        for value in (
+            "nats://host:6667",
+            "irc://host:6667?name=x",
+            "ircs://host:6697#x",
+            "irc://host:",
+            "irc://host:bad",
+            "irc://host:0",
+            "irc://host:70000",
+            "irc://host/channel",
+            "irc://user@host:6667",
+            "irc://ho\x7fst:6667",
+            "irc://" + chr(0xD800) + ":6667",
         ):
-            with self.assertRaisesRegex(ValueError, "control characters"):
-                parse_message(line)
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "invalid IRC server URL",
+                ) as raised:
+                    IRCServer.parse(value)
 
-    def test_parse_accepts_decode_inflated_message(self) -> None:
-        """Accept a wire-legal line whose replacement chars inflate re-encoding."""
-        raw = b"PRIVMSG #chan :" + b"\xe9" * 400 + b"\r\n"
-        assert len(raw) <= MAX_IRC_MESSAGE_BYTES
-
-        message = parse_message(raw.decode(errors="replace"))
-
-        assert message.command == "PRIVMSG"
-        assert message.params[0] == "#chan"
-
-    def test_parse_splits_params_on_space_only(self) -> None:
-        """Verify a tab inside a param does not fragment it."""
-        message = parse_message("PRIVMSG #a\tb :hi\r\n")
-
-        assert message.params == ("#a\tb", "hi")
-
-    def test_parse_tagged_message(self) -> None:
-        """Verify message tags are stripped before parsing."""
-        message = parse_message(
-            "@account=test;label=a\\sb :Nick!user@host PRIVMSG bot :hello world\r\n",
-        )
-
-        assert message.command == "PRIVMSG"
-        assert message.params == ("bot", "hello world")
-        assert message.prefix == Prefix("Nick", "user", "host")
-        # Repeated separators after the tags still leave a prefix first.
-        assert parse_message("@id=1  :srv PING :tok\r\n") == IRCMessage(
-            "PING",
-            ("tok",),
-            Prefix("srv"),
-        )
-
-    def test_prefix_parse_host_without_user(self) -> None:
-        """Parse the RFC 2812 nick@host prefix form without a user part."""
-        prefix = Prefix.parse("owner@static.example")
-
-        assert prefix.nick == "owner"
-        assert prefix.user is None
-        assert prefix.host == "static.example"
-        assert not prefix.complete
-
-    def test_prefix_match(self) -> None:
-        """Verify prefix matching is case-insensitive on nick and host."""
-        prefix = Prefix("Owner", "user", "Host.Example")
-
-        assert prefix.matches(Prefix("owner", "user", "host.example"), "rfc1459")
-        assert not prefix.matches(Prefix("owner", "other", "host.example"), "rfc1459")
-        assert not prefix.matches(Prefix("owner", "user", "other.example"), "rfc1459")
-        assert not prefix.matches(Prefix("owner", "user", "straße.example"), "rfc1459")
-        assert not Prefix("owner", "user", "straße.example").matches(
-            Prefix("owner", "user", "strasse.example"),
-            "rfc1459",
-        )
-
-    def test_identity_fold(self) -> None:
-        """Fold only protocol-defined identity equivalents."""
-        caps = ISupportState()
-
-        # The nick folds under the server casemapping, user@host as ASCII.
-        assert caps.fold_identity("Nick[!User[@HOST") == "nick{!user[@host"
-        assert caps.fold_identity(
-            "Nick!^user@host.example",
-        ) != caps.fold_identity(
-            "Nick!~user@host.example",
-        )
-        assert caps.fold_identity(
-            "Nick!user@straße.example",
-        ) != caps.fold_identity(
-            "Nick!user@strasse.example",
-        )
-
-    def test_prefix_without_op_mode_fails_closed(self) -> None:
-        """Never count a sub-operator PREFIX rank as channel operator."""
-        caps = ISupportState()
-
-        caps.parse_prefix("(v)+")
-        assert caps.op_mode == "o"
-        assert not caps.is_opped({"v"})
-
-        caps.parse_prefix("(qv)~+")
-        assert caps.op_mode == "q"
-        assert caps.is_opped({"q"})
-        assert not caps.is_opped({"v"})
+                assert value not in str(raised.exception)
 
 
 class IRCClientTests(unittest.IsolatedAsyncioTestCase):
@@ -302,10 +109,21 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client()
         client.cap_negotiating = negotiating
         client.outbound = asyncio.Queue(maxsize=64)
-        client.sender_task = asyncio.create_task(asyncio.sleep(60))
+        client.sender_task = asyncio.create_task(never())
         client.writer = mock_writer()
         self.addAsyncCleanup(client.stop_sender)
         return client
+
+    async def unread_connection(
+        self,
+        client: IRCClient,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Connect a client to a peer that never reads what is sent to it."""
+        local, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        reader, writer = await asyncio.open_connection(sock=local)
+        client.writer = writer
+        return reader, writer
 
     def test_pong_reply_echoes_raw_token(self) -> None:
         """Verify PONG echoes raw PING token bytes and always fits the wire."""
@@ -357,7 +175,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         async def failing_connection(server: IRCServer) -> None:
             ports.append(server.port)
             if len(ports) >= 11:
-                client.stopping = True
+                # Stop the loop the way SIGTERM does, by cancellation.
+                raise asyncio.CancelledError
 
             msg = "connection refused"
             raise OSError(msg)
@@ -369,6 +188,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(client, "run_connection", failing_connection),
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
             self.assertLogs("botnats.irc.client", level="WARNING"),
+            self.assertRaises(asyncio.CancelledError),
         ):
             await client.run_forever()
 
@@ -391,7 +211,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             # shorter than STABLE_SESSION_SECONDS.
             client.registered_with_server = len(ports) == 2
             if len(ports) >= 3:
-                client.stopping = True
+                raise asyncio.CancelledError
 
             msg = "connection lost"
             raise OSError(msg)
@@ -403,6 +223,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(client, "run_connection", connection),
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
             self.assertLogs("botnats.irc.client", level="WARNING"),
+            self.assertRaises(asyncio.CancelledError),
         ):
             await client.run_forever()
 
@@ -420,7 +241,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             ports.append(server.port)
             client.registered_with_server = len(ports) == 2
             if len(ports) >= 3:
-                client.stopping = True
+                raise asyncio.CancelledError
 
             msg = "connection lost"
             raise OSError(msg)
@@ -433,6 +254,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
             patch("botnats.irc.client.STABLE_SESSION_SECONDS", 0.0),
             self.assertLogs("botnats.irc.client", level="WARNING"),
+            self.assertRaises(asyncio.CancelledError),
         ):
             await client.run_forever()
 
@@ -568,16 +390,22 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.outbound is not None
         assert client.outbound.get_nowait() == b"CAP REQ :chghost\r\n"
 
-    async def test_reconnect_closes_writer(self) -> None:
-        """Force a reconnection by closing the active socket."""
+    async def test_reconnect_drops_socket_with_unsent_bytes(self) -> None:
+        """Force a reconnection at once, though a peer never reads what is unsent.
+
+        A close would wait to flush those bytes first, so the read loop would
+        never see EOF.
+        """
         client = irc_client()
-        client.reconnect()  # Without a socket there is nothing to close.
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
-        client.writer = writer
+        client.reconnect()  # Without a socket there is nothing to drop.
+        async with asyncio.timeout(5):
+            reader, writer = await self.unread_connection(client)
+            fill_send_buffer(writer)
 
-        client.reconnect()
+            client.reconnect()
 
-        writer.close.assert_called_once_with()
+            assert await reader.read() == b""
+            await client.close()
 
     async def test_welcome_and_own_nick_change_track_current_nick(self) -> None:
         """Follow the server-assigned nick and this client's own NICK changes."""
@@ -757,18 +585,21 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         )
         assert client.outbound.empty()
 
-    async def test_close_releases_writer(self) -> None:
-        """Verify repeated shutdown closes and releases the active writer."""
-        client = irc_client()
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
-        client.writer = writer
+    async def test_close_drops_socket_with_unsent_bytes(self) -> None:
+        """Shut down at once and release the writer, though bytes stay unsent.
 
-        await client.close()
-        await client.close()
+        A close would wait to flush them to a peer that never reads.
+        """
+        client = irc_client()
+        async with asyncio.timeout(5):
+            _, writer = await self.unread_connection(client)
+            fill_send_buffer(writer)
+
+            await client.close()
+            await client.close()
 
         assert client.writer is None
-        writer.close.assert_called_once_with()
-        writer.wait_closed.assert_awaited_once_with()
+        assert writer.is_closing()
 
     async def test_idle_ping_pong(self) -> None:
         """Verify idle timeout sends PING and raises on missing PONG."""
@@ -794,15 +625,15 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         client = irc_client(ports=(port,))
         try:
-            with (
-                patch("botnats.irc.client.IDLE_TIMEOUT", 0.05),
-                patch("botnats.irc.client.PONG_TIMEOUT", 0.05),
-                self.assertRaisesRegex(ConnectionError, "did not answer"),
-            ):
-                async with asyncio.timeout(5):
+            async with asyncio.timeout(5):
+                with (
+                    patch("botnats.irc.client.IDLE_TIMEOUT", 0),
+                    patch("botnats.irc.client.PONG_TIMEOUT", 0),
+                    self.assertRaisesRegex(ConnectionError, "did not answer"),
+                ):
                     await client.run_connection(client.config.servers[0])
 
-            assert ping_seen.is_set()
+                await ping_seen.wait()
         finally:
             await client.close()
             server.close()
@@ -950,7 +781,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(port,))
         try:
             with (
-                patch("botnats.irc.client.REGISTRATION_TIMEOUT", 0.05),
+                patch("botnats.irc.client.REGISTRATION_TIMEOUT", 0),
                 self.assertRaisesRegex(ConnectionError, "complete registration"),
             ):
                 async with asyncio.timeout(5):
@@ -1016,7 +847,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                         ):
                             await client.run_connection(client.config.servers[0])
 
-                        await client.disconnect()
+                        await client.close()
         finally:
             await client.close()
             server.close()
@@ -1049,31 +880,60 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.outbound.empty()
 
     async def test_send_immediate_write_timeout_disconnects(self) -> None:
-        """Close the socket and raise when a write never drains."""
+        """Drop the socket and raise when writes to a peer that never reads stall.
+
+        A close would wait to flush the bytes that did not drain, so the read
+        loop would never see EOF.
+        """
+        client = irc_client()
+        line = format_message("PRIVMSG", ("#chan",), "x" * 480)
+        async with asyncio.timeout(5):
+            reader, writer = await self.unread_connection(client)
+            with (
+                patch("botnats.irc.client.WRITE_TIMEOUT", 0),
+                self.assertRaisesRegex(ConnectionError, "write timed out"),
+            ):
+                while True:
+                    await client.send_immediate(line, writer)
+
+            assert await reader.read() == b""
+            await client.close()
+
+    async def test_send_immediate_skips_waiting_on_another_drain(self) -> None:
+        """Write a PONG at once while the sender still waits for its write to drain."""
         client = irc_client()
         writer = create_autospec(asyncio.StreamWriter, instance=True)
         writer.is_closing.return_value = False
-
-        async def slow_drain() -> None:
-            await asyncio.sleep(60)
-
-        writer.drain = slow_drain
         client.writer = writer
+        draining = asyncio.Event()
+        drained = asyncio.Event()
 
-        with (
-            patch("botnats.irc.client.WRITE_TIMEOUT", 0.01),
-            self.assertRaisesRegex(ConnectionError, "write timed out"),
-        ):
-            await client.send_immediate(b"PING :token\r\n", writer)
+        async def stalled_drain() -> None:
+            draining.set()
+            await drained.wait()
 
-        writer.close.assert_called_once_with()
+        writer.drain.side_effect = stalled_drain
+        async with asyncio.timeout(5):
+            sender = asyncio.create_task(
+                client.send_immediate(b"PRIVMSG #chan :x\r\n", writer),
+            )
+            await draining.wait()
+            draining.clear()
+            pong = asyncio.create_task(
+                client.send_immediate(b"PONG :token\r\n", writer),
+            )
+            await draining.wait()
+
+            writer.write.assert_called_with(b"PONG :token\r\n")
+            drained.set()
+            await asyncio.gather(sender, pong)
 
     async def test_outbound_queue_bounded(self) -> None:
         """Verify outbound queue raises ConnectionError when full."""
         client = irc_client()
         client.outbound = asyncio.Queue(maxsize=1)
         client.outbound.put_nowait(b"PING :queued\r\n")
-        client.sender_task = asyncio.create_task(asyncio.sleep(60))
+        client.sender_task = asyncio.create_task(never())
         client.writer = mock_writer()
         try:
             with self.assertRaisesRegex(ConnectionError, "queue is full"):
@@ -1138,7 +998,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         async def failing_connection(server: IRCServer) -> None:
             ports.append(server.port)
             if len(ports) >= 2:
-                client.stopping = True
+                raise asyncio.CancelledError
 
             msg = "connection refused"
             raise OSError(msg)
@@ -1151,6 +1011,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(client, "run_connection", failing_connection),
             patch("botnats.irc.client.asyncio.sleep", skip_sleep),
             self.assertLogs("botnats.irc.client", level="WARNING") as logs,
+            self.assertRaises(asyncio.CancelledError),
         ):
             await client.run_forever()
 
@@ -1201,7 +1062,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_sender_absorbs_sender_cancellation(self) -> None:
         """Absorb the sender's own cancellation when the caller is not cancelled."""
         client = irc_client()
-        client.sender_task = asyncio.create_task(asyncio.sleep(60))
+        client.sender_task = asyncio.create_task(never())
         client.outbound = asyncio.Queue()
 
         async with asyncio.timeout(5):

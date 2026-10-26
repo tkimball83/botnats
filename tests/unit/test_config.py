@@ -355,7 +355,7 @@ class ConfigTests(unittest.TestCase):
                 replica_count({"jetstream_replicas": bad})
 
     def test_server_url_validation(self) -> None:
-        """Verify IRC and NATS URLs reject unsupported components and ports."""
+        """Verify NATS URLs reject unsupported components and ports."""
         invalid_nats = (
             "http://host:4222",
             "irc://host:4222",
@@ -370,19 +370,6 @@ class ConfigTests(unittest.TestCase):
             "nats://ho\x1bst:4222",
             "nats://" + chr(0xD800) + ":4222",
         )
-        invalid_irc = (
-            "nats://host:6667",
-            "irc://host:6667?name=x",
-            "ircs://host:6697#x",
-            "irc://host:",
-            "irc://host:bad",
-            "irc://host:0",
-            "irc://host:70000",
-            "irc://host/channel",
-            "irc://user@host:6667",
-            "irc://ho\x7fst:6667",
-            "irc://" + chr(0xD800) + ":6667",
-        )
         for value in invalid_nats:
             with self.subTest(value=value):
                 with self.assertRaisesRegex(
@@ -393,16 +380,6 @@ class ConfigTests(unittest.TestCase):
 
                 assert value not in str(raised.exception)
                 assert NATS_CREDENTIAL not in str(raised.exception)
-
-        for value in invalid_irc:
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "invalid IRC server URL",
-                ) as raised:
-                    IRCServer.parse(value)
-
-                assert value not in str(raised.exception)
 
     def test_server_lists_must_hold_urls(self) -> None:
         """Reject an empty server list or one with a non-string or empty entry."""

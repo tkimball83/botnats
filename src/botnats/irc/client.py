@@ -9,6 +9,7 @@ import secrets
 import ssl
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 from botnats import error_label, log_task_failure
@@ -77,7 +78,7 @@ class IRCClientConfig:
 
 
 class IRCClient:
-    """Reconnectable IRC socket with serialized writes."""
+    """Reconnectable IRC socket with a rate-limited send queue."""
 
     def __init__(
         self,
@@ -99,7 +100,6 @@ class IRCClient:
         self.outbound: asyncio.Queue[bytes] | None = None
         self.sender_task: asyncio.Task[None] | None = None
         self.registered_with_server = False
-        self.stopping = False
         needs_tls = any(s.tls for s in config.servers)
         self.tls_context = ssl.create_default_context() if needs_tls else None
         if self.tls_context is not None and not config.verify_tls:
@@ -107,29 +107,25 @@ class IRCClient:
             self.tls_context.verify_mode = ssl.CERT_NONE
 
         self.writer: asyncio.StreamWriter | None = None
-        self.write_lock = asyncio.Lock()
 
     async def close(self) -> None:
-        """Stop reconnecting, then shut down the sender and close the socket."""
-        self.stopping = True
-        await self.disconnect()
-
-    @property
-    def connected(self) -> bool:
-        """Return whether the underlying socket is open."""
-        return self.writer is not None and not self.writer.is_closing()
-
-    async def disconnect(self) -> None:
-        """Shut down the sender and close the socket."""
+        """Shut down the sender and drop the socket."""
         try:
             await self.stop_sender()
         finally:
             writer = self.writer
             self.writer = None
             if writer is not None:
-                writer.close()
+                # Abort, not close: a close waits to flush unsent bytes, which
+                # a peer that stopped reading never takes.
+                writer.transport.abort()
                 with suppress(OSError):
                     await writer.wait_closed()
+
+    @property
+    def connected(self) -> bool:
+        """Return whether the underlying socket is open."""
+        return self.writer is not None and not self.writer.is_closing()
 
     async def dispatch_line(
         self,
@@ -193,7 +189,9 @@ class IRCClient:
             self.send_loop(writer, outbound),
             name="irc-sender",
         )
-        self.sender_task.add_done_callback(self.sender_done)
+        self.sender_task.add_done_callback(
+            partial(log_task_failure, logger=LOGGER, label="IRC sender"),
+        )
         self.cap_available = set()
         self.cap_negotiating = True
         self.cap_ls_done = False
@@ -260,9 +258,9 @@ class IRCClient:
         self.send("NICK", self.current_nick)
 
     def reconnect(self) -> None:
-        """Force a reconnection by closing the current socket."""
+        """Force a reconnection by dropping the current socket."""
         if self.writer is not None:
-            self.writer.close()
+            self.writer.transport.abort()
 
     async def run_connection(self, server: IRCServer) -> None:
         """Read and dispatch messages from a single server session."""
@@ -272,7 +270,7 @@ class IRCClient:
         ping_token: str | None = None
         pong_deadline = 0.0
         registration_deadline = loop.time() + REGISTRATION_TIMEOUT
-        while not self.stopping:
+        while True:
             now = loop.time()
             if ping_token is None:
                 timeout = IDLE_TIMEOUT
@@ -323,7 +321,7 @@ class IRCClient:
         index = 0
         backoff = 0
         loop = asyncio.get_running_loop()
-        while not self.stopping:
+        while True:
             server = self.config.servers[index % len(self.config.servers)]
             session_start = loop.time()
             try:
@@ -341,10 +339,7 @@ class IRCClient:
                 except Exception:
                     LOGGER.exception("IRC disconnect callback failed")
 
-                await self.disconnect()
-
-            if self.stopping:
-                break
+                await self.close()
 
             duration = loop.time() - session_start
             if self.registered_with_server and duration >= STABLE_SESSION_SECONDS:
@@ -386,19 +381,19 @@ class IRCClient:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Write a pre-encoded message to the socket without queuing."""
-        async with self.write_lock:
-            if self.writer is not writer or writer.is_closing():
-                msg = "IRC is not connected"
-                raise ConnectionError(msg)
+        if self.writer is not writer or writer.is_closing():
+            msg = "IRC is not connected"
+            raise ConnectionError(msg)
 
-            writer.write(encoded)
-            try:
-                async with asyncio.timeout(WRITE_TIMEOUT):
-                    await writer.drain()
-            except TimeoutError as error:
-                writer.close()
-                msg = "IRC write timed out"
-                raise ConnectionError(msg) from error
+        writer.write(encoded)
+        try:
+            async with asyncio.timeout(WRITE_TIMEOUT):
+                await writer.drain()
+        except TimeoutError as error:
+            # Abort: a close would wait on the very bytes that did not drain.
+            writer.transport.abort()
+            msg = "IRC write timed out"
+            raise ConnectionError(msg) from error
 
     async def send_loop(
         self,
@@ -427,10 +422,6 @@ class IRCClient:
                 await self.send_immediate(encoded, writer)
         except OSError, RuntimeError:
             writer.close()
-
-    def sender_done(self, task: asyncio.Task[None]) -> None:
-        """Log unexpected sender task failures."""
-        log_task_failure(task, LOGGER, "IRC sender")
 
     async def stop_sender(self) -> None:
         """Cancel the sender task and discard pending messages."""
