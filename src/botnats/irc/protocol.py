@@ -230,12 +230,7 @@ class Prefix:
 
 def casefold(value: str, casemapping: str) -> str:
     """Fold an IRC identifier using a server-advertised casemapping."""
-    table = CASEMAP_TABLES.get(casemapping)
-    if table is None:
-        msg = f"unsupported casemapping: {casemapping!r}"
-        raise ValueError(msg)
-
-    return value.translate(table)
+    return value.translate(CASEMAP_TABLES[casemapping])
 
 
 def format_message(

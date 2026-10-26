@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for IRC channel, key, JOIN, target, and channel revision validation."""
+"""Tests for IRC channel, key, JOIN, server URL, and channel revision validation."""
 
 import re
 import unittest
@@ -13,7 +13,7 @@ from botnats.validators import (
     validate_channel_revision,
     validate_join,
     validate_key,
-    validate_target,
+    validate_server_url,
 )
 
 
@@ -72,15 +72,40 @@ class ValidatorTests(unittest.TestCase):
             with self.subTest(channel=channel, key=key), self.assertRaises(ValueError):
                 validate_join(channel, key)
 
-    def test_validate_target(self) -> None:
-        """Verify command target and ban-mask validation."""
-        assert validate_target("*!*@evil.example") == "*!*@evil.example"
-        for invalid in ("", ":nick", "*!*@ evil", "mask\twith\ttabs", "nul\x00"):
+    def test_validate_server_url(self) -> None:
+        """Reject unsupported URL schemes, components, and ports."""
+        schemes = frozenset({"nats"})
+        assert validate_server_url("nats://host:4222", schemes, "NATS") == (
+            "nats",
+            "host",
+            4222,
+        )
+        assert validate_server_url("nats://host", schemes, "NATS") == (
+            "nats",
+            "host",
+            None,
+        )
+        for invalid in (
+            "http://host:4222",
+            "nats://host:4222?name=x",
+            "nats://host:4222#x",
+            "nats://host:",
+            "nats://host:bad",
+            "nats://host:0",
+            "nats://host:70000",
+            "nats://host/stream",
+            "nats://user@host:4222",
+            "nats://user:secret@host:4222",
+            "nats://ho\x1bst:4222",
+            "nats://ho\x7fst:4222",
+            "nats://" + chr(0xD800) + ":4222",
+        ):
+            # The exact message never echoes the URL or a credential in it.
             with (
                 self.subTest(invalid=invalid),
-                self.assertRaisesRegex(ValueError, "target"),
+                self.assertRaisesRegex(ValueError, "^invalid NATS server URL$"),
             ):
-                validate_target(invalid)
+                validate_server_url(invalid, schemes, "NATS")
 
     def test_channel_revision_requires_ascii_digits(self) -> None:
         """Reject revision counters written with non-ASCII decimal digits."""

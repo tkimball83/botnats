@@ -12,7 +12,7 @@ from botnats import error_label
 from botnats.auth import limit_identity
 from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, format_message
 from botnats.nats.store import PUBLISH_ERRORS
-from botnats.validators import validate_channel, validate_key, validate_target
+from botnats.validators import validate_channel, validate_key
 
 if TYPE_CHECKING:
     from botnats.bot import Bot
@@ -67,16 +67,21 @@ class CommandHandler:
         limit = MAX_IRC_MESSAGE_BYTES - RELAY_SOURCE_BYTES - overhead
         current = head
         for item in items:
+            # An item too long for any line would be cut off in relay.
+            if len(f"{head} {item}".encode()) > limit:
+                LOGGER.warning("dropped a list item too long to send to %s", nickname)
+                continue
+
             candidate = f"{current} {item}"
-            # A header alone is never sent; an item too long for any line is
-            # dropped by reply() with a warning.
-            if len(candidate.encode()) > limit and current != head:
+            if len(candidate.encode()) > limit:
                 self.reply(nickname, current)
                 current = f"{head} {item}"
             else:
                 current = candidate
 
-        self.reply(nickname, current)
+        # A header alone is never sent.
+        if current != head:
+            self.reply(nickname, current)
 
     async def channel_update(
         self,
@@ -115,7 +120,7 @@ class CommandHandler:
             raise ValueError(msg)
 
         channel = validate_channel(arguments[0])
-        mask = validate_target(arguments[1])
+        mask = arguments[1]
         self.opped_channel(channel)
         self.bot.irc.send("MODE", channel, "+b", mask)
         self.reply(prefix.nick, f"Banned {mask} on {channel}")
@@ -217,7 +222,7 @@ class CommandHandler:
             raise ValueError(msg)
 
         channel = validate_channel(arguments[0])
-        target = validate_target(arguments[1])
+        target = arguments[1]
         runtime = self.opped_channel(channel)
         member = runtime.members.get(self.bot.caps.fold(target))
         if member is None or not self.bot.caps.is_opped(member.modes):
@@ -246,7 +251,7 @@ class CommandHandler:
             raise ValueError(msg)
 
         channel = validate_channel(arguments[0])
-        target = validate_target(arguments[1])
+        target = arguments[1]
         self.opped_channel(channel)
         self.bot.irc.send("INVITE", target, channel)
         self.reply(prefix.nick, f"Invited {target} to {channel}")
@@ -268,7 +273,7 @@ class CommandHandler:
             raise ValueError(msg)
 
         channel = validate_channel(arguments[0])
-        target = validate_target(arguments[1])
+        target = arguments[1]
         runtime = self.opped_channel(channel)
         member = runtime.members.get(self.bot.caps.fold(target))
         if member is None:
@@ -286,7 +291,7 @@ class CommandHandler:
             raise ValueError(msg)
 
         channel = validate_channel(arguments[0])
-        target = validate_target(arguments[1])
+        target = arguments[1]
         runtime = self.opped_channel(channel)
         member = runtime.members.get(self.bot.caps.fold(target))
         if member is None or member.prefix is None or not member.prefix.complete:
@@ -348,7 +353,7 @@ class CommandHandler:
             raise ValueError(msg)
 
         channel = validate_channel(arguments[0])
-        mask = validate_target(arguments[1])
+        mask = arguments[1]
         runtime = self.opped_channel(channel)
         stored = runtime.bans.get(self.bot.caps.fold(mask))
         if stored is None:

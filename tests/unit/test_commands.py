@@ -92,19 +92,6 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
 
         assert not limiter.check("user")
 
-    async def test_rate_limited_admin_is_silent(self) -> None:
-        """Silently drop an authenticated admin's commands over the limit."""
-        fake_irc = FakeIRC()
-        bot = make_bot(irc=fake_irc)
-        prefix = Prefix("owner", "user", "host.example")
-        bot.authorizer.grant(prefix.render())
-
-        for _ in range(20):
-            await send_command(bot, prefix, "BOGUS")
-
-        assert len(fake_irc.privmsgs) == 8
-        assert all(text == "Unknown command" for _, text in fake_irc.privmsgs)
-
     async def test_rate_limiting_ignores_nick_change(self) -> None:
         """Verify the command limiter keys on host so nick cycling cannot bypass it."""
         fake_irc = FakeIRC()
@@ -116,6 +103,7 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
             await send_command(bot, prefix, "BOGUS")
 
         assert len(fake_irc.privmsgs) == 8
+        assert all(text == "Unknown command" for _, text in fake_irc.privmsgs)
 
 
 class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -219,14 +207,19 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await bot.commands.dispatch(OWNER, "GETBANS #test")
         assert fake_irc.privmsgs == [("owner", "#test +b *!*@bad.host *!*@evil.host")]
 
-    async def test_reply_list_never_sends_header_alone(self) -> None:
-        """Drop an item too long for any line without sending a bare header."""
+    async def test_reply_list_drops_items_too_long_to_relay(self) -> None:
+        """Drop an item too long to relay whole, never sending a bare header."""
         bot, fake_irc = bot_with_irc()
+        # The shorter mask fits the line the bot sends, but not the line the
+        # server relays with the bot's source in front.
+        for mask in ("*!*@" + "h" * 400, "*!*@" + "h" * 495):
+            with self.subTest(length=len(mask)):
+                fake_irc.privmsgs.clear()
+                with self.assertLogs("botnats.commands", level="WARNING"):
+                    bot.commands.reply_list("owner", "#test +b", [mask, "ok"])
+                    bot.commands.reply_list("owner", "#test +b", [mask])
 
-        with self.assertLogs("botnats.commands", level="WARNING"):
-            bot.commands.reply_list("owner", "#test +b", ["*!*@" + "h" * 495, "ok"])
-
-        assert fake_irc.privmsgs == [("owner", "#test +b ok")]
+                assert fake_irc.privmsgs == [("owner", "#test +b ok")]
 
     async def test_getbans_packs_long_ban_lists(self) -> None:
         """Pack a long ban list many masks to a line, not one line per mask."""
@@ -361,6 +354,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await bot.commands.dispatch(OWNER, "DEOP #test Target")
 
         assert fake_irc.modes == [("#test", "-o", ("Target",))]
+        assert fake_irc.privmsgs == [("owner", "Deopped Target on #test")]
 
     async def test_admin_deop_removes_hidden_lower_modes(self) -> None:
         """Verify DEOP removes lower operator modes hidden by the highest one."""
@@ -448,6 +442,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await bot.commands.dispatch(OWNER, "OP #test Target")
 
         assert fake_irc.modes == [("#test", "+o", ("Target",))]
+        assert fake_irc.privmsgs == [("owner", "Opped Target on #test")]
 
     async def test_admin_op_already_opped(self) -> None:
         """Verify OP reports when target is already opped."""

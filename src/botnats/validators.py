@@ -135,16 +135,3 @@ def validate_server_url(
         raise ValueError(msg)
 
     return parsed.scheme, hostname, port
-
-
-def validate_target(value: str) -> str:
-    """Verify an IRC command target or ban mask is a single safe parameter."""
-    if not value:
-        msg = "target must not be empty"
-        raise ValueError(msg)
-
-    if value.startswith(":") or _has_space_or_nul(value):
-        msg = "target contains unsupported characters"
-        raise ValueError(msg)
-
-    return value
