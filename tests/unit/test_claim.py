@@ -117,7 +117,8 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 assert claim.observe("other-instance", 3)
 
             release.set()
-            await write
+            async with asyncio.timeout(1):
+                await write
 
         assert claim.duplicate
         assert claim.revision is None
@@ -164,7 +165,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 "update",
                 AsyncMock(return_value=refreshed_revision),
             ) as update,
-            patch.object(claim.store, "create", AsyncMock()) as create,
+            patch.object(claim.store, "create", AsyncMock(return_value=None)) as create,
         ):
             await claim.put(PRESENCE)
 

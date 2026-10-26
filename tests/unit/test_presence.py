@@ -173,7 +173,8 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
         ):
             bot.events.handle_welcome(IRCMessage("001", ("alpha", "welcome")))
             tasks = tuple(bot.tasks)
-            await asyncio.gather(*tasks)
+            async with asyncio.timeout(1):
+                await asyncio.gather(*tasks)
 
         assert fake_irc.sent == [("USERHOST", ("alpha",))]
         assert fake_irc.reconnects == 1

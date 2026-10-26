@@ -61,6 +61,7 @@ BETA_PRESENCE = {
     "nick": "beta",
     "user": "user",
 }
+CREATED_REVISION = 2
 NOT_OWNED = "bot ID alpha does not own its presence key"
 SUBJECT = "botnats.v1.efnet.channel"
 
@@ -197,11 +198,16 @@ def presence_entry(*, signed: bool = True) -> SimpleNamespace:
 
 
 def watcher(*entries: object) -> tuple[AsyncMock, AsyncMock]:
-    """Build a KV handle and watcher yielding the given entries."""
+    """Build a KV handle and watcher yielding the given entries.
+
+    Creating a key returns its revision, CREATED_REVISION, as JetStream does.
+    """
     result = AsyncMock()
     result.__aiter__ = MagicMock(return_value=result)
     result.__anext__ = AsyncMock(side_effect=[*entries, StopAsyncIteration])
+    result.stop = AsyncMock(return_value=None)
     kv = AsyncMock()
+    kv.create = AsyncMock(return_value=CREATED_REVISION)
     kv.watchall = AsyncMock(return_value=result)
     return kv, result
 
@@ -268,12 +274,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_help_subscription_covers_every_kind(self) -> None:
         """Subscribe once to the namespace, so every help kind is delivered."""
         coordinator = build_coordinator("alpha", Fixtures())
-        coordinator.nc = AsyncMock()
+        nc = AsyncMock()
 
-        await coordinator.subscribe_help()
+        await coordinator.subscribe_help(nc)
 
-        coordinator.nc.subscribe.assert_awaited_once()
-        assert coordinator.nc.subscribe.await_args.args == (f"{coordinator.ns}.*",)
+        nc.subscribe.assert_awaited_once()
+        assert nc.subscribe.await_args.args == (f"{coordinator.ns}.*",)
 
     async def test_own_help_request_is_skipped(self) -> None:
         """Ignore this bot's own broadcast, which NATS echoes back to it."""
@@ -371,6 +377,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         # The presence key is deleted through the open bucket, so releasing
         # it after the stores reset would delete nothing.
         presence_kv = AsyncMock()
+        presence_kv.delete = AsyncMock(return_value=True)
         coordinator.presence_store.kv = presence_kv
 
         await coordinator.close()
@@ -483,6 +490,41 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert connect.await_count == 2
         assert coordinator.nc is nc
         start_watches.assert_awaited_once_with()
+
+    async def test_cancelled_restart_keeps_help_subscription(self) -> None:
+        """Subscribe to help requests before a restart waits for JetStream.
+
+        A drop of the new client cancels the restart from nats-py's disconnect
+        callback, and the reconnect replays only subscriptions the client holds.
+        """
+        coordinator = build_coordinator("alpha", Fixtures())
+        coordinator.nc = MagicMock(is_closed=True)
+        nc = MagicMock(is_connected=True)
+        nc.subscribe = AsyncMock()
+        connect = AsyncMock(return_value=nc)
+        opening = asyncio.Event()
+
+        async def open_stores() -> None:
+            # JetStream is still down.
+            opening.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch("botnats.nats.coordinator.nats.connect", connect),
+            patch.object(coordinator, "init_stores", open_stores),
+        ):
+            await coordinator.on_closed()
+            restart = coordinator.resync_task
+            assert restart is not None
+            async with asyncio.timeout(5):
+                await opening.wait()
+                await coordinator.on_disconnected()
+                await asyncio.gather(restart, return_exceptions=True)
+
+        assert restart.cancelled()
+        assert coordinator.nc is nc
+        nc.subscribe.assert_awaited_once()
+        assert nc.subscribe.await_args.args == (f"{coordinator.ns}.*",)
 
     async def test_close_cancels_restart(self) -> None:
         """Stop a restart that is still connecting when the bot shuts down."""
@@ -704,17 +746,16 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Verify malformed traffic cannot flood the warning log."""
         coordinator = build_coordinator("alpha", Fixtures())
 
+        # The module's binding only: time.monotonic itself drives the loop.
         with (
-            patch(
-                "botnats.nats.coordinator.time.monotonic",
-                return_value=10.0,
-            ) as clock,
+            patch("botnats.nats.coordinator.time") as clock,
             self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs,
         ):
+            clock.monotonic.return_value = 10.0
             coordinator.warn_decode(SUBJECT, ValueError("bad"))
-            clock.return_value = 11.0
+            clock.monotonic.return_value = 11.0
             coordinator.warn_decode(SUBJECT, ValueError("bad"))
-            clock.return_value = 16.0
+            clock.monotonic.return_value = 16.0
             coordinator.warn_decode(SUBJECT, ValueError("bad"))
 
         assert len(logs.output) == 2
@@ -765,7 +806,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             # outage cannot park the nats-py reconnected callback.
             task = coordinator.resync_task
             assert task is not None
-            await task
+            async with asyncio.timeout(5):
+                await task
 
         assert steps == [
             "open",
@@ -791,7 +833,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.on_reconnected()
             task = coordinator.resync_task
             assert task is not None
-            await asyncio.gather(task, return_exceptions=True)
+            async with asyncio.timeout(5):
+                await asyncio.gather(task, return_exceptions=True)
+
             await asyncio.sleep(0)
 
         assert coordinator.resync_task is None
@@ -827,9 +871,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             )
             async with asyncio.timeout(5):
                 await recovered.wait()
-
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
         assert sum("crashed" in line for line in logs.output) == 1
 
@@ -1186,8 +1229,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(1):
                 await writing.wait()
                 await coordinator.on_disconnected()
-            release.set()
-            await write
+                release.set()
+                await write
 
         assert coordinator.claim.state is PresenceState.UNCLAIMED
         assert coordinator.claim.revision is None
@@ -1289,6 +1332,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.watch_presence(MagicMock())
 
         assert not coordinator.claim.duplicate
+        assert coordinator.claim.revision == CREATED_REVISION
 
     async def test_watch_presence_resolves_on_delete(self) -> None:
         """Verify a live conflict resolves when the presence entry expires."""
@@ -1305,6 +1349,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.watch_presence(MagicMock())
 
         assert not coordinator.claim.duplicate
+        assert coordinator.claim.revision == CREATED_REVISION
 
     async def test_watch_restarts_on_transient_error(self) -> None:
         """Restart a watch after a transient JetStream error, requiring a new replay."""
@@ -1372,10 +1417,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator, "watch_sessions", hang),
         ):
             await coordinator.start_watches()
-            await asyncio.gather(
-                coordinator.start_watches(),
-                coordinator.start_watches(),
-            )
+            async with asyncio.timeout(5):
+                await asyncio.gather(
+                    coordinator.start_watches(),
+                    coordinator.start_watches(),
+                )
+
             assert len(coordinator.watch_tasks) == len(coordinator.watches())
             await coordinator.cancel_watches()
 
@@ -1500,6 +1547,37 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         subscription.stop.assert_awaited_once()
 
+    async def test_cancelled_watch_setup_stops_its_watcher(self) -> None:
+        """Stop a watcher whose setup finishes after its watch was cancelled.
+
+        nats-py subscribes before its setup round trip and keeps the
+        subscription if cancelled there; the watch must not wait for it either.
+        """
+        coordinator = build_coordinator("alpha", Fixtures())
+        kv, subscription = watcher()
+        setting_up = asyncio.Event()
+        release = asyncio.Event()
+        stopped = asyncio.Event()
+        subscription.stop = AsyncMock(side_effect=stopped.set)
+
+        async def watchall() -> AsyncMock:
+            setting_up.set()
+            await release.wait()
+            return subscription
+
+        kv.watchall = watchall
+        coordinator.channels_store.kv = kv
+        watch = asyncio.create_task(coordinator.watch_channels(MagicMock()))
+        async with asyncio.timeout(5):
+            await setting_up.wait()
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
+            release.set()
+            await stopped.wait()
+
+        assert watch.cancelled()
+        subscription.stop.assert_awaited_once_with()
+
     async def test_watch_surfaces_programming_errors(self) -> None:
         """Verify a programming error in a watch is logged at ERROR and retried."""
         coordinator = build_coordinator("alpha", Fixtures())
@@ -1607,13 +1685,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.nc is nc
         assert steps == [
             "connect",
-            "stores",
             "subscribe",
             "close",
             "sleep",
             "connect",
-            "stores",
             "subscribe",
+            "stores",
             "watches",
         ]
         assert [log.getMessage() for log in logs.records] == [

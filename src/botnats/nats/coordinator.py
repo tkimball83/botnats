@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import nats
 
-from botnats import error_label, log_task_failure
+from botnats import Tasks, error_label, log_task_failure
 from botnats.nats.claim import PresenceClaim
 from botnats.nats.status import NATSStatus, collect
 from botnats.nats.store import (
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from nats.aio.msg import Msg
+    from nats.js.kv import KeyValue
 
     from botnats.bot import NATSCallbackHandler
     from botnats.nats.envelope import Envelope
@@ -185,6 +186,7 @@ class Coordinator:
         self.synced_watches: set[str] = set()
         self.watch_generation = 0
         self.watch_tasks: list[asyncio.Task[None]] = []
+        self.watcher_stops = Tasks()
 
     async def cancel_watches(self) -> None:
         """Cancel all running KV watch tasks and await their completion."""
@@ -401,12 +403,8 @@ class Coordinator:
             kind = message.subject.rpartition(".")[2]
             self.callbacks.on_help(kind, channel, presence)
 
-    async def subscribe_help(self) -> None:
-        """Subscribe to help requests on the active connection."""
-        nc = self.nc
-        if nc is None:
-            return
-
+    async def subscribe_help(self, nc: nats.NATS) -> None:
+        """Subscribe a new client to help requests."""
         # Help requests are the only subjects in the namespace; the last token
         # names the kind.
         await nc.subscribe(f"{self.ns}.*", cb=self.deliver_help)
@@ -472,8 +470,10 @@ class Coordinator:
                         reconnected_cb=self.on_reconnected,
                     )
                     self.nc = nc
+                    # Before JetStream: a drop while it is down cancels a
+                    # restart, and nats-py replays only subscriptions it holds.
+                    await self.subscribe_help(nc)
                     await self.init_stores()
-                    await self.subscribe_help()
                 except CONNECT_ERRORS as error:
                     LOGGER.warning(
                         "NATS connection failed; retrying: %s",
@@ -551,10 +551,25 @@ class Coordinator:
             "watch-sessions": self.watch_sessions,
         }
 
+    async def open_watcher(self, kv: KeyValue) -> KeyValue.KeyWatcher:
+        """Watch every key of a bucket, stopping the watcher if cancelled first.
+
+        nats-py subscribes before its setup round trip and keeps the
+        subscription when cancelled there, replaying it on every reconnect. The
+        setup runs shielded instead: a cancelled watch leaves at once, and a
+        background task stops the watcher once it is set up.
+        """
+        setup = asyncio.create_task(kv.watchall())
+        try:
+            return await asyncio.shield(setup)
+        except asyncio.CancelledError:
+            self.watcher_stops.spawn(stop_watcher(setup), "stop-watcher")
+            raise
+
     async def watch_channels(self, synced: Callable[[], None]) -> None:
         """Watch the channels KV bucket and apply record updates."""
         kv = await self.channels_store.open()
-        watcher = await kv.watchall()
+        watcher = await self.open_watcher(kv)
         try:
             async for entry in watcher:
                 if entry is None:
@@ -578,7 +593,7 @@ class Coordinator:
     async def watch_presence(self, synced: Callable[[], None]) -> None:
         """Watch the presence KV bucket and detect duplicate bot IDs."""
         kv = await self.presence_store.open()
-        watcher = await kv.watchall()
+        watcher = await self.open_watcher(kv)
         try:
             saw_conflict = False
             async for entry in watcher:
@@ -634,7 +649,7 @@ class Coordinator:
         """Watch the sessions KV bucket and report validated records by key."""
         replayed: set[str] | None = set()
         kv = await self.sessions.open()
-        watcher = await kv.watchall()
+        watcher = await self.open_watcher(kv)
         try:
             async for entry in watcher:
                 if entry is None:
@@ -666,3 +681,10 @@ class Coordinator:
                 )
         finally:
             await watcher.stop()
+
+
+async def stop_watcher(setup: asyncio.Task[KeyValue.KeyWatcher]) -> None:
+    """Stop a watcher once its setup completes; a failed setup leaves none."""
+    with suppress(*PUBLISH_ERRORS):
+        watcher = await setup
+        await watcher.stop()
