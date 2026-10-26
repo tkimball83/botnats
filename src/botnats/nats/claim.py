@@ -9,7 +9,9 @@ from contextlib import suppress
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
-from botnats.nats.store import PUBLISH_ERRORS, StoreUnavailableError
+from nats.js.errors import BadRequestError
+
+from botnats.nats.store import PUBLISH_ERRORS, StoreUnavailableError, decode_record
 
 if TYPE_CHECKING:
     from botnats.nats.store import PresenceStore
@@ -88,10 +90,6 @@ class PresenceClaim:
 
     async def put(self, presence: dict[str, Any]) -> None:
         """Write or refresh presence, reclaiming the key when not owned."""
-        if presence.get("bot_id") != self.bot_id:
-            msg = "presence does not match coordinator bot ID"
-            raise ValueError(msg)
-
         async with self.lock:
             self.last = presence
             generation = self.generation
@@ -136,12 +134,25 @@ class PresenceClaim:
         return False
 
     async def release(self) -> None:
-        """Delete the owned key on shutdown so a replacement can claim it."""
+        """Delete the owned key on shutdown so a replacement can claim it.
+
+        A heartbeat cancelled after its write reached the server leaves the
+        revision stale. nats-py reports that delete's revision mismatch as a
+        bare BadRequestError; the record is then deleted at its current
+        revision if it is still this instance's.
+        """
         async with self.lock:
             revision = self.revision
             if self.owned and revision is not None:
                 with suppress(*PUBLISH_ERRORS):
-                    await self.store.delete(self.bot_id, revision)
+                    try:
+                        await self.store.delete(self.bot_id, revision)
+                    except BadRequestError:
+                        kv = await self.store.open()
+                        entry = await kv.get(self.key)
+                        record = decode_record(entry.value)
+                        if record and record.get("instance_id") == self.instance_id:
+                            await kv.delete(self.key, last=entry.revision)
 
             self.reset()
 

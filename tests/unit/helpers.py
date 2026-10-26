@@ -379,10 +379,6 @@ class FakeCoordinator:
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
         """Record a presence write."""
-        if presence.get("bot_id") != self.bot_id:
-            msg = "presence does not match coordinator bot ID"
-            raise ValueError(msg)
-
         self.require_writable()
         self.presence_puts.append(presence)
 

@@ -46,11 +46,7 @@ async def run(config: BotConfig) -> None:
     bot = Bot(config)
     task = asyncio.current_task()
     if task is not None:
-        with suppress(NotImplementedError):
-            asyncio.get_running_loop().add_signal_handler(
-                signal.SIGTERM,
-                task.cancel,
-            )
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
 
     await bot.run()
 
