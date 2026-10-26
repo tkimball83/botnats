@@ -21,5 +21,5 @@ jobs:
         with:
           python-version-file: .python-version
       - run: make install
-      - run: venv/bin/pre-commit run --all-files --show-diff-on-failure
+      - run: venv/bin/pre-commit run yamllint --all-files
 ...

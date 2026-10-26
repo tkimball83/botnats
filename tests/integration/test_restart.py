@@ -14,6 +14,7 @@ from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
     connect,
     coordination_key,
+    delete_buckets,
     keep_trying,
 )
 
@@ -109,5 +110,6 @@ async def check() -> None:
         stored_session = json.loads(session_entry.value)
         assert stored_session["prefix"] == SESSION_IDENTITY
         assert stored_session["issuer"] == "integration"
+        await delete_buckets(nc, claims.bucket, channels.bucket, sessions.bucket)
     finally:
         await nc.drain()

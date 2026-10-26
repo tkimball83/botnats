@@ -8,12 +8,9 @@ import os
 import time
 import unittest
 import uuid
-from contextlib import suppress
 from dataclasses import asdict
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
-
-from nats.errors import Error as NatsError
 
 from botnats.channel import ChannelRecord
 from botnats.nats.coordinator import Coordinator, NATSConfig
@@ -22,6 +19,7 @@ from botnats.nats.store import ATTEMPT_LIMIT
 from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
     coordination_key,
+    delete_buckets,
     nats_urls,
 )
 from tests.integration.test_mesh import poll_until
@@ -125,13 +123,8 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def delete_buckets(self) -> None:
         """Delete this test's buckets so they don't load later phases."""
         nc = self.alpha.nc
-        if nc is None:
-            return
-
-        js = nc.jetstream()
-        for store in self.alpha.stores:
-            with suppress(NatsError):
-                await js.delete_key_value(store.bucket)
+        if nc is not None:
+            await delete_buckets(nc, *(store.bucket for store in self.alpha.stores))
 
     async def test_auth_claim_dedup(self) -> None:
         """Verify a TOTP counter can be claimed once across the whole mesh."""

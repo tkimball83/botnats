@@ -14,6 +14,7 @@ from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
     connect,
     coordination_key,
+    delete_buckets,
 )
 from tests.integration.test_restart import SESSION_IDENTITY, SESSION_TTL, session_record
 
@@ -57,5 +58,7 @@ async def reopen_with_ttl(old: float, new: float) -> None:
         else:
             msg = "a replica mismatch opened the bucket"
             raise AssertionError(msg)
+
+        await delete_buckets(nc, after.bucket)
     finally:
         await nc.drain()

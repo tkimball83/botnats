@@ -8,7 +8,7 @@ import os
 import signal
 import sys
 import unittest
-from asyncio.subprocess import DEVNULL, PIPE
+from asyncio.subprocess import DEVNULL, PIPE, Process
 from functools import partial
 
 from tests.integration import (
@@ -34,6 +34,8 @@ NATS_NODES = ("nats-1", "nats-2", "nats-3")
 PHASE_TIMEOUT = 600.0
 READY_ATTEMPTS = 60
 STABLE_READY_CHECKS = 3
+# A cancelled docker compose command gets this long to exit before it is killed.
+STOP_TIMEOUT = 10.0
 # The only copy of the test secrets: compose.yml reads them from here.
 TEST_ENVIRONMENT = {
     "BOTNATS_TEST_COORDINATION_SECRET": "coordination-secret-used-only-for-tests",
@@ -46,7 +48,8 @@ UP = ("up", "--detach", "--no-build", "--wait", "--wait-timeout", "120")
 async def compose(*arguments: str, check: bool = True) -> None:
     """Run one docker compose command, streaming its output."""
     process = await asyncio.create_subprocess_exec(*COMPOSE, *arguments)
-    if await process.wait() != 0 and check:
+    await finish(process)
+    if process.returncode != 0 and check:
         msg = f"docker compose {' '.join(arguments)} failed"
         raise AssertionError(msg)
 
@@ -59,8 +62,30 @@ async def compose_output(*arguments: str) -> str | None:
         stdout=PIPE,
         stderr=DEVNULL,
     )
-    stdout, _ = await process.communicate()
+    stdout = await finish(process)
     return stdout.decode().strip() if process.returncode == 0 else None
+
+
+async def finish(process: Process) -> bytes:
+    """Return a docker compose command's output once it exits.
+
+    A phase timeout or SIGTERM stops the command, so it cannot keep running
+    alongside the log dump and teardown that follow.
+    """
+    try:
+        stdout, _ = await process.communicate()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                async with asyncio.timeout(STOP_TIMEOUT):
+                    await process.wait()
+            except TimeoutError:
+                process.kill()
+
+        raise
+
+    return stdout
 
 
 async def published_address(service: str, port: str) -> str:

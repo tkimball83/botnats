@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-PYTHON ?= python3.14
+PYTHON ?= python$(shell cat .python-version)
 
 .PHONY: all clean hooks install integration test unit venv
 

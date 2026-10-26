@@ -288,8 +288,8 @@ async def run() -> None:
         for channel, key in CHANNELS:
             # Key the channel with other than the key the admin supplied: later
             # rejoins need the key the bots saw on IRC and stored.
-            assert await command(session, "alpha", f"OP {channel} owner") == (
-                f"Opped owner on {channel}"
+            await wait_for_reply(
+                session, "alpha", f"OP {channel} owner", f"Opped owner on {channel}"
             )
             await wait_for_operators(session, channel, present=frozenset({"owner"}))
             await session.send("MODE", channel, "+k", key)
@@ -317,7 +317,6 @@ async def run() -> None:
         assert "i" in await modes(session, first)
         assert "i" not in await modes(session, second)
 
-        await wait_for_operators(session, first, present=frozenset({"alpha"}))
         assert await command(session, "alpha", f"BAN {first} {TEST_BAN}") == (
             f"Banned {TEST_BAN} on {first}"
         )

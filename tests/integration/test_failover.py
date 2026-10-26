@@ -5,6 +5,7 @@
 
 import asyncio
 import os
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import nats
@@ -80,6 +81,14 @@ async def connect() -> nats.NATS:
         CONNECT_TIMEOUT,
         "no NATS node accepted a connection",
     )
+
+
+async def delete_buckets(nc: nats.NATS, *buckets: str) -> None:
+    """Delete a test's own buckets so they don't load later phases."""
+    js = nc.jetstream()
+    for bucket in buckets:
+        with suppress(NatsError):
+            await js.delete_key_value(bucket)
 
 
 async def open_claims() -> tuple[nats.NATS, ClaimStore, KeyValue]:
