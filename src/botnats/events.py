@@ -126,7 +126,9 @@ class IRCEventHandler:
         elif argument is not None:
             # Servers send "*" in place of a hidden key, to operators too
             # during a netsplit; a literal "*" key is set with JOIN instead.
-            if not adding or argument != "*":
+            if adding and argument == "*":
+                self.bot.channel_mgr.key_hidden(runtime.channel)
+            else:
                 self.process_key(runtime, argument if adding else None)
         elif not adding and runtime.key is not None:
             self.process_key(runtime, None)
@@ -686,10 +688,7 @@ class IRCEventHandler:
             LOGGER.warning("ignoring unusable channel key on %s", runtime.channel)
             return
 
-        self.bot.tasks.spawn(
-            self.bot.channel_mgr.record_key(runtime.channel, runtime.key),
-            "record-channel-key",
-        )
+        self.bot.channel_mgr.record_key(runtime.channel)
 
     def process_op(
         self,

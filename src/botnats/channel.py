@@ -21,11 +21,7 @@ from botnats.irc.protocol import (
     mode_requires_argument,
 )
 from botnats.nats.store import PUBLISH_ERRORS
-from botnats.validators import (
-    MAX_CHANNEL_REVISION,
-    parse_channel_record,
-    validate_join,
-)
+from botnats.validators import MAX_CHANNEL_REVISION, validate_join
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,9 +53,10 @@ class ChannelManager:
         # Channels no longer desired whose PART could not be sent yet; this
         # bot is still in them.
         self.pending_parts: dict[str, str] = {}
-        # ASCII-folded channel -> channel whose key write failed. A retry
-        # writes the key this bot sees on IRC at that moment, never the one
-        # it saw when the write failed, so a superseded change is not replayed.
+        # ASCII-folded channel -> channel whose key, as this bot sees it on
+        # IRC, is not recorded yet: its write is queued, in flight, or failed.
+        # Each write takes the key seen at that moment, so a superseded change
+        # is never replayed.
         self.pending_keys: dict[str, str] = {}
         # Key writes and their retries run one at a time, so each compares
         # against the record the previous write left.
@@ -91,14 +88,17 @@ class ChannelManager:
         self.channel_records[folded] = record
         if record.present:
             unparted = self.pending_parts.pop(folded, None) is not None
-            existing = self.channels.get(folded)
-            runtime = existing or ChannelRuntime(caps=self.bot.caps)
+            runtime = self.channels.get(folded) or ChannelRuntime(caps=self.bot.caps)
             self.channels[folded] = runtime
             runtime.channel = record.channel
-            # Take the key only from a record that changes it: a record that
-            # carries the old key over must not clobber a newer key this bot
-            # observed on IRC and is still writing.
-            if existing is None or current is None or current.key != record.key:
+            # A record can carry an older key than one this bot saw on IRC and
+            # has yet to record, even its own write landing late. Otherwise
+            # the record knows best: IRC can hide a key change behind "*".
+            unrecorded = runtime.joined and any(
+                self.bot.caps.fold(channel) == folded
+                for channel in self.pending_keys.values()
+            )
+            if not unrecorded:
                 runtime.key = record.key
 
             if unparted:
@@ -164,37 +164,58 @@ class ChannelManager:
             elif runtime.names_due:
                 self.refresh_names(runtime)
 
-    async def record_key(self, channel: str, key: str | None) -> None:
-        """Record a channel key change in its durable channel record."""
-        async with self.key_lock:
-            await self.write_key(channel, key)
+    def record_key(self, channel: str) -> None:
+        """Record the key this bot now sees on IRC in its durable record.
 
-    async def write_key(self, channel: str, key: str | None) -> bool:
-        """Write a key change after the current record; return False on failure.
+        The key is pending from this moment, not from when its write gets a
+        turn: no record applied in between may replace it.
+        """
+        self.pending_keys[casefold(channel, "ascii")] = channel
+        self.bot.tasks.spawn(self.retry_pending_keys(), "record-channel-key")
+
+    def key_hidden(self, channel: str) -> None:
+        """Drop a key this bot has yet to record once IRC hides a newer one.
+
+        Peers that see the new key record it, and with nothing pending here
+        their records set it.
+        """
+        folded = self.bot.caps.fold(channel)
+        self.pending_keys = {
+            source_key: pending
+            for source_key, pending in self.pending_keys.items()
+            if self.bot.caps.fold(pending) != folded
+        }
+
+    async def write_key(self, channel: str) -> bool:
+        """Write the key this bot sees on IRC now; return False on failure.
 
         A failed write is not applied locally, where it would shadow newer
-        remote records; the channel is marked for a retry instead.
+        remote records. The key stays pending until its record holds it: a
+        failed or lost write is retried, and a key that changed while the
+        write was in flight is written next.
         """
-        source_key = casefold(channel, "ascii")
-        current = self.channel_records.get(self.bot.caps.fold(channel))
-        if current is None or not current.present or current.key == key:
-            self.pending_keys.pop(source_key, None)
-            return True
+        runtime = self.runtime(channel)
+        if runtime is not None and not self.key_recorded(runtime):
+            try:
+                await self.write_record(channel, runtime.key, present=True)
+            except PUBLISH_ERRORS:
+                return False
 
-        try:
-            won = await self.write_record(channel, key, present=True)
-        except PUBLISH_ERRORS:
-            self.pending_keys[source_key] = channel
-            return False
+            runtime = self.runtime(channel)
 
-        if won:
-            self.pending_keys.pop(source_key, None)
-        else:
-            # A concurrent record won, perhaps carrying the old key over; the
-            # retry rewrites the key seen on IRC unless the winner holds it.
-            self.pending_keys[source_key] = channel
+        if runtime is None or self.key_recorded(runtime):
+            self.pending_keys.pop(casefold(channel, "ascii"), None)
 
         return True
+
+    def key_recorded(self, runtime: ChannelRuntime) -> bool:
+        """Return whether the record holds the key this bot sees on IRC.
+
+        A bot no longer in the channel sees no key; the peers still in it
+        observe the same MODE changes and record them.
+        """
+        record = self.channel_records[self.bot.caps.fold(runtime.channel)]
+        return not runtime.joined or record.key == runtime.key
 
     async def write_record(
         self,
@@ -505,17 +526,14 @@ class ChannelManager:
                 await self.request_peer("op", runtime.channel)
 
     async def retry_pending_keys(self) -> None:
-        """Retry failed key writes with the key this bot sees on IRC now.
-
-        A bot no longer in the channel cannot see its key; the peers still in
-        it observe the same MODE changes and record them.
-        """
+        """Write each pending key as this bot sees it on IRC now."""
         async with self.key_lock:
             for source_key, channel in tuple(self.pending_keys.items()):
-                runtime = self.runtime(channel)
-                if runtime is None or not runtime.joined:
-                    self.pending_keys.pop(source_key, None)
-                elif not await self.write_key(channel, runtime.key):
+                # A key hidden during an earlier write is no longer pending.
+                if source_key not in self.pending_keys:
+                    continue
+
+                if not await self.write_key(channel):
                     return
 
     def part(self, channel: str) -> None:
@@ -557,20 +575,13 @@ class ChannelManager:
             self.pending_parts.pop(folded, None)
 
     def safe_join(self, runtime: ChannelRuntime) -> None:
-        """Send JOIN, silently handling connection and validation errors."""
+        """Send JOIN, or leave it due for the next tick while IRC is down."""
         try:
             params = (
                 (runtime.channel, runtime.key) if runtime.key else (runtime.channel,)
             )
             self.bot.irc.send("JOIN", *params)
         except ConnectionError:
-            return
-        except ValueError as error:
-            LOGGER.warning(
-                "cannot join %s: %s",
-                runtime.channel,
-                error_label(error),
-            )
             return
         # Only a JOIN that actually reached the send queue is in flight.
         runtime.start_join()
@@ -647,11 +658,6 @@ class ChannelRecord:
     revision: str
 
     @classmethod
-    def from_dict(cls, value: object) -> ChannelRecord:
-        """Deserialize a channel record from a dictionary."""
-        return cls(*parse_channel_record(value))
-
-    @classmethod
     def new(
         cls,
         channel: str,
@@ -671,7 +677,6 @@ class ChannelRecord:
             msg = "channel revision counter is exhausted"
             raise ValueError(msg)
 
-        channel, key = validate_join(channel, key)
         return cls(
             channel=channel,
             key=key,
@@ -793,8 +798,8 @@ class ChannelRuntime:
         """Set the channel key, validating a non-None key.
 
         Returns False without changing the current key when a key is present
-        but unusable, so the IRC MODE path can reject it the same way the
-        durable path rejects it through ChannelRecord.new's validation.
+        but unusable, so the IRC MODE path rejects it the same way the store
+        rejects an unusable record.
         """
         if key is not None:
             try:

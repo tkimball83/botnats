@@ -723,6 +723,26 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             assert runtime.key == "secret"
             assert coordinator.channel_puts == []
 
+    async def test_mode_hidden_key_drops_pending_write(self) -> None:
+        """Drop a key write still pending once MODE hides a newer key."""
+        coordinator = FailingWriteCoordinator()
+        bot = bot_with_channel(coordinator=coordinator)
+        mgr = bot.channel_mgr
+        runtime = mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        op = Prefix("op", "~op", "op.host")
+        bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "old"), op))
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
+
+        assert mgr.pending_keys == {"#test": "#test"}
+        bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "*"), op))
+        coordinator.failing = False
+        await mgr.retry_pending_keys()
+
+        assert not mgr.pending_keys
+        assert coordinator.channel_puts == []
+
     async def test_mode_key_unset_without_argument(self) -> None:
         """Clear the channel key when a server strips the -k argument."""
         bot, _ = bot_with_irc()
