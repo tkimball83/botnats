@@ -158,6 +158,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(6667, 6668))
         delays: list[float] = []
         ports: list[int] = []
+        real_sleep = asyncio.sleep
 
         async def failing_connection(server: IRCServer) -> None:
             ports.append(server.port)
@@ -170,6 +171,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def record_sleep(delay: float) -> None:
             delays.append(delay)
+            await real_sleep(0)
 
         with (
             patch.object(client, "run_connection", failing_connection),
@@ -177,7 +179,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
-            await client.run_forever()
+            async with asyncio.timeout(5):
+                await client.run_forever()
 
         assert ports == [6667, 6668] * 5 + [6667]
         # The backoff grows to its cap of 8 steps and then stays there.
@@ -191,6 +194,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(6667, 6668))
         delays: list[float] = []
         ports: list[int] = []
+        real_sleep = asyncio.sleep
 
         async def connection(server: IRCServer) -> None:
             ports.append(server.port)
@@ -205,6 +209,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def record_sleep(delay: float) -> None:
             delays.append(delay)
+            await real_sleep(0)
 
         with (
             patch.object(client, "run_connection", connection),
@@ -212,7 +217,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
-            await client.run_forever()
+            async with asyncio.timeout(5):
+                await client.run_forever()
 
         assert ports == [6667, 6668, 6667]
         assert 1.5 <= delays[0] < 1.5 + 1.0
@@ -223,6 +229,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(6667, 6668))
         delays: list[float] = []
         ports: list[int] = []
+        real_sleep = asyncio.sleep
 
         async def connection(server: IRCServer) -> None:
             ports.append(server.port)
@@ -235,6 +242,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def record_sleep(delay: float) -> None:
             delays.append(delay)
+            await real_sleep(0)
 
         with (
             patch.object(client, "run_connection", connection),
@@ -243,7 +251,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
-            await client.run_forever()
+            async with asyncio.timeout(5):
+                await client.run_forever()
 
         # Failure rotates away; the stable session keeps its server and
         # resets the backoff to the base delay.
@@ -622,9 +631,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
                 await ping_seen.wait()
         finally:
-            await client.close()
-            server.close()
-            await server.wait_closed()
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
 
     async def test_oversized_server_line_is_skipped(self) -> None:
         """Skip a complete oversized line without dropping the session."""
@@ -665,9 +675,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             assert dispatched == ["002"]
             assert any("oversized" in line for line in logs.output)
         finally:
-            await client.close()
-            server.close()
-            await server.wait_closed()
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
 
     async def test_partial_line_at_eof_is_not_dispatched(self) -> None:
         """Drop a line truncated by a dying peer instead of parsing it."""
@@ -699,9 +710,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
             assert dispatched == []
         finally:
-            await client.close()
-            server.close()
-            await server.wait_closed()
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
 
     async def test_malformed_server_line_is_skipped(self) -> None:
         """Skip a line that does not parse and keep reading the session."""
@@ -749,9 +761,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 async with asyncio.timeout(5):
                     await client.run_connection(client.config.servers[0])
         finally:
-            await client.close()
-            server.close()
-            await server.wait_closed()
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
 
     async def test_registration_timeout_disconnects(self) -> None:
         """Disconnect when the server never completes registration."""
@@ -778,9 +791,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 async with asyncio.timeout(5):
                     await client.run_connection(client.config.servers[0])
         finally:
-            await client.close()
-            server.close()
-            await server.wait_closed()
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
 
     async def test_reconnect_restarts_registration(self) -> None:
         """Negotiate and register afresh on the session after a registered one.
@@ -794,7 +808,12 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             b":server CAP * LS :multi-prefix\r\n"
             + collision * NICK_COLLISION_LIMIT
             + b":server CAP * ACK :multi-prefix\r\n:server 001 bravo :Welcome\r\n",
-            b":server CAP * LS :sasl\r\n"
+            # An ACK of a NEW capability ahead of this session's LS reply
+            # must not end negotiation as though that LS were done.
+            b":server CAP * NEW :chghost\r\n"
+            b":server CAP * ACK :chghost\r\n"
+            b":server CAP * LS :sasl chghost\r\n"
+            b":server CAP * ACK :chghost\r\n"
             + collision
             + b":server 001 bravo :Welcome\r\n",
         )
@@ -840,14 +859,17 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
                         await client.close()
         finally:
-            await client.close()
-            server.close()
-            await server.wait_closed()
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
 
         assert sessions[1] == [
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
             b"USER alpha 0 * :alpha\r\n",
+            b"CAP REQ :chghost\r\n",
+            b"CAP REQ :chghost\r\n",
             b"CAP END\r\n",
             b"NICK bravo\r\n",
             b"JOIN #sync\r\n",
@@ -966,14 +988,16 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 client.send("MODE", channel)
                 client.send("MODE", channel, "+b")
         finally:
-            await client.close()
-            server.close()
-            await server.wait_closed()
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
 
     async def test_disconnect_callback_failure_is_contained(self) -> None:
         """Log a failing disconnect callback and keep reconnecting."""
         client = irc_client()
         ports: list[int] = []
+        real_sleep = asyncio.sleep
 
         def failing_callback() -> None:
             msg = "callback bug"
@@ -989,6 +1013,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def skip_sleep(delay: float) -> None:
             del delay
+            await real_sleep(0)
 
         client.on_disconnect = failing_callback
         with (
@@ -997,7 +1022,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("botnats.irc.client", level="WARNING") as logs,
             self.assertRaises(asyncio.CancelledError),
         ):
-            await client.run_forever()
+            async with asyncio.timeout(5):
+                await client.run_forever()
 
         assert ports == [6667, 6667]
         failures = [line for line in logs.output if "callback failed" in line]

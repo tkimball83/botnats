@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import threading
 import unittest
 
 from botnats import Tasks, error_label, log_task_failure
@@ -104,3 +105,29 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
             await tasks.drain()
 
         assert not tasks
+
+    async def test_drain_returns_while_done_callback_pending(self) -> None:
+        """Return when a tracked task has finished but is not yet untracked."""
+
+        async def drain_finished() -> list[bool]:
+            tasks = Tasks()
+            tasks.spawn(succeed(), "finished")
+            # The task finishes before this resumes, and its done callback
+            # is queued behind this resumption.
+            await asyncio.sleep(0)
+            tracked = [task.done() for task in tasks]
+            await tasks.drain()
+            return tracked
+
+        loop = asyncio.get_running_loop()
+        drained: asyncio.Future[list[bool]] = loop.create_future()
+
+        def run() -> None:
+            tracked = asyncio.run(drain_finished())
+            loop.call_soon_threadsafe(drained.set_result, tracked)
+
+        # A drain that never yields blocks its event loop, timeouts included,
+        # so it runs on its own loop in a thread this wait can abandon.
+        threading.Thread(target=run, daemon=True).start()
+        async with asyncio.timeout(5):
+            assert await drained == [True]

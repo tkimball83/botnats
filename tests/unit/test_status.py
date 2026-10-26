@@ -33,8 +33,9 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                     leader="nats-1",
                     replicas=[
                         PeerInfo(current=True, lag=0, name="nats-2"),
+                        # A stale current flag does not count an offline peer.
                         PeerInfo(
-                            current=False,
+                            current=True,
                             lag=4,
                             name="nats-3",
                             offline=True,
