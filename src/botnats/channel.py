@@ -7,9 +7,10 @@ import asyncio
 import logging
 import secrets
 import uuid
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from botnats import error_label
 from botnats.irc.protocol import (
@@ -21,19 +22,17 @@ from botnats.irc.protocol import (
     mode_requires_argument,
 )
 from botnats.nats.store import PUBLISH_ERRORS
-from botnats.presence import BotPresence
 from botnats.validators import (
     MAX_CHANNEL_REVISION,
     parse_channel_record,
-    validate_channel_revision,
     validate_join,
-    validate_key,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from botnats.bot import Bot
+    from botnats.presence import BotPresence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -56,7 +55,8 @@ class ChannelManager:
         self.source_records: dict[str, ChannelRecord] = {}
         # One live owner per desired channel: its state, joins, and requests.
         self.channels: dict[str, ChannelRuntime] = {}
-        # Channels no longer desired whose PART could not be sent yet.
+        # Channels no longer desired whose PART could not be sent yet; this
+        # bot is still in them.
         self.pending_parts: dict[str, str] = {}
         # ASCII-folded channel -> channel whose key write failed. A retry
         # writes the key this bot sees on IRC at that moment, never the one
@@ -69,7 +69,7 @@ class ChannelManager:
         # one channel (two admin commands, say) get distinct, ordered revisions.
         self.last_revision = 0
         # Each peer help request kind, and the action that answers it.
-        self.help_actions: dict[str, Callable[[dict[str, Any]], None]] = {
+        self.help_actions: dict[str, Callable[[str, BotPresence], None]] = {
             "invite": self.invite_peer,
             "limit": self.make_room,
             "op": self.op_peer,
@@ -91,7 +91,7 @@ class ChannelManager:
 
         self.channel_records[folded] = record
         if record.present:
-            self.pending_parts.pop(folded, None)
+            unparted = self.pending_parts.pop(folded, None) is not None
             existing = self.channels.get(folded)
             runtime = existing or ChannelRuntime(caps=self.bot.caps)
             self.channels[folded] = runtime
@@ -102,7 +102,13 @@ class ChannelManager:
             if existing is None or current is None or current.key != record.key:
                 runtime.key = record.key
 
-            if self.bot.identity.current is not None and runtime.join_due():
+            if unparted:
+                # Wanted again before its PART went out, so never left: the
+                # server would ignore a JOIN, and NAMES relearns its state.
+                runtime.join = JoinState.JOINED
+                with suppress(ConnectionError):
+                    self.bot.irc.send("NAMES", runtime.channel)
+            elif self.bot.identity.current is not None and runtime.join_due():
                 self.safe_join(runtime)
 
             return
@@ -173,12 +179,18 @@ class ChannelManager:
             return True
 
         try:
-            await self.write_record(channel, key, present=True)
+            won = await self.write_record(channel, key, present=True)
         except PUBLISH_ERRORS:
             self.pending_keys[source_key] = channel
             return False
 
-        self.pending_keys.pop(source_key, None)
+        if won:
+            self.pending_keys.pop(source_key, None)
+        else:
+            # A concurrent record won, perhaps carrying the old key over; the
+            # retry rewrites the key seen on IRC unless the winner holds it.
+            self.pending_keys[source_key] = channel
+
         return True
 
     async def write_record(
@@ -205,7 +217,7 @@ class ChannelManager:
             asdict(record),
             expected=self.durable_revision(channel),
         )
-        authoritative = ChannelRecord.from_dict(stored)
+        authoritative = ChannelRecord(*stored)
         self.apply_record(authoritative)
         return authoritative == record
 
@@ -253,7 +265,8 @@ class ChannelManager:
                 return True
 
             if any(
-                peer.matches(member.prefix, self.bot.caps.casemapping) for peer in peers
+                peer.to_prefix().matches(member.prefix, self.bot.caps.casemapping)
+                for peer in peers
             ):
                 return True
 
@@ -340,19 +353,12 @@ class ChannelManager:
 
     def help_eligible(
         self,
-        payload: dict[str, Any],
+        channel: str,
+        presence: BotPresence,
         *,
         require_member: bool = True,
-    ) -> tuple[str, BotPresence, ChannelRuntime] | None:
-        """Return a validated peer action this bot can fulfill."""
-        try:
-            channel = payload["channel"]
-            presence = BotPresence.from_dict(payload["presence"])
-            if not isinstance(channel, str):
-                return None
-        except KeyError, TypeError, ValueError:
-            return None
-
+    ) -> ChannelRuntime | None:
+        """Return the channel's runtime when this bot can help the peer now."""
         runtime = self.runtime(channel)
         if (
             runtime is None
@@ -367,20 +373,19 @@ class ChannelManager:
                 member is None
                 or self.bot.caps.is_opped(member.modes)
                 or member.prefix is None
-                or not presence.matches(member.prefix, self.bot.caps.casemapping)
+                or not presence.to_prefix().matches(
+                    member.prefix,
+                    self.bot.caps.casemapping,
+                )
             ):
                 return None
 
-        return channel, presence, runtime
+        return runtime
 
-    def invite_peer(self, payload: dict[str, Any]) -> None:
+    def invite_peer(self, channel: str, presence: BotPresence) -> None:
         """Invite a peer bot into a channel this bot holds operator status in."""
-        parsed = self.help_eligible(payload, require_member=False)
-        if parsed is None:
-            return
-
-        channel, presence, runtime = parsed
-        if self.bot.caps.fold(presence.nick) in runtime.members:
+        runtime = self.help_eligible(channel, presence, require_member=False)
+        if runtime is None or self.bot.caps.fold(presence.nick) in runtime.members:
             return
 
         try:
@@ -390,13 +395,11 @@ class ChannelManager:
 
         LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
-    def op_peer(self, payload: dict[str, Any]) -> None:
+    def op_peer(self, channel: str, presence: BotPresence) -> None:
         """Grant operator status to a peer bot."""
-        parsed = self.help_eligible(payload)
-        if parsed is None:
+        if self.help_eligible(channel, presence) is None:
             return
 
-        channel, presence, _ = parsed
         try:
             self.bot.irc.send(
                 "MODE",
@@ -409,13 +412,12 @@ class ChannelManager:
 
         LOGGER.info("opped %s on %s", presence.nick, channel)
 
-    def unban_peer(self, payload: dict[str, Any]) -> None:
+    def unban_peer(self, channel: str, presence: BotPresence) -> None:
         """Remove channel bans matching a peer bot's hostmask."""
-        parsed = self.help_eligible(payload, require_member=False)
-        if parsed is None:
+        runtime = self.help_eligible(channel, presence, require_member=False)
+        if runtime is None:
             return
 
-        channel, presence, runtime = parsed
         prefix = presence.to_prefix()
         for mask in sorted(runtime.bans.values()):
             if not mask_matches(mask, prefix, self.bot.caps.casemapping):
@@ -430,7 +432,12 @@ class ChannelManager:
                 "removed ban %s for bot %s on %s", mask, presence.bot_id, channel
             )
 
-    async def help_after_delay(self, kind: str, payload: dict[str, Any]) -> None:
+    async def help_after_delay(
+        self,
+        kind: str,
+        channel: str,
+        presence: BotPresence,
+    ) -> None:
         """Wait a random moment so answering peers spread out, then act.
 
         The action rechecks eligibility against live IRC state, so a peer that
@@ -441,20 +448,16 @@ class ChannelManager:
             return
 
         await asyncio.sleep(secrets.randbelow(1000) / 1000 * PEER_HELP_DELAY)
-        action(payload)
+        action(channel, presence)
 
-    def make_room(self, payload: dict[str, Any]) -> None:
+    def make_room(self, channel: str, presence: BotPresence) -> None:
         """Raise a full channel's limit so every bot left out can join.
 
         The target is absolute (members plus bots left out), so peers answering
         at once send the same limit, and a peer that sees it already set skips.
         """
-        parsed = self.help_eligible(payload, require_member=False)
-        if parsed is None:
-            return
-
-        channel, _, runtime = parsed
-        if runtime.limit is None:
+        runtime = self.help_eligible(channel, presence, require_member=False)
+        if runtime is None or runtime.limit is None:
             return
 
         left_out = sum(
@@ -519,6 +522,10 @@ class ChannelManager:
         except ConnectionError:
             self.pending_parts[self.bot.caps.fold(channel)] = channel
 
+    def parted(self, channel: str) -> None:
+        """Drop a pending PART for a channel this bot has left anyway."""
+        self.pending_parts.pop(self.bot.caps.fold(channel), None)
+
     def reset(self) -> None:
         """Clear all runtime state and cooldowns after a reconnection."""
         for runtime in self.channels.values():
@@ -529,10 +536,6 @@ class ChannelManager:
     def retry_pending_parts(self) -> None:
         """Reattempt PART for channels that failed to leave previously."""
         for folded, channel in tuple(self.pending_parts.items()):
-            if folded in self.channels:
-                self.pending_parts.pop(folded, None)
-                continue
-
             try:
                 self.bot.irc.send("PART", channel)
             except ConnectionError:
@@ -608,8 +611,8 @@ class ChannelManager:
 
 
 def revision_number(revision: str) -> int:
-    """Return the counter part of a validated channel revision."""
-    return int(validate_channel_revision(revision).partition("-")[0])
+    """Return the counter part of an already validated channel revision."""
+    return int(revision.partition("-")[0])
 
 
 @dataclass(slots=True)
@@ -779,7 +782,7 @@ class ChannelRuntime:
         """
         if key is not None:
             try:
-                validate_key(key)
+                validate_join(self.channel, key)
             except ValueError:
                 return False
 

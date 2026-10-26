@@ -15,7 +15,7 @@ from botnats.nats.store import PUBLISH_ERRORS
 
 if TYPE_CHECKING:
     from botnats.irc.protocol import IRCProtocol
-    from botnats.nats.coordinator import CoordinatorProtocol
+    from botnats.nats.coordinator import PresenceWriter
 
 IDENTITY_RETRY_ATTEMPTS = 5
 IDENTITY_RETRY_DELAY = 5.0
@@ -49,10 +49,6 @@ class BotPresence:
             values.append(item)
 
         return cls(*values)
-
-    def matches(self, prefix: Prefix, casemapping: str) -> bool:
-        """Check whether this presence corresponds to the given IRC prefix."""
-        return self.to_prefix().matches(prefix, casemapping)
 
     def to_prefix(self) -> Prefix:
         """Convert to an IRC prefix for mask matching."""
@@ -114,7 +110,7 @@ class SelfIdentity:
         self,
         *,
         bot_id: str,
-        coordinator: CoordinatorProtocol,
+        coordinator: PresenceWriter,
         instance_id: str,
         irc: IRCProtocol,
     ) -> None:

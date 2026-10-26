@@ -58,7 +58,9 @@ async def run(key: str = CHANNELS[1][1]) -> None:
         mode_string = await modes(session, second)
         assert "k" in mode_string, mode_string
         await wait_for_operators(session, second, present=BOTS)
-        # Checked once every bot is back, so a late rejoin is caught too.
+        # Checked once every bot is back, so a late rejoin is caught too. The
+        # bots are invisible (+i), so only a member of the channel sees them.
+        await session.send("JOIN", first)
         await wait_for_names(session, first, absent=BOTS)
     finally:
         await session.close()

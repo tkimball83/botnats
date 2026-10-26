@@ -9,7 +9,7 @@ from contextlib import suppress
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
-from botnats.nats.store import PUBLISH_ERRORS
+from botnats.nats.store import PUBLISH_ERRORS, StoreUnavailableError
 
 if TYPE_CHECKING:
     from botnats.nats.store import PresenceStore
@@ -40,7 +40,7 @@ class PresenceClaim:
         self.bot_id = bot_id
         self.generation = 0
         self.instance_id = instance_id
-        self.key = bot_id.casefold()
+        self.key = store.key(bot_id)
         self.last: dict[str, Any] = {
             "bot_id": bot_id,
             "host": "",
@@ -66,8 +66,8 @@ class PresenceClaim:
     def require(self) -> None:
         """Require ownership before any write that speaks for this bot ID."""
         if not self.owned:
-            msg = f"duplicate bot ID: {self.bot_id}"
-            raise RuntimeError(msg)
+            msg = f"bot ID {self.bot_id} does not own its presence key"
+            raise StoreUnavailableError(msg)
 
     def reset(self) -> None:
         """Drop ownership when Core NATS disconnects; a duplicate stays one."""

@@ -10,10 +10,11 @@ from unittest.mock import AsyncMock, patch
 from nats.errors import Error as NatsError
 
 from botnats.nats.claim import PresenceClaim, PresenceState
-from botnats.nats.store import PresenceStore
+from botnats.nats.store import PresenceStore, StoreUnavailableError
 from tests.unit.helpers import COORDINATION_KEY
 
 INSTANCE_ID = "instance"
+NOT_OWNED = "bot ID alpha does not own its presence key"
 PRESENCE = {"bot_id": "alpha", "instance_id": INSTANCE_ID}
 
 
@@ -30,7 +31,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         """Refuse writes until this process owns its presence key."""
         claim = build_claim()
 
-        with self.assertRaisesRegex(RuntimeError, "duplicate bot ID"):
+        with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
             claim.require()
 
         claim.state = PresenceState.OWNED
@@ -49,7 +50,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             ) as create,
             patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
         ):
-            with self.assertRaisesRegex(RuntimeError, "duplicate bot ID"):
+            with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
                 await claim.put(PRESENCE)
 
             await claim.put(PRESENCE)
@@ -145,7 +146,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             patch.object(claim.store, "create", AsyncMock(return_value=None)),
             patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
             self.assertLogs("botnats.nats.claim", level="ERROR"),
-            self.assertRaisesRegex(RuntimeError, "duplicate bot ID"),
+            self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED),
         ):
             await claim.put(PRESENCE)
 
@@ -217,3 +218,10 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
         assert claim.owned
         assert claim.revision == reclaimed_revision
+
+    async def test_presence_write_requires_own_bot_id(self) -> None:
+        """Reject a presence write for another bot ID."""
+        claim = build_claim()
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            await claim.put({"bot_id": "beta", "instance_id": INSTANCE_ID})

@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import tempfile
+import traceback
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -25,7 +26,7 @@ from botnats.irc.client import IRCServer
 from tests.unit.helpers import (
     AUTH_KEY,
     CONFIG,
-    COORDINATION_KEY_TEXT,
+    COORDINATION_KEY,
     NATS_CREDENTIAL,
     SECRETS,
 )
@@ -53,7 +54,7 @@ class ConfigTests(unittest.TestCase):
             auth_session_ttl=600,
             bot_id="botnats-1",
             channel_modes="+nt-s",
-            coordination_secret=COORDINATION_KEY_TEXT,
+            coordination_secret=COORDINATION_KEY,
             enforced_modes=(frozenset("nt"), frozenset("s")),
             health_port=9080,
             irc_connect_timeout=45,
@@ -74,7 +75,7 @@ class ConfigTests(unittest.TestCase):
         )
 
     def test_secret_validation(self) -> None:
-        """Reject a missing, malformed, or too-short secret."""
+        """Reject a missing, malformed, too-short, or non-UTF-8 secret."""
         for variable, value, message in (
             ("BOTNATS_TOTP_SECRET", "", "BOTNATS_TOTP_SECRET is required"),
             ("BOTNATS_TOTP_SECRET", "not base32!", "valid base32"),
@@ -95,7 +96,23 @@ class ConfigTests(unittest.TestCase):
                     json.loads(CONFIG),
                     BOTNATS_COORDINATION_SECRET=secret,
                 )
-                assert config.coordination_secret == secret
+                assert config.coordination_secret == secret.encode()
+
+        # Bytes that are not UTF-8 reach os.environ as lone surrogates. The
+        # ASCII part alone exceeds the minimum, so only the UTF-8 check can
+        # reject the value, and the single surrogate is one that a chained
+        # UnicodeEncodeError would quote.
+        secret = "canary-" * 5 + "\udcff"
+        with self.assertRaisesRegex(
+            ValueError,
+            "^BOTNATS_COORDINATION_SECRET must be valid UTF-8$",
+        ) as raised:
+            load_config(json.loads(CONFIG), BOTNATS_COORDINATION_SECRET=secret)
+
+        rendered = "".join(traceback.format_exception(raised.exception))
+        for fragment in ("canary", "udcff"):
+            with self.subTest(fragment=fragment):
+                assert fragment not in rendered
 
     def test_totp_secret_normalization(self) -> None:
         """Decode a TOTP secret written in lowercase groups split by whitespace."""
@@ -115,7 +132,7 @@ class ConfigTests(unittest.TestCase):
             nickname({"nickname": "n" * 300})
 
     def test_optional_settings_default(self) -> None:
-        """Load defaults for omitted optional keys and all-optional tables."""
+        """Load defaults for omitted optional keys, IRC ports, and tables."""
         raw = json.loads(CONFIG)
         del raw["authorization"]
         del raw["coordination"]
@@ -126,6 +143,8 @@ class ConfigTests(unittest.TestCase):
         for key in ("jetstream_replicas", "monitor_port"):
             del raw["nats"][key]
 
+        raw["irc"]["servers"] = ["ircs://irc.example.test", "irc://irc2.example.test"]
+
         # CONFIG sets every optional key away from its default.
         assert load_config(raw) == replace(
             load_config(json.loads(CONFIG)),
@@ -134,12 +153,39 @@ class ConfigTests(unittest.TestCase):
             enforced_modes=(frozenset(), frozenset()),
             health_port=8080,
             irc_connect_timeout=30,
+            # Each scheme defaults to its own port.
+            irc_servers=(
+                IRCServer("irc.example.test", 6697, tls=True),
+                IRCServer("irc2.example.test", 6667, tls=False),
+            ),
             irc_verify_tls=True,
             jetstream_replicas=1,
             maintenance_interval=3,
             nats_monitor_port=8222,
             presence_ttl=15,
         )
+
+    def test_durations_must_be_numbers(self) -> None:
+        """Reject a timeout or interval written as a string or a boolean."""
+        durations = (
+            ("authorization", "session_ttl_seconds"),
+            ("coordination", "maintenance_interval_seconds"),
+            ("coordination", "presence_ttl_seconds"),
+            ("irc", "connect_timeout_seconds"),
+        )
+        for section, key in durations:
+            # Each would read as a valid duration if converted to float.
+            for value in ("30", True):
+                raw = json.loads(CONFIG)
+                raw[section][key] = value
+                with (
+                    self.subTest(key=key, value=value),
+                    self.assertRaisesRegex(
+                        TypeError,
+                        rf"^{section}\.{key} must be a positive number$",
+                    ),
+                ):
+                    load_config(raw)
 
     def test_session_ttl_has_no_maximum(self) -> None:
         """Accept a session lifetime longer than a day."""
@@ -227,6 +273,13 @@ class ConfigTests(unittest.TestCase):
         """Verify a non-object JSON document produces a clear config error."""
         with self.assertRaisesRegex(TypeError, "configuration must be an object"):
             load_config([])
+
+    def test_channel_modes_intent(self) -> None:
+        """Return the mode string with the modes it requires and forbids."""
+        assert mode_string({"channel_modes": "-s+nt"}) == (
+            "-s+nt",
+            (frozenset("nt"), frozenset("s")),
+        )
 
     def test_channel_modes_reject_contradictions(self) -> None:
         """Reject modes configured as both required and forbidden."""

@@ -24,15 +24,20 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
                 for sock in health_check.server.sockets
                 if sock.family == socket.AF_INET
             )
-            reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            writer.write(f"GET {path} HTTP/1.0\r\n\r\n".encode())
-            await writer.drain()
-            response = await reader.read()
-            writer.close()
-            await writer.wait_closed()
+            async with asyncio.timeout(5):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(f"GET {path} HTTP/1.0\r\n\r\n".encode())
+                await writer.drain()
+                response = await reader.read()
+                writer.close()
+                await writer.wait_closed()
+
             return response
         finally:
-            await health_check.close()
+            # wait_closed also waits on a handler that never closes its
+            # connection, so the shutdown needs its own bound.
+            async with asyncio.timeout(5):
+                await health_check.close()
 
     async def test_close_is_idempotent(self) -> None:
         """Verify repeated shutdown stops and releases the listening server."""

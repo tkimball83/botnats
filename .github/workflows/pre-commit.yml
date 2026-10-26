@@ -3,13 +3,7 @@
   push:
     branches:
       - main
-    paths: &paths
-      - .pre-commit-config.yaml
-      - .yamllint
-      - '**/*.yaml'
-      - '**/*.yml'
   pull_request:
-    paths: *paths
 
 permissions:
   contents: read
@@ -26,5 +20,6 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version-file: .python-version
-      - uses: pre-commit/action@v3.0.1
+      - run: make install
+      - run: venv/bin/pre-commit run --all-files --show-diff-on-failure
 ...

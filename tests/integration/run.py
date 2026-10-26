@@ -20,7 +20,7 @@ from tests.integration import (
     test_ttl_change,
 )
 
-BOTS = ("alpha", "beta", "gamma")
+BOTS = tuple(sorted(test_mesh.BOTS))
 COMPOSE = (
     "docker",
     "compose",

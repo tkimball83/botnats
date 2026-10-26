@@ -22,7 +22,7 @@ from botnats.irc.protocol import (
 from botnats.validators import validate_server_url
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Callable
 
 LOGGER = logging.getLogger(__name__)
 
@@ -30,12 +30,16 @@ DESIRED_CAPS = frozenset({"chghost", "multi-prefix"})
 # RFC 1459's NICKLEN: a collision happens during registration, before the
 # server advertises its own limit.
 FALLBACK_NICK_LENGTH = 9
+# A quiet connection gets a PING after IDLE_TIMEOUT and must answer it
+# within PONG_TIMEOUT.
+IDLE_TIMEOUT = 120.0
 IRC_SCHEMES = frozenset({"irc", "ircs"})
 NICK_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 NICK_COLLISION_LIMIT = 20
 # Room for a full join burst: a JOIN and the WHO, MODE, and ban list queries
 # that follow it, for a few hundred channels.
 OUTBOUND_LIMIT = 1024
+PONG_TIMEOUT = 30.0
 REGISTRATION_TIMEOUT = 60.0
 SEND_BURST = 4.0
 SEND_RATE = 1.0
@@ -64,14 +68,12 @@ class IRCServer:
 
 @dataclass(frozen=True, slots=True)
 class IRCClientConfig:
-    """Connection and rate-limit settings for an IRC client."""
+    """Connection settings for an IRC client."""
 
     connect_timeout: float
     nickname: str
     servers: tuple[IRCServer, ...]
     verify_tls: bool
-    idle_timeout: float = 120.0
-    pong_timeout: float = 30.0
 
 
 class IRCClient:
@@ -83,7 +85,7 @@ class IRCClient:
         caps: ISupportState,
         config: IRCClientConfig,
         on_disconnect: Callable[[], None],
-        on_message: Callable[[IRCMessage], Awaitable[None]],
+        on_message: Callable[[IRCMessage], None],
     ) -> None:
         self.cap_available: set[str] = set()
         self.cap_negotiating = False
@@ -164,7 +166,7 @@ class IRCClient:
 
         self.track_registration(message)
         try:
-            await self.on_message(message)
+            self.on_message(message)
         except Exception:
             LOGGER.exception("IRC message handler failed for %s", message.command)
 
@@ -273,7 +275,7 @@ class IRCClient:
         while not self.stopping:
             now = loop.time()
             if ping_token is None:
-                timeout = self.config.idle_timeout
+                timeout = IDLE_TIMEOUT
             else:
                 timeout = max(0.0, pong_deadline - now)
 
@@ -296,7 +298,7 @@ class IRCClient:
                     raise ConnectionError(msg) from error
 
                 ping_token = secrets.token_hex(16)
-                pong_deadline = loop.time() + self.config.pong_timeout
+                pong_deadline = loop.time() + PONG_TIMEOUT
                 await self.send_immediate(
                     format_message("PING", (), ping_token),
                     writer,
@@ -364,8 +366,7 @@ class IRCClient:
         encoded = format_message(command, params, trailing)
         outbound = self.outbound
         if (
-            self.writer is None
-            or self.writer.is_closing()
+            not self.connected
             or outbound is None
             or self.sender_task is None
             or self.sender_task.done()

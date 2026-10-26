@@ -11,7 +11,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import asdict
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from nats.errors import Error as NatsError
 
@@ -29,6 +29,7 @@ from tests.integration.test_restart import session_record
 
 if TYPE_CHECKING:
     from botnats.bot import NATSCallbackHandler
+    from botnats.presence import BotPresence
 
 EVENT_TIMEOUT = 5.0
 HELP_KINDS = ("invite", "limit", "op", "unban")
@@ -59,8 +60,8 @@ def build_coordinator(
 ) -> Coordinator:
     """Build a coordinator whose help requests set the event for their kind."""
 
-    def on_help(kind: str, payload: dict[str, Any]) -> None:
-        del payload
+    def on_help(kind: str, channel: str, presence: BotPresence) -> None:
+        del channel, presence
         if kind in events:
             events[kind].set()
 
@@ -154,18 +155,6 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         assert attempts == [True] * ATTEMPT_LIMIT + [False]
 
-    async def test_auth_rate_limit_boundary(self) -> None:
-        """Verify the mesh limit does not reset at a fixed-window boundary."""
-        coordinators = (self.alpha, self.beta)
-        for attempt in range(ATTEMPT_LIMIT):
-            allowed = await coordinators[attempt % 2].attempts.allow(
-                "boundary.example",
-                now=59.9,
-            )
-            assert allowed
-
-        assert not await self.beta.attempts.allow("boundary.example", now=60)
-
     async def test_help_requests_reach_peer(self) -> None:
         """Deliver every kind of broadcast help request from one bot to its peer."""
         for kind in HELP_KINDS:
@@ -185,7 +174,8 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         stored_first = await self.alpha.put_channel(first, expected=None)
         stored_second = await self.beta.put_channel(second, expected=None)
 
-        assert stored_first["key"] == "first"
+        _, stored_key, _, _ = stored_first
+        assert stored_key == "first"
         assert stored_second == stored_first
 
     async def test_session_write_keeps_highest_order(self) -> None:
@@ -200,9 +190,9 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
             version=1,
         )
 
-        assert await self.alpha.put_session(active) == active
-        assert await self.beta.put_session(stale) == active
-        assert await self.beta.put_session(revocation) == revocation
+        assert asdict(await self.alpha.put_session(active)) == active
+        assert asdict(await self.beta.put_session(stale)) == active
+        assert asdict(await self.beta.put_session(revocation)) == revocation
 
     async def test_duplicate_bot_id_stays_unready(self) -> None:
         """Keep a second process with a live bot's ID unready; the owner stays ready."""

@@ -22,7 +22,7 @@ first.
 
 | Change                      | Required skills                   |
 | --------------------------- | --------------------------------- |
-| Any Python source           | `blank-line-after-blocks`, `unit` |
+| Any Python source           | `unit`                            |
 | Integration or coordination | `integration`                     |
 | Before handoff              | `test`                            |
 | Python version bump         | `python-version`                  |

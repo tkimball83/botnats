@@ -1,16 +1,17 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for JetStream key-value store lifecycle and TOTP counter claims."""
+"""Tests for JetStream KV buckets: attempts, channels, claims, presence, sessions."""
 
 import asyncio
 import json
 import math
+import re
 import time
 import unittest
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from nats.errors import Error as NatsError
 from nats.js.api import StreamConfig
@@ -31,9 +32,13 @@ from botnats.nats.store import (
     ClaimStore,
     KVStore,
     PresenceStore,
+    Session,
     SessionStore,
+    StoreUnavailableError,
     channel_signature,
+    parse_session_record,
     presence_signature,
+    session_signature,
 )
 from tests.unit.helpers import COORDINATION_KEY as SECRET
 from tests.unit.helpers import FakeKV, session_record
@@ -41,8 +46,11 @@ from tests.unit.helpers import FakeKV, session_record
 if TYPE_CHECKING:
     from nats.js.kv import KeyValue
 
+    from botnats.validators import ChannelFields
+
 OTHER_SECRET = b"a-different-coordination-secret!"
 SHA256_HEX_LENGTH = 64
+SESSION_INVALID = "session record is invalid"
 
 
 def signed_presence(instance_id: str) -> dict[str, object]:
@@ -161,6 +169,10 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(NatsError, "repeated update races"):
             await store.reclaim("Alpha", data, "inst")
 
+
+class PresenceValidTests(unittest.TestCase):
+    """Tests for presence record freshness, signatures, and key binding."""
+
     def test_valid_binds_record_to_key(self) -> None:
         """Accept a signed record only under its own bot ID's key."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
@@ -237,6 +249,11 @@ def channel_revision(number: int) -> str:
     return f"{number:020d}-{'0' * 32}"
 
 
+def channel_fields(revision: int) -> ChannelFields:
+    """Return the validated fields channel_record(revision) carries."""
+    return "#test", None, True, channel_revision(revision)
+
+
 def channel_record(revision: int) -> dict[str, object]:
     """Build a valid, signed durable channel record with a sortable revision."""
     record: dict[str, object] = {
@@ -247,6 +264,13 @@ def channel_record(revision: int) -> dict[str, object]:
     }
     record["signature"] = channel_signature(SECRET, "efnet", record)
     return record
+
+
+def parsed_session(record: dict[str, object]) -> Session:
+    """Return the session a valid signed record holds."""
+    session = parse_session_record(SECRET, "efnet", record)
+    assert session is not None
+    return session
 
 
 class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -559,7 +583,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.get.side_effect = KeyNotFoundError()
         record = channel_record(1)
 
-        assert await channels.put(record, expected=None) == record
+        assert await channels.put(record, expected=None) == channel_fields(1)
         key, value = channels.kv.create.await_args.args
         assert key == channels.key("#test")
         assert json.loads(value) == record
@@ -640,14 +664,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         """Detect tampering with the key or presence flag after signing."""
         channels = ChannelStore("efnet", 1, SECRET)
         key = channels.key("#test")
-        signed = channels.sign(
-            {
-                "channel": "#test",
-                "key": "secret",
-                "present": True,
-                "revision": f"{1:020d}-{'0' * 32}",
-            },
-        )
+        signed = channels.sign(("#test", "secret", True, channel_revision(1)))
         assert channels.parse(key, signed) is not None
         assert channels.parse(key, {**signed, "key": "swapped"}) is None
         assert channels.parse(key, {**signed, "present": False}) is None
@@ -668,7 +685,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             expected=channel_revision(1),
         )
 
-        assert stored == concurrent
+        assert stored == channel_fields(2)
         channels.kv.update.assert_awaited_once()
 
     async def test_channel_put_yields_to_racing_create(self) -> None:
@@ -684,7 +701,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         stored = await channels.put(channel_record(2), expected=None)
 
-        assert stored == racer
+        assert stored == channel_fields(1)
         channels.kv.create.assert_awaited_once()
         channels.kv.update.assert_not_awaited()
 
@@ -706,7 +723,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             expected=channel_revision(1),
         )
 
-        assert stored == theirs
+        assert stored == channel_fields(2)
         channels.kv.update.assert_not_awaited()
 
     async def test_put_newer_bounds_lost_create_races(self) -> None:
@@ -751,7 +768,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             value=json.dumps(revocation).encode(),
         )
 
-        assert await sessions.put(active) == revocation
+        assert await sessions.put(active) == parsed_session(revocation)
         sessions.kv.update.assert_not_awaited()
 
         sessions.kv.get.return_value = SimpleNamespace(
@@ -759,23 +776,72 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             value=json.dumps(active).encode(),
         )
 
-        assert await sessions.put(revocation) == revocation
+        assert await sessions.put(revocation) == parsed_session(revocation)
 
         sessions.kv.update.assert_awaited_once()
 
-    async def test_session_put_rejects_future_dated_record(self) -> None:
-        """Refuse a signed record expiring beyond one TTL plus grace from now."""
+    async def test_session_horizon_ends_one_ttl_plus_grace_away(self) -> None:
+        """Accept a record expiring exactly at the horizon and refuse a later one."""
         sessions = SessionStore("efnet", 1, SECRET, 60)
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
-        future = session_record(time.time() + 60 + SESSION_EXPIRY_GRACE + 60)
+        key = sessions.key("owner!user@host")
+        now = 1_000_000.0
+        edge = session_record(now + 60 + SESSION_EXPIRY_GRACE)
+        future = session_record(now + 60 + SESSION_EXPIRY_GRACE + 1)
 
-        with self.assertRaisesRegex(ValueError, "session record is invalid"):
-            await sessions.put(future)
+        with patch("botnats.nats.store.time.time", return_value=now):
+            assert sessions.parse(key, future) is None
+            with self.assertRaisesRegex(ValueError, SESSION_INVALID):
+                await sessions.put(future)
+
+            assert kv.entries == {}
+            assert sessions.parse(key, edge) == parsed_session(edge)
+            assert await sessions.put(edge) == parsed_session(edge)
+
+        assert list(kv.entries) == [key]
+
+    async def test_session_signature_covers_every_field(self) -> None:
+        """Refuse a record whose signed fields changed or whose signature is bad."""
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+        kv = FakeKV()
+        sessions.kv = cast("KeyValue", kv)
+        expiry = time.time() + 30
+        valid = session_record(expiry, 1, revoked=True)
+        other_network = {k: v for k, v in valid.items() if k != "signature"}
+        other_network["signature"] = session_signature(SECRET, "undernet", valid)
+        assert parse_session_record(SECRET, "undernet", other_network) is not None
+        # Each record differs from the valid revocation in one field alone, and
+        # every changed value is well-formed, so only the signature rejects it.
+        invalid: dict[str, dict[str, object]] = {
+            "prefix changed": {**valid, "prefix": "other!user@host"},
+            "issuer changed": {**valid, "issuer": "beta"},
+            "expiry extended": {**valid, "expires_at": expiry + 10},
+            "version raised": {**valid, "version": 2},
+            "revoked flag removed": {k: v for k, v in valid.items() if k != "revoked"},
+            "revoked flag changed": {**valid, "revoked": False},
+            "signed for another network": other_network,
+            "forged signature": {**valid, "signature": "0" * SHA256_HEX_LENGTH},
+            # Rejected by shape, before a non-ASCII signature can reach the
+            # digest comparison, which raises on one.
+            "non-ASCII signature": {**valid, "signature": "é" * SHA256_HEX_LENGTH},
+            "unsigned": {k: v for k, v in valid.items() if k != "signature"},
+            # Too large for float(), so it cannot be signed or ordered.
+            "overflowing expiry": {**valid, "expires_at": 10**400},
+        }
+        for label, record in invalid.items():
+            # The record's own key, so key binding cannot mask a bad signature.
+            key = sessions.key(str(record["prefix"]))
+            with self.subTest(label):
+                assert parse_session_record(SECRET, "efnet", record) is None
+                assert sessions.parse(key, record) is None
+                with self.assertRaisesRegex(ValueError, SESSION_INVALID):
+                    await sessions.put(record)
 
         assert kv.entries == {}
-        current = session_record(time.time() + 60)
-        assert await sessions.put(current) == current
+        key = sessions.key("owner!user@host")
+        assert sessions.parse(key, valid) == parsed_session(valid)
+        assert await sessions.put(valid) == parsed_session(valid)
 
     async def test_session_parse_binds_record_to_key_and_horizon(self) -> None:
         """Reject a signed session under another identity's key or past the TTL."""
@@ -812,7 +878,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_channel = channel_record(2)
-        assert await channels.put(valid_channel, expected=None) == valid_channel
+        assert await channels.put(valid_channel, expected=None) == channel_fields(2)
         channels.kv.update.assert_awaited_once()
 
         sessions = SessionStore("efnet", 1, SECRET, 60)
@@ -824,7 +890,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_session = session_record(time.time() + 40, 0, revoked=False)
-        assert await sessions.put(valid_session) == valid_session
+        assert await sessions.put(valid_session) == parsed_session(valid_session)
         sessions.kv.update.assert_awaited_once()
 
     async def test_oversized_json_integer_is_replaced(self) -> None:
@@ -837,7 +903,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         valid_channel = channel_record(2)
-        assert await channels.put(valid_channel, expected=None) == valid_channel
+        assert await channels.put(valid_channel, expected=None) == channel_fields(2)
         channels.kv.update.assert_awaited_once()
 
     async def test_state_keys_do_not_depend_on_irc_casemapping(self) -> None:
@@ -852,6 +918,19 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert sessions.key("NICK[!user@host") == sessions.key("nick[!user@host")
         assert sessions.key("Straße!user@host") != sessions.key(
             "strasse!user@host",
+        )
+
+    async def test_channel_and_session_keys_are_secret_derived(self) -> None:
+        """Key records by a digest of the coordination secret, never the raw name."""
+        channel_key = ChannelStore("efnet", 1, SECRET).key("#test")
+        session_key = SessionStore("efnet", 1, SECRET, 60).key("owner!user@host")
+
+        for key in (channel_key, session_key):
+            assert re.fullmatch("[0-9a-f]{64}", key) is not None
+
+        assert channel_key != ChannelStore("efnet", 1, OTHER_SECRET).key("#test")
+        assert session_key != SessionStore("efnet", 1, OTHER_SECRET, 60).key(
+            "owner!user@host",
         )
 
     async def test_session_parse_rejects_unencodable_identity(self) -> None:
@@ -890,7 +969,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         store.reset()
         release.set()
 
-        with self.assertRaisesRegex(RuntimeError, "changed while opening"):
+        with self.assertRaisesRegex(StoreUnavailableError, "changed while opening"):
             await task
 
         assert store.js is None

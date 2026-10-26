@@ -10,13 +10,7 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 from botnats.irc.protocol import casefold
-from botnats.nats.store import (
-    PUBLISH_ERRORS,
-    Session,
-    parse_session_record,
-    session_signature,
-    within_horizon,
-)
+from botnats.nats.store import PUBLISH_ERRORS, Session, session_signature
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -24,7 +18,7 @@ if TYPE_CHECKING:
     from botnats import Tasks
     from botnats.bot import Bot
     from botnats.irc.protocol import Prefix
-    from botnats.nats.coordinator import CoordinatorProtocol
+    from botnats.nats.coordinator import SessionWriter
 
 TOTP_CODE_LENGTH = 6
 TOTP_PERIOD = 30
@@ -67,13 +61,13 @@ class AuthFlow:
             # The identity must still hold after the write: IRC may have
             # disconnected while it waited on JetStream.
             if (
-                not await bot.sessions.sync(rendered, session)
+                not await bot.sessions.sync(session)
                 or not bot.authorizer.authorized(rendered)
                 or not bot.sessions.watched_valid(rendered)
             ):
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
-                    await bot.sessions.sync(revoked.prefix, revoked)
+                    await bot.sessions.sync(revoked)
 
                 bot.commands.reply(prefix.nick, "Authorization failed")
                 return
@@ -127,7 +121,7 @@ class SessionSync:
     def __init__(
         self,
         authorizer: TotpAuthorizer,
-        coordinator: CoordinatorProtocol,
+        coordinator: SessionWriter,
         tasks: Tasks,
     ) -> None:
         self.authorizer = authorizer
@@ -214,28 +208,28 @@ class SessionSync:
         for key in [k for k, mapped in self.watched.items() if mapped[1] <= current]:
             del self.watched[key]
 
-    def queue(self, identity: str, session: Session) -> str:
-        """Queue a mutation unless an unwritten one for the identity outranks it.
+    def queue(self, session: Session) -> str:
+        """Queue a mutation unless an unwritten one for its identity outranks it.
 
         AUTH grants before it waits for the lock, so a revocation queued
-        meanwhile by a QUIT must not be replaced by the older grant.
+        meanwhile by a QUIT must not be replaced by the older grant. The
+        identity is the session's own prefix, which the store keys it by.
         """
-        key = casefold(identity, "ascii")
-        now = time.time()
+        key = casefold(session.prefix, "ascii")
         queued = self.pending.get(key)
-        if (
-            queued is None
-            or queued.expires_at <= now
-            or (session.expires_at > now and session.order > queued.order)
-        ):
+        if queued is None or session.order > queued.order:
             self.pending[key] = session
 
         return key
 
-    async def sync(self, identity: str, session: Session) -> bool:
-        """Queue and write one mutation now; report whether it was written."""
+    async def sync(self, session: Session) -> bool:
+        """Queue and write one mutation now.
+
+        Returns whether nothing remains unwritten for its identity; a queued
+        revocation that outranks the session drops it.
+        """
         async with self.lock:
-            key = self.queue(identity, session)
+            key = self.queue(session)
             await self.drain()
             return key not in self.pending
 
@@ -250,10 +244,7 @@ class SessionSync:
         self.invalidate(identity)
         revoked = self.authorizer.revoke(identity)
         if revoked is not None:
-            # File it under the session's own prefix: the observed prefix can
-            # differ in IRC-case-equivalent characters, and the store keys and
-            # validates sessions by their own prefix.
-            self.queue(revoked.prefix, revoked)
+            self.queue(revoked)
             self.tasks.spawn(self.retry(), "session-sync")
 
     async def drain(self) -> None:
@@ -269,7 +260,11 @@ class SessionSync:
         except PUBLISH_ERRORS:
             return False
 
-        winner = self.authorizer.import_session(stored)
+        # The store returns a validated record; an expired one is no winner.
+        winner = stored if stored.expires_at > time.time() else None
+        if winner is not None:
+            self.authorizer.keep(winner)
+
         # revoke() queues without the lock, so a newer mutation for
         # this identity may have replaced this entry during the write; it is
         # still unwritten and must stay queued for its own drain.
@@ -383,20 +378,6 @@ class TotpAuthorizer:
 
         return session
 
-    def import_session(
-        self,
-        value: object,
-        *,
-        now: float | None = None,
-    ) -> Session | None:
-        """Import a remotely supplied session into local cache and return it."""
-        current = time.time() if now is None else now
-        incoming = self.parse(value, current)
-        if incoming is not None:
-            self.keep(incoming)
-
-        return incoming
-
     def keep(self, incoming: Session) -> None:
         """Keep a session or revocation if it outranks the identity's record."""
         key = self.identity_fold(incoming.prefix)
@@ -421,21 +402,6 @@ class TotpAuthorizer:
 
         return None
 
-    def parse(self, value: object, current: float) -> Session | None:
-        """Validate and parse a remotely supplied authorization session."""
-        if not isinstance(value, dict):
-            return None
-
-        parsed = parse_session_record(self.coordination_key, self.network, value)
-        if (
-            parsed is None
-            or parsed.expires_at <= current
-            or not within_horizon(parsed, self.session_ttl, current)
-        ):
-            return None
-
-        return parsed
-
     def prune(self, current: float | None = None) -> None:
         """Remove expired sessions and revocations."""
         cutoff = time.time() if current is None else current
@@ -450,7 +416,7 @@ class TotpAuthorizer:
             self.keep(record)
 
     def revoke(self, prefix: str) -> Session | None:
-        """Destroy the session associated with the given prefix."""
+        """Replace the prefix's session with a signed revocation; return it."""
         key = self.identity_fold(prefix)
         record = self.records.get(key)
         if record is None or record.revoked:

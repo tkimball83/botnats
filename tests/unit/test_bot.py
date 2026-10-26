@@ -8,6 +8,7 @@ import ssl
 import time
 import unittest
 from dataclasses import astuple
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
@@ -16,25 +17,26 @@ from botnats import error_label
 from botnats.bot import Bot
 from botnats.channel import JoinState
 from botnats.irc.client import IRCClient
-from botnats.irc.protocol import (
-    Prefix,
-    casefold,
-)
+from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
+    FailingWriteCoordinator,
     FakeCoordinator,
     FakeIRC,
     bot_with_channel,
     bot_with_coordinator,
-    bot_with_irc,
     config,
+    drain_session_writes,
     make_bot,
     session_value,
 )
 
+if TYPE_CHECKING:
+    from botnats.nats.store import Session
+
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for bot wiring, readiness, shutdown, and NATS callbacks."""
+    """Tests for bot wiring, readiness, startup, shutdown, and NATS callbacks."""
 
     async def test_channel_record_applies_key(self) -> None:
         """Apply the key carried by a watched channel record."""
@@ -50,56 +52,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.callbacks.on_channel(astuple(record))
         assert runtime.key == "good-key"
-
-    async def test_disconnect_clears_runtime(self) -> None:
-        """Clear server-specific state on disconnect, keeping lookups valid.
-
-        The channel and the session identity fold differently under ascii and
-        rfc1459, so both are found again only if disconnect rekeys them onto
-        the default casemapping it restores.
-        """
-        bot = make_bot()
-        bot.channel_mgr.set_casemapping("ascii")
-        channel = "#te[st"
-        bot.channel_mgr.apply_record(
-            bot.channel_mgr.new_record(channel, None, present=True),
-        )
-        identity = "owner[!user@host.example"
-        bot.authorizer.grant(identity)
-        runtime = bot.channel_mgr.runtime(channel)
-        assert runtime is not None
-        bot.caps.parse_chanmodes("b,k,l,imn")
-        bot.caps.parse_prefix("(yov)@%+")
-        runtime.join = JoinState.JOINED
-        runtime.member("alpha").modes.add("o")
-        runtime.modes = "+nstl"
-        runtime.limit = 3
-        bot.identity.current = BotPresence("alpha", "host", "one", "alpha", "user")
-        bot.identity.registered = True
-        generation = bot.identity.generation
-
-        bot.on_irc_disconnect()
-
-        assert bot.identity.current is None
-        assert bot.identity.generation == generation + 1
-        assert not bot.identity.registered
-        assert bot.caps.casemapping == "rfc1459"
-        assert bot.caps.chanmodes == ("beI", "k", "l", "imnst")
-        assert bot.caps.member_prefixes == {
-            "%": "h",
-            "&": "a",
-            "+": "v",
-            "@": "o",
-            "~": "q",
-        }
-        assert bot.caps.membership_modes == "qaohv"
-        assert bot.caps.op_mode == "o"
-        assert bot.channel_mgr.runtime(channel) is runtime
-        assert not runtime.joined
-        assert not runtime.members
-        assert runtime.modes == ""
-        assert runtime.limit is None
-        assert bot.authorizer.authorized(identity)
 
     async def test_irc_client_verifies_tls(self) -> None:
         """Build the IRC client from configuration with verified TLS."""
@@ -125,7 +77,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 async with asyncio.timeout(1):
                     await started.wait()
 
-        bot, _ = bot_with_irc(coordinator=SpawningCoordinator())
+        bot, _, _ = bot_with_coordinator(SpawningCoordinator())
 
         await bot.close()
 
@@ -148,7 +100,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             async def close(self) -> None:
                 order.append("coordinator-closed")
 
-        bot, _ = bot_with_irc(coordinator=OrderingCoordinator())
+        bot, _, _ = bot_with_coordinator(OrderingCoordinator())
         bot.tasks.spawn(long_task(), "long")
         async with asyncio.timeout(1):
             await running.wait()
@@ -166,7 +118,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 msg = "connection reset"
                 raise OSError(msg)
 
-        bot, _ = bot_with_irc(coordinator=RaisingCoordinator())
+        bot, _, _ = bot_with_coordinator(RaisingCoordinator())
         with (
             patch.object(bot.irc, "close") as irc_close,
             patch.object(bot.health_check, "close") as health_close,
@@ -176,6 +128,55 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         irc_close.assert_awaited_once()
         health_close.assert_awaited_once()
+
+    async def test_close_writes_queued_revocation(self) -> None:
+        """Write a revocation still queued at shutdown before closing NATS."""
+        coordinator = FailingWriteCoordinator()
+        bot, _, _ = bot_with_coordinator(coordinator)
+        prefix = Prefix("owner", "user", "host.example")
+        bot.authorizer.grant(prefix.render())
+        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+        await drain_session_writes(bot)
+        assert bot.sessions.pending
+        # JetStream recovers, but no maintenance tick retries before shutdown.
+        coordinator.failing = False
+
+        async def disconnect() -> None:
+            coordinator.connected = False
+
+        with patch.object(coordinator, "close", disconnect):
+            await bot.close()
+
+        puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
+        assert puts == [(prefix.render(), True)]
+        assert not bot.sessions.pending
+
+    async def test_close_bounds_queued_revocation_write(self) -> None:
+        """Finish shutdown when the queued revocation's write hangs."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        bot.authorizer.grant(prefix.render())
+        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+        writing = asyncio.Event()
+
+        async def hang(record: dict[str, Any]) -> Session:
+            del record
+            writing.set()
+            never: asyncio.Future[Session] = asyncio.get_running_loop().create_future()
+            return await never
+
+        with (
+            patch.object(coordinator, "put_session", hang),
+            patch.object(coordinator, "close", AsyncMock()) as coordinator_close,
+            patch("botnats.bot.SHUTDOWN_SYNC_TIMEOUT", 0),
+        ):
+            async with asyncio.timeout(1):
+                await bot.close()
+
+        assert writing.is_set()
+        assert bot.sessions.pending
+        coordinator_close.assert_awaited_once()
+        assert not fake_irc.connected
 
     async def test_nats_callbacks_reach_their_owners(self) -> None:
         """Route presence and session watch callbacks to the owners that hold them."""
@@ -206,7 +207,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         runtime.key = "irc-key"
         bot.channel_mgr.pending_keys[casefold("#test", "ascii")] = "#test"
         prefix = "owner!user@host.example"
-        bot.sessions.queue(prefix, bot.authorizer.grant(prefix))
+        bot.sessions.queue(bot.authorizer.grant(prefix))
         outage = NatsError("NATS unavailable")
 
         with (
@@ -263,30 +264,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         coordinator.connected = False
         assert not bot.ready()
 
-    async def test_session_delete_keeps_colliding_live_identity(self) -> None:
-        """Delete only the ASCII durable identity represented by a KV key."""
-        bot, _ = bot_with_irc()
-        first = "Owner[!user@host"
-        second = "Owner{!user@host"
-        # The prefixes collide under the IRC fold but not under the ASCII fold.
-        assert bot.caps.fold_identity(first) == bot.caps.fold_identity(second)
-        assert casefold(first, "ascii") != casefold(second, "ascii")
-        now = time.time()
-        bot.authorizer.grant(first, now=now)
-        bot.authorizer.grant(second, now=now + 1)
-        # Each prefix has its own ASCII-folded KV key; deletes arrive by key.
-        expiry = now + 60
-        bot.sessions.watched["first-key"] = (first, expiry)
-        bot.sessions.watched["second-key"] = (second, expiry)
-
-        bot.callbacks.on_session_delete("first-key")
-
-        assert [s.prefix for s in bot.authorizer.records.values()] == [second]
-        assert bot.authorizer.authorized(second)
-
-        bot.callbacks.on_session_delete("second-key")
-        assert not bot.authorizer.records
-
 
 class ErrorLabelTests(unittest.TestCase):
     """Tests for the error_label helper."""
@@ -301,7 +278,7 @@ class ErrorLabelTests(unittest.TestCase):
 
 
 class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for bounded long-lived maintenance state."""
+    """Tests for the maintenance loops and the upkeep each tick performs."""
 
     async def test_loop_continues_after_tick_error(self) -> None:
         """Verify the maintenance loop survives a tick exception."""
@@ -359,8 +336,10 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
 
             self.fail("presence heartbeat stalled behind the maintenance tick")
 
+        # The channel key retry stalls, not the session retry: shutdown makes
+        # one bounded session retry of its own, which would wait out its bound.
         with (
-            patch.object(bot.sessions, "retry", stall),
+            patch.object(bot.channel_mgr, "retry_pending_keys", stall),
             patch.object(bot.health_check, "start", AsyncMock()),
             patch.object(fake_irc, "run_forever", run_until_heartbeats),
             patch("botnats.bot.asyncio.sleep", yield_once),
@@ -375,89 +354,3 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         await bot.maintenance_tick()
 
         assert not bot.authorizer.records
-
-    async def test_requests_op_before_who_replies(self) -> None:
-        """Verify op request proceeds when opped members lack prefixes."""
-        bot, _, coordinator = bot_with_coordinator()
-        bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
-        )
-        bot.identity.registered = True
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
-        runtime.member("beta").modes.add("o")
-
-        await bot.maintenance_tick()
-
-        op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
-        assert len(op_requests) == 1
-
-    async def test_requests_op_for_unopped_channels(self) -> None:
-        """Request op only in joined channels where this bot lacks it.
-
-        A peer bot is opped in every channel, so only this bot's own state
-        decides: #opped needs no op, and #waiting is not joined yet.
-        """
-        bot, _, coordinator = bot_with_coordinator()
-        bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
-        )
-        bot.identity.registered = True
-        peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer)
-        for channel in ("#opped", "#waiting"):
-            record = bot.channel_mgr.new_record(channel, None, present=True)
-            bot.channel_mgr.apply_record(record)
-
-        for channel, state in (
-            ("#test", JoinState.JOINED),
-            ("#opped", JoinState.JOINED),
-            ("#waiting", JoinState.JOINING),
-        ):
-            runtime = bot.channel_mgr.channels[casefold(channel, "rfc1459")]
-            runtime.join = state
-            runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
-            runtime.member("beta").prefix = Prefix("beta", "~beta", "beta.host")
-            runtime.member("beta").modes.add("o")
-
-        bot.channel_mgr.channels["#opped"].member("alpha").modes.add("o")
-
-        await bot.maintenance_tick()
-
-        op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
-        assert [payload["channel"] for _, payload in op_requests] == ["#test"]
-
-    async def test_skips_op_request_when_no_peer_opped(self) -> None:
-        """Verify maintenance tick skips op request when no peer has op."""
-        bot, _, coordinator = bot_with_coordinator()
-        bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
-        )
-        bot.identity.registered = True
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
-
-        await bot.maintenance_tick()
-
-        op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
-        assert len(op_requests) == 0
-
-    async def test_skips_op_request_when_only_user_opped(self) -> None:
-        """Verify opped non-peer users do not trigger op requests."""
-        bot, _, coordinator = bot_with_coordinator()
-        bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
-        )
-        bot.identity.registered = True
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
-        runtime.member("stranger").prefix = Prefix("stranger", "user", "other.host")
-        runtime.member("stranger").modes.add("o")
-
-        await bot.maintenance_tick()
-
-        op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
-        assert len(op_requests) == 0

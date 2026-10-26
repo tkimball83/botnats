@@ -33,7 +33,7 @@ class BotConfig:
     auth_session_ttl: float
     bot_id: str
     channel_modes: str
-    coordination_secret: str = field(repr=False)
+    coordination_secret: bytes = field(repr=False)
     # The channel modes to keep set and to keep unset.
     enforced_modes: tuple[frozenset[str], frozenset[str]]
     health_port: int
@@ -90,7 +90,7 @@ class BotConfig:
         servers = irc_servers(irc)
         nats_servers = nats_urls(nats_section)
         totp_secret, nats_token, coordination_secret = load_secrets()
-        channel_modes = mode_string(irc)
+        channel_modes, enforced_modes = mode_string(irc)
         maintenance_interval = positive_float(
             coordination,
             "maintenance_interval_seconds",
@@ -122,7 +122,7 @@ class BotConfig:
             bot_id=bot_id,
             channel_modes=channel_modes,
             coordination_secret=coordination_secret,
-            enforced_modes=mode_intent(channel_modes),
+            enforced_modes=enforced_modes,
             health_port=port(bot, "health_port", "bot", 8080),
             irc_connect_timeout=positive_float(
                 irc,
@@ -174,24 +174,31 @@ def irc_servers(section: dict[str, Any]) -> tuple[IRCServer, ...]:
     return servers
 
 
-def load_secrets() -> tuple[bytes, str, str]:
+def load_secrets() -> tuple[bytes, str, bytes]:
     """Load and validate required secrets from environment variables."""
     totp_secret = totp_key(os.environ.get("BOTNATS_TOTP_SECRET", ""))
     nats_token = os.environ.get("BOTNATS_NATS_TOKEN", "")
-    coordination_secret = os.environ.get("BOTNATS_COORDINATION_SECRET", "")
     if not nats_token:
         msg = "BOTNATS_NATS_TOKEN is required"
         raise ValueError(msg)
 
-    if len(coordination_secret.encode()) < MIN_COORDINATION_KEY_BYTES:
+    try:
+        coordination_secret = os.environ.get("BOTNATS_COORDINATION_SECRET", "").encode()
+    except UnicodeEncodeError:
+        msg = "BOTNATS_COORDINATION_SECRET must be valid UTF-8"
+        raise ValueError(msg) from None
+
+    if len(coordination_secret) < MIN_COORDINATION_KEY_BYTES:
         msg = "BOTNATS_COORDINATION_SECRET must contain at least 32 bytes"
         raise ValueError(msg)
 
     return totp_secret, nats_token, coordination_secret
 
 
-def mode_string(section: dict[str, Any]) -> str:
-    """Extract and validate the enforced channel modes from the irc section."""
+def mode_string(
+    section: dict[str, Any],
+) -> tuple[str, tuple[frozenset[str], frozenset[str]]]:
+    """Extract the enforced channel modes from the irc section, and their intent."""
     value = section.get("channel_modes", "")
     if not isinstance(value, str):
         msg = "irc.channel_modes must be a string"
@@ -207,7 +214,7 @@ def mode_string(section: dict[str, Any]) -> str:
     if value:
         format_message("MODE", ("#x", value), None)
 
-    return value
+    return value, (required, forbidden)
 
 
 def mode_intent(value: str) -> tuple[frozenset[str], frozenset[str]]:

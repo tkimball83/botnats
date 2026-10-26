@@ -3,19 +3,32 @@ default_stages:
   - pre-commit
 
 repos:
-  - repo: https://github.com/jsh9/blank-line-after-blocks
-    rev: 0.1.4
+  # The Python tools run from the project venv (make install), so
+  # pyproject.toml pins each of them once.
+  - repo: local
     hooks:
       - id: blank-line-after-blocks
+        name: blank-line-after-blocks
+        entry: venv/bin/blank-line-after-blocks
+        language: system
         files: ^(src|tests)/.*\.py$
         verbose: true
-
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.9
-    hooks:
       - id: ruff-check
-        args: [--fix]
+        name: ruff check
+        entry: venv/bin/ruff check --fix
+        language: system
+        types_or: [python, pyi]
       - id: ruff-format
+        name: ruff format
+        entry: venv/bin/ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy
+        entry: venv/bin/mypy src tests
+        language: system
+        pass_filenames: false
+        types: [python]
 
   - repo: https://github.com/adrienverge/yamllint.git
     rev: v1.38.0
@@ -23,13 +36,4 @@ repos:
       - id: yamllint
         types: [file, yaml]
         entry: yamllint --strict
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.3.1
-    hooks:
-      - id: mypy
-        args: [src, tests]
-        pass_filenames: false
-        additional_dependencies:
-          - nats-py==2.15.0
 ...

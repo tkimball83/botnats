@@ -6,20 +6,17 @@
 import asyncio
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from contextlib import suppress
+from typing import TYPE_CHECKING
 
 from botnats import Tasks
 from botnats.auth import AuthFlow, SessionSync, TotpAuthorizer
 from botnats.channel import ChannelManager, ChannelRecord
 from botnats.commands import CommandHandler
+from botnats.events import IRCEventHandler
 from botnats.health_check import HealthCheck
 from botnats.irc.client import IRCClient, IRCClientConfig
-from botnats.irc.events import IRCEventHandler
-from botnats.irc.protocol import (
-    DEFAULT_CASEMAPPING,
-    IRCProtocol,
-    ISupportState,
-)
+from botnats.irc.protocol import IRCProtocol, ISupportState
 from botnats.nats.coordinator import Coordinator, CoordinatorProtocol, NATSConfig
 from botnats.nats.envelope import Envelope
 from botnats.presence import BotPresence, PresenceRegistry, SelfIdentity
@@ -32,6 +29,8 @@ if TYPE_CHECKING:
     from botnats.validators import ChannelFields
 
 LOGGER = logging.getLogger(__name__)
+# The most shutdown waits to write revocations still queued.
+SHUTDOWN_SYNC_TIMEOUT = 5.0
 
 
 class Bot:
@@ -45,12 +44,11 @@ class Bot:
         coordinator: CoordinatorProtocol | None = None,
     ) -> None:
         """Build and wire every component; tests may supply the IRC and NATS ends."""
-        coordination_key = config.coordination_secret.encode()
         self.config = config
         self.caps = ISupportState()
         self.authorizer = TotpAuthorizer(
             config.totp_secret,
-            coordination_secret=coordination_key,
+            coordination_secret=config.coordination_secret,
             identity_fold=self.caps.fold_identity,
             scope=(config.bot_id, config.network),
             session_ttl=config.auth_session_ttl,
@@ -71,7 +69,7 @@ class Bot:
                 session_ttl=config.auth_session_ttl,
                 token=config.nats_token,
             ),
-            envelope=Envelope(config.bot_id, coordination_key),
+            envelope=Envelope(config.bot_id, config.coordination_secret),
         )
         self.sessions = SessionSync(self.authorizer, self.coordinator, self.tasks)
         self.channel_mgr = ChannelManager(self)
@@ -87,7 +85,7 @@ class Bot:
                 servers=config.irc_servers,
                 verify_tls=config.irc_verify_tls,
             ),
-            on_disconnect=self.on_irc_disconnect,
+            on_disconnect=self.events.on_irc_disconnect,
             on_message=self.events.on_irc_message,
         )
         self.identity = SelfIdentity(
@@ -107,6 +105,12 @@ class Bot:
         # socket or the health port.
         await self.tasks.drain()
         try:
+            # A revocation still queued would stay valid until it expires for
+            # peers that never saw its QUIT or NICK; give it one bounded try.
+            with suppress(TimeoutError):
+                async with asyncio.timeout(SHUTDOWN_SYNC_TIMEOUT):
+                    await self.sessions.retry()
+
             await self.coordinator.close()
         finally:
             await self.tasks.drain()
@@ -142,15 +146,6 @@ class Bot:
         if self.coordinator.ready:
             await self.sessions.retry()
             await self.channel_mgr.retry_pending_keys()
-
-    def on_irc_disconnect(self) -> None:
-        """Clear connection-scoped state when the IRC connection drops."""
-        self.events.stop_nick_watch()
-        self.sessions.invalidate_all()
-        self.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
-        self.caps.reset()
-        self.channel_mgr.reset()
-        self.identity.reset()
 
     def ready(self) -> bool:
         """Return whether IRC and all coordination dependencies are ready."""
@@ -217,7 +212,9 @@ class NATSCallbackHandler:
         """Drop sessions a completed watch replay no longer contains."""
         self.bot.sessions.replayed(keys)
 
-    def on_help(self, kind: str, payload: dict[str, Any]) -> None:
+    def on_help(self, kind: str, channel: str, presence: BotPresence) -> None:
         """Schedule a peer's help request."""
-        channels = self.bot.channel_mgr
-        self.bot.tasks.spawn(channels.help_after_delay(kind, payload), "peer-help")
+        self.bot.tasks.spawn(
+            self.bot.channel_mgr.help_after_delay(kind, channel, presence),
+            "peer-help",
+        )

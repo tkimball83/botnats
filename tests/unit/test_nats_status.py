@@ -86,26 +86,29 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=3/3 lag=0"
         )
 
-    async def test_collect_single_node(self) -> None:
-        """Report a replication-free single-node stream as up."""
+    async def test_collect_stream_without_cluster(self) -> None:
+        """Report a cluster-less stream as up only when it wants one replica."""
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
-        kv = AsyncMock()
-        kv.status.return_value = SimpleNamespace(
-            stream_info=SimpleNamespace(
-                cluster=None,
-                config=SimpleNamespace(num_replicas=1),
-            ),
-        )
+        for replicas, state in ((1, "up"), (3, "degraded")):
+            with self.subTest(replicas=replicas):
+                kv = AsyncMock()
+                kv.status.return_value = SimpleNamespace(
+                    stream_info=SimpleNamespace(
+                        cluster=None,
+                        config=SimpleNamespace(num_replicas=replicas),
+                    ),
+                )
 
-        with patch(
-            "botnats.nats.status.route_count",
-            AsyncMock(return_value=0),
-        ):
-            status = await collect(nc, kv, 1, 8222)
+                with patch(
+                    "botnats.nats.status.route_count",
+                    AsyncMock(return_value=0),
+                ):
+                    status = await collect(nc, kv, replicas, 8222)
 
-        assert status.render() == (
-            "nats connection=up routes=0 jetstream=up leader=? replicas=1/1 lag=0"
-        )
+                assert status.render() == (
+                    f"nats connection=up routes=0 jetstream={state} leader=? "
+                    f"replicas=1/{replicas} lag=0"
+                )
 
     async def test_collect_unknown_when_disconnected(self) -> None:
         """Return unknown details without monitoring a disconnected client."""
@@ -164,6 +167,16 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 request = writer.write.call_args.args[0]
                 assert f"\r\nHost: {location}\r\n".encode() in request
                 writer.close.assert_called_once_with()
+
+    async def test_route_count_unknown_when_unreachable(self) -> None:
+        """Report no route count when the monitoring port refuses connections."""
+        with patch(
+            "botnats.nats.status.asyncio.open_connection",
+            AsyncMock(side_effect=ConnectionRefusedError("refused")),
+        ):
+            routes = await route_count("nats-1", 8222)
+
+        assert routes is None
 
     async def test_route_count_refuses_redirects(self) -> None:
         """Reject a redirect response instead of following it."""

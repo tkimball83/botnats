@@ -14,14 +14,8 @@ from nats.errors import Error as NatsError
 
 from botnats import Tasks
 from botnats.auth import TOTP_PERIOD, SessionSync, TotpAuthorizer, totp
-from botnats.channel import JoinState
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
-from botnats.nats.store import (
-    ATTEMPT_LIMIT,
-    SESSION_EXPIRY_GRACE,
-    Session,
-    SessionStore,
-)
+from botnats.nats.store import ATTEMPT_LIMIT, Session
 from tests.unit.helpers import (
     AUTH_KEY,
     COORDINATION_KEY,
@@ -50,7 +44,7 @@ def authorizer(issuer: str = "alpha", network: str = "efnet") -> TotpAuthorizer:
 
 
 class TotpAuthorizerTests(unittest.TestCase):
-    """Tests for TOTP code matching, session binding, and import."""
+    """Tests for TOTP code matching, session binding, and record ordering."""
 
     def test_rfc_vector_and_invalid_codes(self) -> None:
         """Match the RFC 4226 test vector and reject malformed or wrong codes."""
@@ -97,14 +91,13 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert not auth.authorized("Owner{!user@host", now=15)
 
     def test_revocation_blocks_stale_import(self) -> None:
-        """Verify a revoked session cannot be restored by a stale import."""
+        """Keep a local revocation over the stale session it revoked."""
         auth = authorizer("alpha")
         prefix = "owner!user@example.test"
-        auth.grant(prefix, now=10)
-        session = auth.records[auth.identity_fold(prefix)]
+        session = auth.grant(prefix, now=10)
 
         auth.revoke(prefix)
-        auth.import_session(asdict(session), now=20)
+        auth.keep(session)
 
         assert not auth.authorized(prefix, now=21)
 
@@ -112,7 +105,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         """Keep a revocation when its durable key is deleted.
 
         drop_session forgets only a live session: forgetting the revocation
-        would let the stale grant it revoked import again.
+        would let the stale grant it revoked be kept again.
         """
         auth = authorizer("alpha")
         prefix = "owner!user@example.test"
@@ -120,45 +113,28 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth.revoke(prefix)
 
         auth.drop_session(prefix)
-        auth.import_session(asdict(session), now=20)
+        auth.keep(session)
 
         assert [record.revoked for record in auth.records.values()] == [True]
         assert not auth.authorized(prefix, now=21)
-        # The stale grant is still importable where no revocation is held.
+        # The stale grant is still kept where no revocation is held.
         fresh = authorizer("beta")
-        fresh.import_session(asdict(session), now=20)
+        fresh.keep(session)
         assert fresh.authorized(prefix, now=21)
 
     def test_durable_revocation_blocks_stale_session(self) -> None:
-        """Keep a KV revocation authoritative over its original session."""
+        """Keep a watched revocation authoritative over its original session."""
         source = authorizer("alpha")
         target = authorizer("beta")
         prefix = "owner!user@example.test"
         session = source.grant(prefix, now=10)
         revoked = source.revoke(prefix)
         assert revoked is not None
-        revocation = asdict(revoked)
 
-        target.import_session(revocation, now=20)
-        target.import_session(asdict(session), now=20)
+        target.keep(revoked)
+        target.keep(session)
 
         assert not target.authorized(prefix, now=21)
-
-    def test_revocation_flag_is_authenticated(self) -> None:
-        """Reject a revocation whose signed state marker is removed or changed."""
-        source = authorizer("alpha")
-        prefix = "owner!user@example.test"
-        source.grant(prefix, now=10)
-        revoked = source.revoke(prefix)
-        assert revoked is not None
-
-        missing = asdict(revoked)
-        missing.pop("revoked")
-        changed = {**asdict(revoked), "revoked": False}
-        for payload in (missing, changed):
-            target = authorizer("beta")
-            target.import_session(payload, now=20)
-            assert not target.authorized(prefix, now=21)
 
     def test_session_binding_and_expiry(self) -> None:
         """Bind a session to its prefix, expire it after TTL, and prune it."""
@@ -181,66 +157,16 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert not auth.authorized("owner!user@strasse.example", now=20)
 
     def test_session_import(self) -> None:
-        """Verify a session imports into another authorizer instance."""
+        """Keep a session granted by another authorizer until it expires."""
         first = authorizer("alpha")
         second = authorizer("beta")
         prefix = "owner!user@example.test"
 
-        first.grant(prefix, now=10)
-        session = next(iter(first.records.values()))
-        second.import_session(asdict(session), now=20)
+        session = first.grant(prefix, now=10)
+        second.keep(session)
 
         assert second.authorized(prefix, now=39.9)
         assert not second.authorized(prefix, now=40)
-
-    def test_future_dated_session_is_rejected(self) -> None:
-        """Reject a signed session expiring beyond one TTL plus grace from now."""
-        receiver = authorizer()
-        prefix = "owner!user@example.test"
-        now = 1_000.0
-        horizon = now + receiver.session_ttl + SESSION_EXPIRY_GRACE
-        future = receiver.create(prefix, horizon + 1, "alpha")
-
-        assert receiver.import_session(asdict(future), now=now) is None
-        assert not receiver.authorized(prefix, now=now)
-
-        edge = receiver.create(prefix, horizon, "alpha")
-        assert receiver.import_session(asdict(edge), now=now) == edge
-        assert receiver.authorized(prefix, now=now)
-
-    def test_session_network_binding(self) -> None:
-        """Verify a session signed for one network is invalid on another."""
-        first = authorizer("alpha", "efnet")
-        second = authorizer("beta", "undernet")
-        prefix = "owner!user@example.test"
-
-        first.grant(prefix, now=10)
-        session = next(iter(first.records.values()))
-        second.import_session(asdict(session), now=20)
-
-        assert not second.authorized(prefix, now=21)
-
-    def test_session_signature_validation(self) -> None:
-        """Reject complete records whose only defect is the signature or expiry."""
-        source = authorizer("alpha")
-        prefix = "attacker!user@example.test"
-        valid = asdict(source.create(prefix, 40.0, "alpha"))
-        payloads = {
-            "forged": {**valid, "signature": "0" * 64},
-            "non-ASCII": {**valid, "signature": "é" * 64},
-            "non-finite": asdict(source.create(prefix, float("nan"), "alpha")),
-            "unsigned": {k: v for k, v in valid.items() if k != "signature"},
-        }
-
-        for name, payload in payloads.items():
-            with self.subTest(name):
-                receiver = authorizer("beta")
-                assert receiver.import_session(payload, now=20) is None
-                assert not receiver.authorized(prefix, now=21)
-
-        receiver = authorizer("beta")
-        assert receiver.import_session(valid, now=20) is not None
-        assert receiver.authorized(prefix, now=21)
 
     def test_totp_matching_windows(self) -> None:
         """Accept codes one period either side of now, and none further out."""
@@ -265,7 +191,6 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """Verify authenticated users receive automatic operator privileges."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
         runtime.member("alpha").modes.add("o")
         runtime.member("owner").prefix = OWNER
 
@@ -277,7 +202,6 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """Verify auto-op skips users who already have operator status."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
         runtime.member("alpha").modes.add("o")
         runtime.member("owner").prefix = OWNER
         runtime.member("owner").modes.add("o")
@@ -290,7 +214,6 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """Do not op a nickname held by a different IRC identity."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
         runtime.member("alpha").modes.add("o")
         runtime.member("owner").prefix = Prefix("owner", "other", "other.host")
 
@@ -302,7 +225,6 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """Verify auto-op skips channels where bot is not opped."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
         runtime.member("owner").prefix = OWNER
 
         bot.auth_flow.auto_op(OWNER)
@@ -311,9 +233,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_claim_publish_failure_revokes(self) -> None:
         """Verify a publish failure after claim success revokes the session."""
-        bot, fake_irc = bot_with_irc(
-            coordinator=FailingWriteCoordinator(),
-        )
+        bot, fake_irc, _ = bot_with_coordinator(FailingWriteCoordinator())
         prefix = Prefix("owner", "user", "host.example")
         counter = int(time.time() // 30)
         valid_code = totp(bot.authorizer.secret, counter)
@@ -334,23 +254,23 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         syncing = asyncio.Event()
         sync = bot.sessions.sync
 
-        async def signal_sync(identity: str, session: Session) -> bool:
+        async def signal_sync(session: Session) -> bool:
             syncing.set()
-            return await sync(identity, session)
+            return await sync(session)
 
+        # Bounded: a QUIT whose revocation waited on the held lock would hang.
         with patch.object(bot.sessions, "sync", signal_sync):
-            async with bot.sessions.lock:
-                auth = asyncio.create_task(
-                    send_command(bot, prefix, f"AUTH {valid_code}"),
-                )
-                async with asyncio.timeout(1):
+            async with asyncio.timeout(1):
+                async with bot.sessions.lock:
+                    auth = asyncio.create_task(
+                        send_command(bot, prefix, f"AUTH {valid_code}"),
+                    )
                     await syncing.wait()
-                # AUTH has granted locally and now waits for the lock.
-                await bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+                    # AUTH has granted locally and now waits for the lock.
+                    bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
 
-            await auth
-
-        await drain_session_writes(bot)
+                await auth
+                await drain_session_writes(bot)
 
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
@@ -378,7 +298,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             async with asyncio.timeout(1):
                 await claiming.wait()
-            bot.on_irc_disconnect()
+            bot.events.on_irc_disconnect()
             release.set()
             await auth
 
@@ -392,8 +312,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         prefix = Prefix("owner", "user", "host.example")
         put_session = coordinator.put_session
 
-        async def disconnect_during_put(record: dict[str, Any]) -> dict[str, Any]:
-            bot.on_irc_disconnect()
+        async def disconnect_during_put(record: dict[str, Any]) -> Session:
+            bot.events.on_irc_disconnect()
             return await put_session(record)
 
         valid_code = totp(bot.authorizer.secret, int(time.time() // 30))
@@ -424,13 +344,61 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             async with asyncio.timeout(1):
                 await claiming.wait()
-            await bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
             release.set()
             await auth
 
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
         assert coordinator.session_puts == []
+
+    async def test_queued_auth_stays_invalid_after_sender_returns(self) -> None:
+        """Refuse a queued AUTH whose sender quit and returned as the same prefix.
+
+        The returning user's message watches the prefix again; that must not
+        clear the invalidation the QUIT left for the AUTH still queued.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+        async with asyncio.timeout(1):
+            # The held lock keeps the AUTH queued while its sender quits,
+            # reconnects as the same prefix, and sends another message.
+            async with bot.events.command_lock:
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
+                )
+                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", "XYZZY"), prefix),
+                )
+
+            await asyncio.gather(*tuple(bot.tasks))
+
+        assert not bot.authorizer.authorized(prefix.render())
+        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert coordinator.session_puts == []
+        assert not bot.sessions.watched_identities
+
+    async def test_auth_queued_behind_own_command_is_granted(self) -> None:
+        """Grant an AUTH queued behind another command from the same identity.
+
+        The earlier command's watch ends first; the AUTH's own watch must
+        outlive it, or the AUTH would see its identity as unwatched.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+        # Both arrive before either runs.
+        bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", "XYZZY"), prefix))
+        await send_command(bot, prefix, f"AUTH {valid_code}")
+
+        assert bot.authorizer.authorized(prefix.render())
+        assert fake_irc.privmsgs == [("owner", "Authorized")]
+        assert len(coordinator.session_puts) == 1
+        assert not bot.sessions.watched_identities
 
     async def test_auth_success_grants_session(self) -> None:
         """Grant a session for a valid TOTP code, then op the user where opped."""
@@ -498,28 +466,21 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         prefix = Prefix("owner", "user", "host.example")
         counter = int(time.time() // 30)
         valid_code = totp(bot.authorizer.secret, counter)
+        # A peer's revocation, stored but not yet watched here, outlasts any
+        # session this AUTH can grant.
+        revocation = bot.authorizer.create(
+            prefix.render(),
+            time.time() + bot.config.auth_session_ttl + 30,
+            "beta",
+            revoked=True,
+        )
+        await coordinator.sessions.put(asdict(revocation))
 
-        async def put_session(record: dict[str, object]) -> dict[str, object]:
-            incoming = bot.authorizer.parse(record, time.time())
-            assert incoming is not None
-            winner = bot.authorizer.create(
-                incoming.prefix,
-                incoming.expires_at,
-                incoming.issuer,
-                incoming.version + 1,
-                revoked=True,
-            )
-            return asdict(winner)
-
-        with patch.object(
-            coordinator,
-            "put_session",
-            AsyncMock(side_effect=put_session),
-        ):
-            await send_command(bot, prefix, f"AUTH {valid_code}")
+        await send_command(bot, prefix, f"AUTH {valid_code}")
 
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert [put["revoked"] for put in coordinator.session_puts] == [False]
 
     async def test_auth_queues_revocation_when_bot_id_is_duplicate(self) -> None:
         """Queue a revocation when the session write fails on a duplicate bot ID."""
@@ -527,14 +488,17 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         prefix = Prefix("owner", "user", "host.example")
         counter = int(time.time() // 30)
         valid_code = totp(bot.authorizer.secret, counter)
+        put_session = coordinator.put_session
 
-        with patch.object(
-            coordinator,
-            "put_session",
-            AsyncMock(side_effect=RuntimeError("duplicate bot ID")),
-        ):
+        async def lose_bot_id(record: dict[str, Any]) -> Session:
+            # A peer claims this bot ID after AUTH passed the readiness gate.
+            coordinator.duplicate = True
+            return await put_session(record)
+
+        with patch.object(coordinator, "put_session", lose_bot_id):
             await send_command(bot, prefix, f"AUTH {valid_code}")
 
+        assert coordinator.session_puts == []
         assert not bot.authorizer.authorized(prefix.render())
         pending = bot.sessions.pending
         assert len(pending) == 1
@@ -619,9 +583,9 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             coordinator,
             "put_session",
-            AsyncMock(return_value=asdict(winner)),
+            AsyncMock(return_value=winner),
         ):
-            synced = await bot.sessions.sync(prefix, stale)
+            synced = await bot.sessions.sync(stale)
 
         assert not synced
         pending = bot.sessions.pending[casefold(prefix, "ascii")]
@@ -635,7 +599,7 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         coordinator.duplicate = True
         session = bot.authorizer.grant("a!u@h")
 
-        assert not await bot.sessions.sync("a!u@h", session)
+        assert not await bot.sessions.sync(session)
         assert bot.sessions.pending
 
         coordinator.duplicate = False
@@ -662,20 +626,20 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-        async def put_session(payload: dict[str, object]) -> dict[str, object]:
+        async def put_session(payload: dict[str, Any]) -> Session:
             if payload == asdict(blocked):
                 msg = "unavailable"
                 raise NatsError(msg)
 
-            return payload
+            return Session(**payload)
 
         with patch.object(
             coordinator,
             "put_session",
             AsyncMock(side_effect=put_session),
         ) as put:
-            assert not await bot.sessions.sync("old!user@host.example", blocked)
-            assert not await bot.sessions.sync(identity, session)
+            assert not await bot.sessions.sync(blocked)
+            assert not await bot.sessions.sync(session)
 
         assert put.await_count == 2
         assert all(call.args[0] == asdict(blocked) for call in put.await_args_list)
@@ -684,8 +648,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_revocation_drains_from_pending_queue(self) -> None:
         """Drain a pending revocation whose stored record has already expired.
 
-        The expired record imports as no winner: the queue must still drop it
-        and write the next identity, without caching the expired record.
+        The store returns the expired record, which is no winner: the queue
+        must still drop it and write the next identity, without caching it.
         """
         bot, _, coordinator = bot_with_coordinator()
         revocation = bot.authorizer.create(
@@ -707,19 +671,12 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             coordinator,
             "put_session",
             AsyncMock(
-                side_effect=[
-                    NatsError("unavailable"),
-                    asdict(revocation),
-                    asdict(session),
-                ],
+                side_effect=[NatsError("unavailable"), revocation, session],
             ),
         ):
-            assert not await bot.sessions.sync(
-                "old!user@host.example",
-                revocation,
-            )
+            assert not await bot.sessions.sync(revocation)
             assert bot.sessions.pending
-            assert await bot.sessions.sync(identity, session)
+            assert await bot.sessions.sync(session)
 
         assert not bot.sessions.pending
         assert bot.authorizer.authorized(identity)
@@ -745,21 +702,21 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             revoked=True,
         )
 
-        async def put_session(payload: dict[str, object]) -> dict[str, object]:
+        async def put_session(payload: dict[str, Any]) -> Session:
             if payload.get("revoked") is True:
                 msg = "unavailable"
                 raise NatsError(msg)
 
             coordinator.session_puts.append(payload)
-            return payload
+            return Session(**payload)
 
         with patch.object(
             coordinator,
             "put_session",
             AsyncMock(side_effect=put_session),
         ) as put:
-            assert not await bot.sessions.sync(old_identity, revocation)
-            assert await bot.sessions.sync(identity, session)
+            assert not await bot.sessions.sync(revocation)
+            assert await bot.sessions.sync(session)
             await bot.sessions.retry()
 
         assert put.await_count == 2
@@ -781,9 +738,9 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             coordinator,
             "put_session",
-            AsyncMock(return_value=asdict(winner)),
+            AsyncMock(return_value=winner),
         ):
-            assert await bot.sessions.sync(identity, active)
+            assert await bot.sessions.sync(active)
 
         assert not bot.authorizer.authorized(identity)
 
@@ -794,26 +751,27 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         session = bot.authorizer.grant(prefix.render())
         writing = asyncio.Event()
         release = asyncio.Event()
-        written: list[dict[str, object]] = []
+        written: list[dict[str, Any]] = []
 
-        async def slow_put(record: dict[str, object]) -> dict[str, object]:
+        async def slow_put(record: dict[str, Any]) -> Session:
             if not record["revoked"]:
                 writing.set()
                 await release.wait()
 
             written.append(record)
-            return record
+            return Session(**record)
 
+        # Bounded: a QUIT whose revocation waited on the held lock would hang.
         with patch.object(coordinator, "put_session", AsyncMock(side_effect=slow_put)):
-            grant = asyncio.create_task(
-                bot.sessions.sync(prefix.render(), session),
-            )
             async with asyncio.timeout(1):
+                grant = asyncio.create_task(
+                    bot.sessions.sync(session),
+                )
                 await writing.wait()
-            await bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-            release.set()
-            await grant
-            await drain_session_writes(bot)
+                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+                release.set()
+                await grant
+                await drain_session_writes(bot)
 
         assert [record["revoked"] for record in written] == [False, True]
         assert not bot.sessions.pending
@@ -829,18 +787,18 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             "beta",
             active.version,
         )
-        attempts: list[dict[str, object]] = []
+        attempts: list[dict[str, Any]] = []
 
-        async def put_session(session: dict[str, object]) -> dict[str, object]:
+        async def put_session(session: dict[str, Any]) -> Session:
             attempts.append(session)
-            return asdict(winner) if len(attempts) == 1 else session
+            return winner if len(attempts) == 1 else Session(**session)
 
         with patch.object(
             coordinator,
             "put_session",
             AsyncMock(side_effect=put_session),
         ):
-            await bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
             await drain_session_writes(bot)
             assert not bot.authorizer.authorized(prefix.render())
             assert bot.sessions.pending
@@ -869,7 +827,7 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             "put_session",
             AsyncMock(side_effect=NatsError("unavailable")),
         ) as put:
-            await bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
             await drain_session_writes(bot)
             assert bot.sessions.pending
             put.side_effect = None
@@ -883,22 +841,19 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         """File a revocation under its session's prefix, not the observed one.
 
         Under rfc1459, foo[ and foo{ fold together, so a QUIT seen as foo{
-        revokes the session granted to foo[; the store rejects a record filed
-        under a key that differs from its own prefix.
+        revokes the session granted to foo[. The store keys a record by its
+        own prefix, so only a revocation carrying foo[ replaces that session's
+        durable record.
         """
         bot, _, coordinator = bot_with_coordinator()
-        store = SessionStore("efnet", 1, COORDINATION_KEY, 3600)
-        bot.authorizer.grant("foo[!u@h")
+        assert await bot.sessions.sync(bot.authorizer.grant("foo[!u@h"))
 
         bot.sessions.revoke(Prefix("foo{", "u", "h"))
-        with patch.object(coordinator, "put_session", store.put):
-            await bot.sessions.retry()
+        await drain_session_writes(bot)
 
-        key, record = next(iter(bot.sessions.pending.items()))
-        assert record.prefix == "foo[!u@h"
-        assert key == casefold("foo[!u@h", "ascii")
-        assert store.parse(store.key("foo[!u@h"), asdict(record)) is not None
-        await bot.tasks.drain()
+        puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
+        assert puts == [("foo[!u@h", False), ("foo[!u@h", True)]
+        assert not bot.sessions.pending
 
     async def test_requeued_revocation_does_not_block_later_writes(self) -> None:
         """Write a later grant when an earlier revocation meets a newer grant."""
@@ -906,7 +861,7 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         bot.authorizer.grant("x!u@h")
         revoked = bot.authorizer.revoke("x!u@h")
         assert revoked is not None
-        bot.sessions.queue(revoked.prefix, revoked)
+        bot.sessions.queue(revoked)
         newer = bot.authorizer.create(
             revoked.prefix,
             revoked.expires_at,
@@ -914,15 +869,15 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             revoked.version + 1,
         )
 
-        async def put_session(record: dict[str, object]) -> dict[str, object]:
+        async def put_session(record: dict[str, Any]) -> Session:
             if record["prefix"] == revoked.prefix:
-                return asdict(newer)
+                return newer
 
-            return record
+            return Session(**record)
 
         grant = bot.authorizer.grant("y!u@h")
         with patch.object(coordinator, "put_session", put_session):
-            assert await bot.sessions.sync("y!u@h", grant)
+            assert await bot.sessions.sync(grant)
 
         replacement = bot.sessions.pending[casefold("x!u@h", "ascii")]
         assert replacement.revoked
@@ -965,3 +920,27 @@ class SessionSyncWatchTests(unittest.TestCase):
             sessions.observe("opaque", record, replaying=True)
 
         prune.assert_not_called()
+
+    def test_session_delete_keeps_colliding_live_identity(self) -> None:
+        """Delete only the ASCII durable identity represented by a KV key."""
+        bot, _ = bot_with_irc()
+        first = "Owner[!user@host"
+        second = "Owner{!user@host"
+        # The prefixes collide under the IRC fold but not under the ASCII fold.
+        assert bot.caps.fold_identity(first) == bot.caps.fold_identity(second)
+        assert casefold(first, "ascii") != casefold(second, "ascii")
+        now = time.time()
+        bot.authorizer.grant(first, now=now)
+        bot.authorizer.grant(second, now=now + 1)
+        # Each prefix has its own ASCII-folded KV key; deletes arrive by key.
+        expiry = now + 60
+        bot.sessions.watched["first-key"] = (first, expiry)
+        bot.sessions.watched["second-key"] = (second, expiry)
+
+        bot.callbacks.on_session_delete("first-key")
+
+        assert [s.prefix for s in bot.authorizer.records.values()] == [second]
+        assert bot.authorizer.authorized(second)
+
+        bot.callbacks.on_session_delete("second-key")
+        assert not bot.authorizer.records

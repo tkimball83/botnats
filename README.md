@@ -92,7 +92,7 @@ Example `bot.json`:
 | `irc.verify_tls`                            | Applies only to `ircs://` connections                       |
 | `nats.jetstream_replicas`                   | Use `3` only when three JetStream storage peers are present |
 | `nats.monitor_port`                         | Connected-server monitoring port used by `STATUS`           |
-| `nats.servers`                              | Ordered `nats://` or `tls://` failover endpoints            |
+| `nats.servers`                              | `nats://` or `tls://` endpoints, tried in any order         |
 
 Plain IRC exposes commands and responses, so use a trusted network when IRCS is
 unavailable. JetStream requires file storage; persist each peer's directory.

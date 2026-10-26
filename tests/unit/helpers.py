@@ -9,7 +9,12 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 from nats.errors import Error as NatsError
-from nats.js.errors import KeyNotFoundError, KeyWrongLastSequenceError
+from nats.js.errors import (
+    InvalidKeyError,
+    KeyNotFoundError,
+    KeyWrongLastSequenceError,
+)
+from nats.js.kv import VALID_KEY_RE
 
 from botnats.bot import Bot
 from botnats.config import BotConfig
@@ -27,6 +32,7 @@ from botnats.nats.store import (
     ClaimStore,
     Session,
     SessionStore,
+    StoreUnavailableError,
     parse_session_record,
     session_signature,
 )
@@ -36,6 +42,7 @@ if TYPE_CHECKING:
 
     from botnats.irc.protocol import IRCProtocol
     from botnats.nats.coordinator import CoordinatorProtocol
+    from botnats.validators import ChannelFields
 
 AUTH_KEY = b"12345678901234567890"
 COORDINATION_KEY_TEXT = "coordination-secret-used-only-for-tests"
@@ -88,7 +95,7 @@ async def drain_session_writes(bot: Bot) -> None:
 
 async def send_command(bot: Bot, prefix: Prefix, text: str) -> None:
     """Queue a private-message command as IRC delivers it and wait for it."""
-    await bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
+    bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
     await asyncio.gather(
         *(task for task in tuple(bot.tasks) if task.get_name() == "admin-command"),
     )
@@ -150,12 +157,10 @@ def make_bot(
 
 def bot_with_coordinator(
     coordinator: FakeCoordinator | None = None,
-    *,
-    irc: FakeIRC | None = None,
 ) -> tuple[Bot, FakeIRC, FakeCoordinator]:
     """Create a bot wired to a fake IRC client and fake coordinator."""
     coordinator = coordinator or FakeCoordinator()
-    fake_irc = irc or FakeIRC()
+    fake_irc = FakeIRC()
     return (
         bot_with_channel(irc=fake_irc, coordinator=coordinator),
         fake_irc,
@@ -163,13 +168,10 @@ def bot_with_coordinator(
     )
 
 
-def bot_with_irc(
-    *,
-    coordinator: CoordinatorProtocol | None = None,
-) -> tuple[Bot, FakeIRC]:
+def bot_with_irc() -> tuple[Bot, FakeIRC]:
     """Create a bot wired to a fake IRC client."""
     fake_irc = FakeIRC()
-    return bot_with_channel(irc=fake_irc, coordinator=coordinator), fake_irc
+    return bot_with_channel(irc=fake_irc), fake_irc
 
 
 def config() -> BotConfig:
@@ -178,7 +180,7 @@ def config() -> BotConfig:
         auth_session_ttl=3600,
         bot_id="alpha",
         channel_modes="+npst",
-        coordination_secret=COORDINATION_KEY_TEXT,
+        coordination_secret=COORDINATION_KEY,
         enforced_modes=(frozenset("npst"), frozenset()),
         health_port=8080,
         irc_connect_timeout=30,
@@ -253,21 +255,6 @@ class FakeIRC:
             self.sent.append((command, params))
 
 
-class FailingIRC(FakeIRC):
-    """IRC stub that raises ConnectionError on send."""
-
-    def send(
-        self,
-        command: str,
-        *params: str,
-        trailing: str | None = None,
-    ) -> None:
-        """Raise ConnectionError to simulate a disconnect."""
-        del command, params, trailing
-        msg = "IRC disconnected"
-        raise ConnectionError(msg)
-
-
 class FailingPartIRC(FakeIRC):
     """IRC stub that raises ConnectionError on PART until it recovers."""
 
@@ -291,7 +278,7 @@ class FailingPartIRC(FakeIRC):
 
 
 class FakeKV:
-    """In-memory JetStream KV bucket with the revision checks the stores use."""
+    """In-memory JetStream KV bucket with the key and revision checks of nats-py."""
 
     def __init__(self) -> None:
         """Start with an empty bucket."""
@@ -300,6 +287,7 @@ class FakeKV:
 
     async def create(self, key: str, value: bytes) -> int:
         """Store a new key, or fail as JetStream does when it already exists."""
+        check_key(key)
         if key in self.entries:
             raise KeyWrongLastSequenceError
 
@@ -307,6 +295,7 @@ class FakeKV:
 
     async def get(self, key: str) -> SimpleNamespace:
         """Return the stored entry, or fail as JetStream does when it is absent."""
+        check_key(key)
         if key not in self.entries:
             raise KeyNotFoundError
 
@@ -321,10 +310,17 @@ class FakeKV:
 
     async def update(self, key: str, value: bytes, last: int) -> int:
         """Replace a key only while its revision is still last."""
+        check_key(key)
         if key not in self.entries or self.entries[key][0] != last:
             raise KeyWrongLastSequenceError
 
         return self.store(key, value)
+
+
+def check_key(key: str) -> None:
+    """Reject a key that nats-py rejects before it reaches the bucket."""
+    if VALID_KEY_RE.fullmatch(key) is None or key.startswith(".") or key.endswith("."):
+        raise InvalidKeyError
 
 
 class FakeCoordinator:
@@ -362,8 +358,8 @@ class FakeCoordinator:
     def require_writable(self) -> None:
         """Mirror the real write gate: this process must own its bot ID."""
         if self.duplicate or not self.connected:
-            msg = f"duplicate bot ID: {self.bot_id}"
-            raise RuntimeError(msg)
+            msg = f"bot ID {self.bot_id} does not own its presence key"
+            raise StoreUnavailableError(msg)
 
     async def close(self) -> None:
         """No-op close."""
@@ -374,7 +370,7 @@ class FakeCoordinator:
         record: dict[str, Any],
         *,
         expected: str | None,
-    ) -> dict[str, Any]:
+    ) -> ChannelFields:
         """Record a channel write and store it as ChannelStore would."""
         self.require_writable()
         self.channel_puts.append(record)
@@ -390,7 +386,7 @@ class FakeCoordinator:
         self.require_writable()
         self.presence_puts.append(presence)
 
-    async def put_session(self, session: dict[str, Any]) -> dict[str, Any]:
+    async def put_session(self, session: dict[str, Any]) -> Session:
         """Record a session write and store it as SessionStore would."""
         self.require_writable()
         self.session_puts.append(session)
@@ -449,7 +445,7 @@ class FailingWriteCoordinator(FakeCoordinator):
         record: dict[str, Any],
         *,
         expected: str | None,
-    ) -> dict[str, Any]:
+    ) -> ChannelFields:
         """Raise NatsError while failing, to simulate a NATS disconnect."""
         if self.failing:
             msg = f"NATS disconnected: channel {record['channel']}"
@@ -457,7 +453,7 @@ class FailingWriteCoordinator(FakeCoordinator):
 
         return await super().put_channel(record, expected=expected)
 
-    async def put_session(self, session: dict[str, Any]) -> dict[str, Any]:
+    async def put_session(self, session: dict[str, Any]) -> Session:
         """Raise NatsError while failing, to simulate a NATS disconnect."""
         if self.failing:
             msg = f"NATS disconnected: session {session['prefix']}"

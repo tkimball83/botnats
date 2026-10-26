@@ -13,6 +13,8 @@ from nats.errors import Error as NatsError
 from botnats.nats.store import ClaimStore
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from nats.js.kv import KeyValue
 
 CONNECT_TIMEOUT = 30.0
@@ -20,6 +22,7 @@ COUNTER = 987_654_320
 # The bots' jetstream_replicas in config/*.json; their buckets set it.
 JETSTREAM_REPLICAS = 3
 LEADER_TIMEOUT = 30.0
+RETRY_INTERVAL = 0.2
 
 
 def coordination_key() -> bytes:
@@ -37,20 +40,46 @@ async def ignore_error(error: Exception) -> None:
     del error
 
 
+async def keep_trying[T](
+    attempt: Callable[[], Awaitable[T | None]],
+    wait_seconds: float,
+    failure: str,
+) -> T:
+    """Repeat an attempt through NATS errors until it returns a result.
+
+    A timeout fails with the last NATS error as its cause, so a permanent
+    problem such as a bad token is not reported as a bare timeout.
+    """
+    last_error: Exception | None = None
+    try:
+        async with asyncio.timeout(wait_seconds):
+            while True:
+                try:
+                    result = await attempt()
+                except (NatsError, OSError) as error:
+                    last_error = error
+                else:
+                    if result is not None:
+                        return result
+
+                await asyncio.sleep(RETRY_INTERVAL)
+    except TimeoutError as error:
+        raise AssertionError(failure) from last_error or error
+
+
 async def connect() -> nats.NATS:
     """Connect to any NATS node, retrying while Docker exposes a restarted one."""
-    async with asyncio.timeout(CONNECT_TIMEOUT):
-        while True:
-            try:
-                return await nats.connect(
-                    servers=nats_urls(),
-                    connect_timeout=2,
-                    error_cb=ignore_error,
-                    max_reconnect_attempts=5,
-                    token=os.environ["BOTNATS_TEST_NATS_TOKEN"],
-                )
-            except NatsError, OSError:
-                await asyncio.sleep(0.2)
+    return await keep_trying(
+        lambda: nats.connect(
+            servers=nats_urls(),
+            connect_timeout=2,
+            error_cb=ignore_error,
+            max_reconnect_attempts=5,
+            token=os.environ["BOTNATS_TEST_NATS_TOKEN"],
+        ),
+        CONNECT_TIMEOUT,
+        "no NATS node accepted a connection",
+    )
 
 
 async def open_claims() -> tuple[nats.NATS, ClaimStore, KeyValue]:
@@ -58,15 +87,16 @@ async def open_claims() -> tuple[nats.NATS, ClaimStore, KeyValue]:
     nc = await connect()
     claims = ClaimStore("integration", JETSTREAM_REPLICAS, coordination_key())
     try:
-        async with asyncio.timeout(LEADER_TIMEOUT):
-            while True:
-                try:
-                    return nc, claims, await claims.open(nc.jetstream())
-                except NatsError:
-                    await asyncio.sleep(0.2)
+        kv = await keep_trying(
+            lambda: claims.open(nc.jetstream()),
+            LEADER_TIMEOUT,
+            "the claim bucket did not open",
+        )
     except BaseException:
         await nc.drain()
         raise
+
+    return nc, claims, kv
 
 
 async def stream_leader() -> str:
@@ -95,15 +125,13 @@ async def claim_after_failover(previous: str) -> None:
 
 async def wait_leader(kv: KeyValue, previous: str) -> None:
     """Wait for JetStream to elect a replacement stream leader."""
-    async with asyncio.timeout(LEADER_TIMEOUT):
-        while True:
-            try:
-                cluster = (await kv.status()).stream_info.cluster
-            except NatsError:
-                pass
-            else:
-                # No leader at all means the election is still running.
-                if cluster is not None and cluster.leader not in {None, "", previous}:
-                    return
 
-            await asyncio.sleep(0.2)
+    async def new_leader() -> str | None:
+        cluster = (await kv.status()).stream_info.cluster
+        # No leader at all means the election is still running.
+        if cluster is None or cluster.leader in {None, "", previous}:
+            return None
+
+        return cluster.leader
+
+    await keep_trying(new_leader, LEADER_TIMEOUT, f"no leader replaced {previous}")

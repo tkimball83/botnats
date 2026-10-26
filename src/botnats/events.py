@@ -1,14 +1,18 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""IRC event routing, coordination triggers, and capability tracking."""
+"""IRC event routing, coordination triggers, and capability tracking.
+
+Handlers run on the IRC read loop and never wait: anything that waits on
+JetStream or a timer runs as a background task.
+"""
 
 import asyncio
 import logging
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from botnats.channel import JoinState
+from botnats.channel import ChannelRuntime, JoinState
 from botnats.irc.protocol import (
     DEFAULT_CASEMAPPING,
     IRCMessage,
@@ -18,13 +22,16 @@ from botnats.irc.protocol import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Callable
 
     from botnats.bot import Bot
-    from botnats.channel import ChannelRuntime
 
 ISON_POLL_INTERVAL = 5.0
 LOGGER = logging.getLogger(__name__)
+# Each JOIN refusal that a peer can help with, and the help it asks for.
+# A bad key (475) asks none: an invite does not get past +k, and the next
+# attempt uses the stored key, which peers in the channel keep current.
+REFUSAL_HELP = {"471": "limit", "473": "invite", "474": "unban"}
 
 
 class IRCEventHandler:
@@ -34,7 +41,7 @@ class IRCEventHandler:
         self.bot = bot
         self.command_lock = asyncio.Lock()
         self.nick_watch_task: asyncio.Task[None] | None = None
-        self.handlers: dict[str, Callable[[IRCMessage], Awaitable[None]]] = {
+        self.handlers: dict[str, Callable[[IRCMessage], None]] = {
             "001": self.handle_welcome,
             "005": self.handle_isupport,
             "302": self.handle_userhost,
@@ -44,10 +51,10 @@ class IRCEventHandler:
             "353": self.handle_names,
             "366": self.handle_end_of_names,
             "367": self.handle_ban_list,
-            "471": self.handle_channel_full,
-            "473": self.handle_invite_only,
-            "474": self.handle_banned,
-            "475": self.handle_join_refused,
+            "471": self.handle_join_refusal,
+            "473": self.handle_join_refusal,
+            "474": self.handle_join_refusal,
+            "475": self.handle_join_refusal,
             "731": self.handle_monitor_offline,
             "CHGHOST": self.handle_chghost,
             "INVITE": self.handle_invite,
@@ -63,7 +70,6 @@ class IRCEventHandler:
     def apply_mode_changes(
         self,
         runtime: ChannelRuntime,
-        channel: str,
         modes: str,
         arguments: tuple[str, ...],
     ) -> tuple[bool, bool]:
@@ -91,14 +97,14 @@ class IRCEventHandler:
                 runtime.update_mode(mode, adding=adding)
 
             if mode in "kl":
-                self.process_setting(runtime, channel, mode, argument, adding=adding)
+                self.process_setting(runtime, mode, argument, adding=adding)
                 continue
 
             if argument is None:
                 continue
 
             if mode == "b":
-                self.process_ban(runtime, channel, argument, adding=adding)
+                self.process_ban(runtime, argument, adding=adding)
             elif mode in self.bot.caps.operator_modes:
                 self.process_op(runtime, mode, argument, adding=adding)
                 if adding:
@@ -109,7 +115,6 @@ class IRCEventHandler:
     def process_setting(
         self,
         runtime: ChannelRuntime,
-        channel: str,
         mode: str,
         argument: str | None,
         *,
@@ -122,11 +127,11 @@ class IRCEventHandler:
             # Servers send "*" in place of a hidden key, to operators too
             # during a netsplit; a literal "*" key is set with JOIN instead.
             if not adding or argument != "*":
-                self.process_key(runtime, channel, argument if adding else None)
+                self.process_key(runtime, argument if adding else None)
         elif not adding and runtime.key is not None:
-            self.process_key(runtime, channel, None)
+            self.process_key(runtime, None)
 
-    async def handle_ban_list(self, message: IRCMessage) -> None:
+    def handle_ban_list(self, message: IRCMessage) -> None:
         """Record a ban mask from the channel ban list reply."""
         if len(message.params) < 3:
             return
@@ -137,7 +142,7 @@ class IRCEventHandler:
         if runtime is not None:
             runtime.add_ban(mask)
 
-    async def handle_channel_modes(self, message: IRCMessage) -> None:
+    def handle_channel_modes(self, message: IRCMessage) -> None:
         """Take the modes, limit, and key from an RPL_CHANNELMODEIS reply.
 
         The reply is the channel's full state, so a key it lacks is gone and
@@ -167,7 +172,7 @@ class IRCEventHandler:
                 key = argument or "*"
 
         if key not in ("*", runtime.key):
-            self.process_key(runtime, channel, key)
+            self.process_key(runtime, key)
 
     def log_join_error(self, message: IRCMessage) -> None:
         """Log, once, an unhandled error naming a channel this bot is joining.
@@ -194,22 +199,28 @@ class IRCEventHandler:
             message.params[-1],
         )
 
-    def join_refused(self, channel: str) -> None:
-        """Return a refused JOIN to idle so the next tick tries again."""
+    def handle_join_refusal(self, message: IRCMessage) -> None:
+        """Return a refused JOIN to idle and ask peers for the help it needs.
+
+        The next tick tries the JOIN again: after the help, or with the
+        stored key.
+        """
+        if len(message.params) < 2:
+            return
+
+        channel = message.params[1]
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is not None:
             runtime.refuse_join()
 
-    async def handle_banned(self, message: IRCMessage) -> None:
-        """Request an unban when the bot is banned from a channel."""
-        if len(message.params) >= 2:
-            self.join_refused(message.params[1])
+        kind = REFUSAL_HELP.get(message.command)
+        if kind is not None:
             self.bot.tasks.spawn(
-                self.bot.channel_mgr.request_peer("unban", message.params[1]),
-                "banned-unban-request",
+                self.bot.channel_mgr.request_peer(kind, channel),
+                f"{kind}-request",
             )
 
-    async def handle_chghost(self, message: IRCMessage) -> None:
+    def handle_chghost(self, message: IRCMessage) -> None:
         """Revoke authorization and update member state after a host change."""
         if message.prefix is None or len(message.params) < 2:
             return
@@ -242,7 +253,7 @@ class IRCEventHandler:
             self.bot.tasks.spawn(self.bot.identity.announce(), "presence-announce")
             self.bot.channel_mgr.join_desired()
 
-    async def queue_command(self, message: IRCMessage) -> None:
+    def queue_command(self, message: IRCMessage) -> None:
         """Run a private-message command in background, in arrival order.
 
         AUTH and the durable JOIN/PART commands wait on JetStream; the IRC
@@ -276,7 +287,7 @@ class IRCEventHandler:
         finally:
             self.bot.sessions.unwatch_identity(prefix.render())
 
-    async def handle_end_of_names(self, message: IRCMessage) -> None:
+    def handle_end_of_names(self, message: IRCMessage) -> None:
         """Finalize channel join by requesting WHO data and enforcing modes."""
         if len(message.params) < 2:
             return
@@ -301,7 +312,7 @@ class IRCEventHandler:
                 "names-op-request",
             )
 
-    async def handle_invite(self, message: IRCMessage) -> None:
+    def handle_invite(self, message: IRCMessage) -> None:
         """Join a configured channel when invited."""
         if len(message.params) < 2:
             return
@@ -311,7 +322,7 @@ class IRCEventHandler:
         if runtime is not None and not runtime.joined and self.bot.irc.is_self(target):
             self.bot.channel_mgr.safe_join(runtime)
 
-    async def handle_ison_reply(self, message: IRCMessage) -> None:
+    def handle_ison_reply(self, message: IRCMessage) -> None:
         """Reclaim the desired nickname when ISON reports it offline."""
         if not message.params:
             return
@@ -324,7 +335,7 @@ class IRCEventHandler:
 
         self.try_nick_reclaim()
 
-    async def handle_monitor_offline(self, message: IRCMessage) -> None:
+    def handle_monitor_offline(self, message: IRCMessage) -> None:
         """Reclaim the desired nickname when MONITOR reports it offline."""
         if not message.params:
             return
@@ -380,7 +391,7 @@ class IRCEventHandler:
             self.bot.irc.send("MONITOR", "+", self.bot.config.nickname)
 
     async def ison_poll_loop(self) -> None:
-        """Poll ISON at a fixed interval until the desired nickname is free."""
+        """Poll ISON at a fixed interval until the desired nickname is ours."""
         while True:
             await asyncio.sleep(ISON_POLL_INTERVAL)
             if self.bot.irc.is_self(self.bot.config.nickname):
@@ -389,29 +400,8 @@ class IRCEventHandler:
             with suppress(ConnectionError):
                 self.bot.irc.send("ISON", self.bot.config.nickname)
 
-    def forget_isupport(self, name: str) -> None:
-        """Restore default behavior for a removed ISUPPORT parameter."""
-        if name == "CASEMAPPING":
-            self.bot.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
-            return
-
-        self.bot.caps.forget(name)
-        if name == "MONITOR":
-            # Without MONITOR, an unfinished nick watch falls back to ISON.
-            self.start_nick_watch()
-
-    def apply_isupport(self, name: str, value: str) -> None:
-        """Apply a single ISUPPORT name=value token."""
-        if name == "CASEMAPPING":
-            self.bot.channel_mgr.set_casemapping(value.lower())
-            return
-
-        self.bot.caps.apply(name, value)
-        if name == "MONITOR":
-            self.start_nick_watch()
-
-    async def handle_isupport(self, message: IRCMessage) -> None:
-        """Parse RPL_ISUPPORT tokens into server capability state."""
+    def handle_isupport(self, message: IRCMessage) -> None:
+        """Apply advertised and withdrawn RPL_ISUPPORT tokens."""
         tokens = message.params[1:]
         if tokens and " " in tokens[-1]:
             tokens = tokens[:-1]
@@ -419,13 +409,24 @@ class IRCEventHandler:
         for token in tokens:
             # "TOKEN" and "TOKEN=" are equivalent: an empty value.
             name, _, value = token.partition("=")
-            name = name.upper()
-            if name.startswith("-"):
-                self.forget_isupport(name[1:])
-            else:
-                self.apply_isupport(name, value)
+            withdrawn = name.startswith("-")
+            name = name.removeprefix("-").upper()
+            if name == "CASEMAPPING":
+                self.bot.channel_mgr.set_casemapping(
+                    DEFAULT_CASEMAPPING if withdrawn else value.lower(),
+                )
+                continue
 
-    async def handle_join(self, message: IRCMessage) -> None:
+            if withdrawn:
+                self.bot.caps.forget(name)
+            else:
+                self.bot.caps.apply(name, value)
+
+            if name == "MONITOR":
+                # Switch an unfinished nick watch to MONITOR, or back to ISON.
+                self.start_nick_watch()
+
+    def handle_join(self, message: IRCMessage) -> None:
         """Process a JOIN event, initializing channel state for self-joins."""
         if message.prefix is None or not message.params:
             return
@@ -448,34 +449,7 @@ class IRCEventHandler:
         else:
             runtime.member(message.prefix.nick).prefix = message.prefix
 
-    async def handle_invite_only(self, message: IRCMessage) -> None:
-        """Request a peer invite when an invite-only channel refuses a JOIN."""
-        if len(message.params) >= 2:
-            self.join_refused(message.params[1])
-            self.bot.tasks.spawn(
-                self.bot.channel_mgr.request_peer("invite", message.params[1]),
-                "invite-request",
-            )
-
-    async def handle_channel_full(self, message: IRCMessage) -> None:
-        """Ask peers to raise the limit of a channel too full to join."""
-        if len(message.params) >= 2:
-            self.join_refused(message.params[1])
-            self.bot.tasks.spawn(
-                self.bot.channel_mgr.request_peer("limit", message.params[1]),
-                "limit-request",
-            )
-
-    async def handle_join_refused(self, message: IRCMessage) -> None:
-        """Retry a JOIN refused for a bad key.
-
-        An invite does not get past +k, so none is requested; the next attempt
-        uses the stored key, which peers in the channel keep current.
-        """
-        if len(message.params) >= 2:
-            self.join_refused(message.params[1])
-
-    async def handle_kick(self, message: IRCMessage) -> None:
+    def handle_kick(self, message: IRCMessage) -> None:
         """Handle a KICK by removing the target or requesting an unban for self."""
         if len(message.params) < 2:
             return
@@ -484,6 +458,9 @@ class IRCEventHandler:
         target = message.params[1]
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is None:
+            if self.bot.irc.is_self(target):
+                self.bot.channel_mgr.parted(channel)
+
             return
 
         if self.bot.irc.is_self(target):
@@ -495,7 +472,7 @@ class IRCEventHandler:
         else:
             runtime.remove(target)
 
-    async def handle_mode(self, message: IRCMessage) -> None:
+    def handle_mode(self, message: IRCMessage) -> None:
         """Apply channel MODE changes and trigger enforcement or op requests."""
         if len(message.params) < 2:
             return
@@ -508,12 +485,7 @@ class IRCEventHandler:
             return
 
         was_opped = self.bot.channel_mgr.is_self_opped(runtime)
-        lost_enforced, saw_new_op = self.apply_mode_changes(
-            runtime,
-            channel,
-            modes,
-            arguments,
-        )
+        lost_enforced, saw_new_op = self.apply_mode_changes(runtime, modes, arguments)
         opped = self.bot.channel_mgr.is_self_opped(runtime)
         if opped and not was_opped:
             # Operators see a key the server hides from other members.
@@ -528,7 +500,7 @@ class IRCEventHandler:
                 "op-request",
             )
 
-    async def handle_names(self, message: IRCMessage) -> None:
+    def handle_names(self, message: IRCMessage) -> None:
         """Parse NAMES reply entries and update member mode prefixes."""
         if len(message.params) < 4:
             return
@@ -553,7 +525,7 @@ class IRCEventHandler:
             if nick:
                 runtime.member(nick).modes = modes
 
-    async def handle_nick(self, message: IRCMessage) -> None:
+    def handle_nick(self, message: IRCMessage) -> None:
         """Update member records and bot identity when a nick changes."""
         if message.prefix is None or not message.params:
             return
@@ -582,21 +554,26 @@ class IRCEventHandler:
             elif self.bot.identity.registered:
                 self.start_nick_watch()
 
-    async def handle_part(self, message: IRCMessage) -> None:
+    def handle_part(self, message: IRCMessage) -> None:
         """Remove a member on PART or reset channel state for self-parts."""
         if message.prefix is None or not message.params:
             return
 
-        runtime = self.bot.channel_mgr.runtime(message.params[0])
+        channel = message.params[0]
+        runtime = self.bot.channel_mgr.runtime(channel)
+        is_self = self.bot.irc.is_self(message.prefix.nick)
         if runtime is None:
+            if is_self:
+                self.bot.channel_mgr.parted(channel)
+
             return
 
-        if self.bot.irc.is_self(message.prefix.nick):
+        if is_self:
             runtime.reset()
         else:
             runtime.remove(message.prefix.nick)
 
-    async def handle_quit(self, message: IRCMessage) -> None:
+    def handle_quit(self, message: IRCMessage) -> None:
         """Remove a user and revoke its session on QUIT."""
         if message.prefix is None:
             return
@@ -605,7 +582,7 @@ class IRCEventHandler:
         if prefix.complete:
             self.bot.sessions.revoke(prefix)
 
-    async def handle_userhost(self, message: IRCMessage) -> None:
+    def handle_userhost(self, message: IRCMessage) -> None:
         """Extract the bot's user and host from a USERHOST reply."""
         if not message.params:
             return
@@ -623,7 +600,16 @@ class IRCEventHandler:
                 )
                 return
 
-    async def handle_welcome(self, message: IRCMessage) -> None:
+    def on_irc_disconnect(self) -> None:
+        """Clear connection-scoped state when the IRC connection drops."""
+        self.stop_nick_watch()
+        self.bot.sessions.invalidate_all()
+        self.bot.channel_mgr.set_casemapping(DEFAULT_CASEMAPPING)
+        self.bot.caps.reset()
+        self.bot.channel_mgr.reset()
+        self.bot.identity.reset()
+
+    def handle_welcome(self, message: IRCMessage) -> None:
         """Notify the bot that IRC registration is complete."""
         LOGGER.debug("received welcome: %s", " ".join(message.params))
         self.bot.identity.on_registered()
@@ -634,7 +620,7 @@ class IRCEventHandler:
         self.bot.channel_mgr.reset()
         self.start_nick_watch()
 
-    async def handle_who(self, message: IRCMessage) -> None:
+    def handle_who(self, message: IRCMessage) -> None:
         """Update member identity and modes from a WHO reply entry."""
         if len(message.params) < 8:
             return
@@ -660,17 +646,16 @@ class IRCEventHandler:
         if self.bot.irc.is_self(nick):
             self.set_identity(member.prefix)
 
-    async def on_irc_message(self, message: IRCMessage) -> None:
+    def on_irc_message(self, message: IRCMessage) -> None:
         """Route an IRC message to its registered handler."""
         if handler := self.handlers.get(message.command):
-            await handler(message)
+            handler(message)
         elif message.command.isdigit() and message.command[0] in "45":
             self.log_join_error(message)
 
     def process_ban(
         self,
         runtime: ChannelRuntime,
-        channel: str,
         mask: str,
         *,
         adding: bool,
@@ -685,25 +670,24 @@ class IRCEventHandler:
                 self.bot.caps.casemapping,
             ):
                 self.bot.tasks.spawn(
-                    self.bot.channel_mgr.request_peer("unban", channel),
+                    self.bot.channel_mgr.request_peer("unban", runtime.channel),
                     "ban-unban-request",
                 )
         else:
             runtime.remove_ban(mask)
 
-    def process_key(
-        self,
-        runtime: ChannelRuntime,
-        channel: str,
-        key: str | None,
-    ) -> None:
-        """Store or clear the channel key and record it durably."""
+    def process_key(self, runtime: ChannelRuntime, key: str | None) -> None:
+        """Store or clear the channel key and record it durably.
+
+        The record is written under the channel's own name, which the store
+        keys it by, not as this message happened to spell it.
+        """
         if not runtime.set_key(key):
-            LOGGER.warning("ignoring unusable channel key on %s", channel)
+            LOGGER.warning("ignoring unusable channel key on %s", runtime.channel)
             return
 
         self.bot.tasks.spawn(
-            self.bot.channel_mgr.record_key(channel, runtime.key),
+            self.bot.channel_mgr.record_key(runtime.channel, runtime.key),
             "record-channel-key",
         )
 

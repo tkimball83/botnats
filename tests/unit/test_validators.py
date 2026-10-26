@@ -1,12 +1,16 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for IRC channel, key, JOIN, and target validation."""
+"""Tests for IRC channel, key, JOIN, target, and channel revision validation."""
 
+import re
 import unittest
 
 from botnats.validators import (
+    MAX_CHANNEL_REVISION,
+    parse_channel_record,
     validate_channel,
+    validate_channel_revision,
     validate_join,
     validate_key,
     validate_target,
@@ -21,17 +25,19 @@ class ValidatorTests(unittest.TestCase):
         for valid in ("#general", "&local", "+modeless", "!ABCDEsafe"):
             assert validate_channel(valid) == valid
 
-        for invalid in (
-            "#",
-            "general",
-            "#bad channel",
-            "#bad\tchannel",
-            "#bad,channel",
-            "#bad\x07channel",
+        for invalid, message in (
+            ("#", "channel name is empty"),
+            ("", "channel must start with #, &, +, or !"),
+            ("x", "channel must start with #, &, +, or !"),
+            ("general", "channel must start with #, &, +, or !"),
+            ("#bad channel", "channel contains unsupported characters"),
+            ("#bad\tchannel", "channel contains unsupported characters"),
+            ("#bad,channel", "channel contains unsupported characters"),
+            ("#bad\x07channel", "channel contains unsupported characters"),
         ):
             with (
                 self.subTest(invalid=invalid),
-                self.assertRaisesRegex(ValueError, "channel"),
+                self.assertRaisesRegex(ValueError, f"^{re.escape(message)}$"),
             ):
                 validate_channel(invalid)
 
@@ -75,3 +81,43 @@ class ValidatorTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "target"),
             ):
                 validate_target(invalid)
+
+    def test_channel_revision_requires_ascii_digits(self) -> None:
+        """Reject revision counters written with non-ASCII decimal digits."""
+        arabic_indic = "\u0660" * 19 + "\u0661"
+        assert int(arabic_indic) == 1
+        with self.assertRaisesRegex(ValueError, "invalid revision"):
+            validate_channel_revision(f"{arabic_indic}-{'0' * 32}")
+
+        valid = f"{'0' * 19}1-{'0' * 32}"
+        assert validate_channel_revision(valid) == valid
+
+    def test_channel_revision_validation(self) -> None:
+        """Verify malformed revisions cannot permanently outrank valid updates."""
+        suffix = "0" * 32
+        for revision in (
+            None,
+            "",
+            "1",
+            "z",
+            "0" * 20 + "-not-hex",
+            f"{MAX_CHANNEL_REVISION + 1:020d}-{suffix}",
+        ):
+            with (
+                self.subTest(revision=revision),
+                self.assertRaisesRegex(ValueError, "invalid revision"),
+            ):
+                parse_channel_record(
+                    {
+                        "channel": "#safe",
+                        "key": None,
+                        "present": True,
+                        "revision": revision,
+                    },
+                )
+
+        # The same record with the highest valid revision parses.
+        newest = f"{MAX_CHANNEL_REVISION:020d}-{suffix}"
+        assert parse_channel_record(
+            {"channel": "#safe", "key": None, "present": True, "revision": newest},
+        ) == ("#safe", None, True, newest)

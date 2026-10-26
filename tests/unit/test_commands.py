@@ -1,12 +1,12 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for command parsing, input validation, and rate limiting."""
+"""Tests for admin command parsing, dispatch, replies, and rate limiting."""
 
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import MagicMock, call, patch
 
 from botnats.channel import (
     ChannelRecord,
@@ -19,7 +19,6 @@ from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     OWNER,
-    FailingIRC,
     FakeIRC,
     bot_with_coordinator,
     bot_with_irc,
@@ -29,7 +28,7 @@ from tests.unit.helpers import (
 
 
 class CommandTests(unittest.TestCase):
-    """Tests for command parsing, channel validation, and key validation."""
+    """Tests for command parsing."""
 
     def test_parse_preserves_backslash(self) -> None:
         """Verify backslashes in arguments are preserved, not shell-escaped."""
@@ -140,17 +139,16 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         """Tell the admin when another bot's newer record wins the write."""
         bot, fake_irc, coordinator = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
+        # Stored by a peer, but not yet watched here.
         winner = ChannelRecord.new("#new", None, present=False, floor=1_000)
+        await coordinator.channels.put(asdict(winner), expected=None)
 
-        with patch.object(
-            coordinator,
-            "put_channel",
-            AsyncMock(return_value=asdict(winner)),
-        ):
-            await bot.commands.dispatch(OWNER, "JOIN #new")
+        await bot.commands.dispatch(OWNER, "JOIN #new")
 
+        assert [put["present"] for put in coordinator.channel_puts] == [True]
         assert fake_irc.privmsgs == [("owner", "Update superseded for #new")]
         assert bot.channel_mgr.runtime("#new") is None
+        assert bot.channel_mgr.channel_records[casefold("#new", "rfc1459")] == winner
 
     async def test_part_orders_after_peer_record(self) -> None:
         """Mint a PART after a peer's record whose revision outruns this bot's.
@@ -335,35 +333,19 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert all_nicks == [f"longernickname{i:03d}" for i in range(80)]
 
     async def test_admin_commands_with_disconnected_irc(self) -> None:
-        """Swallow the ConnectionError of every send attempted while disconnected."""
-        failing_irc = FailingIRC()
-        bot, _, _ = bot_with_coordinator(irc=failing_irc)
+        """Report a command's failed send, and swallow the undeliverable reply."""
+        bot, fake_irc, _ = bot_with_coordinator()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        runtime.add_ban("*!~beta@beta.host")
         bot.authorizer.grant(OWNER.render())
-        peer = BotPresence("beta", "beta.host", "one", "beta", "~beta")
-        bot.presence.update(peer)
-        action = {"channel": "#test", "presence": asdict(peer)}
+        fake_irc.connected = False
 
-        with patch.object(
-            failing_irc,
-            "send",
-            MagicMock(wraps=failing_irc.send),
-        ) as send:
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
             await bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host")
-            bot.channel_mgr.invite_peer(action)
-            # Invited peers are outside the channel; op goes to a member.
-            runtime.member("beta").prefix = Prefix("beta", "~beta", "beta.host")
-            bot.channel_mgr.unban_peer(action)
-            bot.channel_mgr.op_peer(action)
 
         assert send.call_args_list == [
             call("MODE", "#test", "+b", "*!*@bad.host"),
-            call("PRIVMSG", "owner", trailing="IRC disconnected"),
-            call("INVITE", "beta", "#test"),
-            call("MODE", "#test", "-b", "*!~beta@beta.host"),
-            call("MODE", "#test", "+o", "beta"),
+            call("PRIVMSG", "owner", trailing="IRC is not connected"),
         ]
 
     async def test_admin_deop(self) -> None:
@@ -615,13 +597,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_join_preserves_live_key(self) -> None:
         """Verify a repeated keyless JOIN retains a key learned from IRC."""
-        bot, _, coordinator = bot_with_coordinator()
+        bot, fake_irc, coordinator = bot_with_coordinator()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.key = "live-key"
         base = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")].revision
 
         await bot.commands.cmd_join(OWNER, ("#test",))
 
+        assert fake_irc.privmsgs == [("owner", "Joining #test")]
         payload = coordinator.channel_puts[-1]
         assert payload["key"] == "live-key"
         assert runtime.key == "live-key"

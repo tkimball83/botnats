@@ -26,8 +26,12 @@ def _has_space_or_nul(value: str) -> bool:
 
 def validate_channel(value: str) -> str:
     """Verify an IRC channel name is well-formed and return it."""
-    if len(value) < 2 or not value.startswith(("#", "&", "+", "!")):
+    if not value.startswith(("#", "&", "+", "!")):
         msg = "channel must start with #, &, +, or !"
+        raise ValueError(msg)
+
+    if len(value) < 2:
+        msg = "channel name is empty"
         raise ValueError(msg)
 
     if "," in value or "\x07" in value or _has_space_or_nul(value):

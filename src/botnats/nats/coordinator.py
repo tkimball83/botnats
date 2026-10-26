@@ -8,6 +8,7 @@ import logging
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
 import nats
@@ -24,7 +25,6 @@ from botnats.nats.store import (
     ClaimStore,
     PresenceStore,
     SessionStore,
-    StoreUnavailableError,
     decode_record,
     is_delete,
 )
@@ -37,13 +37,17 @@ if TYPE_CHECKING:
 
     from botnats.bot import NATSCallbackHandler
     from botnats.nats.envelope import Envelope
+    from botnats.nats.store import Session
+    from botnats.validators import ChannelFields
+
+    # Each KV watch, by name; it calls its argument once its replay is complete.
+    type Watch = Callable[[Callable[[], None]], Awaitable[None]]
 
 LOGGER = logging.getLogger(__name__)
 
 DECODE_WARNING_INTERVAL = 5.0
 TRANSIENT_WARNING_INTERVAL = 60.0
 RECONNECT_WAIT = 1
-WATCH_NAMES = frozenset({"watch-channels", "watch-presence", "watch-sessions"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +64,23 @@ class NATSConfig:
     token: str = field(repr=False)
 
 
-class CoordinatorProtocol(Protocol):
+class PresenceWriter(Protocol):
+    """Writes this bot's presence heartbeat."""
+
+    async def put_presence(self, presence: dict[str, Any]) -> None:
+        """Store or refresh bot presence in JetStream KV."""
+        ...
+
+
+class SessionWriter(Protocol):
+    """Writes durable session mutations."""
+
+    async def put_session(self, session: dict[str, Any]) -> Session:
+        """Store an auth session and return the authoritative session."""
+        ...
+
+
+class CoordinatorProtocol(PresenceWriter, SessionWriter, Protocol):
     """Structural interface for coordinator implementations."""
 
     async def close(self) -> None:
@@ -72,16 +92,8 @@ class CoordinatorProtocol(Protocol):
         record: dict[str, Any],
         *,
         expected: str | None,
-    ) -> dict[str, Any]:
+    ) -> ChannelFields:
         """Store a channel record written after expected; return the winner."""
-        ...
-
-    async def put_presence(self, presence: dict[str, Any]) -> None:
-        """Store or refresh bot presence in JetStream KV."""
-        ...
-
-    async def put_session(self, session: dict[str, Any]) -> dict[str, Any]:
-        """Store an auth session and return the authoritative record."""
         ...
 
     @property
@@ -108,12 +120,6 @@ class CoordinatorProtocol(Protocol):
     async def status(self) -> NATSStatus:
         """Return Core NATS and JetStream cluster status."""
         ...
-
-
-def sender_owns_presence(sender: str, payload: dict[str, Any]) -> bool:
-    """Return whether an action payload's presence belongs to its sender."""
-    presence = payload.get("presence")
-    return isinstance(presence, dict) and presence.get("bot_id") == sender
 
 
 class Coordinator:
@@ -173,6 +179,8 @@ class Coordinator:
             config.instance_id,
         )
         self.resync_task: asyncio.Task[None] | None = None
+        # Startup and a restart after nats-py closed the client never overlap.
+        self.start_lock = asyncio.Lock()
         self.store_generation = 0
         self.synced_watches: set[str] = set()
         self.watch_generation = 0
@@ -236,9 +244,25 @@ class Coordinator:
         for store in self.stores:
             store.reset()
 
+    async def on_closed(self) -> None:
+        """Start over when nats-py closes the client for good.
+
+        A server error, such as one for a rotated token, closes the client
+        without reconnecting. close() drops the client first, so a closed
+        client still held here was not closed on purpose.
+        """
+        nc = self.nc
+        if nc is None or not nc.is_closed:
+            return
+
+        self.nc = None
+        await self.cancel_resync()
+        self.resync_task = asyncio.create_task(self.start(), name="nats-restart")
+        self.resync_task.add_done_callback(self.resync_done)
+
     async def on_error(self, error: Exception) -> None:
-        """Log a NATS transport error."""
-        LOGGER.warning("NATS error: %s", error_label(error))
+        """Log a NATS transport error, which repeats during an outage."""
+        self.warn_transient("NATS error", error)
 
     async def on_reconnected(self) -> None:
         """Resynchronize state after a NATS reconnection.
@@ -253,7 +277,7 @@ class Coordinator:
         self.resync_task.add_done_callback(self.resync_done)
 
     def resync_done(self, task: asyncio.Task[None]) -> None:
-        """Surface a failed resynchronization instead of losing it to GC."""
+        """Surface a failed resynchronization or restart instead of losing it."""
         if self.resync_task is task:
             self.resync_task = None
 
@@ -265,19 +289,25 @@ class Coordinator:
         await self.start_watches()
 
     async def cancel_resync(self) -> None:
-        """Cancel an in-flight reconnect resynchronization task."""
+        """Cancel an in-flight resynchronization or restart task.
+
+        A restart that closes its own failed client reaches this through the
+        disconnect callback; it must go on retrying, not cancel itself.
+        """
         task = self.resync_task
+        if task is None or task is asyncio.current_task():
+            return
+
         self.resync_task = None
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def put_channel(
         self,
         record: dict[str, Any],
         *,
         expected: str | None,
-    ) -> dict[str, Any]:
+    ) -> ChannelFields:
         """Store a channel record written after expected; return the winner."""
         self.claim.require()
         return await self.channels_store.put(record, expected=expected)
@@ -286,8 +316,8 @@ class Coordinator:
         """Store or refresh bot presence in JetStream KV."""
         await self.claim.put(presence)
 
-    async def put_session(self, session: dict[str, Any]) -> dict[str, Any]:
-        """Store an auth session and return the authoritative record."""
+    async def put_session(self, session: dict[str, Any]) -> Session:
+        """Store an auth session and return the authoritative session."""
         self.claim.require()
         return await self.sessions.put(session)
 
@@ -301,7 +331,7 @@ class Coordinator:
         return (
             self.connected
             and all(store.ready for store in self.stores)
-            and self.synced_watches == WATCH_NAMES
+            and self.synced_watches == self.watches().keys()
             and self.claim.owned
         )
 
@@ -341,34 +371,35 @@ class Coordinator:
         with suppress(*PUBLISH_ERRORS):
             await nc.publish(subject, self.envelope.encode(subject, payload))
 
-    def decode_help(self, message: Msg) -> dict[str, Any] | None:
-        """Decode a request whose signed sender owns its presence identity."""
+    def decode_help(self, message: Msg) -> tuple[str, BotPresence] | None:
+        """Decode a request's channel and the presence of the bot that signed it."""
         try:
             sender, payload = self.envelope.decode(message.subject, message.data)
-        except DECODE_ERRORS as error:
+            channel = payload["channel"]
+            presence = BotPresence.from_dict(payload["presence"])
+            if not isinstance(channel, str):
+                msg = "help request names no channel"
+                raise TypeError(msg)
+
+            if presence.bot_id != sender:
+                msg = "sender does not match presence"
+                raise ValueError(msg)
+        except (*DECODE_ERRORS, KeyError) as error:
             self.warn_decode(message.subject, error)
             return None
 
-        if not sender_owns_presence(sender, payload):
-            self.warn_decode(
-                message.subject,
-                ValueError("sender does not match presence"),
-            )
-            return None
-
-        return payload
+        return channel, presence
 
     async def deliver_help(self, message: Msg) -> None:
         """Hand a peer's request and its kind to the bot; skip unready or our own."""
         if not self.ready:
             return
 
-        payload = self.decode_help(message)
-        if (
-            payload is not None
-            and payload["presence"]["bot_id"] != self.envelope.bot_id
-        ):
-            self.callbacks.on_help(message.subject.rpartition(".")[2], payload)
+        request = self.decode_help(message)
+        if request is not None and request[1].bot_id != self.envelope.bot_id:
+            channel, presence = request
+            kind = message.subject.rpartition(".")[2]
+            self.callbacks.on_help(kind, channel, presence)
 
     async def subscribe_help(self) -> None:
         """Subscribe to help requests on the active connection."""
@@ -396,12 +427,7 @@ class Coordinator:
         if generation == self.watch_generation:
             self.synced_watches.discard(name)
 
-    async def run_watch(
-        self,
-        name: str,
-        watch_fn: Callable[[], Awaitable[None]],
-        generation: int,
-    ) -> None:
+    async def run_watch(self, name: str, watch_fn: Watch, generation: int) -> None:
         """Run a watch coroutine, retrying on errors after a fixed wait.
 
         The generation check ejects a superseded task that survived
@@ -410,10 +436,8 @@ class Coordinator:
         """
         while self.connected and generation == self.watch_generation:
             try:
-                await watch_fn()
-            except asyncio.CancelledError:
-                raise
-            except (*CONNECT_ERRORS, StoreUnavailableError) as error:
+                await watch_fn(partial(self.synced_watches.add, name))
+            except PUBLISH_ERRORS as error:
                 if not self.connected:
                     return
 
@@ -432,36 +456,39 @@ class Coordinator:
 
     async def start(self) -> None:
         """Connect to NATS, subscribe to subjects, and start KV watches."""
-        while self.nc is None:
-            try:
-                nc = await nats.connect(
-                    servers=list(self.config.servers),
-                    token=self.config.token,
-                    name=f"botnats-{self.envelope.bot_id}",
-                    allow_reconnect=True,
-                    max_reconnect_attempts=-1,
-                    reconnect_time_wait=RECONNECT_WAIT,
-                    disconnected_cb=self.on_disconnected,
-                    error_cb=self.on_error,
-                    reconnected_cb=self.on_reconnected,
-                )
-                self.nc = nc
-                await self.init_stores()
-                await self.subscribe_help()
-            except CONNECT_ERRORS as error:
-                LOGGER.warning(
-                    "NATS connection failed; retrying: %s",
-                    error_label(error),
-                )
-                if self.nc is not None:
-                    with suppress(*PUBLISH_ERRORS):
-                        await self.nc.close()
+        async with self.start_lock:
+            while self.nc is None:
+                try:
+                    nc = await nats.connect(
+                        servers=list(self.config.servers),
+                        token=self.config.token,
+                        name=f"botnats-{self.envelope.bot_id}",
+                        allow_reconnect=True,
+                        max_reconnect_attempts=-1,
+                        reconnect_time_wait=RECONNECT_WAIT,
+                        closed_cb=self.on_closed,
+                        disconnected_cb=self.on_disconnected,
+                        error_cb=self.on_error,
+                        reconnected_cb=self.on_reconnected,
+                    )
+                    self.nc = nc
+                    await self.init_stores()
+                    await self.subscribe_help()
+                except CONNECT_ERRORS as error:
+                    LOGGER.warning(
+                        "NATS connection failed; retrying: %s",
+                        error_label(error),
+                    )
+                    # Dropped first, so on_closed knows this close is ours.
+                    failed, self.nc = self.nc, None
+                    if failed is not None:
+                        with suppress(*PUBLISH_ERRORS):
+                            await failed.close()
 
-                    self.nc = None
+                    await asyncio.sleep(RECONNECT_WAIT)
 
-                await asyncio.sleep(RECONNECT_WAIT)
+            await self.start_watches()
 
-        await self.start_watches()
         LOGGER.info("connected to Core NATS")
 
     async def start_watches(self) -> None:
@@ -473,21 +500,12 @@ class Coordinator:
         if self.watch_generation != generation:
             return
 
-        watches = (
-            ("watch-channels", self.watch_channels),
-            ("watch-presence", self.watch_presence),
-            ("watch-sessions", self.watch_sessions),
-        )
-        for name, watch_fn in watches:
+        for name, watch_fn in self.watches().items():
             task = asyncio.create_task(
                 self.run_watch(name, watch_fn, generation),
                 name=name,
             )
             self.watch_tasks.append(task)
-
-    def mark_watch_synced(self, name: str) -> None:
-        """Record one completed watch replay."""
-        self.synced_watches.add(name)
 
     async def status(self) -> NATSStatus:
         """Return Core NATS and JetStream cluster status."""
@@ -525,14 +543,22 @@ class Coordinator:
         if suffix is not None:
             LOGGER.warning("%s: %s%s", context, error_label(error), suffix)
 
-    async def watch_channels(self) -> None:
+    def watches(self) -> dict[str, Watch]:
+        """Return every KV watch by name; readiness needs each one's replay."""
+        return {
+            "watch-channels": self.watch_channels,
+            "watch-presence": self.watch_presence,
+            "watch-sessions": self.watch_sessions,
+        }
+
+    async def watch_channels(self, synced: Callable[[], None]) -> None:
         """Watch the channels KV bucket and apply record updates."""
         kv = await self.channels_store.open()
         watcher = await kv.watchall()
         try:
             async for entry in watcher:
                 if entry is None:
-                    self.mark_watch_synced("watch-channels")
+                    synced()
                     continue
 
                 if is_delete(entry.operation):
@@ -549,7 +575,7 @@ class Coordinator:
         finally:
             await watcher.stop()
 
-    async def watch_presence(self) -> None:
+    async def watch_presence(self, synced: Callable[[], None]) -> None:
         """Watch the presence KV bucket and detect duplicate bot IDs."""
         kv = await self.presence_store.open()
         watcher = await kv.watchall()
@@ -560,7 +586,7 @@ class Coordinator:
                     if not saw_conflict:
                         await self.try_reclaim(self.claim.reclaim)
 
-                    self.mark_watch_synced("watch-presence")
+                    synced()
                     continue
 
                 if is_delete(entry.operation):
@@ -604,7 +630,7 @@ class Coordinator:
         self.callbacks.on_presence(presence)
         return duplicate
 
-    async def watch_sessions(self) -> None:
+    async def watch_sessions(self, synced: Callable[[], None]) -> None:
         """Watch the sessions KV bucket and report validated records by key."""
         replayed: set[str] | None = set()
         kv = await self.sessions.open()
@@ -616,7 +642,7 @@ class Coordinator:
                         self.callbacks.on_sessions_replayed(replayed)
                         replayed = None
 
-                    self.mark_watch_synced("watch-sessions")
+                    synced()
                     continue
 
                 if is_delete(entry.operation):

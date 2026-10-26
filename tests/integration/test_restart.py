@@ -3,12 +3,10 @@
 
 """Verify durable state survives a complete NATS cluster restart."""
 
-import asyncio
 import json
 import time
 from dataclasses import asdict
-
-from nats.errors import Error as NatsError
+from typing import TYPE_CHECKING
 
 from botnats.channel import ChannelRecord
 from botnats.nats.store import ChannelStore, ClaimStore, SessionStore, session_signature
@@ -16,7 +14,11 @@ from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
     connect,
     coordination_key,
+    keep_trying,
 )
+
+if TYPE_CHECKING:
+    from nats.js.kv import KeyValue
 
 CHANNEL = "#botnats-restart"
 CHANNEL_KEY = "restart-key"
@@ -65,12 +67,12 @@ async def mark() -> None:
         assert await claims.claim(COUNTER)
         await channels.open(nc.jetstream())
         record = asdict(ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True))
-        stored = await channels.put(record, expected=None)
-        assert stored["key"] == CHANNEL_KEY
+        _, stored_key, _, _ = await channels.put(record, expected=None)
+        assert stored_key == CHANNEL_KEY
         await sessions.open(nc.jetstream())
         expires_at = time.time() + SESSION_TTL / 2
         session = await sessions.put(session_record("restart-test", expires_at))
-        assert session["prefix"] == SESSION_IDENTITY
+        assert session.prefix == SESSION_IDENTITY
     finally:
         await nc.drain()
 
@@ -80,38 +82,32 @@ async def check() -> None:
     nc = await connect()
     try:
         claims, channels, sessions = stores()
-        # A missing key here can be transient while JetStream replays after
-        # the restart, so keep retrying; only a genuine loss (or an elapsed
-        # claim TTL) exhausts the timeout, which we surface as a clear error
-        # instead of an opaque TimeoutError.
-        try:
-            async with asyncio.timeout(REPLAY_TIMEOUT):
-                while True:
-                    try:
-                        kv = await claims.open(nc.jetstream())
-                        entry = await kv.get(claims.key(COUNTER))
-                        channel_kv = await channels.open(nc.jetstream())
-                        channel_entry = await channel_kv.get(channels.key(CHANNEL))
-                        session_kv = await sessions.open(nc.jetstream())
-                        session_entry = await session_kv.get(
-                            sessions.key(SESSION_IDENTITY),
-                        )
-                    except NatsError:
-                        await asyncio.sleep(0.5)
-                        continue
 
-                    assert entry.value == b"1"
-                    assert channel_entry.value is not None
-                    channel_record = json.loads(channel_entry.value)
-                    assert channel_record["key"] == CHANNEL_KEY
-                    assert channel_record["present"] is True
-                    assert session_entry.value is not None
-                    stored_session = json.loads(session_entry.value)
-                    assert stored_session["prefix"] == SESSION_IDENTITY
-                    assert stored_session["issuer"] == "integration"
-                    break
-        except TimeoutError:
-            msg = "durable state missing after NATS restart"
-            raise AssertionError(msg) from None
+        async def read() -> tuple[KeyValue.Entry, ...]:
+            # A missing key can be transient while JetStream replays after the
+            # restart; only a genuine loss (or an elapsed claim TTL) times out.
+            claim_kv = await claims.open(nc.jetstream())
+            channel_kv = await channels.open(nc.jetstream())
+            session_kv = await sessions.open(nc.jetstream())
+            return (
+                await claim_kv.get(claims.key(COUNTER)),
+                await channel_kv.get(channels.key(CHANNEL)),
+                await session_kv.get(sessions.key(SESSION_IDENTITY)),
+            )
+
+        entry, channel_entry, session_entry = await keep_trying(
+            read,
+            REPLAY_TIMEOUT,
+            "durable state missing after NATS restart",
+        )
+        assert entry.value == b"1"
+        assert channel_entry.value is not None
+        channel_record = json.loads(channel_entry.value)
+        assert channel_record["key"] == CHANNEL_KEY
+        assert channel_record["present"] is True
+        assert session_entry.value is not None
+        stored_session = json.loads(session_entry.value)
+        assert stored_session["prefix"] == SESSION_IDENTITY
+        assert stored_session["issuer"] == "integration"
     finally:
         await nc.drain()

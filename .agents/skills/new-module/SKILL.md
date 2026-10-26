@@ -16,7 +16,6 @@ Every source file starts with:
 
 Place IRC and NATS modules in their existing subpackages. Place other modules at
 the package root unless a genuine domain boundary requires a new subpackage.
-Export a public name from `__init__.py` only when package callers need it.
 
 Add `tests/unit/test_{{ name }}.py` with `unittest.TestCase`. Prefer fakes for
 focused behavior and standard-library mocks at external boundaries.

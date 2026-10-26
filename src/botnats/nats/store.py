@@ -37,10 +37,19 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# Transport failures, and the RuntimeError family a store or presence claim
-# raises when a write cannot proceed (unavailable store, duplicate bot ID).
+
+class StoreUnavailableError(Exception):
+    """A durable write cannot proceed yet, though nothing is wrong with it.
+
+    JetStream handles are reset or replaced while Core NATS reconnects, and a
+    process writes only while it owns its bot ID's presence key.
+    """
+
+
+# Transport failures, and the error a store or presence claim raises when a
+# write cannot proceed yet (store reconnecting, presence key not owned).
 CONNECT_ERRORS = (NatsError, OSError)
-PUBLISH_ERRORS = (*CONNECT_ERRORS, RuntimeError)
+PUBLISH_ERRORS = (*CONNECT_ERRORS, StoreUnavailableError)
 DECODE_ERRORS = (RecursionError, TypeError, ValueError)
 
 ATTEMPT_LIMIT = 3
@@ -51,15 +60,6 @@ CLAIM_TTL = 300.0
 DUPLICATE_WINDOW = 120.0
 PRESENCE_DRIFT = 30.0
 SESSION_EXPIRY_GRACE = 60.0
-
-
-class StoreUnavailableError(RuntimeError):
-    """JetStream handles are reset or replaced while Core NATS reconnects.
-
-    A RuntimeError subclass so every PUBLISH_ERRORS handler treats it as
-    transient, while watches can distinguish it from a genuine RuntimeError
-    programming failure.
-    """
 
 
 class KVStore:
@@ -143,17 +143,20 @@ class KVStore:
         self.js = None
         self.kv = None
 
-    async def put_newer(
+    async def put_newer[T](
         self,
         key: str,
         data: dict[str, Any],
-        newer: Callable[[dict[str, Any]], bool],
-    ) -> dict[str, Any]:
-        """Atomically store JSON and return the authoritative value.
+        written: T,
+        standing: Callable[[dict[str, Any]], T | None],
+    ) -> T:
+        """Atomically store JSON unless the stored record stands; return the winner.
 
-        Bounded like reclaim: repeatedly losing the CAS race against a
-        handful of peers is transient, so exhaustion raises for the caller's
-        retry path instead of spinning against the bucket.
+        standing parses the stored record and returns it when it outranks
+        the write, or None when the write may replace it. Bounded like
+        reclaim: repeatedly losing the CAS race against a handful of peers is
+        transient, so exhaustion raises for the caller's retry path instead of
+        spinning against the bucket.
         """
         kv = await self.open()
         encoded = json.dumps(data).encode()
@@ -166,18 +169,19 @@ class KVStore:
                 except KeyWrongLastSequenceError:
                     continue
 
-                return data
+                return written
 
             current = decode_record(entry.value)
-            if current is not None and not newer(current):
-                return current
+            winner = standing(current) if current is not None else None
+            if winner is not None:
+                return winner
 
             try:
                 await kv.update(key, encoded, last=entry.revision)
             except KeyWrongLastSequenceError:
                 continue
 
-            return data
+            return written
 
         msg = "durable write lost repeated update races"
         raise NatsError(msg)
@@ -256,9 +260,9 @@ class ChannelStore(KVStore):
         folded = casefold(channel, "ascii")
         return _sign_fields(self.secret, "botnats-channel-v1", folded)
 
-    def sign(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Return a canonical, signed copy of a valid channel record."""
-        channel, channel_key, present, revision = parse_channel_record(data)
+    def sign(self, fields: ChannelFields) -> dict[str, Any]:
+        """Return the canonical, signed record of validated channel fields."""
+        channel, channel_key, present, revision = fields
         record: dict[str, Any] = {
             "channel": channel,
             "key": channel_key,
@@ -281,25 +285,15 @@ class ChannelStore(KVStore):
         except TypeError, ValueError:
             return None
 
-        channel, channel_key, present, revision = fields
         signature = record.get("signature")
         if (
-            self.key(channel) != key
+            self.key(fields[0]) != key
             or not isinstance(signature, str)
             or SIGNATURE_RE.fullmatch(signature) is None
         ):
             return None
 
-        expected = channel_signature(
-            self.secret,
-            self.network,
-            {
-                "channel": channel,
-                "key": channel_key,
-                "present": present,
-                "revision": revision,
-            },
-        )
+        expected = channel_signature(self.secret, self.network, record)
         if not hmac.compare_digest(expected, signature):
             return None
 
@@ -310,26 +304,25 @@ class ChannelStore(KVStore):
         data: dict[str, Any],
         *,
         expected: str | None,
-    ) -> dict[str, Any]:
-        """Store a signed channel record and return the authoritative record.
+    ) -> ChannelFields:
+        """Store a signed channel record and return the authoritative fields.
 
         expected is the revision the record was written after (None when no
         record was known). The write lands only while that is still the
         stored record, so a concurrent write from another bot wins cleanly
         instead of by the random revision suffix.
         """
-        signed = self.sign(data)
-        key = self.key(signed["channel"])
+        fields = parse_channel_record(data)
+        key = self.key(fields[0])
 
-        def newer(current: dict[str, Any]) -> bool:
-            fields = self.parse(key, current)
-            if fields is None:
-                return True
+        def standing(current: dict[str, Any]) -> ChannelFields | None:
+            stored = self.parse(key, current)
+            if stored is None or stored[3] == expected:
+                return None
 
-            _, _, _, revision = fields
-            return revision == expected
+            return stored
 
-        return await self.put_newer(key, signed, newer)
+        return await self.put_newer(key, self.sign(fields), fields, standing)
 
 
 class ClaimStore(KVStore):
@@ -375,18 +368,22 @@ class PresenceStore(KVStore):
         self.network = network
         self.secret = secret
 
+    def key(self, bot_id: str) -> str:
+        """Return the presence key of a bot ID, which is case-insensitive."""
+        return bot_id.casefold()
+
     async def create(self, bot_id: str, data: dict[str, Any]) -> int | None:
         """Atomically create a signed presence key and return its revision."""
         kv = await self.open()
         try:
-            return await kv.create(bot_id.casefold(), self.sign(data))
+            return await kv.create(self.key(bot_id), self.sign(data))
         except KeyWrongLastSequenceError:
             return None
 
     async def delete(self, bot_id: str, revision: int) -> None:
         """Delete the presence key only while its owned revision still matches."""
         kv = await self.open()
-        await kv.delete(bot_id.casefold(), last=revision)
+        await kv.delete(self.key(bot_id), last=revision)
 
     async def reclaim(
         self,
@@ -412,7 +409,7 @@ class PresenceStore(KVStore):
         # heartbeat retries far sooner than eight rounds would resolve.
         for _ in range(2):
             try:
-                entry = await kv.get(bot_id.casefold())
+                entry = await kv.get(self.key(bot_id))
             except KeyNotFoundError:
                 # The occupant expired between the failed create and this
                 # read; the key is unowned, so claim it. On a lost create
@@ -425,7 +422,7 @@ class PresenceStore(KVStore):
                 continue
 
             current = decode_record(entry.value)
-            if current is not None and self.valid(bot_id.casefold(), current):
+            if current is not None and self.valid(self.key(bot_id), current):
                 return (
                     entry.revision
                     if current.get("instance_id") == instance_id
@@ -434,7 +431,7 @@ class PresenceStore(KVStore):
 
             try:
                 return await kv.update(
-                    bot_id.casefold(), self.sign(data), last=entry.revision
+                    self.key(bot_id), self.sign(data), last=entry.revision
                 )
             except KeyWrongLastSequenceError:
                 # Lost the overwrite race; re-read to evaluate the racing
@@ -460,7 +457,7 @@ class PresenceStore(KVStore):
         """Refresh presence only while its last owned revision still matches."""
         kv = await self.open()
         try:
-            return await kv.update(bot_id.casefold(), self.sign(data), last=revision)
+            return await kv.update(self.key(bot_id), self.sign(data), last=revision)
         except KeyWrongLastSequenceError:
             return None
 
@@ -476,7 +473,7 @@ class PresenceStore(KVStore):
         if (
             not isinstance(bot_id, str)
             or IDENTIFIER_RE.fullmatch(bot_id) is None
-            or bot_id.casefold() != key
+            or self.key(bot_id) != key
             or not isinstance(signature, str)
             or SIGNATURE_RE.fullmatch(signature) is None
             or not isinstance(timestamp, int)
@@ -525,8 +522,8 @@ class SessionStore(KVStore):
 
         return session
 
-    async def put(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Store a session or revocation and return the authoritative record.
+    async def put(self, data: dict[str, Any]) -> Session:
+        """Store a session or revocation and return the authoritative session.
 
         Only the future horizon is bounded: an already-expired record must
         stay writable so a near-expiry revocation is not rejected under
@@ -539,15 +536,14 @@ class SessionStore(KVStore):
 
         key = self.key(session.prefix)
 
-        def newer(current: dict[str, Any]) -> bool:
+        def standing(current: dict[str, Any]) -> Session | None:
             stored = self.parse(key, current)
-            return (
-                stored is None
-                or stored.expires_at <= time.time()
-                or stored.order < session.order
-            )
+            if stored is None or stored.order < session.order:
+                return None
 
-        return await self.put_newer(key, data, newer)
+            return stored
+
+        return await self.put_newer(key, data, session, standing)
 
 
 @dataclass(frozen=True, slots=True)

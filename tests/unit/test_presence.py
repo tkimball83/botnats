@@ -1,20 +1,24 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for bot presence matching and registry expiry."""
+"""Tests for bot presence records, registry expiry, and identity discovery."""
 
 import asyncio
 import unittest
 from dataclasses import asdict
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from botnats.irc.protocol import IRCMessage, Prefix
+from botnats.irc.protocol import IRCMessage
 from botnats.presence import BotPresence, PresenceRegistry
 from tests.unit.helpers import FakeIRC, make_bot
 
+if TYPE_CHECKING:
+    from botnats.bot import Bot
+
 
 class PresenceTests(unittest.TestCase):
-    """Tests for presence matching, expiry, and update semantics."""
+    """Tests for presence parsing, expiry, and update semantics."""
 
     def test_from_dict_rejects_invalid_input(self) -> None:
         """Verify from_dict rejects non-dict, missing, and empty fields."""
@@ -51,15 +55,6 @@ class PresenceTests(unittest.TestCase):
 
         assert registry.active(now=14.9) == (presence,)
         assert registry.active(now=15) == ()
-
-    def test_presence_matching(self) -> None:
-        """Verify presence matches prefix by nick, user, and host."""
-        presence = BotPresence("vhagar", "host.example", "instance", "Vhagar", "~bot")
-
-        assert presence.matches(Prefix("vhagar", "~bot", "HOST.EXAMPLE"), "rfc1459")
-        assert not presence.matches(
-            Prefix("vhagar", "someone", "host.example"), "rfc1459"
-        )
 
     def test_presence_membership(self) -> None:
         """Verify exact presence membership uses the current bot entry."""
@@ -142,6 +137,31 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [("USERHOST", ("alpha",))]
         assert fake_irc.reconnects == 0
 
+    async def test_identity_discovery_stops_after_reset(self) -> None:
+        """Stop a discovery whose connection reset while it waited for a reply."""
+        # With two attempts the check before the second USERHOST sees the
+        # reset; with one, only the check before reconnecting does.
+        for attempts in (1, 2):
+            fake_irc = FakeIRC()
+            bot = make_bot(irc=fake_irc)
+            generation = bot.identity.generation
+
+            async def reset_identity(delay: float, bot: Bot = bot) -> None:
+                del delay
+                bot.identity.reset()
+
+            with (
+                self.subTest(attempts=attempts),
+                patch("botnats.presence.IDENTITY_RETRY_ATTEMPTS", attempts),
+                patch("botnats.presence.asyncio.sleep", reset_identity),
+            ):
+                async with asyncio.timeout(1):
+                    await bot.identity.discover(generation)
+
+                assert bot.identity.generation == generation + 1
+                assert fake_irc.sent == [("USERHOST", ("alpha",))]
+                assert fake_irc.reconnects == 0
+
     async def test_identity_discovery_reconnects(self) -> None:
         """Verify bot reconnects when identity discovery exhausts retries."""
         fake_irc = FakeIRC()
@@ -151,7 +171,7 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.presence.IDENTITY_RETRY_DELAY", 0),
             self.assertLogs("botnats.presence", level="WARNING"),
         ):
-            await bot.events.handle_welcome(IRCMessage("001", ("alpha", "welcome")))
+            bot.events.handle_welcome(IRCMessage("001", ("alpha", "welcome")))
             tasks = tuple(bot.tasks)
             await asyncio.gather(*tasks)
 

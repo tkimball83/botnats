@@ -130,10 +130,17 @@ async def connect(address: str) -> IRCSession:
     try:
         await session.send("NICK", "owner")
         await session.send("USER", "owner", "0", "*", trailing="BotNATS test owner")
-        await session.read_until(
-            lambda message: message.command == "001",
-            wait_seconds=COMMAND_TIMEOUT,
-        )
+        # The owner session a previous step just closed can hold the nick for
+        # a moment; ask again until the server releases it.
+        async with asyncio.timeout(COMMAND_TIMEOUT):
+            while (
+                await session.read_until(
+                    lambda message: message.command in {"001", "433"},
+                    wait_seconds=COMMAND_TIMEOUT,
+                )
+            ).command == "433":
+                await asyncio.sleep(POLL_INTERVAL)
+                await session.send("NICK", "owner")
     except BaseException:
         await session.close()
         raise

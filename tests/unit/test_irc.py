@@ -38,15 +38,13 @@ from botnats.irc.protocol import (
 MASK_MATCH_BUDGET_SECONDS = 0.5
 
 
-async def ignore_message(message: object) -> None:
+def ignore_message(message: object) -> None:
     """Ignore an IRC message in transport-only tests."""
     del message
 
 
 def irc_client(
     *,
-    idle_timeout: float = 120,
-    pong_timeout: float = 30,
     ports: tuple[int, ...] = (6667,),
     tls: bool = False,
     verify_tls: bool = True,
@@ -56,9 +54,7 @@ def irc_client(
         caps=ISupportState(),
         config=IRCClientConfig(
             connect_timeout=1,
-            idle_timeout=idle_timeout,
             nickname="alpha",
-            pong_timeout=pong_timeout,
             servers=tuple(IRCServer("127.0.0.1", port, tls=tls) for port in ports),
             verify_tls=verify_tls,
         ),
@@ -313,6 +309,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
     def test_pong_reply_echoes_raw_token(self) -> None:
         """Verify PONG echoes raw PING token bytes and always fits the wire."""
+        # A bare PING still gets an answer.
+        assert pong_reply(b"PING\r\n") == b"PONG\r\n"
         assert pong_reply(b"PING :token\r\n") == b"PONG :token\r\n"
         assert pong_reply(b"PING token\r\n") == b"PONG token\r\n"
         assert pong_reply(b":server PING :token\r\n") == b"PONG :token\r\n"
@@ -511,7 +509,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.registered_with_server = True
         dispatched: list[str] = []
 
-        async def record_message(message: IRCMessage) -> None:
+        def record_message(message: IRCMessage) -> None:
             dispatched.append(message.command)
 
         client.on_message = record_message
@@ -533,7 +531,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client()
         dispatched: list[str] = []
 
-        async def fragile_handler(message: IRCMessage) -> None:
+        def fragile_handler(message: IRCMessage) -> None:
             if message.command == "PRIVMSG":
                 msg = "handler bug"
                 raise RuntimeError(msg)
@@ -557,7 +555,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_cap_line_reaches_capability_negotiation(self) -> None:
         """Route a CAP line to negotiation rather than the message handler."""
         client = self.cap_client()
-        handler = AsyncMock()
+        handler = MagicMock()
         client.on_message = handler
         raw = b":server CAP * LS :chghost\r\n"
 
@@ -565,7 +563,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             parse_message(raw.decode()), raw, mock_writer(), None
         )
 
-        handler.assert_not_awaited()
+        handler.assert_not_called()
         assert client.cap_available == {"chghost"}
         assert client.outbound is not None
         assert client.outbound.get_nowait() == b"CAP REQ :chghost\r\n"
@@ -653,36 +651,28 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         sent = client.outbound.get_nowait()
         assert sent == b"CAP REQ :chghost multi-prefix\r\n"
 
-    async def test_dispatch_answers_inflated_ping(self) -> None:
-        """Verify dispatch_line answers a decode-inflated PING from raw bytes."""
+    async def test_dispatch_answers_ping_from_raw_bytes(self) -> None:
+        """Verify dispatch_line answers inflated and bare PINGs from raw bytes."""
         client = irc_client()
-        raw = b"PING :" + b"\xe9" * 400 + b"\r\n"
-        message = parse_message(raw.decode(errors="replace"))
+        token = b"\xe9" * 400
+        cases = (
+            (b"PING :" + token + b"\r\n", b"PONG :" + token + b"\r\n"),
+            # A PING without parameters must not fall through unanswered.
+            (b"PING\r\n", b"PONG\r\n"),
+        )
 
-        with patch.object(client, "send_immediate", AsyncMock()) as send:
-            result = await client.dispatch_line(message, raw, mock_writer(), "tok")
+        for raw, reply in cases:
+            message = parse_message(raw.decode(errors="replace"))
+            with (
+                self.subTest(params=len(message.params)),
+                patch.object(client, "send_immediate", AsyncMock()) as send,
+            ):
+                result = await client.dispatch_line(message, raw, mock_writer(), "tok")
 
-        assert result == "tok"
-        send.assert_awaited_once()
-        assert send.await_args is not None
-        assert send.await_args.args[0] == b"PONG :" + b"\xe9" * 400 + b"\r\n"
-
-    async def test_bare_ping_gets_pong(self) -> None:
-        """Answer a PING with no token instead of ignoring it."""
-        client = irc_client()
-        raw = b"PING\r\n"
-
-        with patch.object(client, "send_immediate", AsyncMock()) as send:
-            await client.dispatch_line(
-                parse_message(raw.decode()),
-                raw,
-                mock_writer(),
-                None,
-            )
-
-        send.assert_awaited_once()
-        assert send.await_args is not None
-        assert send.await_args.args[0] == b"PONG\r\n"
+                assert result == "tok"
+                send.assert_awaited_once()
+                assert send.await_args is not None
+                assert send.await_args.args[0] == reply
 
     async def test_cap_new_ack_mid_ls_does_not_end_negotiation(self) -> None:
         """Verify a NEW-triggered ACK before LS completes keeps negotiating."""
@@ -802,10 +792,15 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
 
-        client = irc_client(idle_timeout=0.05, pong_timeout=0.05, ports=(port,))
+        client = irc_client(ports=(port,))
         try:
-            with self.assertRaisesRegex(ConnectionError, "did not answer"):
-                await client.run_connection(client.config.servers[0])
+            with (
+                patch("botnats.irc.client.IDLE_TIMEOUT", 0.05),
+                patch("botnats.irc.client.PONG_TIMEOUT", 0.05),
+                self.assertRaisesRegex(ConnectionError, "did not answer"),
+            ):
+                async with asyncio.timeout(5):
+                    await client.run_connection(client.config.servers[0])
 
             assert ping_seen.is_set()
         finally:
@@ -817,7 +812,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Skip a complete oversized line without dropping the session."""
         dispatched: list[str] = []
 
-        async def record_message(message: IRCMessage) -> None:
+        def record_message(message: IRCMessage) -> None:
             dispatched.append(message.command)
 
         boundary = b":server 002 alpha :" + b"x" * 491 + b"\r\n"
@@ -859,7 +854,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Drop a line truncated by a dying peer instead of parsing it."""
         dispatched: list[object] = []
 
-        async def record_message(message: object) -> None:
+        def record_message(message: object) -> None:
             dispatched.append(message)
 
         async def server_handler(
@@ -893,7 +888,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client()
         dispatched: list[str] = []
 
-        async def record_message(message: IRCMessage) -> None:
+        def record_message(message: IRCMessage) -> None:
             dispatched.append(message.command)
 
         client.on_message = record_message
@@ -958,7 +953,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 patch("botnats.irc.client.REGISTRATION_TIMEOUT", 0.05),
                 self.assertRaisesRegex(ConnectionError, "complete registration"),
             ):
-                await client.run_connection(client.config.servers[0])
+                async with asyncio.timeout(5):
+                    await client.run_connection(client.config.servers[0])
         finally:
             await client.close()
             server.close()
@@ -998,7 +994,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-        async def join_on_welcome(message: IRCMessage) -> None:
+        def join_on_welcome(message: IRCMessage) -> None:
             if message.command == "001":
                 client.send("JOIN", "#sync")
 
@@ -1086,6 +1082,19 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             client.sender_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await client.sender_task
+
+    async def test_send_refuses_closing_socket(self) -> None:
+        """Refuse a command once the socket is closing, though the sender lives."""
+        client = self.cap_client()
+        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        writer.is_closing.return_value = True
+        client.writer = writer
+
+        with self.assertRaisesRegex(ConnectionError, "not connected"):
+            client.send("NOTICE", "owner", trailing="hello")
+
+        assert client.outbound is not None
+        assert client.outbound.empty()
 
     async def test_send_queue_holds_join_burst(self) -> None:
         """Queue the join burst for a few hundred channels without overflow.
