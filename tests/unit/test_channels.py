@@ -75,7 +75,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ) as send,
             self.assertLogs("botnats.channel", level="WARNING") as logs,
         ):
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
 
         send.assert_called_once_with("MODE", "#test", "+npst")
         assert logs.output == [
@@ -93,7 +95,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.caps.chanmodes = ("beI", "kx", "l", "imnst")
 
         with self.assertLogs("botnats.channel", level="WARNING"):
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
 
         assert fake_irc.modes == []
 
@@ -111,12 +115,16 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send,
             self.assertNoLogs("botnats.channel", level="WARNING"),
         ):
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
             assert send.call_args_list == []
 
             bot.config = configured
             fake_irc.connected = False
-            bot.channel_mgr.enforce_modes("#test")
+            bot.channel_mgr.enforce_modes(
+                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            )
 
         send.assert_called_once_with("MODE", "#test", "+npst")
 

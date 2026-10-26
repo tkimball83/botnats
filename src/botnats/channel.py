@@ -117,7 +117,7 @@ class ChannelManager:
         if dropped is not None and dropped.joined:
             self.part(record.channel)
 
-    def enforce_modes(self, channel: str) -> None:
+    def enforce_modes(self, runtime: ChannelRuntime) -> None:
         """Set the configured channel modes when the bot has operator status."""
         if not self.bot.config.channel_modes:
             return
@@ -136,24 +136,22 @@ class ChannelManager:
         ):
             LOGGER.warning(
                 "cannot enforce modes on %s: configured mode requires an argument",
-                channel,
+                runtime.channel,
             )
             return
 
         try:
             self.bot.irc.send(
                 "MODE",
-                channel,
+                runtime.channel,
                 self.bot.config.channel_modes,
             )
         except ConnectionError:
             # The next tick resends NAMES, whose end reply enforces again.
-            runtime = self.runtime(channel)
-            if runtime is not None:
-                runtime.names_due = True
+            runtime.names_due = True
         except ValueError as error:
             LOGGER.warning(
-                "cannot enforce modes on %s: %s", channel, error_label(error)
+                "cannot enforce modes on %s: %s", runtime.channel, error_label(error)
             )
 
     def join_desired(self) -> None:

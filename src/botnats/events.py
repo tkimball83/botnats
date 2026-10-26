@@ -171,7 +171,9 @@ class IRCEventHandler:
                 # Some servers show members without access "*" for the key.
                 key = argument or "*"
 
-        if key not in ("*", runtime.key):
+        # Check the record even for a key this bot already holds: a key write
+        # lost while it was out of the channel left only the record stale.
+        if key != "*":
             self.process_key(runtime, key)
 
     def log_join_error(self, message: IRCMessage) -> None:
@@ -308,7 +310,7 @@ class IRCEventHandler:
             runtime.names_due = True
 
         if self.bot.channel_mgr.is_self_opped(runtime):
-            self.bot.channel_mgr.enforce_modes(channel)
+            self.bot.channel_mgr.enforce_modes(runtime)
         else:
             self.bot.tasks.spawn(
                 self.bot.channel_mgr.request_peer("op", channel),
@@ -407,12 +409,9 @@ class IRCEventHandler:
             self.poll_ison()
 
     async def ison_poll_loop(self) -> None:
-        """Poll ISON at a fixed interval until the desired nickname is ours."""
+        """Poll ISON at a fixed interval until the nick watch stops."""
         while True:
             await asyncio.sleep(ISON_POLL_INTERVAL)
-            if self.bot.irc.is_self(self.bot.config.nickname):
-                return
-
             with suppress(ConnectionError):
                 self.bot.irc.send("ISON", self.bot.config.nickname)
 
@@ -512,7 +511,7 @@ class IRCEventHandler:
                 runtime.names_due = True
 
         if opped and (lost_enforced or not was_opped):
-            self.bot.channel_mgr.enforce_modes(channel)
+            self.bot.channel_mgr.enforce_modes(runtime)
         elif not opped and (saw_new_op or was_opped):
             self.bot.tasks.spawn(
                 self.bot.channel_mgr.request_peer("op", channel),
