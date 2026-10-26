@@ -62,6 +62,9 @@ class ChannelManager:
         # Highest revision this bot has minted: concurrent local changes to
         # one channel (two admin commands, say) get distinct, ordered revisions.
         self.last_revision = 0
+        # Revisions of this bot's writes in flight: the KV watch can deliver
+        # one before the store's reply reaches the writer.
+        self.writing: set[str] = set()
         # Each peer help request kind, and the action that answers it.
         self.help_actions: dict[str, Callable[[str, BotPresence], None]] = {
             "invite": self.invite_peer,
@@ -70,11 +73,8 @@ class ChannelManager:
             "unban": self.unban_peer,
         }
 
-    def apply_record(self, record: ChannelRecord, *, own_write: bool = False) -> None:
-        """Apply a channel configuration record, joining or parting as needed.
-
-        own_write marks this bot's own record as the store accepted it.
-        """
+    def apply_record(self, record: ChannelRecord) -> None:
+        """Apply a channel configuration record, joining or parting as needed."""
         source_key = casefold(record.channel, "ascii")
         source = self.source_records.get(source_key)
         if source is not None and source.revision >= record.revision:
@@ -97,6 +97,7 @@ class ChannelManager:
             # flight, and against any record while a key it saw awaits its
             # write. Otherwise the record knows best: IRC can hide a key
             # change behind "*".
+            own_write = record.revision in self.writing
             if not (runtime.joined and (own_write or runtime.key_pending)):
                 runtime.key = record.key
 
@@ -233,14 +234,18 @@ class ChannelManager:
             present=present,
             after=current.revision if current is not None else None,
         )
-        stored = await self.bot.coordinator.put_channel(
-            asdict(record),
-            after=self.durable_revision(channel),
-        )
-        authoritative = ChannelRecord(*stored)
-        won = authoritative == record
-        self.apply_record(authoritative, own_write=won)
-        return won
+        self.writing.add(record.revision)
+        try:
+            stored = await self.bot.coordinator.put_channel(
+                asdict(record),
+                after=self.durable_revision(channel),
+            )
+            authoritative = ChannelRecord(*stored)
+            self.apply_record(authoritative)
+        finally:
+            self.writing.discard(record.revision)
+
+        return authoritative == record
 
     def durable_revision(self, channel: str) -> str | None:
         """Return the stored revision of this exact channel name, if any.

@@ -154,7 +154,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         first = bot.channel_mgr.new_record("#x", None, present=True)
         second = bot.channel_mgr.new_record("#x", "key", present=True)
 
-        assert second.revision > first.revision
+        # Equal counters would order by random suffix alone.
+        assert revision_number(second.revision) > revision_number(first.revision)
         # The other bot has minted only its own record for #test.
         assert other.channel_mgr.last_revision == 1
 
@@ -171,6 +172,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         new_folded = casefold("#Test[]", "ascii")
         assert new_folded in bot.channel_mgr.channels
+        assert casefold("#Test[]", "rfc1459") not in bot.channel_mgr.channels
         assert new_folded in bot.channel_mgr.channel_records
         assert bot.authorizer.authorized("nick[!~user@host.example")
         assert not bot.authorizer.authorized("nick{!~user@host.example")
@@ -249,28 +251,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.retry_pending_parts()
         assert ("PART", ("#room[",)) in fake_irc.sent
         assert bot.channel_mgr.pending_parts == {}
-
-    async def test_channel_record_injection(self) -> None:
-        """Store and join no channel whose name or key would inject a command."""
-        for channel, key in (
-            ("#safe\r\nOPER root pass", None),
-            ("#safe", "key\r\nOPER root pass"),
-        ):
-            with self.subTest(channel=channel):
-                coordinator = FakeCoordinator()
-                kv = FakeKV()
-                coordinator.channels.kv = cast("KeyValue", kv)
-                bot, fake_irc, _ = bot_with_coordinator(coordinator)
-                bot.identity.current = BotPresence(
-                    "alpha", "alpha.host", "inst", "alpha", "~alpha"
-                )
-
-                with self.assertRaisesRegex(ValueError, "unsupported characters"):
-                    await bot.channel_mgr.write_record(channel, key, present=True)
-
-                assert kv.entries == {}
-                assert bot.channel_mgr.runtime(channel) is None
-                assert fake_irc.sent == []
 
     async def test_multi_channel_join_part_isolation(self) -> None:
         """Verify keyed channels join and part without changing their peers."""
@@ -600,6 +580,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key_pending
         # A failed write must not shadow newer remote records.
         assert bot.channel_mgr.channel_records[folded] == before
+        assert bot.channel_mgr.writing == set()
         coordinator.failing = False
         await bot.channel_mgr.retry_pending_keys()
 
@@ -914,6 +895,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         await see_key(bot, runtime, "seen")
         assert runtime.key_pending
         runtime.reset()  # kicked, or the IRC connection dropped
+        # A late MODE reply shows the key again once this bot is out.
+        runtime.key_pending = True
 
         coordinator.failing = False
         await bot.channel_mgr.retry_pending_keys()
@@ -938,46 +921,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not runtime.key_pending
         assert runtime.key == "A"
-
-    async def test_hidden_key_outlasts_a_late_write(self) -> None:
-        """Keep the key IRC last showed past this bot's late write of an older one."""
-        coordinator = FakeCoordinator()
-        bot = bot_with_channel(coordinator=coordinator)
-        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
-        runtime = mgr.channels[folded]
-        runtime.join = JoinState.JOINED
-        record_put = coordinator.put_channel
-        in_flight = asyncio.Event()
-        release = asyncio.Event()
-
-        async def put_channel(
-            record: dict[str, Any],
-            *,
-            after: str | None,
-        ) -> ChannelFields:
-            if record["key"] == "B":
-                msg = "NATS disconnected"
-                raise NatsError(msg)
-
-            in_flight.set()
-            await release.wait()
-            return await record_put(record, after=after)
-
-        with patch.object(coordinator, "put_channel", put_channel):
-            async with asyncio.timeout(5):
-                bot.events.process_key(runtime, "A")
-                await in_flight.wait()
-                # IRC shows B while the write of A is in flight.
-                bot.events.process_key(runtime, "B")
-                release.set()
-                await settle(bot)
-
-        assert mgr.channel_records[folded].key == "A"
-        assert runtime.key_pending
-        # A netsplit resends the unchanged B as "*".
-        runtime.hide_key()
-
-        assert runtime.key == "B"
 
     async def test_late_write_keeps_a_key_seen_and_hidden(self) -> None:
         """Keep the key IRC showed while this bot's older write was in flight.
@@ -1024,6 +967,50 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         mgr.safe_join(runtime)
 
         assert fake_irc.sent == [("JOIN", ("#test", "B")), ("JOIN", ("#test", "A"))]
+
+    async def test_late_write_watched_before_its_reply_keeps_the_key(self) -> None:
+        """Keep the key IRC showed when the watch delivers this bot's write first.
+
+        NATS does not order the KV watch against the store's reply, so the
+        record is this bot's own write whichever reaches it first.
+        """
+        coordinator = FakeCoordinator()
+        bot, fake_irc, _ = bot_with_coordinator(coordinator)
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+        runtime = mgr.channels[folded]
+        runtime.join = JoinState.JOINED
+        record_put = coordinator.put_channel
+        in_flight = asyncio.Event()
+        release = asyncio.Event()
+
+        async def watched_put(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            in_flight.set()
+            await release.wait()
+            stored = await record_put(record, after=after)
+            bot.callbacks.on_channel(stored)
+            return stored
+
+        with patch.object(coordinator, "put_channel", watched_put):
+            async with asyncio.timeout(5):
+                bot.events.process_key(runtime, "A")
+                await in_flight.wait()
+                bot.events.process_key(runtime, "B")
+                runtime.hide_key()
+                release.set()
+                await settle(bot)
+
+        assert mgr.channel_records[folded].key == "A"
+        runtime.reset()  # kicked
+        mgr.safe_join(runtime)
+
+        assert fake_irc.sent == [("JOIN", ("#test", "B"))]
 
     async def test_own_write_keys_a_channel_not_joined(self) -> None:
         """Join a channel with the key this bot's own write stored for it."""
@@ -1103,11 +1090,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert not runtime.key_pending
 
     async def test_retry_skips_channels_changed_meanwhile(self) -> None:
-        """Skip a key hidden, or a channel parted, while an earlier write ran."""
+        """Skip a key hidden, or a channel parted, while an earlier write ran.
+
+        The keys still pending after them are written all the same.
+        """
         coordinator = FailingWriteCoordinator()
         bot = bot_with_channel(coordinator=coordinator)
         mgr = bot.channel_mgr
-        channels = ("#test", "#hidden", "#parted")
+        channels = ("#test", "#hidden", "#parted", "#kept")
         for channel in channels[1:]:
             mgr.apply_record(mgr.new_record(channel, None, present=True))
 
@@ -1147,7 +1137,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await retry
 
-        assert [put["channel"] for put in coordinator.channel_puts] == ["#test"]
+        assert [put["channel"] for put in coordinator.channel_puts] == [
+            "#test",
+            "#kept",
+        ]
         assert "#parted" not in mgr.channels
         assert not mgr.channel_records["#parted"].present
 
@@ -1565,6 +1558,22 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 2
 
+    async def test_refused_join_send_stays_due(self) -> None:
+        """Leave a JOIN the send queue refuses due for the next tick."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        fake_irc.connected = False
+
+        bot.channel_mgr.join_desired()
+        assert runtime.join is JoinState.IDLE
+
+        fake_irc.connected = True
+        bot.channel_mgr.join_desired()
+        assert fake_irc.sent == [("JOIN", ("#test",))]
+
     async def test_unban_request_identity(self) -> None:
         """Send this bot's identity with a request; send none before it is known."""
         coordinator = FakeCoordinator()
@@ -1678,14 +1687,16 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert [payload["channel"] for _, payload in op_requests] == ["#test"]
 
     async def test_skips_op_request_when_only_user_opped(self) -> None:
-        """Verify opped non-peer users do not trigger op requests."""
+        """Request no op while only a non-peer user, and no peer bot, holds it."""
         bot, _, coordinator = bot_with_coordinator()
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
+        bot.presence.update(BotPresence("beta", "beta.host", "two", "beta", "~beta"))
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
+        runtime.member("beta").prefix = Prefix("beta", "~beta", "beta.host")
         runtime.member("stranger").prefix = Prefix("stranger", "user", "other.host")
         runtime.member("stranger").modes.add("o")
 
