@@ -58,12 +58,7 @@ class Envelope:
             msg = "NATS envelope exceeds the size limit"
             raise ValueError(msg)
 
-        try:
-            envelope = json.loads(value)
-        except RecursionError as error:
-            msg = "NATS envelope is too deeply nested"
-            raise ValueError(msg) from error
-
+        envelope = json.loads(value)
         if not isinstance(envelope, dict):
             msg = "NATS envelope is not an object"
             raise TypeError(msg)
@@ -106,16 +101,11 @@ class Envelope:
             msg = "NATS envelope signature is invalid"
             raise ValueError(msg)
 
-        bound_subject = payload.get(SUBJECT_FIELD)
-        if bound_subject is None:
-            msg = "NATS envelope is not bound to a subject"
+        if payload.get(SUBJECT_FIELD) != subject:
+            msg = "NATS envelope is not bound to its subject"
             raise ValueError(msg)
 
-        if bound_subject != subject:
-            msg = "NATS envelope subject is invalid"
-            raise ValueError(msg)
-
-        payload.pop(SUBJECT_FIELD, None)
+        del payload[SUBJECT_FIELD]
         self.seen_nonces[nonce] = now + NONCE_TTL
         return sender, payload
 

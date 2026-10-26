@@ -4,10 +4,11 @@
 """Tests for TOTP authorization and session management."""
 
 import asyncio
+import json
 import time
 import unittest
 from dataclasses import asdict
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
@@ -15,7 +16,7 @@ from nats.errors import Error as NatsError
 from botnats import Tasks
 from botnats.auth import TOTP_PERIOD, SessionSync, TotpAuthorizer, totp
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
-from botnats.nats.store import ATTEMPT_LIMIT, Session
+from botnats.nats.store import ATTEMPT_LIMIT, SESSION_EXPIRY_GRACE, Session
 from tests.unit.helpers import (
     AUTH_KEY,
     COORDINATION_KEY,
@@ -23,6 +24,7 @@ from tests.unit.helpers import (
     FailingWriteCoordinator,
     FakeCoordinator,
     FakeIRC,
+    FakeKV,
     bot_with_coordinator,
     bot_with_irc,
     drain_session_writes,
@@ -90,16 +92,15 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert not auth.authorized("Owner[!user@host", now=15)
         assert not auth.authorized("Owner{!user@host", now=15)
 
-    def test_revocation_blocks_stale_import(self) -> None:
-        """Keep a local revocation over the stale session it revoked."""
-        auth = authorizer("alpha")
+    def test_outlasting_revocation_blocks_grant(self) -> None:
+        """Keep a held revocation that expires after a new session would."""
+        auth = authorizer()
         prefix = "owner!user@example.test"
-        session = auth.grant(prefix, now=10)
+        auth.keep(auth.create(prefix, 10 + auth.session_ttl + 1, "beta", revoked=True))
 
-        auth.revoke(prefix)
-        auth.keep(session)
+        auth.grant(prefix, now=10)
 
-        assert not auth.authorized(prefix, now=21)
+        assert not auth.authorized(prefix, now=20)
 
     def test_dropped_key_keeps_revocation(self) -> None:
         """Keep a revocation when its durable key is deleted.
@@ -298,9 +299,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             async with asyncio.timeout(1):
                 await claiming.wait()
-            bot.events.on_irc_disconnect()
-            release.set()
-            await auth
+                bot.events.on_irc_disconnect()
+                release.set()
+                await auth
 
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
@@ -344,9 +345,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             async with asyncio.timeout(1):
                 await claiming.wait()
-            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-            release.set()
-            await auth
+                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+                release.set()
+                await auth
 
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
@@ -505,6 +506,24 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         session = next(iter(pending.values()))
         assert session.revoked
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+
+    async def test_auth_revokes_grant_past_store_horizon(self) -> None:
+        """Revoke and refuse a grant the store rejects after the clock steps back.
+
+        The store's clock is two minutes behind the one that granted, so the
+        session expires past the store's horizon.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+        with patch("botnats.nats.store.time") as clock:
+            clock.time.return_value = time.time() - 120
+            await send_command(bot, prefix, f"AUTH {valid_code}")
+
+        assert not bot.authorizer.authorized(prefix.render())
+        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert next(iter(bot.sessions.pending.values())).revoked
 
     async def test_auth_attempt_limit(self) -> None:
         """Answer only the AUTH attempts the limit allows, however nicks cycle.
@@ -883,6 +902,188 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert replacement.revoked
         assert replacement.version == newer.version + 1
 
+    async def test_rolled_back_grant_rewrites_held_revocation(self) -> None:
+        """Write a held revocation again when its key rolls back to the grant.
+
+        A NATS writer without the coordination secret can re-put the earlier
+        signed grant; a bot started later would replay only that grant.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = "owner!user@host.example"
+        grant = bot.authorizer.grant(prefix)
+        assert await bot.sessions.sync(grant)
+        revocation = bot.authorizer.revoke(prefix)
+        assert revocation is not None
+        assert await bot.sessions.sync(revocation)
+        key = coordinator.sessions.key(prefix)
+        # The watch echoing this bot's own write is no rollback.
+        bot.sessions.observe(key, revocation, replaying=False)
+        assert not bot.tasks
+
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        kv.store(key, json.dumps(asdict(grant)).encode())
+
+        bot.sessions.observe(key, grant, replaying=False)
+        await drain_session_writes(bot)
+
+        stored = json.loads(kv.entries[key][1])
+        assert coordinator.sessions.parse(key, stored) == revocation
+        assert not bot.authorizer.authorized(prefix)
+        assert not bot.sessions.pending
+
+    async def test_written_back_revocation_yields_to_newer_grant(self) -> None:
+        """Drop, never escalate, a written-back revocation a newer grant outranks.
+
+        The watch may deliver this bot's grant only after its revocation is
+        stored, which writes the revocation back; if that write fails, the
+        user may authenticate again on a peer before the retry.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = "owner!user@host.example"
+        grant = bot.authorizer.grant(prefix)
+        assert await bot.sessions.sync(grant)
+        revocation = bot.authorizer.revoke(prefix)
+        assert revocation is not None
+        assert await bot.sessions.sync(revocation)
+        key = coordinator.sessions.key(prefix)
+        coordinator.duplicate = True
+        bot.sessions.observe(key, grant, replaying=False)
+        await drain_session_writes(bot)
+        assert bot.sessions.pending
+
+        later = bot.authorizer.create(prefix, revocation.expires_at + 30, "beta")
+        await coordinator.sessions.put(asdict(later))
+        bot.sessions.observe(key, later, replaying=False)
+        coordinator.duplicate = False
+        await bot.sessions.retry()
+
+        assert coordinator.session_puts[-1] == asdict(revocation)
+        assert bot.authorizer.authorized(prefix)
+        assert not bot.sessions.pending
+        assert not bot.sessions.restoring
+
+    async def test_revocation_queued_over_write_back_escalates(self) -> None:
+        """Escalate a QUIT's revocation that replaced a queued write-back."""
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        grant = bot.authorizer.grant(prefix.render())
+        assert await bot.sessions.sync(grant)
+        revocation = bot.authorizer.revoke(prefix.render())
+        assert revocation is not None
+        assert await bot.sessions.sync(revocation)
+        key = coordinator.sessions.key(prefix.render())
+        coordinator.duplicate = True
+        bot.sessions.observe(key, grant, replaying=False)
+        later = bot.authorizer.create(prefix.render(), grant.expires_at + 30, "beta")
+        await coordinator.sessions.put(asdict(later))
+        bot.sessions.observe(key, later, replaying=False)
+        bot.sessions.revoke(prefix)
+        await drain_session_writes(bot)
+        # A peer grants again before the QUIT's revocation is written.
+        latest = bot.authorizer.create(prefix.render(), later.expires_at + 10, "beta")
+        await coordinator.sessions.put(asdict(latest))
+
+        coordinator.duplicate = False
+        await bot.sessions.retry()
+        await bot.sessions.retry()
+
+        assert not bot.authorizer.authorized(prefix.render())
+        last = coordinator.session_puts[-1]
+        assert (last["expires_at"], last["revoked"]) == (latest.expires_at, True)
+        assert not bot.sessions.pending
+
+    async def test_write_back_keeps_queued_revocation(self) -> None:
+        """Never replace a queued revocation with a held record to write back.
+
+        The queued revocation must still meet the newer grant and escalate.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        grant = bot.authorizer.grant(prefix.render())
+        assert await bot.sessions.sync(grant)
+        coordinator.duplicate = True
+        bot.sessions.revoke(prefix)
+        await drain_session_writes(bot)
+        key = coordinator.sessions.key(prefix.render())
+        later = bot.authorizer.create(prefix.render(), grant.expires_at + 30, "beta")
+        await coordinator.sessions.put(asdict(later))
+        bot.sessions.observe(key, later, replaying=False)
+
+        # The earlier grant, re-put over the newer one, ranks below it.
+        bot.sessions.observe(key, grant, replaying=False)
+        coordinator.duplicate = False
+        await drain_session_writes(bot)
+        await bot.sessions.retry()
+        await bot.sessions.retry()
+
+        assert not bot.authorizer.authorized(prefix.render())
+        last = coordinator.session_puts[-1]
+        assert last["revoked"] is True
+        assert last["version"] == later.version + 1
+
+    async def test_drain_skips_mutation_replaced_during_earlier_write(self) -> None:
+        """Write the revocation that replaced a grant during an earlier write."""
+        bot, _, coordinator = bot_with_coordinator()
+        bot.authorizer.grant("other!user@host.example")
+        earlier = bot.authorizer.revoke("other!user@host.example")
+        assert earlier is not None
+        bot.sessions.queue(earlier)
+        owner = Prefix("owner", "user", "host.example")
+        grant = bot.authorizer.grant(owner.render())
+        writing = asyncio.Event()
+        release = asyncio.Event()
+        put_session = coordinator.put_session
+
+        async def slow_put(record: dict[str, Any]) -> Session:
+            if record["prefix"] == earlier.prefix:
+                writing.set()
+                await release.wait()
+
+            return await put_session(record)
+
+        with patch.object(coordinator, "put_session", slow_put):
+            async with asyncio.timeout(1):
+                sync = asyncio.create_task(bot.sessions.sync(grant))
+                await writing.wait()
+                # The owner quits while the earlier identity's write runs.
+                bot.sessions.revoke(owner)
+                release.set()
+                await sync
+
+            await drain_session_writes(bot)
+
+        owner_puts = [
+            put["revoked"]
+            for put in coordinator.session_puts
+            if put["prefix"] == owner.render()
+        ]
+        assert owner_puts == [True]
+        assert not bot.sessions.pending
+
+    async def test_unwritable_session_does_not_block_later_writes(self) -> None:
+        """Keep a record the store refuses queued, and write the ones after it.
+
+        A record expiring past the store's horizon, as after the wall clock
+        steps back, is refused until the clock catches up.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        refused = bot.authorizer.create(
+            "other!user@host.example",
+            time.time() + bot.config.auth_session_ttl + SESSION_EXPIRY_GRACE + 60,
+            bot.authorizer.issuer,
+            1,
+            revoked=True,
+        )
+        bot.sessions.queue(refused)
+        grant = bot.authorizer.grant("owner!user@host.example")
+
+        assert await bot.sessions.sync(grant)
+        assert list(bot.sessions.pending.values()) == [refused]
+        assert [put["prefix"] for put in coordinator.session_puts] == [
+            refused.prefix,
+            grant.prefix,
+        ]
+
 
 class SessionSyncWatchTests(unittest.TestCase):
     """Tests for the watched session records SessionSync owns."""
@@ -910,6 +1111,46 @@ class SessionSyncWatchTests(unittest.TestCase):
         sessions.observe(key, session_value(expiry), replaying=False)
 
         assert sessions.watched == {key: ("owner!user@host", expiry)}
+
+    def test_expired_record_forgets_key(self) -> None:
+        """Treat an expired record as a delete of the session its key held."""
+        auth = authorizer()
+        sessions = SessionSync(auth, FakeCoordinator(), Tasks())
+        sessions.observe("opaque", session_value(time.time() + 60), replaying=False)
+        assert auth.authorized("owner!user@host")
+
+        sessions.observe("opaque", session_value(time.time() - 1), replaying=False)
+
+        assert sessions.watched == {}
+        assert not auth.authorized("owner!user@host")
+
+    def test_delete_forgets_key(self) -> None:
+        """Drop the session a deleted key held, and ignore an unknown key."""
+        auth = authorizer()
+        sessions = SessionSync(auth, FakeCoordinator(), Tasks())
+        sessions.observe("opaque", session_value(time.time() + 60), replaying=False)
+
+        sessions.forget("opaque")
+        sessions.forget("unknown")
+
+        assert sessions.watched == {}
+        assert not auth.authorized("owner!user@host")
+
+    def test_replay_drops_missing_keys(self) -> None:
+        """Drop sessions whose keys a completed replay no longer contains."""
+        auth = authorizer()
+        sessions = SessionSync(auth, FakeCoordinator(), Tasks())
+        expiry = time.time() + 60
+        kept = auth.create("kept!user@host", expiry, "beta")
+        gone = auth.create("gone!user@host", expiry, "beta")
+        sessions.observe("kept-key", kept, replaying=True)
+        sessions.observe("gone-key", gone, replaying=True)
+
+        sessions.replayed({"kept-key"})
+
+        assert sessions.watched == {"kept-key": (kept.prefix, expiry)}
+        assert auth.authorized(kept.prefix)
+        assert not auth.authorized(gone.prefix)
 
     def test_session_identity_cache_does_not_prune_during_replay(self) -> None:
         """Avoid rescanning the growing cache for every replayed session."""

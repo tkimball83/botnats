@@ -6,7 +6,6 @@
 import json
 import time
 import unittest
-from unittest.mock import patch
 
 from botnats.nats.envelope import Envelope
 from tests.unit.helpers import COORDINATION_KEY
@@ -17,23 +16,6 @@ SUBJECT = "botnats.v1.efnet.channel"
 
 class EnvelopeTests(unittest.TestCase):
     """Tests for envelope signing, replay protection, and decoding safety."""
-
-    def test_decode_rejects_deeply_nested_json(self) -> None:
-        """Verify deeply nested JSON is rejected as a value error, not a crash."""
-        envelope = Envelope("alpha", COORDINATION_KEY)
-
-        # The parser overflows only past the native stack, a depth that varies
-        # by platform, so raise its RecursionError directly.
-        with (
-            patch(
-                "botnats.nats.envelope.json.loads",
-                side_effect=RecursionError("maximum recursion depth exceeded"),
-            ) as loads,
-            self.assertRaisesRegex(ValueError, "too deeply nested"),
-        ):
-            envelope.decode(SUBJECT, b"[[]]")
-
-        loads.assert_called_once_with(b"[[]]")
 
     def test_decode_rejects_large_payload(self) -> None:
         """Verify oversized envelopes are rejected before JSON parsing."""
@@ -156,5 +138,5 @@ class EnvelopeTests(unittest.TestCase):
         receiver = Envelope("beta", key)
         encoded = sender.encode(SUBJECT, {"channel": "#test"})
 
-        with self.assertRaisesRegex(ValueError, "subject is invalid"):
+        with self.assertRaisesRegex(ValueError, "not bound"):
             receiver.decode("botnats.v1.efnet.auth.session", encoded)

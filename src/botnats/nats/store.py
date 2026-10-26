@@ -218,7 +218,7 @@ class AttemptStore(KVStore):
 
                 try:
                     timestamp = float.fromhex(entry.value.decode())
-                except UnicodeDecodeError, ValueError:
+                except OverflowError, UnicodeDecodeError, ValueError:
                     continue
 
                 if not math.isfinite(timestamp) or timestamp > cutoff:
@@ -308,16 +308,20 @@ class ChannelStore(KVStore):
         """Store a signed channel record and return the authoritative fields.
 
         expected is the revision the record was written after (None when no
-        record was known). The write lands only while that is still the
-        stored record, so a concurrent write from another bot wins cleanly
-        instead of by the random revision suffix.
+        record was known). The write lands only while the stored record is
+        no newer than that, so a concurrent write from another bot wins
+        cleanly instead of by the random revision suffix. An older stored
+        record was rolled back, as when a NATS writer without the
+        coordination secret replays a signed one; honoring it would supersede
+        every later write.
         """
         fields = parse_channel_record(data)
         key = self.key(fields[0])
 
         def standing(current: dict[str, Any]) -> ChannelFields | None:
             stored = self.parse(key, current)
-            if stored is None or stored[3] == expected:
+            # Revisions are fixed-width, so string order is revision order.
+            if stored is None or (expected is not None and stored[3] <= expected):
                 return None
 
             return stored
