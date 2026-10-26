@@ -97,10 +97,6 @@ async def wait_until_ready(*coordinators: Coordinator) -> None:
     await poll_until(ready, wait_seconds=START_TIMEOUT, interval=0.05)
 
 
-@unittest.skipUnless(
-    os.environ.get("BOTNATS_TEST_NATS_URLS"),
-    "needs the Docker integration mesh (make integration)",
-)
 class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """Tests for live NATS state exchange, conflicts, and help requests."""
 

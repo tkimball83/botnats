@@ -136,8 +136,8 @@ async def wait_all_ready() -> None:
 
 async def live_coordinator() -> None:
     """Run the live-NATS coordinator tests against the running cluster."""
-    # Unlike a thread, a subprocess stops when the phase is cancelled. It
-    # inherits BOTNATS_TEST_NATS_URLS, without which the tests would skip.
+    # Unlike a thread, a subprocess stops when the phase is cancelled. The
+    # tests never skip, so a zero exit status means they all ran and passed.
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
