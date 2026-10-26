@@ -106,16 +106,11 @@ class Envelope:
             msg = "NATS envelope signature is invalid"
             raise ValueError(msg)
 
-        bound_subject = payload.get(SUBJECT_FIELD)
-        if bound_subject is None:
-            msg = "NATS envelope is not bound to a subject"
+        if payload.get(SUBJECT_FIELD) != subject:
+            msg = "NATS envelope is not bound to its subject"
             raise ValueError(msg)
 
-        if bound_subject != subject:
-            msg = "NATS envelope subject is invalid"
-            raise ValueError(msg)
-
-        payload.pop(SUBJECT_FIELD, None)
+        del payload[SUBJECT_FIELD]
         self.seen_nonces[nonce] = now + NONCE_TTL
         return sender, payload
 

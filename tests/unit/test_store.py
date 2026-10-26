@@ -283,7 +283,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.get.side_effect = KeyNotFoundError()
         attempts.kv.create.side_effect = [
             KeyWrongLastSequenceError(),
-            None,
+            1,
         ]
 
         assert await attempts.allow("host.example", now=60)
@@ -312,6 +312,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         # One error must not leave the store unready: nothing would reopen it.
         assert attempts.ready
         attempts.kv.create.side_effect = None
+        attempts.kv.create.return_value = 1
         assert await attempts.allow("host.example", now=61)
 
     async def test_keys_are_secret_derived(self) -> None:
@@ -340,6 +341,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=7,
             value=float(0).hex().encode(),
         )
+        attempts.kv.update.return_value = 8
 
         assert await attempts.allow("host.example", now=61)
         attempts.kv.update.assert_awaited_once_with(
@@ -357,6 +359,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=7,
             value=(now - ATTEMPT_WINDOW).hex().encode(),
         )
+        attempts.kv.update.return_value = 8
 
         assert await attempts.allow("host.example", now=now)
         attempts.kv.update.assert_awaited_once_with(
@@ -376,6 +379,18 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         assert not await attempts.allow("host.example", now=60)
+
+    async def test_overflowing_attempt_is_skipped(self) -> None:
+        """Count a slot too large for a float as taken, and try the next one."""
+        attempts = AttemptStore("efnet", 3, SECRET)
+        kv = FakeKV()
+        attempts.kv = cast("KeyValue", kv)
+        slot = attempts.key("host.example", 0)
+        kv.store(slot, b"0x1p+1024")
+
+        assert await attempts.allow("host.example", now=60)
+        assert kv.entries[slot] == (1, b"0x1p+1024")
+        assert attempts.key("host.example", 1) in kv.entries
 
     async def test_sliding_window_update_conflict_does_not_overbook(self) -> None:
         """Deny when a peer claims the only expired slot first."""
@@ -435,6 +450,7 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         """Verify a valid counter uses a secret-derived key."""
         claims = ClaimStore("efnet", 3, SECRET)
         claims.kv = AsyncMock()
+        claims.kv.create.return_value = 1
 
         assert await claims.claim(42)
 
@@ -465,6 +481,7 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         # One error must not leave the store unready: nothing would reopen it.
         assert claims.ready
         claims.kv.create.side_effect = None
+        claims.kv.create.return_value = 1
         assert await claims.claim(42)
 
     async def test_missing_store(self) -> None:
@@ -480,7 +497,9 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         """Verify a claim retries opening KV after reconnect initialization fails."""
         claims = ClaimStore("efnet", 3, SECRET)
         js = AsyncMock()
-        js.create_key_value.side_effect = [NatsError("recovering"), AsyncMock()]
+        kv = AsyncMock()
+        kv.create.return_value = 1
+        js.create_key_value.side_effect = [NatsError("recovering"), kv]
 
         with self.assertRaisesRegex(NatsError, "recovering"):
             await claims.open(js)
@@ -549,6 +568,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         """Delete only the case-insensitive presence revision this process owns."""
         presence = PresenceStore("efnet", 1, 15, SECRET)
         presence.kv = AsyncMock()
+        presence.kv.delete.return_value = True
 
         await presence.delete("Alpha", 8)
 
@@ -581,6 +601,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
         channels.kv.get.side_effect = KeyNotFoundError()
+        channels.kv.create.return_value = 1
         record = channel_record(1)
 
         assert await channels.put(record, expected=None) == channel_fields(1)
@@ -678,7 +699,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(revision=7, value=json.dumps(channel_record(1)).encode()),
             SimpleNamespace(revision=8, value=json.dumps(concurrent).encode()),
         )
-        channels.kv.update.side_effect = (KeyWrongLastSequenceError(), None)
+        channels.kv.update.side_effect = KeyWrongLastSequenceError()
 
         stored = await channels.put(
             channel_record(3),
@@ -725,6 +746,23 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert stored == channel_fields(2)
         channels.kv.update.assert_not_awaited()
+
+    async def test_channel_put_replaces_rolled_back_record(self) -> None:
+        """Replace a signed record older than the one the write follows.
+
+        A NATS writer without the coordination secret can replay an earlier
+        signed record; honoring it would supersede every later write.
+        """
+        channels = ChannelStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        channels.kv = cast("KeyValue", kv)
+        key = channels.key("#test")
+        kv.store(key, json.dumps(channel_record(1)).encode())
+
+        stored = await channels.put(channel_record(3), expected=channel_revision(2))
+
+        assert stored == channel_fields(3)
+        assert json.loads(kv.entries[key][1]) == channel_record(3)
 
     async def test_put_newer_bounds_lost_create_races(self) -> None:
         """Count lost create races toward the same CAS attempt bound."""
@@ -775,6 +813,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=8,
             value=json.dumps(active).encode(),
         )
+        sessions.kv.update.return_value = 9
 
         assert await sessions.put(revocation) == parsed_session(revocation)
 
@@ -876,6 +915,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=json.dumps(malformed_channel).encode(),
         )
+        channels.kv.update.return_value = 2
 
         valid_channel = channel_record(2)
         assert await channels.put(valid_channel, expected=None) == channel_fields(2)
@@ -888,6 +928,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=json.dumps(impossible).encode(),
         )
+        sessions.kv.update.return_value = 2
 
         valid_session = session_record(time.time() + 40, 0, revoked=False)
         assert await sessions.put(valid_session) == parsed_session(valid_session)
@@ -901,6 +942,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=b'{"revision":' + b"9" * 5_000 + b"}",
         )
+        channels.kv.update.return_value = 2
 
         valid_channel = channel_record(2)
         assert await channels.put(valid_channel, expected=None) == channel_fields(2)
@@ -970,7 +1012,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         release.set()
 
         with self.assertRaisesRegex(StoreUnavailableError, "changed while opening"):
-            await task
+            async with asyncio.timeout(1):
+                await task
 
         assert store.js is None
         assert store.kv is None

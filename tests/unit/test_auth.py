@@ -4,10 +4,11 @@
 """Tests for TOTP authorization and session management."""
 
 import asyncio
+import json
 import time
 import unittest
 from dataclasses import asdict
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
@@ -23,6 +24,7 @@ from tests.unit.helpers import (
     FailingWriteCoordinator,
     FakeCoordinator,
     FakeIRC,
+    FakeKV,
     bot_with_coordinator,
     bot_with_irc,
     drain_session_writes,
@@ -298,9 +300,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             async with asyncio.timeout(1):
                 await claiming.wait()
-            bot.events.on_irc_disconnect()
-            release.set()
-            await auth
+                bot.events.on_irc_disconnect()
+                release.set()
+                await auth
 
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
@@ -344,9 +346,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             async with asyncio.timeout(1):
                 await claiming.wait()
-            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-            release.set()
-            await auth
+                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+                release.set()
+                await auth
 
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
@@ -882,6 +884,36 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         replacement = bot.sessions.pending[casefold("x!u@h", "ascii")]
         assert replacement.revoked
         assert replacement.version == newer.version + 1
+
+    async def test_rolled_back_grant_rewrites_held_revocation(self) -> None:
+        """Write a held revocation again when its key rolls back to the grant.
+
+        A NATS writer without the coordination secret can re-put the earlier
+        signed grant; a bot started later would replay only that grant.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = "owner!user@host.example"
+        grant = bot.authorizer.grant(prefix)
+        assert await bot.sessions.sync(grant)
+        revocation = bot.authorizer.revoke(prefix)
+        assert revocation is not None
+        assert await bot.sessions.sync(revocation)
+        key = coordinator.sessions.key(prefix)
+        # The watch echoing this bot's own write is no rollback.
+        bot.sessions.observe(key, revocation, replaying=False)
+        assert not bot.tasks
+
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        kv.store(key, json.dumps(asdict(grant)).encode())
+
+        bot.sessions.observe(key, grant, replaying=False)
+        async with asyncio.timeout(1):
+            await drain_session_writes(bot)
+
+        stored = json.loads(kv.entries[key][1])
+        assert coordinator.sessions.parse(key, stored) == revocation
+        assert not bot.authorizer.authorized(prefix)
+        assert not bot.sessions.pending
 
 
 class SessionSyncWatchTests(unittest.TestCase):

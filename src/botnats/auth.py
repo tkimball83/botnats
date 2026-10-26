@@ -179,14 +179,25 @@ class SessionSync:
         }
 
     def observe(self, key: str, session: Session, *, replaying: bool) -> None:
-        """Apply a validated watched record: keep it, or drop it if expired."""
+        """Apply a validated watched record: keep it, or drop it if expired.
+
+        A record below the one held for its key was rolled back, as when a
+        NATS writer without the coordination secret re-puts the grant a
+        revocation replaced. Bots that start later replay only that record,
+        so the held one is written again.
+        """
         now = time.time()
         if not replaying:
             self.prune(now)
 
         if session.expires_at > now:
             self.watched[key] = (session.prefix, session.expires_at)
-            self.authorizer.keep(session)
+            held = self.authorizer.keep(session)
+            # A record of an IRC-equivalent identity lives under another key.
+            identity = casefold(session.prefix, "ascii")
+            if held is not None and casefold(held.prefix, "ascii") == identity:
+                self.queue(held)
+                self.tasks.spawn(self.retry(), "session-sync")
         else:
             self.forget(key)
 
@@ -378,12 +389,18 @@ class TotpAuthorizer:
 
         return session
 
-    def keep(self, incoming: Session) -> None:
-        """Keep a session or revocation if it outranks the identity's record."""
+    def keep(self, incoming: Session) -> Session | None:
+        """Keep a session or revocation if it outranks the identity's record.
+
+        Returns the identity's record instead when that outranks incoming.
+        """
         key = self.identity_fold(incoming.prefix)
         existing = self.records.get(key)
         if existing is None or incoming.order > existing.order:
             self.records[key] = incoming
+            return None
+
+        return existing if existing.order > incoming.order else None
 
     def match(self, code: str, *, now: float | None = None) -> int | None:
         """Return the TOTP counter that produced the code, or None."""

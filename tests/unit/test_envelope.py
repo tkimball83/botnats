@@ -156,5 +156,5 @@ class EnvelopeTests(unittest.TestCase):
         receiver = Envelope("beta", key)
         encoded = sender.encode(SUBJECT, {"channel": "#test"})
 
-        with self.assertRaisesRegex(ValueError, "subject is invalid"):
+        with self.assertRaisesRegex(ValueError, "not bound"):
             receiver.decode("botnats.v1.efnet.auth.session", encoded)
