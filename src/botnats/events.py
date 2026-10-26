@@ -216,6 +216,8 @@ class IRCEventHandler:
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is not None:
             runtime.refuse_join()
+            if message.command == "475":
+                self.bot.channel_mgr.refuse_key(runtime)
 
         kind = REFUSAL_HELP.get(message.command)
         if kind is not None:

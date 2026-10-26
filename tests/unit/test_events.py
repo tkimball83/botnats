@@ -576,6 +576,38 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [join, join, join]
         await settle(bot)
 
+    async def test_bad_key_refusal_takes_the_stored_key(self) -> None:
+        """Join with a peer's recorded key once the server refuses this bot's.
+
+        The record arrived while this bot had a key of its own pending, and
+        the change that followed was hidden as "*".
+        """
+        bot, fake_irc, _ = bot_with_coordinator(FailingWriteCoordinator())
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+        runtime = mgr.channels[folded]
+        runtime.join = JoinState.JOINED
+        op = Prefix("op", "~op", "op.host")
+        bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "A"), op))
+        mgr.apply_record(
+            mgr.new_record(
+                "#test", "B", present=True, after=mgr.channel_records[folded].revision
+            ),
+        )
+        bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "*"), op))
+        bot.events.on_irc_message(IRCMessage("KICK", ("#test", "alpha"), op))
+        await settle(bot)
+
+        mgr.safe_join(runtime)
+        bot.events.on_irc_message(
+            IRCMessage("475", ("alpha", "#test", "Cannot join channel (+k)")),
+        )
+        mgr.safe_join(runtime)
+
+        assert fake_irc.sent == [("JOIN", ("#test", "A")), ("JOIN", ("#test", "B"))]
+
     async def test_mode_enforce_once_on_op_with_unset(self) -> None:
         """Verify one enforcement when a single MODE ops the bot and unsets."""
         bot, fake_irc = bot_with_irc()
@@ -782,9 +814,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             assert coordinator.channel_puts == []
 
     async def test_mode_hidden_key_drops_pending_write(self) -> None:
-        """Drop a key write still pending once MODE hides a newer key.
+        """Drop a key write still pending once MODE hides a key, but keep the key.
 
-        Under rfc1459, MODE #room{ changes the configured #room[.
+        Under rfc1459, MODE #room{ changes the configured #room[. A netsplit
+        can resend an unchanged key as "*".
         """
         coordinator = FailingWriteCoordinator()
         bot = bot_with_channel(coordinator=coordinator)
@@ -802,6 +835,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await mgr.retry_pending_keys()
 
         assert not runtime.key_pending
+        assert runtime.key == "old"
         assert coordinator.channel_puts == []
 
     async def test_mode_key_unset_without_argument(self) -> None:
