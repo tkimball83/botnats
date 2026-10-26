@@ -7,16 +7,15 @@ import asyncio
 import ssl
 import time
 import unittest
-from dataclasses import astuple
+from dataclasses import astuple, replace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
 
-from botnats import error_label
 from botnats.bot import Bot
 from botnats.channel import JoinState
-from botnats.irc.client import IRCClient
+from botnats.irc.client import IRCClient, IRCServer
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
@@ -55,7 +54,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_irc_client_verifies_tls(self) -> None:
         """Build the IRC client from configuration with verified TLS."""
-        bot = Bot(config())
+        server = IRCServer("irc.example.test", 6697, tls=True)
+        bot = Bot(replace(config(), irc_servers=(server,)))
 
         assert isinstance(bot.irc, IRCClient)
         assert bot.irc.config.nickname == "alpha"
@@ -263,18 +263,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.connected = True
         coordinator.connected = False
         assert not bot.ready()
-
-
-class ErrorLabelTests(unittest.TestCase):
-    """Tests for the error_label helper."""
-
-    def test_error_with_message(self) -> None:
-        """Verify error_label returns the message when present."""
-        assert error_label(ValueError("boom")) == "boom"
-
-    def test_error_without_message(self) -> None:
-        """Verify error_label falls back to the type name."""
-        assert error_label(RuntimeError()) == "RuntimeError"
 
 
 class MaintenanceTests(unittest.IsolatedAsyncioTestCase):

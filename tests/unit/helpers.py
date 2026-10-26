@@ -88,17 +88,19 @@ SECRETS = {
 
 async def drain_session_writes(bot: Bot) -> None:
     """Wait for durable session writes that IRC handlers run in background."""
-    await asyncio.gather(
-        *(task for task in tuple(bot.tasks) if task.get_name() == "session-sync"),
-    )
+    async with asyncio.timeout(5):
+        await asyncio.gather(
+            *(task for task in tuple(bot.tasks) if task.get_name() == "session-sync"),
+        )
 
 
 async def send_command(bot: Bot, prefix: Prefix, text: str) -> None:
     """Queue a private-message command as IRC delivers it and wait for it."""
     bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
-    await asyncio.gather(
-        *(task for task in tuple(bot.tasks) if task.get_name() == "admin-command"),
-    )
+    async with asyncio.timeout(5):
+        await asyncio.gather(
+            *(task for task in tuple(bot.tasks) if task.get_name() == "admin-command"),
+        )
 
 
 def session_record(
@@ -184,7 +186,7 @@ def config() -> BotConfig:
         enforced_modes=(frozenset("npst"), frozenset()),
         health_port=8080,
         irc_connect_timeout=30,
-        irc_servers=(IRCServer("irc.example.test", 6697, tls=True),),
+        irc_servers=(IRCServer("irc.example.test", 6667, tls=False),),
         irc_verify_tls=True,
         jetstream_replicas=1,
         maintenance_interval=3,
