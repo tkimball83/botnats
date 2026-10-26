@@ -127,7 +127,7 @@ class IRCEventHandler:
             # Servers send "*" in place of a hidden key, to operators too
             # during a netsplit; a literal "*" key is set with JOIN instead.
             if adding and argument == "*":
-                runtime.hide_key()
+                self.bot.channel_mgr.hide_key(runtime)
             else:
                 self.process_key(runtime, argument if adding else None)
         elif not adding and runtime.key is not None:

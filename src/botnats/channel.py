@@ -162,7 +162,27 @@ class ChannelManager:
         turn: no record applied in between may replace it.
         """
         runtime.key_pending = True
+        runtime.key_seen_after = self.channel_records[
+            self.bot.caps.fold(runtime.channel)
+        ].revision
         self.bot.tasks.spawn(self.retry_pending_keys(), "record-channel-key")
+
+    def hide_key(self, runtime: ChannelRuntime) -> None:
+        """Drop a pending key once IRC hides a key change from this bot.
+
+        A record held back for the pending key arrived after IRC last showed
+        this bot the key, so its key is newer. With none, the key this bot saw
+        is still the newest it knows: a netsplit can resend an unchanged key
+        as "*". Peers that see a new key record it, and with nothing pending
+        their records set it.
+        """
+        if not runtime.key_pending:
+            return
+
+        runtime.key_pending = False
+        record = self.channel_records[self.bot.caps.fold(runtime.channel)]
+        if record.revision != runtime.key_seen_after:
+            runtime.key = record.key
 
     async def write_key(self, runtime: ChannelRuntime) -> bool:
         """Write the key this bot sees on IRC now; return False on failure.
@@ -686,6 +706,8 @@ class ChannelRuntime:
     # in flight, or failed. Each write takes the key seen at that moment, so
     # a superseded change is never replayed.
     key_pending: bool = False
+    # The record revision current when IRC last showed this bot the key.
+    key_seen_after: str = ""
     limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
     modes: str = ""
@@ -721,14 +743,6 @@ class ChannelRuntime:
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""
         self.bans[self.caps.fold(mask)] = mask
-
-    def hide_key(self) -> None:
-        """Record a key change IRC hid: drop the key this bot has yet to record.
-
-        Peers that see the new key record it, and with nothing pending here
-        their records set it.
-        """
-        self.key_pending = False
 
     def member(self, nickname: str) -> ChannelMember:
         """Return the member for a nickname, creating one if absent."""
