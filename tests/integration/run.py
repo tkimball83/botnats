@@ -41,7 +41,7 @@ TEST_ENVIRONMENT = {
     "BOTNATS_TEST_NATS_TOKEN": "integration-token",
     "BOTNATS_TEST_TOTP_SECRET": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
 }
-UP = ("up", "--detach", "--no-build", "--wait", "--wait-timeout", "120")
+UP = ("up", "--no-build", "--wait", "--wait-timeout", "120")
 
 
 async def compose(*arguments: str, check: bool = True) -> None:
