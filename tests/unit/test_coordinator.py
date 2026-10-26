@@ -1000,26 +1000,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         callback.assert_not_called()
 
-    async def test_watch_channel_ignores_deeply_nested_json(self) -> None:
-        """Skip malformed JSON without trapping the channel watch in replay."""
-        coordinator = build_coordinator("alpha")
-        entry = SimpleNamespace(operation="PUT", value=b"[[]]")
-        kv, _ = watcher(entry, None)
-        coordinator.channels_store.kv = kv
-        synced = MagicMock()
-
-        # The parser overflows only past the native stack, a depth that varies
-        # by platform, so raise its RecursionError directly. Only the store's
-        # binding is patched, not the process-wide json.loads.
-        with patch("botnats.nats.store.json") as parser:
-            parser.loads.side_effect = RecursionError(
-                "maximum recursion depth exceeded"
-            )
-            await coordinator.watch_channels(synced)
-
-        parser.loads.assert_called_once_with(b"[[]]")
-        synced.assert_called_once_with()
-
     async def test_watch_presence_binds_key_and_applies_delete(self) -> None:
         """Reject misplaced presence values; a peer's delete keeps this bot's claim."""
         coordinator = build_coordinator("alpha")

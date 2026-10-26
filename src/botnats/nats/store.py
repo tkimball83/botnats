@@ -533,7 +533,7 @@ class SessionStore(KVStore):
         if (
             session is None
             or self.key(session.prefix) != key
-            or not within_horizon(session, self.ttl, time.time())
+            or not self.within_horizon(session)
         ):
             return None
 
@@ -547,7 +547,7 @@ class SessionStore(KVStore):
         clock skew, and consumers treat expired records as deletions.
         """
         session = parse_session_record(self.secret, self.network, data)
-        if session is None or not within_horizon(session, self.ttl, time.time()):
+        if session is None or not self.within_horizon(session):
             msg = "session record is invalid"
             raise ValueError(msg)
 
@@ -561,6 +561,10 @@ class SessionStore(KVStore):
             return stored
 
         return await self.put_newer(key, data, session, standing)
+
+    def within_horizon(self, session: Session) -> bool:
+        """Return whether a session expires no later than one TTL plus grace away."""
+        return session.expires_at <= time.time() + self.ttl + SESSION_EXPIRY_GRACE
 
 
 @dataclass(frozen=True, slots=True)
@@ -633,11 +637,6 @@ def parse_session_record(
         version=version,
         signature=signature,
     )
-
-
-def within_horizon(session: Session, ttl: float, now: float) -> bool:
-    """Return whether a session expires no later than one TTL plus grace away."""
-    return session.expires_at <= now + ttl + SESSION_EXPIRY_GRACE
 
 
 def decode_record(value: bytes | None) -> dict[str, Any] | None:

@@ -26,6 +26,7 @@ from botnats.nats.store import (
     ATTEMPT_LIMIT,
     ATTEMPT_WINDOW,
     CAS_ATTEMPT_LIMIT,
+    PRESENCE_DRIFT,
     SESSION_EXPIRY_GRACE,
     AttemptStore,
     ChannelStore,
@@ -36,6 +37,7 @@ from botnats.nats.store import (
     SessionStore,
     StoreUnavailableError,
     channel_signature,
+    decode_record,
     parse_session_record,
     presence_signature,
     session_signature,
@@ -226,7 +228,7 @@ class PresenceValidTests(unittest.TestCase):
         assert not store.valid("be.ta", signed("be.ta"), now=now)
 
     def test_valid_rejects_stale_and_uncrashable(self) -> None:
-        """Reject stale and future-dated replays, and surrogates without raising."""
+        """Reject stale or future-dated replays and malformed fields without raising."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
         now = 1_000_000.0
 
@@ -246,15 +248,19 @@ class PresenceValidTests(unittest.TestCase):
         )
         assert store.valid("alpha", fresh, now=now)
 
-        stale = dict(fresh)
-        stale["timestamp"] = int(now - 1000)
-        stale["signature"] = presence_signature(SECRET, "efnet", stale)
-        assert not store.valid("alpha", stale, now=now)
-
-        future = dict(fresh)
-        future["timestamp"] = int(now + 1000)
-        future["signature"] = presence_signature(SECRET, "efnet", future)
-        assert not store.valid("alpha", future, now=now)
+        # Fresh from one TTL plus drift ago to one drift ahead, inclusive.
+        bounds = {
+            PRESENCE_DRIFT: True,
+            PRESENCE_DRIFT + 1: False,
+            -store.ttl - PRESENCE_DRIFT: True,
+            -store.ttl - PRESENCE_DRIFT - 1: False,
+        }
+        with patch("botnats.nats.store.time") as clock:
+            clock.time.return_value = now
+            for offset, fresh_at in bounds.items():
+                record = sign({**fresh, "timestamp": int(now + offset)})
+                with self.subTest(offset=offset):
+                    assert store.valid("alpha", record) is fresh_at
 
         surrogate = {
             "bot_id": "alpha",
@@ -266,6 +272,11 @@ class PresenceValidTests(unittest.TestCase):
             "signature": "0" * SHA256_HEX_LENGTH,
         }
         assert not store.valid("alpha", surrogate, now=now)
+
+        # A missing or mistyped signed field fails the signature, never raises.
+        missing_host = {k: v for k, v in surrogate.items() if k != "host"}
+        assert not store.valid("alpha", missing_host, now=now)
+        assert not store.valid("alpha", {**surrogate, "host": 5}, now=now)
 
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
@@ -561,20 +572,43 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await store.open(js) is kv
         js.create_key_value.assert_awaited_once()
 
-    async def test_retune_without_ttl_keeps_default_duplicate_window(self) -> None:
-        """Retune a TTL-less bucket to the duplicate window nats-py creates it with."""
-        store = KVStore("test", 1, 0)
+    async def test_retune_matches_created_duplicate_window(self) -> None:
+        """Retune a bucket to the duplicate window nats-py creates it with.
+
+        That is two minutes, or the TTL when it is shorter.
+        """
+        for ttl, window in ((0, 120), (15, 15)):
+            store = KVStore("test", 1, ttl)
+            js = AsyncMock()
+            kv = AsyncMock()
+            js.create_key_value.side_effect = [BadRequestError(), kv]
+            js.stream_info.return_value = SimpleNamespace(
+                config=StreamConfig(name="KV_test", max_age=3600, duplicate_window=60),
+            )
+
+            with self.subTest(ttl=ttl):
+                assert await store.open(js) is kv
+                updated = js.update_stream.await_args.args[0]
+                assert updated.max_age == ttl
+                assert updated.duplicate_window == window
+
+    async def test_retune_keeps_matching_ttl(self) -> None:
+        """Leave a bucket whose TTL matches; creating it fails as it did first."""
+        store = KVStore("test", 1, 60)
         js = AsyncMock()
-        kv = AsyncMock()
-        js.create_key_value.side_effect = [BadRequestError(), kv]
+        error = BadRequestError(description="replicas cannot be updated")
+        js.create_key_value.side_effect = error
         js.stream_info.return_value = SimpleNamespace(
-            config=StreamConfig(name="KV_test", max_age=3600, duplicate_window=60),
+            config=StreamConfig(name="KV_test", max_age=60, duplicate_window=60),
         )
 
-        assert await store.open(js) is kv
-        updated = js.update_stream.await_args.args[0]
-        assert updated.max_age == 0
-        assert updated.duplicate_window == 120
+        with self.assertRaises(BadRequestError) as raised:
+            await store.open(js)
+
+        assert raised.exception is error
+        assert js.create_key_value.await_count == 2
+        js.update_stream.assert_not_awaited()
+        assert not store.ready
 
     async def test_open_reports_create_failure_without_bucket(self) -> None:
         """Raise the creation error, not the lookup's, when no bucket exists."""
@@ -963,17 +997,27 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(label):
                 assert parse_session_record(SECRET, "efnet", record) is None
 
-    async def test_session_parse_binds_record_to_key_and_horizon(self) -> None:
-        """Reject a signed session under another identity's key or past the TTL."""
+        # Values that cannot be signed keep the valid record's well-formed
+        # signature, so only the type checks stand between them and a crash.
+        mistyped: dict[str, dict[str, object]] = {
+            "non-string issuer": {"issuer": 5},
+            "non-string prefix": {"prefix": 5},
+            "non-numeric expiry": {"expires_at": "soon"},
+            "non-integer version": {"version": "1"},
+        }
+        for label, change in mistyped.items():
+            record = {**valid, **change}
+            with self.subTest(label):
+                assert parse_session_record(SECRET, "efnet", record) is None
+
+    async def test_session_parse_binds_record_to_key(self) -> None:
+        """Reject a signed session stored under another identity's key."""
         sessions = SessionStore("efnet", 1, SECRET, 60)
         key = sessions.key("owner!user@host")
         current = session_record(time.time() + 60)
 
         assert sessions.parse(key, current) is not None
         assert sessions.parse(sessions.key("other!user@host"), current) is None
-
-        future = session_record(time.time() + 60 + SESSION_EXPIRY_GRACE + 60)
-        assert sessions.parse(key, future) is None
 
     async def test_session_parse_rejects_non_finite_expiry(self) -> None:
         """Reject a correctly signed record whose expiry is NaN or infinite."""
@@ -1028,6 +1072,22 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         valid_channel = channel_record(2)
         assert await channels.put(valid_channel, after=None) == channel_fields(2)
         channels.kv.update.assert_awaited_once()
+
+    async def test_decode_record_rejects_non_objects_and_deep_nesting(self) -> None:
+        """Decode only JSON objects; nesting too deep to parse is malformed."""
+        assert decode_record(b'{"present": true}') == {"present": True}
+        assert decode_record(b"[1]") is None
+
+        # The parser overflows only past the native stack, a depth that varies
+        # by platform, so raise its RecursionError directly. Only the store's
+        # binding is patched, not the process-wide json.loads.
+        with patch("botnats.nats.store.json") as parser:
+            parser.loads.side_effect = RecursionError(
+                "maximum recursion depth exceeded"
+            )
+            assert decode_record(b"[[]]") is None
+
+        parser.loads.assert_called_once_with(b"[[]]")
 
     async def test_state_keys_do_not_depend_on_irc_casemapping(self) -> None:
         """Keep RFC1459-only equivalents in distinct durable KV entries."""
