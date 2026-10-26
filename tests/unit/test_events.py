@@ -81,7 +81,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage("MODE", ("#test", "+b", mask), Prefix("op", "user", "host")),
             )
-            await asyncio.gather(*bot.tasks)
+            async with asyncio.timeout(5):
+                await asyncio.gather(*bot.tasks)
 
         await ban("*!*@other.host")
         assert coordinator.help_requests == []
@@ -112,7 +113,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("CHGHOST", (new_user, new_host), old_prefix),
         )
-        await drain_session_writes(bot)
+        async with asyncio.timeout(5):
+            await drain_session_writes(bot)
 
         assert not bot.authorizer.authorized(old_prefix.render())
         new_prefix = Prefix("owner", new_user, new_host)
@@ -132,7 +134,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("owner")),
         )
-        await drain_session_writes(bot)
+        async with asyncio.timeout(5):
+            await drain_session_writes(bot)
 
         assert not bot.authorizer.authorized(old_prefix.render())
         assert len(coordinator.session_puts) == 1
@@ -147,7 +150,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("CHGHOST", ("newuser", "new.host"), old_prefix),
         )
-        await drain_session_writes(bot)
+        async with asyncio.timeout(5):
+            await drain_session_writes(bot)
 
         assert not bot.authorizer.authorized(old_prefix.render())
         pending = bot.sessions.pending
@@ -213,7 +217,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
             queued = len(bot.tasks)
             watched = bot.sessions.watched_identities[prefix.render()]
-        await bot.tasks.drain()
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
         assert queued == 8
         assert watched == (8, False)
@@ -251,7 +256,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("366", ("alpha", "#test", "End of /NAMES list")),
         )
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
 
         assert fake_irc.sent == [
             ("WHO", ("#test",)),
@@ -259,6 +265,36 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             ("MODE", ("#test", "+b")),
         ]
         assert [kind for kind, _ in coordinator.help_requests] == ["op"]
+
+    async def test_end_of_names_queries_resent_after_refusal(self) -> None:
+        """Resend NAMES on the next tick when the queries after it are refused.
+
+        Its end reply then asks for members, modes, and bans again.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        end_of_names = IRCMessage("366", ("alpha", "#test", "End of /NAMES list"))
+
+        # A full send queue refuses commands as a dropped connection does.
+        fake_irc.connected = False
+        bot.events.on_irc_message(end_of_names)
+        fake_irc.connected = True
+        bot.channel_mgr.join_desired()
+        bot.events.on_irc_message(end_of_names)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
+
+        assert fake_irc.sent == [
+            ("NAMES", ("#test",)),
+            ("WHO", ("#test",)),
+            ("MODE", ("#test",)),
+            ("MODE", ("#test", "+b")),
+        ]
+        assert not runtime.names_due
 
     async def test_names_and_who_record_only_operator_modes(self) -> None:
         """Track operator prefixes only; sub-op modes are never applied."""
@@ -268,8 +304,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("353", ("alpha", "=", "#test", "+bob @carol @+dave")),
         )
-        assert runtime.member("bob").modes == set()
-        assert runtime.member("carol").modes == {"o"}
+        assert runtime.members["bob"].modes == set()
+        assert runtime.members["carol"].modes == {"o"}
         # multi-prefix lists every prefix a member holds, highest first.
         assert set(runtime.members) == {"bob", "carol", "dave"}
         assert runtime.members["dave"].modes == {"o"}
@@ -280,8 +316,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 ("alpha", "#test", "user", "host", "srv", "bob", "H+", "0 realname"),
             ),
         )
-        assert runtime.member("bob").prefix == Prefix("bob", "user", "host")
-        assert runtime.member("bob").modes == set()
+        assert runtime.members["bob"].prefix == Prefix("bob", "user", "host")
+        assert runtime.members["bob"].modes == set()
 
     async def test_names_replaces_stale_modes(self) -> None:
         """Verify a NAMES reply without op prefix clears a prior op mode."""
@@ -306,7 +342,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("QUIT", (), Prefix.parse("owner@static.example")),
         )
-        await drain_session_writes(bot)
+        async with asyncio.timeout(5):
+            await drain_session_writes(bot)
 
         assert casefold("owner", "rfc1459") not in runtime.members
         assert not bot.authorizer.authorized(owner.render())
@@ -436,8 +473,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 assert ("MONITOR", ("+", "alpha")) in fake_irc.sent
                 assert not bot.tasks
 
-    async def test_monitor_subscription_skips_lost_connection(self) -> None:
-        """Skip the MONITOR subscription quietly when IRC has gone away."""
+    async def test_refused_monitor_subscription_polls_ison(self) -> None:
+        """Poll ISON instead when the send queue refuses MONITOR +."""
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
         fake_irc.connected = False
@@ -445,7 +482,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.events.start_nick_watch()
 
-        assert not bot.tasks
+        task = bot.events.nick_watch_task
+        assert task is not None
+        assert task.get_name() == "nick-ison-poll"
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_isupport_without_trailing(self) -> None:
         """Verify the final ISUPPORT token is kept when trailing text is omitted."""
@@ -534,7 +575,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage(numeric, ("alpha", "#test", "cannot join channel")),
             )
-            await asyncio.gather(*bot.tasks)
+            async with asyncio.timeout(5):
+                await asyncio.gather(*bot.tasks)
+
             # Every refusal returns the JOIN to idle so a later tick retries it.
             assert runtime.join is JoinState.IDLE
 
@@ -579,7 +622,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage("MODE", ("#test", *params), Prefix("someone", "u", "h")),
             )
-            await asyncio.gather(*bot.tasks)
+            async with asyncio.timeout(5):
+                await asyncio.gather(*bot.tasks)
 
         await mode("-o+o", "alpha", "alpha")
         assert fake_irc.modes == []
@@ -605,7 +649,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("MODE", ("#test", "+o", "beta"), Prefix("chanserv")),
         )
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
 
         assert [kind for kind, _ in coordinator.help_requests] == ["op"]
 
@@ -619,6 +664,33 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.events.on_irc_message(UNSET_MODE)
         assert fake_irc.modes == [("#test", "+npst", ())]
+
+    async def test_mode_enforcement_resent_after_refusal(self) -> None:
+        """Enforce modes after the next tick's NAMES when enforcement is refused."""
+        bot, fake_irc = bot_with_irc()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha").modes.add("o")
+
+        # A full send queue refuses commands as a dropped connection does.
+        fake_irc.connected = False
+        bot.events.on_irc_message(UNSET_MODE)
+        fake_irc.connected = True
+        bot.channel_mgr.join_desired()
+        bot.events.on_irc_message(
+            IRCMessage("366", ("alpha", "#test", "End of /NAMES list")),
+        )
+
+        assert fake_irc.sent == [
+            ("NAMES", ("#test",)),
+            ("WHO", ("#test",)),
+            ("MODE", ("#test",)),
+            ("MODE", ("#test", "+b")),
+            ("MODE", ("#test", "+npst")),
+        ]
 
     async def test_mode_enforce_unset_mode_added(self) -> None:
         """Verify enforcement triggers when a negated mode is set by another user."""
@@ -718,7 +790,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                     Prefix("services", "service", "services.host"),
                 ),
             )
-            await asyncio.gather(*bot.tasks)
+            async with asyncio.timeout(5):
+                await asyncio.gather(*bot.tasks)
 
             assert runtime.key == "secret"
             assert coordinator.channel_puts == []
@@ -780,7 +853,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("NICK", ("newowner",), Prefix("owner")),
         )
-        await drain_session_writes(bot)
+        async with asyncio.timeout(5):
+            await drain_session_writes(bot)
 
         new_prefix = Prefix("newowner", "user", "host.example")
         assert not bot.authorizer.authorized(new_prefix.render())
@@ -837,7 +911,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage("324", ("alpha", "#test", *params), None),
             )
-            await asyncio.gather(*bot.tasks)
+            async with asyncio.timeout(5):
+                await asyncio.gather(*bot.tasks)
 
         await channel_modes("+ntk", "*")
         assert runtime.key is None
@@ -873,6 +948,42 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent.count(("MODE", ("#test",))) == 1
         assert fake_irc.modes == [("#test", "+npst", ())]
+
+    async def test_op_gain_mode_query_resent_after_refusal(self) -> None:
+        """Resend NAMES on the next tick when the MODE query on op is refused.
+
+        Its end reply then queries the modes again.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        record = fake_irc.send
+
+        def refuse_mode_query(
+            command: str,
+            *params: str,
+            trailing: str | None = None,
+        ) -> None:
+            if (command, params) == ("MODE", ("#test",)):
+                msg = "IRC outbound queue is full"
+                raise ConnectionError(msg)
+
+            record(command, *params, trailing=trailing)
+
+        with patch.object(fake_irc, "send", refuse_mode_query):
+            bot.events.on_irc_message(
+                IRCMessage("MODE", ("#test", "+o", "alpha"), Prefix("chanserv")),
+            )
+
+        bot.channel_mgr.join_desired()
+
+        assert fake_irc.sent == [
+            ("MODE", ("#test", "+npst")),
+            ("NAMES", ("#test",)),
+        ]
 
     async def test_channel_limit_tracked(self) -> None:
         """Track +l from RPL_CHANNELMODEIS and MODE changes."""
@@ -993,7 +1104,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 Prefix("chanserv", "service", "services.host"),
             ),
         )
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
 
         assert first.member("Target").modes == {"o"}
         assert set(first.bans.values()) == {"*!*@first.host"}
@@ -1061,7 +1173,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("NICK", ("newowner",), old_prefix),
         )
-        await drain_session_writes(bot)
+        async with asyncio.timeout(5):
+            await drain_session_writes(bot)
 
         assert not bot.authorizer.authorized(old_prefix.render())
         assert not bot.authorizer.authorized(new_prefix.render())
@@ -1166,7 +1279,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             # The AUTH waits behind STATUS when the user quits.
             bot.events.on_irc_message(IRCMessage("QUIT", (), owner))
             release.set()
-            await asyncio.gather(*bot.tasks)
+            async with asyncio.timeout(5):
+                await asyncio.gather(*bot.tasks)
 
         # The code was valid and claimed; only the QUIT refused it.
         assert coordinator.claim_requests == [counter]
@@ -1181,7 +1295,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.authorizer.grant(prefix.render())
 
         bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-        await drain_session_writes(bot)
+        async with asyncio.timeout(5):
+            await drain_session_writes(bot)
 
         assert not bot.authorizer.authorized(prefix.render())
         assert len(coordinator.session_puts) == 1
@@ -1198,7 +1313,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("JOIN", ("#test",), Prefix("alpha", "~alpha", "host.example")),
         )
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
 
         assert runtime.joined
         assert runtime.bans == {}
@@ -1323,7 +1439,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 Prefix("someone", "user", "host"),
             ),
         )
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
 
         assert not runtime.joined
         assert runtime.bans == {}
@@ -1346,26 +1463,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not runtime.joined
         assert runtime.bans == {}
         assert runtime.members == {}
-
-    async def test_welcome_resets_channel_state(self) -> None:
-        """Forget the previous connection's channel state on registration."""
-        bot, _ = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.add_ban("*!*@old.ban")
-        runtime.member("alpha").modes.add("o")
-        runtime.names_due = True
-        bot.channel_mgr.pending_parts[casefold("#gone", "rfc1459")] = "#gone"
-
-        bot.events.on_irc_message(IRCMessage("001", ("alpha", "Welcome")))
-        await bot.tasks.drain()
-
-        assert bot.identity.registered
-        assert runtime.join is JoinState.IDLE
-        assert runtime.bans == {}
-        assert runtime.members == {}
-        assert not runtime.names_due
-        assert bot.channel_mgr.pending_parts == {}
 
     async def test_userhost_identity(self) -> None:
         """Verify USERHOST reply sets bot identity."""
@@ -1426,7 +1523,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
         )
-        await bot.tasks.drain()
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
         assert bot.identity.current == BotPresence(
             "alpha", "alpha.host", bot.identity.instance_id, "alpha", "~alpha"
@@ -1478,7 +1576,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.identity.current is not None
         assert bot.identity.current.host == "new.host"
         assert fake_irc.sent == [join, join]
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
 
     async def test_set_identity_dedups_presence_publish(self) -> None:
         """Verify redundant identity updates do not re-publish presence."""
@@ -1488,11 +1587,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.events.set_identity(prefix)
         bot.events.set_identity(prefix)
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
+
         assert len(coordinator.presence_puts) == 1
 
         bot.events.set_identity(Prefix("alpha", "~alpha", "new.host"))
-        await asyncio.gather(*bot.tasks)
+        async with asyncio.timeout(5):
+            await asyncio.gather(*bot.tasks)
+
         assert bot.identity.current is not None
         assert bot.identity.current.host == "new.host"
         assert len(coordinator.presence_puts) == 2
@@ -1517,9 +1620,12 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.caps.parse_chanmodes("b,k,l,imn")
         bot.caps.parse_prefix("(yov)@%+")
         runtime.join = JoinState.JOINED
+        runtime.add_ban("*!*@old.ban")
         runtime.member("alpha").modes.add("o")
         runtime.modes = "+nstl"
         runtime.limit = 3
+        runtime.names_due = True
+        bot.channel_mgr.pending_parts[bot.caps.fold("#gone")] = "#gone"
         bot.identity.current = BotPresence("alpha", "host", "one", "alpha", "user")
         bot.identity.registered = True
         generation = bot.identity.generation
@@ -1542,9 +1648,12 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.caps.op_mode == "o"
         assert bot.channel_mgr.runtime(channel) is runtime
         assert not runtime.joined
+        assert runtime.bans == {}
         assert not runtime.members
         assert runtime.modes == ""
         assert runtime.limit is None
+        assert not runtime.names_due
+        assert bot.channel_mgr.pending_parts == {}
         assert bot.authorizer.authorized(identity)
 
 
@@ -1595,6 +1704,30 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
 
         assert ("NICK", ("alpha",)) not in fake_irc.sent
 
+    async def test_refused_monitor_reclaim_polls_ison(self) -> None:
+        """Poll ISON, once, when the send queue refuses a NICK MONITOR prompted.
+
+        MONITOR reports the nick offline only once, so nothing else retries it.
+        """
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        bot.caps.monitor = True
+        bot.events.start_nick_watch()
+        assert bot.events.nick_watch_task is None
+
+        fake_irc.connected = False
+        for _ in range(2):
+            bot.events.on_irc_message(
+                IRCMessage("731", ("fallback", "alpha!user@host")),
+            )
+
+        task = bot.events.nick_watch_task
+        assert task is not None
+        assert task.get_name() == "nick-ison-poll"
+        assert bot.tasks == {task}
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
+
     async def test_welcome_starts_ison_poll(self) -> None:
         """Start ISON polling when registered with a fallback nick."""
         bot, fake_irc = bot_with_irc()
@@ -1605,7 +1738,8 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert bot.events.nick_watch_task is not None
-        await bot.tasks.drain()
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_welcome_skips_watch_when_nick_matches(self) -> None:
         """Skip nick watch when registered with the desired nick."""
@@ -1616,19 +1750,24 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert bot.events.nick_watch_task is None
-        await bot.tasks.drain()
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_isupport_monitor_switches_nick_watch(self) -> None:
         """Watch the nick with MONITOR while advertised, and with ISON after."""
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
         bot.events.start_nick_watch()
-        assert bot.events.nick_watch_task is not None
+        poll = bot.events.nick_watch_task
+        assert poll is not None
 
         bot.events.on_irc_message(
             IRCMessage("005", ("fallback", "MONITOR=100", "supported")),
         )
+        async with asyncio.timeout(5):
+            await asyncio.gather(poll, return_exceptions=True)
 
+        assert poll.cancelled()
         assert bot.events.nick_watch_task is None
         assert ("MONITOR", ("+", "alpha")) in fake_irc.sent
 
@@ -1638,20 +1777,25 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.caps.monitor
         assert bot.events.nick_watch_task is not None
-        await bot.tasks.drain()
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_nick_reclaim_stops_ison_watch(self) -> None:
         """Stop the ISON poll when the bot reclaims its desired nickname."""
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
         bot.events.start_nick_watch()
-        assert bot.events.nick_watch_task is not None
+        poll = bot.events.nick_watch_task
+        assert poll is not None
 
         fake_irc.current_nick = "alpha"
         bot.events.on_irc_message(
             IRCMessage("NICK", ("alpha",), Prefix("fallback", "~alpha", "host")),
         )
+        async with asyncio.timeout(5):
+            await asyncio.gather(poll, return_exceptions=True)
 
+        assert poll.cancelled()
         assert bot.events.nick_watch_task is None
 
     async def test_nick_change_away_starts_watch(self) -> None:
@@ -1711,10 +1855,14 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
         bot.events.start_nick_watch()
-        assert bot.events.nick_watch_task is not None
+        poll = bot.events.nick_watch_task
+        assert poll is not None
 
         bot.events.on_irc_disconnect()
+        async with asyncio.timeout(5):
+            await asyncio.gather(poll, return_exceptions=True)
 
+        assert poll.cancelled()
         assert bot.events.nick_watch_task is None
 
     async def test_ison_poll_loop_polls_until_nick_reclaimed(self) -> None:

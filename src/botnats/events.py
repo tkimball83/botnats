@@ -298,11 +298,14 @@ class IRCEventHandler:
             return
 
         # A failed send means the connection is gone or the send queue is
-        # full, so the rest would fail too.
-        with suppress(ConnectionError):
+        # full, so the rest would fail too; the next tick resends NAMES, and
+        # its end reply asks again.
+        try:
             self.bot.irc.send("WHO", channel)
             self.bot.irc.send("MODE", channel)
             self.bot.irc.send("MODE", channel, "+b")
+        except ConnectionError:
+            runtime.names_due = True
 
         if self.bot.channel_mgr.is_self_opped(runtime):
             self.bot.channel_mgr.enforce_modes(channel)
@@ -349,13 +352,19 @@ class IRCEventHandler:
                 return
 
     def try_nick_reclaim(self) -> None:
-        """Send a NICK command to reclaim the desired nickname."""
+        """Send a NICK command to reclaim the desired nickname.
+
+        MONITOR reports the nick offline only once, so a refused NICK falls
+        back to polling ISON.
+        """
         desired = self.bot.config.nickname
         if self.bot.irc.is_self(desired):
             return
 
-        with suppress(ConnectionError):
+        try:
             self.bot.irc.send("NICK", desired)
+        except ConnectionError:
+            self.poll_ison()
 
     def start_nick_watch(self) -> None:
         """Begin watching for the desired nickname to become available."""
@@ -366,6 +375,11 @@ class IRCEventHandler:
         if self.bot.caps.monitor:
             self.monitor_nick()
         else:
+            self.poll_ison()
+
+    def poll_ison(self) -> None:
+        """Start polling ISON for the desired nickname unless already polling."""
+        if self.nick_watch_task is None:
             self.nick_watch_task = self.bot.tasks.spawn(
                 self.ison_poll_loop(),
                 "nick-ison-poll",
@@ -386,9 +400,11 @@ class IRCEventHandler:
                 self.bot.irc.send("MONITOR", "-", self.bot.config.nickname)
 
     def monitor_nick(self) -> None:
-        """Subscribe to MONITOR notifications for the desired nickname."""
-        with suppress(ConnectionError):
+        """Subscribe to MONITOR notifications, or poll ISON if refused."""
+        try:
             self.bot.irc.send("MONITOR", "+", self.bot.config.nickname)
+        except ConnectionError:
+            self.poll_ison()
 
     async def ison_poll_loop(self) -> None:
         """Poll ISON at a fixed interval until the desired nickname is ours."""
@@ -488,9 +504,12 @@ class IRCEventHandler:
         lost_enforced, saw_new_op = self.apply_mode_changes(runtime, modes, arguments)
         opped = self.bot.channel_mgr.is_self_opped(runtime)
         if opped and not was_opped:
-            # Operators see a key the server hides from other members.
-            with suppress(ConnectionError):
+            # Operators see a key the server hides from other members; a
+            # refused query is asked again after the next tick's NAMES.
+            try:
                 self.bot.irc.send("MODE", channel)
+            except ConnectionError:
+                runtime.names_due = True
 
         if opped and (lost_enforced or not was_opped):
             self.bot.channel_mgr.enforce_modes(channel)
@@ -617,7 +636,6 @@ class IRCEventHandler:
             self.bot.identity.discover(self.bot.identity.generation),
             "identity-discovery",
         )
-        self.bot.channel_mgr.reset()
         self.start_nick_watch()
 
     def handle_who(self, message: IRCMessage) -> None:

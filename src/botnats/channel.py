@@ -147,14 +147,17 @@ class ChannelManager:
                 self.bot.config.channel_modes,
             )
         except ConnectionError:
-            return
+            # The next tick resends NAMES, whose end reply enforces again.
+            runtime = self.runtime(channel)
+            if runtime is not None:
+                runtime.names_due = True
         except ValueError as error:
             LOGGER.warning(
                 "cannot enforce modes on %s: %s", channel, error_label(error)
             )
 
     def join_desired(self) -> None:
-        """Join desired channels not yet entered; resend a rejoin's NAMES."""
+        """Join desired channels not yet entered; resend NAMES where due."""
         if self.bot.identity.current is None:
             return
 
@@ -704,7 +707,8 @@ class ChannelRuntime:
     limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
     modes: str = ""
-    # A rejoin whose NAMES could not be sent yet; the next tick resends it.
+    # A NAMES, or a query or enforcement its end reply sends, that could not
+    # be sent; the next tick resends NAMES, and its end reply the rest.
     names_due: bool = False
 
     @property
