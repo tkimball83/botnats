@@ -406,8 +406,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert not await attempts.allow("host.example", now=61)
         attempts.kv.update.assert_awaited_once()
 
-    async def test_sliding_window_denies_at_boundary(self) -> None:
-        """Verify three recent attempts deny immediately across a boundary."""
+    async def test_recent_attempts_deny(self) -> None:
+        """Deny while every slot holds an attempt from within the window."""
         attempts = AttemptStore("efnet", 3, SECRET)
         attempts.kv = AsyncMock()
         attempts.kv.get.side_effect = [
@@ -418,8 +418,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert not await attempts.allow("host.example", now=60)
 
-    async def test_clock_skew_counts_future_bucket(self) -> None:
-        """Verify attempts by a faster peer count for a slower peer."""
+    async def test_future_attempts_deny(self) -> None:
+        """Count attempts a faster peer stamped after this peer's now."""
         attempts = AttemptStore("efnet", 3, SECRET)
         attempts.kv = AsyncMock()
         attempts.kv.get.side_effect = [
@@ -608,6 +608,27 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         key, value = channels.kv.create.await_args.args
         assert key == channels.key("#test")
         assert json.loads(value) == record
+
+    async def test_channel_put_rejects_injected_fields(self) -> None:
+        """Refuse, before any write, a channel or key that could inject IRC."""
+        channels = ChannelStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        channels.kv = cast("KeyValue", kv)
+        injected: dict[str, dict[str, object]] = {
+            "CR in channel": {"channel": "#test\rQUIT"},
+            "LF in channel": {"channel": "#test\nQUIT"},
+            "space in channel": {"channel": "#test QUIT"},
+            "NUL in channel": {"channel": "#test\x00"},
+            "CR in key": {"key": "secret\rQUIT"},
+            "LF in key": {"key": "secret\nQUIT"},
+            "space in key": {"key": "secret QUIT"},
+            "NUL in key": {"key": "secret\x00"},
+        }
+        for label, change in injected.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                await channels.put({**channel_record(1), **change}, expected=None)
+
+        assert kv.entries == {}
 
     async def test_channel_parse_binds_record_to_key(self) -> None:
         """Reject a valid channel record stored under another channel's key."""
@@ -829,7 +850,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         edge = session_record(now + 60 + SESSION_EXPIRY_GRACE)
         future = session_record(now + 60 + SESSION_EXPIRY_GRACE + 1)
 
-        with patch("botnats.nats.store.time.time", return_value=now):
+        with patch("botnats.nats.store.time") as clock:
+            clock.time.return_value = now
             assert sessions.parse(key, future) is None
             with self.assertRaisesRegex(ValueError, SESSION_INVALID):
                 await sessions.put(future)
@@ -881,6 +903,22 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         key = sessions.key("owner!user@host")
         assert sessions.parse(key, valid) == parsed_session(valid)
         assert await sessions.put(valid) == parsed_session(valid)
+
+    async def test_session_parse_rejects_malformed_signed_fields(self) -> None:
+        """Reject a correctly signed record whose fields have the wrong shape."""
+        valid = session_record(time.time() + 30)
+        malformed: dict[str, dict[str, object]] = {
+            "negative version": {"version": -1},
+            "boolean version": {"version": True},
+            "boolean expiry": {"expires_at": True},
+            "empty issuer": {"issuer": ""},
+            "empty prefix": {"prefix": ""},
+        }
+        for label, change in malformed.items():
+            record = {**valid, **change}
+            record["signature"] = session_signature(SECRET, "efnet", record)
+            with self.subTest(label):
+                assert parse_session_record(SECRET, "efnet", record) is None
 
     async def test_session_parse_binds_record_to_key_and_horizon(self) -> None:
         """Reject a signed session under another identity's key or past the TTL."""

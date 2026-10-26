@@ -58,12 +58,7 @@ class Envelope:
             msg = "NATS envelope exceeds the size limit"
             raise ValueError(msg)
 
-        try:
-            envelope = json.loads(value)
-        except RecursionError as error:
-            msg = "NATS envelope is too deeply nested"
-            raise ValueError(msg) from error
-
+        envelope = json.loads(value)
         if not isinstance(envelope, dict):
             msg = "NATS envelope is not an object"
             raise TypeError(msg)

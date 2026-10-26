@@ -111,7 +111,8 @@ class SessionSync:
     Writes: IRC handlers apply a revocation locally at once and queue its
     durable write, which a background drain performs, so the IRC read loop
     never waits on JetStream. AUTH awaits sync() because it replies with the
-    outcome. A drain stops at the first failed write; the next retry resumes.
+    outcome. A drain stops at the first write JetStream fails; the next retry
+    resumes.
 
     Watched records: the coordinator reports validated records by KV key.
     A delete carries only the key, so the prefix each key holds is kept here
@@ -128,6 +129,9 @@ class SessionSync:
         self.coordinator = coordinator
         self.lock = asyncio.Lock()
         self.pending: dict[str, Session] = {}
+        # Identity -> held record queued to write back over a rollback, not a
+        # new mutation: a newer grant supersedes it unrevoked.
+        self.restoring: dict[str, Session] = {}
         # KV key -> (prefix, expiry) for each unexpired watched session.
         self.watched: dict[str, tuple[str, float]] = {}
         # ASCII-folded identity -> (commands in flight, invalidated since the
@@ -184,7 +188,9 @@ class SessionSync:
         A record below the one held for its key was rolled back, as when a
         NATS writer without the coordination secret re-puts the grant a
         revocation replaced. Bots that start later replay only that record,
-        so the held one is written again.
+        so the held one is written again unless a mutation for its identity
+        is already queued. The record may instead be a late echo of this
+        bot's own write, so the write-back never escalates over a newer grant.
         """
         now = time.time()
         if not replaying:
@@ -195,8 +201,12 @@ class SessionSync:
             held = self.authorizer.keep(session)
             # A record of an IRC-equivalent identity lives under another key.
             identity = casefold(session.prefix, "ascii")
-            if held is not None and casefold(held.prefix, "ascii") == identity:
-                self.queue(held)
+            if (
+                held is not None
+                and casefold(held.prefix, "ascii") == identity
+                and identity not in self.pending
+            ):
+                self.pending[identity] = self.restoring[identity] = held
                 self.tasks.spawn(self.retry(), "session-sync")
         else:
             self.forget(key)
@@ -259,17 +269,29 @@ class SessionSync:
             self.tasks.spawn(self.retry(), "session-sync")
 
     async def drain(self) -> None:
-        """Write queued mutations in order while holding the lock."""
-        for identity, session in tuple(self.pending.items()):
-            if not await self.write(identity, session):
+        """Write queued mutations in order while holding the lock.
+
+        Each entry is read when its turn comes: revoke() may replace one
+        during an earlier write, and the superseded one must not be written.
+        """
+        for identity in tuple(self.pending):
+            if not await self.write(identity, self.pending[identity]):
                 return
 
     async def write(self, identity: str, session: Session) -> bool:
-        """Write one queued mutation; re-queue a revocation that met a newer grant."""
+        """Write one queued mutation; re-queue a revocation that met a newer grant.
+
+        Returns False only when JetStream fails, which stops the drain. A
+        record the store refuses, expiring past its horizon after the wall
+        clock stepped back, stays queued until the clock catches up without
+        holding later writes.
+        """
         try:
             stored = await self.coordinator.put_session(asdict(session))
         except PUBLISH_ERRORS:
             return False
+        except ValueError:
+            return True
 
         # The store returns a validated record; an expired one is no winner.
         winner = stored if stored.expires_at > time.time() else None
@@ -282,7 +304,12 @@ class SessionSync:
         if self.pending.get(identity) is not session:
             return True
 
-        if session.revoked and winner is not None and not winner.revoked:
+        if (
+            session.revoked
+            and winner is not None
+            and not winner.revoked
+            and self.restoring.get(identity) is not session
+        ):
             replacement = self.authorizer.create(
                 winner.prefix,
                 winner.expires_at,
@@ -297,6 +324,7 @@ class SessionSync:
             return True
 
         del self.pending[identity]
+        self.restoring.pop(identity, None)
         return True
 
 
