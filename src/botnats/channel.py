@@ -67,8 +67,11 @@ class ChannelManager:
             "unban": self.unban_peer,
         }
 
-    def apply_record(self, record: ChannelRecord) -> None:
-        """Apply a channel configuration record, joining or parting as needed."""
+    def apply_record(self, record: ChannelRecord, *, own_write: bool = False) -> None:
+        """Apply a channel configuration record, joining or parting as needed.
+
+        own_write marks this bot's own record as the store accepted it.
+        """
         source_key = casefold(record.channel, "ascii")
         source = self.source_records.get(source_key)
         if source is not None and source.revision >= record.revision:
@@ -86,10 +89,12 @@ class ChannelManager:
             runtime = self.channels.get(folded) or ChannelRuntime(caps=self.bot.caps)
             self.channels[folded] = runtime
             runtime.channel = record.channel
-            # A record can carry an older key than one this bot saw on IRC and
-            # has yet to record, even its own write landing late. Otherwise
-            # the record knows best: IRC can hide a key change behind "*".
-            if not (runtime.joined and runtime.key_pending):
+            # A joined channel keeps the key this bot sees on IRC against its
+            # own write, whose key IRC may have replaced while it was in
+            # flight, and against any record while a key it saw awaits its
+            # write. Otherwise the record knows best: IRC can hide a key
+            # change behind "*".
+            if not (runtime.joined and (own_write or runtime.key_pending)):
                 runtime.key = record.key
 
             if unparted:
@@ -229,8 +234,9 @@ class ChannelManager:
             expected=self.durable_revision(channel),
         )
         authoritative = ChannelRecord(*stored)
-        self.apply_record(authoritative)
-        return authoritative == record
+        won = authoritative == record
+        self.apply_record(authoritative, own_write=won)
+        return won
 
     def durable_revision(self, channel: str) -> str | None:
         """Return the stored revision of this exact channel name, if any.
