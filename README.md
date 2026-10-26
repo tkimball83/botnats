@@ -77,22 +77,22 @@ Example `bot.json`:
 }
 ```
 
-| Setting                                     | Behavior                                                    |
-| ------------------------------------------- | ----------------------------------------------------------- |
-| `authorization.session_ttl_seconds`         | Authorized session lifetime; 3,600 seconds by default       |
-| `bot.health_port`                           | HTTP liveness and readiness port; 8080 by default           |
-| `bot.id`                                    | Unique mesh ID; compared case-insensitively                 |
-| `bot.network`                               | One IRC network per process; namespaces shared NATS state   |
-| `bot.nickname`                              | IRC nickname and connection identity                        |
-| `coordination.maintenance_interval_seconds` | Seconds between maintenance cycles and presence heartbeats  |
-| `coordination.presence_ttl_seconds`         | Must exceed the maintenance interval                        |
-| `irc.channel_modes`                         | Required (`+`) and forbidden (`-`) modes; empty by default  |
-| `irc.connect_timeout_seconds`               | Per-server connection timeout                               |
-| `irc.servers`                               | Ordered failover endpoints for the configured network       |
-| `irc.verify_tls`                            | Applies only to `ircs://` connections                       |
-| `nats.jetstream_replicas`                   | Use `3` only when three JetStream storage peers are present |
-| `nats.monitor_port`                         | Connected-server monitoring port used by `STATUS`           |
-| `nats.servers`                              | `nats://` or `tls://` endpoints, tried in any order         |
+| Setting                                     | Behavior                                                                  |
+| ------------------------------------------- | ------------------------------------------------------------------------- |
+| `authorization.session_ttl_seconds`         | Authorized session lifetime; 3,600 seconds by default                     |
+| `bot.health_port`                           | HTTP liveness and readiness port; 8080 by default                         |
+| `bot.id`                                    | Unique mesh ID; compared case-insensitively; required                     |
+| `bot.network`                               | One IRC network per process; namespaces shared NATS state; required       |
+| `bot.nickname`                              | IRC nickname and connection identity; required                            |
+| `coordination.maintenance_interval_seconds` | Seconds between maintenance cycles and presence heartbeats; 3 by default  |
+| `coordination.presence_ttl_seconds`         | Must exceed the maintenance interval; 15 seconds by default               |
+| `irc.channel_modes`                         | Required (`+`) and forbidden (`-`) modes; empty by default                |
+| `irc.connect_timeout_seconds`               | Per-server connection timeout; 30 seconds by default                      |
+| `irc.servers`                               | Ordered failover endpoints for the configured network; required           |
+| `irc.verify_tls`                            | Applies only to `ircs://` connections; `true` by default                  |
+| `nats.jetstream_replicas`                   | Use `3` only when three JetStream storage peers are present; 1 by default |
+| `nats.monitor_port`                         | Connected-server monitoring port used by `STATUS`; 8222 by default        |
+| `nats.servers`                              | `nats://` or `tls://` endpoints, tried in any order; required             |
 
 Plain IRC exposes commands and responses, so use a trusted network when IRCS is
 unavailable. JetStream requires file storage; persist each peer's directory.

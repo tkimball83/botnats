@@ -31,4 +31,5 @@ jobs:
           python-version-file: .python-version
       - run: make install
       - run: venv/bin/pre-commit run yamllint --all-files
+    timeout-minutes: 10
 ...
