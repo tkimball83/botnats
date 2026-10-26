@@ -8,8 +8,7 @@ PYTHON ?= python$(shell cat .python-version)
 all: test
 
 clean:
-	$(RM) -r .mypy_cache .ruff_cache build dist \
-		src/*.egg-info venv
+	$(RM) -r .mypy_cache .ruff_cache src/*.egg-info venv
 	find src tests -type d -name __pycache__ -prune -exec $(RM) -r {} +
 
 install: venv

@@ -3,7 +3,14 @@
   push:
     branches:
       - main
+    paths: &paths
+      - .pre-commit-config.yaml
+      - .yamllint
+      - '**/*.yaml'
+      - '**/*.yml'
+      - pyproject.toml
   pull_request:
+    paths: *paths
 
 permissions:
   contents: read
@@ -17,8 +24,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@v7.1.0
         with:
+          cache: pip
+          cache-dependency-path: pyproject.toml
           python-version-file: .python-version
       - run: make install
       - run: venv/bin/pre-commit run yamllint --all-files
