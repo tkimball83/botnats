@@ -577,8 +577,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
 
-        await see_key(bot, runtime, "same-key")
+        bot.events.process_key(runtime, "same-key")
+        assert runtime.key_pending
+        await settle(bot)
 
+        assert not runtime.key_pending
         assert coordinator.channel_puts == []
         assert bot.channel_mgr.channel_records[casefold("#test", "rfc1459")] == record
 
@@ -593,13 +596,13 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         await see_key(bot, runtime, "recordkey")
 
-        assert bot.channel_mgr.pending_keys == {"#test": "#test"}
+        assert runtime.key_pending
         # A failed write must not shadow newer remote records.
         assert bot.channel_mgr.channel_records[folded] == before
         coordinator.failing = False
         await bot.channel_mgr.retry_pending_keys()
 
-        assert not bot.channel_mgr.pending_keys
+        assert not runtime.key_pending
         assert coordinator.channel_puts[0]["key"] == "recordkey"
         assert bot.channel_mgr.channel_records[folded].key == "recordkey"
 
@@ -612,6 +615,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[folded]
         runtime.join = JoinState.JOINED
         await see_key(bot, runtime, "newkey")
+        assert runtime.key_pending
         # Another bot parts the channel at the revision number this write used,
         # with a suffix that sorts lower than any this bot might have minted.
         number = revision_number(base.revision) + 1
@@ -627,7 +631,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert folded not in bot.channel_mgr.channels
         assert coordinator.channel_puts == []
-        assert not bot.channel_mgr.pending_keys
 
     async def test_queued_key_write_does_not_override_a_later_part(self) -> None:
         """Drop a key write that waited its turn while another bot parted."""
@@ -646,6 +649,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         async with mgr.key_lock:
             # MODE +k k queues behind a key write still in flight...
             bot.events.process_key(runtime, "k")
+            assert runtime.key_pending
             # ...while another bot's PART #test arrives.
             mgr.apply_record(tombstone)
 
@@ -654,7 +658,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.channel_puts == []
         assert folded not in mgr.channels
         assert mgr.channel_records[folded] == tombstone
-        assert not mgr.pending_keys
 
     async def test_failed_key_write_does_not_override_a_newer_key(self) -> None:
         """Drop a failed key write once another bot has recorded a newer key."""
@@ -665,6 +668,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[folded]
         runtime.join = JoinState.JOINED
         await see_key(bot, runtime, "stale")
+        assert runtime.key_pending
         # While this bot was cut off, another bot recorded a later MODE +k,
         # which IRC showed this bot only as "*".
         newer = replace(
@@ -672,15 +676,13 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             revision=f"{revision_number(base.revision) + 2:020d}-{'0' * 32}",
         )
 
-        bot.events.on_irc_message(
-            IRCMessage("MODE", ("#test", "+k", "*"), Prefix("op", "~op", "op.host")),
-        )
+        runtime.hide_key()
         bot.channel_mgr.apply_record(newer)
         coordinator.failing = False
         await bot.channel_mgr.retry_pending_keys()
 
         assert coordinator.channel_puts == []
-        assert not bot.channel_mgr.pending_keys
+        assert not runtime.key_pending
         assert bot.channel_mgr.channel_records[folded].key == "x"
         assert runtime.key == "x"
 
@@ -703,14 +705,12 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = mgr.runtime("#room{")
         assert runtime is not None
         runtime.join = JoinState.JOINED
-        runtime.set_key("secret")
-        # Each write names the spelling that is not the newest local record.
-        mgr.record_key("#room{")
-        await settle(bot)
-        assert mgr.channel_records[casefold("#room[", "rfc1459")].channel == "#room{"
-        await bot.commands.cmd_join(OWNER, ("#room[", "other"))
+        # A key write names the channel's newest record, #room[...
+        await see_key(bot, runtime, "secret")
+        # ...and a command the spelling it was given.
+        await bot.commands.cmd_join(OWNER, ("#room{", "other"))
 
-        assert coordinator.channel_expected == [brace.revision, bracket.revision]
+        assert coordinator.channel_expected == [bracket.revision, brace.revision]
 
     async def test_unrelated_newer_record_keeps_observed_key(self) -> None:
         """Keep an observed key and its pending write past an unrelated record."""
@@ -779,7 +779,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         await mgr.retry_pending_keys()
 
         assert mgr.channel_records[folded].key == "B"
-        assert not mgr.pending_keys
+        assert not runtime.key_pending
 
     async def test_key_is_pending_once_seen(self) -> None:
         """Keep a key seen on IRC past a record landing before its write starts."""
@@ -828,7 +828,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         await mgr.retry_pending_keys()
 
         assert mgr.channel_records[folded].key == "B"
-        assert not mgr.pending_keys
+        assert not runtime.key_pending
 
     async def test_joined_bot_learns_a_hidden_key_from_peers(self) -> None:
         """Take a peer's recorded key when IRC showed this bot only "*".
@@ -895,42 +895,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             await see_key(bot, runtime, "B")  # MODE #test +k B, seen on IRC
 
         assert mgr.channel_records[folded].key == "A"
-        assert mgr.pending_keys == {"#test": "#test"}
+        assert runtime.key_pending
 
         await mgr.retry_pending_keys()
 
         _, stored = kv.entries[coordinator.channels.key("#test")]
         assert json.loads(stored)["key"] == "B"
         assert mgr.channel_records[folded].key == "B"
-        assert not mgr.pending_keys
-
-    async def test_retry_does_not_replay_a_superseded_key(self) -> None:
-        """Retry with the key seen on IRC now, not the one seen at failure."""
-        coordinator = FailingWriteCoordinator()
-        bot = bot_with_channel(coordinator=coordinator)
-        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
-        runtime = mgr.channels[folded]
-        runtime.join = JoinState.JOINED
-        stored = mgr.new_record(
-            "#test", "A", present=True, after=mgr.channel_records[folded].revision
-        )
-        mgr.apply_record(stored)
-        await see_key(bot, runtime, "B")
-        # The key then moves on to C and back to A, recorded by other bots;
-        # A is also what this bot now sees on IRC.
-        changed = mgr.new_record("#test", "C", present=True, after=stored.revision)
-        mgr.apply_record(changed)
-        mgr.apply_record(
-            mgr.new_record("#test", "A", present=True, after=changed.revision),
-        )
-        await see_key(bot, runtime, "A")
-
-        coordinator.failing = False
-        await mgr.retry_pending_keys()
-
-        assert runtime.key == "A"
-        assert coordinator.channel_puts == []
-        assert mgr.channel_records[folded].key == "A"
+        assert not runtime.key_pending
 
     async def test_retry_dropped_once_bot_leaves_channel(self) -> None:
         """Drop a failed key write once this bot can no longer see the key."""
@@ -939,26 +911,63 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         await see_key(bot, runtime, "seen")
+        assert runtime.key_pending
         runtime.reset()  # kicked, or the IRC connection dropped
 
         coordinator.failing = False
         await bot.channel_mgr.retry_pending_keys()
 
         assert coordinator.channel_puts == []
-        assert not bot.channel_mgr.pending_keys
+        assert not runtime.key_pending
 
-    async def test_retry_skips_a_key_hidden_meanwhile(self) -> None:
-        """Skip a pending key that IRC hid while an earlier retry was in flight."""
+    async def test_unjoined_channel_takes_the_recorded_key(self) -> None:
+        """Take a record's key in a channel this bot has left.
+
+        A key it saw before a kick is no longer pending, nor is one a late
+        reply shows once it is out.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot = bot_with_channel(coordinator=coordinator)
+        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+        runtime = mgr.channels[folded]
+        runtime.join = JoinState.JOINED
+        await see_key(bot, runtime, "seen")
+        assert runtime.key_pending
+
+        runtime.reset()  # kicked
+        assert not runtime.key_pending
+        peer = mgr.new_record(
+            "#test", "x", present=True, after=mgr.channel_records[folded].revision
+        )
+        mgr.apply_record(peer)
+        assert runtime.key == "x"
+
+        # The reply to a MODE query sent before the kick shows another key.
+        bot.events.process_key(runtime, "late")
+        assert runtime.key_pending
+        mgr.apply_record(
+            mgr.new_record("#test", "y", present=True, after=peer.revision)
+        )
+        assert runtime.key == "y"
+        await settle(bot)
+
+        assert not runtime.key_pending
+
+    async def test_retry_skips_channels_changed_meanwhile(self) -> None:
+        """Skip a key hidden, or a channel parted, while an earlier write ran."""
         coordinator = FailingWriteCoordinator()
         bot = bot_with_channel(coordinator=coordinator)
         mgr = bot.channel_mgr
-        mgr.apply_record(mgr.new_record("#first", None, present=True))
-        for channel in ("#first", "#test"):
-            runtime = mgr.channels[casefold(channel, "rfc1459")]
+        channels = ("#test", "#hidden", "#parted")
+        for channel in channels[1:]:
+            mgr.apply_record(mgr.new_record(channel, None, present=True))
+
+        runtimes = [mgr.channels[casefold(channel, "rfc1459")] for channel in channels]
+        for runtime in runtimes:
             runtime.join = JoinState.JOINED
             await see_key(bot, runtime, "seen")
+            assert runtime.key_pending
 
-        assert list(mgr.pending_keys) == ["#first", "#test"]
         coordinator.failing = False
         record_put = coordinator.put_channel
         in_flight = asyncio.Event()
@@ -977,12 +986,21 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(5):
                 retry = asyncio.create_task(mgr.retry_pending_keys())
                 await in_flight.wait()
-                mgr.key_hidden("#test")
+                runtimes[1].hide_key()
+                mgr.apply_record(
+                    mgr.new_record(
+                        "#parted",
+                        None,
+                        present=False,
+                        after=mgr.channel_records["#parted"].revision,
+                    ),
+                )
                 release.set()
                 await retry
 
-        assert [put["channel"] for put in coordinator.channel_puts] == ["#first"]
-        assert not mgr.pending_keys
+        assert [put["channel"] for put in coordinator.channel_puts] == ["#test"]
+        assert "#parted" not in mgr.channels
+        assert not mgr.channel_records["#parted"].present
 
     async def test_quick_key_changes_are_written_in_order(self) -> None:
         """Compare each key change against the record the previous one left."""

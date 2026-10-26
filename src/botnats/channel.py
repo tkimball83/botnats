@@ -53,11 +53,6 @@ class ChannelManager:
         # Channels no longer desired whose PART could not be sent yet; this
         # bot is still in them.
         self.pending_parts: dict[str, str] = {}
-        # ASCII-folded channel -> channel whose key, as this bot sees it on
-        # IRC, is not recorded yet: its write is queued, in flight, or failed.
-        # Each write takes the key seen at that moment, so a superseded change
-        # is never replayed.
-        self.pending_keys: dict[str, str] = {}
         # Key writes and their retries run one at a time, so each compares
         # against the record the previous write left.
         self.key_lock = asyncio.Lock()
@@ -94,11 +89,7 @@ class ChannelManager:
             # A record can carry an older key than one this bot saw on IRC and
             # has yet to record, even its own write landing late. Otherwise
             # the record knows best: IRC can hide a key change behind "*".
-            unrecorded = runtime.joined and any(
-                self.bot.caps.fold(channel) == folded
-                for channel in self.pending_keys.values()
-            )
-            if not unrecorded:
+            if not (runtime.joined and runtime.key_pending):
                 runtime.key = record.key
 
             if unparted:
@@ -164,29 +155,16 @@ class ChannelManager:
             elif runtime.names_due:
                 self.refresh_names(runtime)
 
-    def record_key(self, channel: str) -> None:
+    def record_key(self, runtime: ChannelRuntime) -> None:
         """Record the key this bot now sees on IRC in its durable record.
 
         The key is pending from this moment, not from when its write gets a
         turn: no record applied in between may replace it.
         """
-        self.pending_keys[casefold(channel, "ascii")] = channel
+        runtime.key_pending = True
         self.bot.tasks.spawn(self.retry_pending_keys(), "record-channel-key")
 
-    def key_hidden(self, channel: str) -> None:
-        """Drop a key this bot has yet to record once IRC hides a newer one.
-
-        Peers that see the new key record it, and with nothing pending here
-        their records set it.
-        """
-        folded = self.bot.caps.fold(channel)
-        self.pending_keys = {
-            source_key: pending
-            for source_key, pending in self.pending_keys.items()
-            if self.bot.caps.fold(pending) != folded
-        }
-
-    async def write_key(self, channel: str) -> bool:
+    async def write_key(self, runtime: ChannelRuntime) -> bool:
         """Write the key this bot sees on IRC now; return False on failure.
 
         A failed write is not applied locally, where it would shadow newer
@@ -194,17 +172,14 @@ class ChannelManager:
         failed or lost write is retried, and a key that changed while the
         write was in flight is written next.
         """
-        runtime = self.runtime(channel)
-        if runtime is not None and not self.key_recorded(runtime):
+        if not self.key_recorded(runtime):
             try:
-                await self.write_record(channel, runtime.key, present=True)
+                await self.write_record(runtime.channel, runtime.key, present=True)
             except PUBLISH_ERRORS:
                 return False
 
-            runtime = self.runtime(channel)
-
-        if runtime is None or self.key_recorded(runtime):
-            self.pending_keys.pop(casefold(channel, "ascii"), None)
+        if self.key_recorded(runtime):
+            runtime.key_pending = False
 
         return True
 
@@ -212,10 +187,14 @@ class ChannelManager:
         """Return whether the record holds the key this bot sees on IRC.
 
         A bot no longer in the channel sees no key; the peers still in it
-        observe the same MODE changes and record them.
+        observe the same MODE changes and record them. A channel parted
+        meanwhile is not written back.
         """
+        if not runtime.joined or self.runtime(runtime.channel) is not runtime:
+            return True
+
         record = self.channel_records[self.bot.caps.fold(runtime.channel)]
-        return not runtime.joined or record.key == runtime.key
+        return record.key == runtime.key
 
     async def write_record(
         self,
@@ -528,12 +507,9 @@ class ChannelManager:
     async def retry_pending_keys(self) -> None:
         """Write each pending key as this bot sees it on IRC now."""
         async with self.key_lock:
-            for source_key, channel in tuple(self.pending_keys.items()):
-                # A key hidden during an earlier write is no longer pending.
-                if source_key not in self.pending_keys:
-                    continue
-
-                if not await self.write_key(channel):
+            for runtime in tuple(self.channels.values()):
+                # Checked at its turn: IRC can hide a key during earlier writes.
+                if runtime.key_pending and not await self.write_key(runtime):
                     return
 
     def part(self, channel: str) -> None:
@@ -706,6 +682,10 @@ class ChannelRuntime:
     join_error: str | None = None
     join_sent_at: float = 0.0
     key: str | None = None
+    # A key seen on IRC that this bot has yet to record: its write is queued,
+    # in flight, or failed. Each write takes the key seen at that moment, so
+    # a superseded change is never replayed.
+    key_pending: bool = False
     limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
     modes: str = ""
@@ -741,6 +721,14 @@ class ChannelRuntime:
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""
         self.bans[self.caps.fold(mask)] = mask
+
+    def hide_key(self) -> None:
+        """Record a key change IRC hid: drop the key this bot has yet to record.
+
+        Peers that see the new key record it, and with nothing pending here
+        their records set it.
+        """
+        self.key_pending = False
 
     def member(self, nickname: str) -> ChannelMember:
         """Return the member for a nickname, creating one if absent."""
@@ -782,6 +770,7 @@ class ChannelRuntime:
         self.cooldowns.clear()
         self.join = JoinState.IDLE
         self.join_error = None
+        self.key_pending = False
         self.limit = None
         self.members.clear()
         self.modes = ""

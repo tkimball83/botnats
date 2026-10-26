@@ -205,7 +205,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.key = "irc-key"
-        bot.channel_mgr.pending_keys[casefold("#test", "ascii")] = "#test"
+        runtime.key_pending = True
         prefix = "owner!user@host.example"
         bot.sessions.queue(bot.authorizer.grant(prefix))
         outage = NatsError("NATS unavailable")
