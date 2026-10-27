@@ -126,6 +126,19 @@ class ConfigTests(unittest.TestCase):
 
         assert config.totp_secret == AUTH_KEY
 
+    def test_totp_secret_without_padding(self) -> None:
+        """Decode a base32 TOTP secret written without its trailing padding."""
+        key = AUTH_KEY + b"1"
+        encoded = base64.b32encode(key).decode()
+        assert encoded.endswith("=")
+
+        config = load_config(
+            json.loads(CONFIG),
+            BOTNATS_TOTP_SECRET=encoded.rstrip("="),
+        )
+
+        assert config.totp_secret == key
+
     def test_nickname_must_fit_registration(self) -> None:
         """Reject a nickname whose USER registration line exceeds 512 bytes."""
         with self.assertRaisesRegex(ValueError, "512 bytes"):

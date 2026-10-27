@@ -156,7 +156,7 @@ class ISupportState:
 
     def parse_prefix(self, value: str) -> None:
         """Map membership symbols to modes from an ISUPPORT PREFIX value."""
-        if value in {"", "()"}:
+        if not value:
             self.member_prefixes = {}
             self.membership_modes = ""
             self.op_mode = DEFAULT_OP_MODE
@@ -243,7 +243,7 @@ def format_message(
     trailing: str | None,
 ) -> bytes:
     """Encode an IRC command, parameters, and trailing text into bytes."""
-    if not command or not command.isascii() or not command.isalnum():
+    if not command.isascii() or not command.isalnum():
         msg = "IRC command contains unsupported characters"
         raise ValueError(msg)
 
