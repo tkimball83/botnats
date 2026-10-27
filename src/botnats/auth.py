@@ -58,16 +58,32 @@ class AuthFlow:
         # identity that is already gone.
         if counter is not None and claimed and bot.sessions.watched_valid(rendered):
             session = bot.authorizer.grant(rendered)
+            try:
+                synced = await bot.sessions.sync(session)
+            except asyncio.CancelledError:
+                # Shutdown cancels AUTH mid-write, before the check below can
+                # deny it, and its final flush would write the grant still
+                # queued. The cancelled write may already have landed, so
+                # only a revocation supersedes it.
+                revoked = bot.authorizer.revoke(rendered)
+                if revoked is not None:
+                    bot.sessions.queue(revoked)
+
+                raise
+
             # The identity must still hold after the write: IRC may have
             # disconnected while it waited on JetStream.
             if (
-                not await bot.sessions.sync(session)
+                not synced
                 or not bot.authorizer.authorized(rendered)
                 or not bot.sessions.watched_valid(rendered)
             ):
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
-                    await bot.sessions.sync(revoked)
+                    # Queued before waiting on the lock: shutdown may cancel
+                    # the wait, and its final flush writes only what is queued.
+                    bot.sessions.queue(revoked)
+                    await bot.sessions.retry()
 
                 bot.commands.reply(prefix.nick, "Authorization failed")
                 return

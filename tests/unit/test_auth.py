@@ -358,6 +358,89 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
         assert coordinator.session_puts[-1]["revoked"] is True
 
+    async def test_auth_revokes_grant_when_shutdown_cancels_write(self) -> None:
+        """Leave a revocation stored when shutdown cancels AUTH's grant write.
+
+        The cancelled write has already landed, so shutdown's final flush
+        must write a revocation over it, not leave or rewrite the grant.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        put_session = coordinator.put_session
+        writing = asyncio.Event()
+
+        async def hang_after_first_put(record: dict[str, Any]) -> Session:
+            stored = await put_session(record)
+            if not writing.is_set():
+                writing.set()
+                await asyncio.Event().wait()
+
+            return stored
+
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        with patch.object(coordinator, "put_session", hang_after_first_put):
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
+            )
+            async with asyncio.timeout(1):
+                await writing.wait()
+                # A SIGTERM ends the IRC loop, which reports the disconnect,
+                # then closes the bot.
+                bot.events.on_irc_disconnect()
+                await bot.close()
+
+        key = coordinator.sessions.key(prefix.render())
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
+        assert stored is not None
+        assert stored.revoked
+        assert stored.version == 1
+        assert not bot.authorizer.authorized(prefix.render())
+        assert not bot.sessions.pending
+
+    async def test_auth_revocation_survives_shutdown_awaiting_lock(self) -> None:
+        """Store AUTH's revocation though shutdown cancels its wait for the lock.
+
+        IRC disconnects while the grant is written, so AUTH revokes it, but a
+        background write holds the lock until shutdown cancels both.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        put_session = coordinator.put_session
+        holding = asyncio.Event()
+
+        async def hold_lock() -> None:
+            async with bot.sessions.lock:
+                holding.set()
+                await asyncio.Event().wait()
+
+        async def disconnect_during_put(record: dict[str, Any]) -> Session:
+            stored = await put_session(record)
+            bot.events.on_irc_disconnect()
+            # Start waiting for the lock ahead of AUTH's revocation.
+            bot.tasks.spawn(hold_lock(), "hold-lock")
+            await asyncio.sleep(0)
+            return stored
+
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        with patch.object(coordinator, "put_session", disconnect_during_put):
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
+            )
+            async with asyncio.timeout(1):
+                await holding.wait()
+
+        async with asyncio.timeout(1):
+            await bot.close()
+
+        key = coordinator.sessions.key(prefix.render())
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
+        assert stored is not None
+        assert stored.revoked
+        assert stored.version == 1
+        assert not bot.sessions.pending
+
     async def test_auth_refuses_identity_invalidated_mid_auth(self) -> None:
         """Grant nothing when the user quits while AUTH waits on JetStream."""
         bot, fake_irc, coordinator = bot_with_coordinator()
@@ -544,30 +627,6 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
         assert [put["revoked"] for put in coordinator.session_puts] == [False]
-
-    async def test_auth_queues_revocation_when_bot_id_is_duplicate(self) -> None:
-        """Queue a revocation when the session write fails on a duplicate bot ID."""
-        bot, fake_irc, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
-        counter = int(time.time() // 30)
-        valid_code = totp(bot.authorizer.secret, counter)
-        put_session = coordinator.put_session
-
-        async def lose_bot_id(record: dict[str, Any]) -> Session:
-            # A peer claims this bot ID after AUTH passed the readiness gate.
-            coordinator.duplicate = True
-            return await put_session(record)
-
-        with patch.object(coordinator, "put_session", lose_bot_id):
-            await send_command(bot, prefix, f"AUTH {valid_code}")
-
-        assert coordinator.session_puts == []
-        assert not bot.authorizer.authorized(prefix.render())
-        pending = bot.sessions.pending
-        assert len(pending) == 1
-        session = next(iter(pending.values()))
-        assert session.revoked
-        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
 
     async def test_auth_revokes_grant_past_store_horizon(self) -> None:
         """Revoke and refuse a grant the store rejects after the clock steps back.

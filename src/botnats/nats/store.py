@@ -218,7 +218,7 @@ class AttemptStore(KVStore):
 
                 try:
                     timestamp = float.fromhex(entry.value.decode())
-                except OverflowError, UnicodeDecodeError, ValueError:
+                except OverflowError, ValueError:
                     continue
 
                 if not math.isfinite(timestamp) or timestamp > cutoff:
