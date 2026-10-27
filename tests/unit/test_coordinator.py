@@ -1076,6 +1076,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             value=json.dumps(record).encode(),
         )
         kv, _ = watcher(entry, None)
+        # The occupant still holds the key when the replay ends.
+        kv.create = AsyncMock(side_effect=KeyWrongLastSequenceError)
+        kv.get = AsyncMock(return_value=entry)
         coordinator.presence_store.kv = kv
 
         with (
@@ -1281,13 +1284,34 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Verify a duplicate detected during replay is not resolved by the sentinel."""
         # Differs from the record's bot ID in case only: claims ignore case.
         coordinator = build_coordinator("Alpha")
-        kv, _ = watcher(presence_entry(), None)
+        entry = presence_entry()
+        kv, _ = watcher(entry, None)
+        # The occupant still holds the key when the replay ends.
+        kv.create = AsyncMock(side_effect=KeyWrongLastSequenceError)
+        kv.get = AsyncMock(return_value=entry)
         coordinator.presence_store.kv = kv
 
         with self.assertLogs("botnats.nats.claim", level="ERROR"):
             await coordinator.watch_presence(MagicMock())
 
         assert coordinator.claim.duplicate
+
+    async def test_watch_presence_reclaims_key_expired_after_replay(self) -> None:
+        """Resolve a replayed duplicate whose record expired before the replay ended."""
+        coordinator = build_coordinator("alpha")
+        # TTL expiry emits no watch event; creating the free key succeeds.
+        kv, _ = watcher(presence_entry(), None)
+        coordinator.presence_store.kv = kv
+
+        with self.assertLogs("botnats.nats.claim", level="INFO") as logs:
+            await coordinator.watch_presence(MagicMock())
+
+        assert [log.getMessage() for log in logs.records] == [
+            "duplicate bot ID detected: alpha",
+            "duplicate bot ID conflict resolved: alpha",
+        ]
+        assert coordinator.claim.owned
+        assert coordinator.claim.revision == CREATED_REVISION
 
     async def test_watch_presence_ignores_unsigned_record(self) -> None:
         """Verify an unsigned presence record cannot demote the owner."""
@@ -1344,13 +1368,33 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             operation="DEL",
             value=None,
         )
-        kv, _ = watcher(presence_entry(), None, delete_entry)
+        entry = presence_entry()
+        kv, _ = watcher(entry, None, delete_entry)
+        # The occupant holds the key until it is deleted.
+        kv.create = AsyncMock(
+            side_effect=[KeyWrongLastSequenceError, CREATED_REVISION],
+        )
+        kv.get = AsyncMock(return_value=entry)
         coordinator.presence_store.kv = kv
 
         with self.assertLogs("botnats.nats.claim", level="ERROR"):
             await coordinator.watch_presence(MagicMock())
 
         assert not coordinator.claim.duplicate
+        assert coordinator.claim.revision == CREATED_REVISION
+
+    async def test_watch_presence_recreates_own_deleted_key(self) -> None:
+        """Stop owning this bot's deleted key and create it again."""
+        coordinator = build_coordinator("alpha")
+        coordinator.claim.adopt(5)
+        deleted = SimpleNamespace(key="alpha", operation=KV_DEL, value=None)
+        kv, _ = watcher(None, deleted)
+        coordinator.presence_store.kv = kv
+
+        await coordinator.watch_presence(MagicMock())
+
+        kv.create.assert_awaited_once()
+        assert coordinator.claim.owned
         assert coordinator.claim.revision == CREATED_REVISION
 
     async def test_watch_restarts_on_transient_error(self) -> None:
@@ -1644,7 +1688,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert len(sessions.entries) == 1
 
     async def test_start_retries_failed_connection(self) -> None:
-        """Close and retry a connection whose setup failed, then start watches."""
+        """Close and retry a connection whose setup failed, even if closing fails."""
         coordinator = build_coordinator("alpha")
         steps: list[str] = []
 
@@ -1661,7 +1705,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         # nats-py retries the connect itself; a closed connection fails setup.
         failed = MagicMock(
-            close=step("close"),
+            close=step("close", OSError("connection reset")),
             is_connected=True,
             subscribe=step("subscribe", ConnectionClosedError()),
         )

@@ -598,12 +598,11 @@ class Coordinator:
         kv = await self.presence_store.open()
         watcher = await self.open_watcher(kv)
         try:
-            saw_conflict = False
             async for entry in watcher:
                 if entry is None:
-                    if not saw_conflict:
-                        await self.try_reclaim(self.claim.reclaim)
-
+                    # Yields to a duplicate the replay showed if it still
+                    # holds the key, and resolves it if it has expired since.
+                    await self.try_reclaim(self.claim.reclaim)
                     synced()
                     continue
 
@@ -615,12 +614,8 @@ class Coordinator:
                     continue
 
                 data = decode_record(entry.value)
-                if data is not None and self.observe_presence(
-                    entry.key,
-                    data,
-                    entry.revision,
-                ):
-                    saw_conflict = True
+                if data is not None:
+                    self.observe_presence(entry.key, data, entry.revision)
         finally:
             await watcher.stop()
 
@@ -629,24 +624,22 @@ class Coordinator:
         key: str,
         data: dict[str, Any],
         revision: int,
-    ) -> bool:
-        """Apply one presence update and report a duplicate identity."""
+    ) -> None:
+        """Apply one presence update, including one on this bot's own key."""
         if not self.presence_store.valid(key, data):
-            return False
+            return
 
-        duplicate = key == self.claim.key and self.claim.observe(
-            data["instance_id"],
-            revision,
-        )
+        if key == self.claim.key:
+            self.claim.observe(data["instance_id"], revision)
+
         try:
             presence = BotPresence.from_dict(data)
         except TypeError, ValueError:
             # A starting process claims its key before it knows its IRC
             # identity: a duplicate to detect, not yet a peer to record.
-            return duplicate
+            return
 
         self.callbacks.on_presence(presence)
-        return duplicate
 
     async def watch_sessions(self, synced: Callable[[], None]) -> None:
         """Watch the sessions KV bucket and report validated records by key."""
