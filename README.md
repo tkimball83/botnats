@@ -105,10 +105,13 @@ from deleting or overwriting existing bucket entries, so a hostile token holder
 can still churn state (for example, repeatedly clobbering a presence key to
 stall a bot's readiness). NATS wildcards match whole subject tokens and each
 bucket name is one token, so when the token is shared more widely, restrict the
-buckets by their concrete names via server permissions — for a network named
-`efnet`, `$KV.botnats_v1_efnet_presence.>`, and ideally the other four buckets
-too (`auth_attempts`, `channels`, `sessions`, and `used_totp` under the same
-`botnats_v1_efnet_` prefix).
+buckets by their concrete names via server permissions. For a network named
+`efnet`, deny `$KV.botnats_v1_efnet_presence.>` and the JetStream API subjects
+that purge, delete, or edit its backing stream
+(`$JS.API.STREAM.*.KV_botnats_v1_efnet_presence` and
+`$JS.API.STREAM.MSG.DELETE.KV_botnats_v1_efnet_presence`), and ideally the same
+for the other four buckets (`auth_attempts`, `channels`, `sessions`, and
+`used_totp` under the same `botnats_v1_efnet_` prefix).
 
 ## Health
 
