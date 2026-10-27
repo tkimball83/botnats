@@ -178,7 +178,7 @@ async def cluster_restart() -> None:
 
 
 async def recovery() -> None:
-    """Recover from a ban, a kick, and limits, and keep a session across a restart."""
+    """Recover from a ban, kick, limit, or invite-only; keep a session on restart."""
     await test_recovery.run(partial(compose, "restart"))
     await wait_ready("alpha")
 
