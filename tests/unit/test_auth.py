@@ -34,13 +34,13 @@ from tests.unit.helpers import (
 )
 
 
-def authorizer(issuer: str = "alpha", network: str = "efnet") -> TotpAuthorizer:
+def authorizer(issuer: str = "alpha") -> TotpAuthorizer:
     """Create a TotpAuthorizer with test credentials."""
     return TotpAuthorizer(
         AUTH_KEY,
         coordination_secret=COORDINATION_KEY,
         identity_fold=lambda value: casefold(value, "ascii"),
-        scope=(issuer, network),
+        scope=(issuer, "efnet"),
         session_ttl=30,
     )
 
@@ -1228,10 +1228,10 @@ class SessionSyncWatchTests(unittest.TestCase):
         bot.sessions.watched["first-key"] = (first, expiry)
         bot.sessions.watched["second-key"] = (second, expiry)
 
-        bot.callbacks.on_session_delete("first-key")
+        bot.sessions.forget("first-key")
 
         assert [s.prefix for s in bot.authorizer.records.values()] == [second]
         assert bot.authorizer.authorized(second)
 
-        bot.callbacks.on_session_delete("second-key")
+        bot.sessions.forget("second-key")
         assert not bot.authorizer.records

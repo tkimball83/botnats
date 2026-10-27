@@ -206,6 +206,23 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         assert not claim.owned
         assert claim.revision is None
 
+    async def test_lost_revision_drops_ownership_before_reclaim(self) -> None:
+        """Stop owning a key whose revision was lost even when reclaiming it fails."""
+        claim = build_claim()
+        claim.adopt(1)
+
+        with (
+            patch.object(claim.store, "update", AsyncMock(return_value=None)),
+            patch.object(
+                claim.store, "create", AsyncMock(side_effect=NatsError("down"))
+            ),
+            self.assertRaises(NatsError),
+        ):
+            await claim.put(PRESENCE)
+
+        assert not claim.owned
+        assert claim.revision is None
+
     def test_observe_own_record_adopts_newest_revision(self) -> None:
         """Adopt this instance's own watched record, never moving backwards."""
         claim = build_claim()

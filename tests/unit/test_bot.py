@@ -211,9 +211,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert bot.authorizer.authorized(session.prefix)
 
         bot.callbacks.on_presence_delete("BETA")
-        bot.callbacks.on_sessions_replayed(set())
+        bot.callbacks.on_session_delete("opaque")
 
         assert not bot.presence.has(peer)
+        assert not bot.sessions.watched
+        assert not bot.authorizer.authorized(session.prefix)
+
+        bot.callbacks.on_session_update("opaque", session, replaying=False)
+        assert bot.authorizer.authorized(session.prefix)
+        bot.callbacks.on_sessions_replayed(set())
+
         assert not bot.sessions.watched
         assert not bot.authorizer.authorized(session.prefix)
 
