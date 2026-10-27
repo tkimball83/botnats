@@ -118,8 +118,9 @@ async def command(session: IRCSession, bot: str, text: str) -> str:
     return response.params[-1]
 
 
-async def connect(address: str) -> IRCSession:
+async def connect() -> IRCSession:
     """Connect and register the integration-test IRC user."""
+    address = os.environ["BOTNATS_TEST_IRC_ADDRESS"]
     host, separator, raw_port = address.rpartition(":")
     if not separator:
         msg = f"invalid IRC address: {address!r}"
@@ -267,7 +268,7 @@ async def poll_until(
 
 async def run() -> None:
     """Exercise auth deduplication, session propagation, and channel convergence."""
-    session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
+    session = await connect()
     try:
         await wait_for_bots(session)
 

@@ -3,8 +3,6 @@
 
 """Verify a restarted bot rebuilds its channels, keys, and ops from the mesh."""
 
-import os
-
 from tests.integration.test_mesh import (
     BOTS,
     CHANNELS,
@@ -28,7 +26,7 @@ async def change_key(new_key: str) -> None:
     bot finds it once it is back.
     """
     channel, old_key = CHANNELS[1]
-    session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
+    session = await connect()
     try:
         await authenticate(session, "alpha", fresh_code())
         await join_as_operator(session, channel, old_key)
@@ -48,7 +46,7 @@ async def run(key: str = CHANNELS[1][1]) -> None:
     """Check the bots hold the keyed channel with ops and stay out of the parted one."""
     first, _ = CHANNELS[0]
     second, _ = CHANNELS[1]
-    session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
+    session = await connect()
     try:
         await wait_for_bots(session)
         # Joining with the key proves the channel still has it; a restarted
