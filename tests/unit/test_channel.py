@@ -184,6 +184,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.authorizer.authorized("nick[!~user@host.example")
         assert not bot.authorizer.authorized("nick{!~user@host.example")
 
+        # A casemapping this bot cannot fold by keeps the current one.
+        bot.channel_mgr.set_casemapping("rfc7613")
+
+        assert bot.caps.casemapping == "ascii"
+
     async def test_casemapping_change_keeps_joined_runtime(self) -> None:
         """Keep a joined channel's live state; the server sends no second JOIN."""
         bot = bot_with_channel(irc=FakeIRC())
@@ -1181,9 +1186,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
         assert mgr.last_revision < revision_number(peer.revision)
 
-        assert await mgr.write_record("#test", None, present=False)
+        assert await mgr.write_record("#Test", None, present=False)
 
-        assert fake_irc.sent == [("PART", ("#test",))]
+        assert fake_irc.sent == [("PART", ("#Test",))]
         assert mgr.runtime("#test") is None
         record = mgr.channel_records[casefold("#test", "rfc1459")]
         assert not record.present
@@ -1401,7 +1406,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         peers = (
             BotPresence("beta-id", "beta.host", "one", "beta", "~beta"),
             BotPresence("gamma-id", "gamma.host", "two", "gamma", "~gamma"),
-            BotPresence("delta-id", "delta.host", "three", "delta", "~delta"),
+            BotPresence("delta-id", "delta.host", "three", "Delta", "~delta"),
         )
         for peer in peers:
             bot.presence.update(peer)
@@ -1437,17 +1442,19 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
 
         peers = (
-            BotPresence("beta-id", "beta.host", "one", "beta", "~beta"),
-            BotPresence("gamma-id", "gamma.host", "two", "gamma", "~gamma"),
+            BotPresence("beta-id", "beta.host", "one", "Beta", "~beta"),
+            BotPresence("gamma-id", "gamma.host", "two", "Gamma", "~gamma"),
         )
         for peer in peers:
             bot.presence.update(peer)
-            runtime.member(peer.nick).prefix = Prefix(peer.nick, peer.user, peer.host)
+            # IRC shows each member in another case than its presence.
+            nick = peer.nick.lower()
+            runtime.member(nick).prefix = Prefix(nick, peer.user, peer.host)
             bot.channel_mgr.op_peer("#test", peer)
 
         assert fake_irc.modes == [
-            ("#test", "+o", ("beta",)),
-            ("#test", "+o", ("gamma",)),
+            ("#test", "+o", ("Beta",)),
+            ("#test", "+o", ("Gamma",)),
         ]
 
     async def test_op_requires_matching_host(self) -> None:

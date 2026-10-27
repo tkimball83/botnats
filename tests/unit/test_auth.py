@@ -386,6 +386,35 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
         assert coordinator.session_puts == []
 
+    async def test_quit_invalidates_queued_auth(self) -> None:
+        """Refuse an AUTH that was still queued behind another command at QUIT.
+
+        The earlier command's watch ends first; that must not clear the
+        invalidation the QUIT left for the AUTH still queued.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        counter = int(time.time() // TOTP_PERIOD)
+        valid_code = totp(bot.authorizer.secret, counter)
+
+        async with asyncio.timeout(1):
+            # The held lock keeps both commands queued while their sender quits.
+            async with bot.events.command_lock:
+                for text in ("XYZZY", f"AUTH {valid_code}"):
+                    bot.events.on_irc_message(
+                        IRCMessage("PRIVMSG", ("alpha", text), prefix),
+                    )
+
+                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+
+            await asyncio.gather(*tuple(bot.tasks))
+
+        # The code was valid and claimed; only the QUIT refused it.
+        assert coordinator.claim_requests == [counter]
+        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert not bot.authorizer.authorized(prefix.render())
+        assert not bot.sessions.watched_identities
+
     async def test_queued_auth_stays_invalid_after_sender_returns(self) -> None:
         """Refuse a queued AUTH whose sender quit and returned as the same prefix.
 
