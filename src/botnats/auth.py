@@ -246,13 +246,11 @@ class SessionSync:
     async def sync(self, session: Session) -> bool:
         """Queue and write one mutation now.
 
-        Returns whether nothing remains unwritten for its identity; a queued
-        revocation that outranks the session drops it.
+        Returns whether nothing remained unwritten for its identity once its
+        write finished; a queued revocation that outranks the session drops it.
         """
         async with self.lock:
-            key = self.queue(session)
-            await self.drain()
-            return key not in self.pending
+            return await self.drain(self.queue(session))
 
     async def retry(self) -> None:
         """Retry queued writes that failed while JetStream was unavailable."""
@@ -268,15 +266,24 @@ class SessionSync:
             self.queue(revoked)
             self.tasks.spawn(self.retry(), "session-sync")
 
-    async def drain(self) -> None:
+    async def drain(self, key: str | None = None) -> bool:
         """Write queued mutations in order while holding the lock.
 
         Each entry is read when its turn comes: revoke() may replace one
         during an earlier write, and the superseded one must not be written.
+        Returns whether key's write left nothing queued for it, checked
+        before later writes: the watch may meanwhile deliver an older record
+        for key and queue the record just written to write back.
         """
+        settled = False
         for identity in tuple(self.pending):
             if not await self.write(identity, self.pending[identity]):
-                return
+                break
+
+            if identity == key:
+                settled = key not in self.pending
+
+        return settled
 
     async def write(self, identity: str, session: Session) -> bool:
         """Write one queued mutation; re-queue a revocation that met a newer grant.
