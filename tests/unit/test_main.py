@@ -99,6 +99,26 @@ class MainTests(unittest.TestCase):
         run_loop.assert_called_once_with(run_bot.return_value)
         assert basic_config.call_args.kwargs["level"] == logging.DEBUG
 
+    def test_sigterm_exits_cleanly(self) -> None:
+        """Return normally when SIGTERM cancels the bot, as docker stop does."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bot.json")
+            path.write_bytes(CONFIG)
+            with (
+                patch.object(sys, "argv", ["botnats", "--config", str(path)]),
+                patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": "INFO"}),
+                patch("botnats.__main__.logging.basicConfig"),
+                # The SIGTERM handler cancels the main task; asyncio.run raises.
+                patch(
+                    "botnats.__main__.asyncio.run",
+                    side_effect=asyncio.CancelledError,
+                ) as run_loop,
+                patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
+            ):
+                main()
+
+        run_loop.assert_called_once_with(run_bot.return_value)
+
 
 class RunTests(unittest.IsolatedAsyncioTestCase):
     """Tests for running one configured bot until termination."""

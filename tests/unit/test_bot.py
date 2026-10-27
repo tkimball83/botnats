@@ -16,8 +16,10 @@ from botnats.bot import Bot
 from botnats.channel import JoinState
 from botnats.irc.client import IRCClient, IRCClientConfig, IRCServer
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
+from botnats.nats.coordinator import Coordinator, NATSConfig
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
+    NATS_CREDENTIAL,
     FailingWriteCoordinator,
     FakeCoordinator,
     FakeIRC,
@@ -72,6 +74,37 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                     servers=(server,),
                     verify_tls=verify,
                 )
+
+    async def test_components_from_config(self) -> None:
+        """Build auth, presence, health, and NATS components from configuration."""
+        bot = Bot(
+            replace(
+                config(),
+                auth_session_ttl=600,
+                health_port=9080,
+                jetstream_replicas=3,
+                nats_monitor_port=9222,
+                network="libera",
+                presence_ttl=10,
+            ),
+        )
+
+        assert bot.authorizer.session_ttl == 600
+        assert bot.authorizer.network == "libera"
+        assert bot.presence.ttl == 10
+        assert bot.health_check.port == 9080
+        assert isinstance(bot.coordinator, Coordinator)
+        assert bot.coordinator.config == NATSConfig(
+            instance_id=bot.identity.instance_id,
+            monitor_port=9222,
+            network="libera",
+            presence_ttl=10,
+            replicas=3,
+            servers=("nats://nats.internal:4222",),
+            session_ttl=600,
+            token=NATS_CREDENTIAL,
+        )
+        assert bot.coordinator.envelope.bot_id == "alpha-id"
 
     async def test_close_reaps_task_spawned_during_shutdown(self) -> None:
         """Drain a task a coordinator callback spawns mid-shutdown."""
@@ -251,7 +284,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             put_channel.assert_awaited_once()
 
     async def test_run_does_not_wait_for_coordinator(self) -> None:
-        """Serve IRC while coordinator startup blocks on an outage."""
+        """Serve IRC while coordinator startup blocks on an outage, then close."""
         bot, fake_irc, coordinator = bot_with_coordinator()
         coordinator_started = asyncio.Event()
 
@@ -265,12 +298,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(coordinator, "start", blocked_start),
             patch.object(fake_irc, "run_forever", run_forever),
-            patch.object(bot.health_check, "start", AsyncMock()),
+            patch.object(bot.health_check, "start", AsyncMock()) as health_start,
             patch.object(bot.health_check, "close", AsyncMock()),
         ):
             # run() returns only once run_forever has run beside the blocked start.
             async with asyncio.timeout(5):
                 await bot.run()
+
+        health_start.assert_awaited_once()
+        # close() cancelled the blocked start and both maintenance loops.
+        assert not bot.tasks
 
     async def test_ready(self) -> None:
         """Verify readiness requires IRC registration, connection, and NATS."""
@@ -362,6 +399,22 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         ):
             async with asyncio.timeout(5):
                 await bot.run()
+
+    async def test_requests_missing_op(self) -> None:
+        """Ask peers again for op in a joined channel where this bot lacks it."""
+        bot, _, coordinator = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        bot.identity.registered = True
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha")
+        runtime.member("beta").modes.add("o")
+
+        await bot.maintenance_tick()
+
+        assert [kind for kind, _ in coordinator.help_requests] == ["op"]
 
     async def test_prunes_expired_sessions_while_disconnected(self) -> None:
         """Remove expired auth sessions even while IRC is disconnected."""
