@@ -195,8 +195,7 @@ class Coordinator:
         for task in tasks:
             task.cancel()
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def close(self) -> None:
         """Close the NATS connection and cancel watches."""
@@ -208,7 +207,7 @@ class Coordinator:
         for store in self.stores:
             store.reset()
 
-        if nc is not None and not nc.is_closed:
+        if nc is not None:
             await nc.close()
 
     @property

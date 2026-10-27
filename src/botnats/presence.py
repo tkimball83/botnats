@@ -14,7 +14,7 @@ from botnats.irc.protocol import Prefix
 from botnats.nats.store import PUBLISH_ERRORS
 
 if TYPE_CHECKING:
-    from botnats.irc.protocol import IRCProtocol
+    from botnats.irc.protocol import IRCSender
     from botnats.nats.coordinator import PresenceWriter
 
 IDENTITY_RETRY_ATTEMPTS = 5
@@ -112,7 +112,7 @@ class SelfIdentity:
         bot_id: str,
         coordinator: PresenceWriter,
         instance_id: str,
-        irc: IRCProtocol,
+        irc: IRCSender,
     ) -> None:
         self.bot_id = bot_id
         self.coordinator = coordinator

@@ -581,6 +581,21 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         )
         assert client.outbound.empty()
 
+    async def test_cap_new_with_full_queue_keeps_session(self) -> None:
+        """Drop a CAP NEW request that finds the send queue full, not the session."""
+        client = self.cap_client(negotiating=False)
+        client.outbound = asyncio.Queue(maxsize=1)
+        client.outbound.put_nowait(b"JOIN #queued\r\n")
+        raw = b":server CAP alpha NEW :chghost\r\n"
+
+        result = await client.dispatch_line(
+            parse_message(raw.decode()), raw, mock_writer(), "token"
+        )
+
+        assert result == "token"
+        assert client.outbound.get_nowait() == b"JOIN #queued\r\n"
+        assert client.outbound.empty()
+
     async def test_close_drops_socket_with_unsent_bytes(self) -> None:
         """Shut down at once and release the writer, though bytes stay unsent.
 

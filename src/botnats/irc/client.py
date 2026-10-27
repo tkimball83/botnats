@@ -234,7 +234,9 @@ class IRCClient:
         elif subcommand == "NEW":
             wanted = DESIRED_CAPS & caps
             if wanted:
-                self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
+                # A full send queue is temporary; it must not end the session.
+                with suppress(ConnectionError):
+                    self.send("CAP", "REQ", trailing=" ".join(sorted(wanted)))
         elif subcommand in {"ACK", "NAK"} and self.cap_negotiating and self.cap_ls_done:
             # End only once the LS phase has issued its REQ; a NEW-triggered
             # ACK arriving mid-LS must not cut the initial exchange short.

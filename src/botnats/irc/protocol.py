@@ -49,10 +49,27 @@ class IRCMessage:
     prefix: Prefix | None = None
 
 
-class IRCProtocol(Protocol):
-    """Interface for IRC client implementations."""
+class IRCSender(Protocol):
+    """Sends commands as this bot's current nick, reconnecting on demand."""
 
     current_nick: str
+
+    def reconnect(self) -> None:
+        """Force a reconnection."""
+        ...
+
+    def send(
+        self,
+        command: str,
+        *params: str,
+        trailing: str | None = None,
+    ) -> None:
+        """Enqueue an IRC command."""
+        ...
+
+
+class IRCProtocol(IRCSender, Protocol):
+    """Interface for IRC client implementations."""
 
     async def close(self) -> None:
         """Close the connection."""
@@ -67,21 +84,8 @@ class IRCProtocol(Protocol):
         """Return whether a nickname identifies this client."""
         ...
 
-    def reconnect(self) -> None:
-        """Force a reconnection."""
-        ...
-
     async def run_forever(self) -> None:
         """Maintain a persistent connection."""
-        ...
-
-    def send(
-        self,
-        command: str,
-        *params: str,
-        trailing: str | None = None,
-    ) -> None:
-        """Enqueue an IRC command."""
         ...
 
 
