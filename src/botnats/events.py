@@ -155,7 +155,9 @@ class IRCEventHandler:
 
         channel = message.params[1]
         runtime = self.bot.channel_mgr.runtime(channel)
-        if runtime is None:
+        # A query answered after a KICK or PART shows the channel as a
+        # non-member sees it, without its key.
+        if runtime is None or not runtime.joined:
             return
 
         # A channel without modes shows a bare "+"; no modes are tracked as "".

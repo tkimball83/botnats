@@ -577,8 +577,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_bad_key_refusal_takes_the_stored_key(self) -> None:
         """Join with a peer's recorded key once the server refuses this bot's.
 
-        The record arrived while this bot had a key of its own pending, and
-        the change that followed was hidden as "*".
+        The peer's record, spelling the channel its own way, arrived while
+        this bot had a key of its own pending, and the change that followed
+        was hidden as "*".
         """
         bot, fake_irc, _ = bot_with_coordinator(FailingWriteCoordinator())
         bot.identity.current = BotPresence(
@@ -591,7 +592,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "A"), op))
         mgr.apply_record(
             mgr.new_record(
-                "#test", "B", present=True, after=mgr.channel_records[folded].revision
+                "#Test", "B", present=True, after=mgr.channel_records[folded].revision
             ),
         )
         bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "*"), op))
@@ -604,7 +605,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         mgr.safe_join(runtime)
 
-        assert fake_irc.sent == [("JOIN", ("#test", "A")), ("JOIN", ("#test", "B"))]
+        assert fake_irc.sent == [("JOIN", ("#Test", "A")), ("JOIN", ("#Test", "B"))]
 
     async def test_mode_enforce_once_on_op_with_unset(self) -> None:
         """Verify one enforcement when a single MODE ops the bot and unsets."""
@@ -903,6 +904,38 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             old_prefix.render()
         ]
 
+    async def test_nick_only_prefix_skips_members_awaiting_who(self) -> None:
+        """Revoke from another channel's member when NAMES alone lists one.
+
+        A member WHO has not described yet has no user or host to complete a
+        nick-only QUIT, NICK, or CHGHOST prefix from.
+        """
+        owner = Prefix("owner", "user", "host.example")
+        for message in (
+            IRCMessage("QUIT", ("bye",), Prefix("Owner")),
+            IRCMessage("NICK", ("newowner",), Prefix("Owner")),
+            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("Owner")),
+        ):
+            with self.subTest(command=message.command):
+                bot, _, coordinator = bot_with_coordinator()
+                bot.authorizer.grant(owner.render())
+                mgr = bot.channel_mgr
+                mgr.apply_record(mgr.new_record("#other", None, present=True))
+                # Seen first, as listed by NAMES; WHO has not answered yet.
+                mgr.channels[casefold("#test", "rfc1459")].member("owner")
+                mgr.channels[casefold("#other", "rfc1459")].member(
+                    "owner"
+                ).prefix = owner
+
+                with self.assertNoLogs("botnats", level="ERROR"):
+                    bot.events.on_irc_message(message)
+                    await drain_session_writes(bot)
+
+                assert not bot.authorizer.authorized(owner.render())
+                assert [
+                    (put["prefix"], put["revoked"]) for put in coordinator.session_puts
+                ] == [(owner.render(), True)]
+
     async def test_mode_key_unusable(self) -> None:
         """Ignore a key no JOIN could send, and record nothing for it."""
         bot, _, coordinator = bot_with_coordinator()
@@ -996,6 +1029,29 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert [p["key"] for p in coordinator.channel_puts] == ["new-key"]
         record = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
         assert record.key == "new-key"
+
+    async def test_channel_modes_ignored_after_kick(self) -> None:
+        """Keep the key when a mode query is answered after a KICK.
+
+        The server shows the channel to a non-member without its key, so
+        taking that reply would send the next JOIN without one.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        mgr = bot.channel_mgr
+        await mgr.write_record("#test", "secret", present=True)
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+
+        bot.events.on_irc_message(
+            IRCMessage("KICK", ("#test", "alpha"), Prefix("op", "~op", "op.host")),
+        )
+        bot.events.on_irc_message(IRCMessage("324", ("alpha", "#test", "+nt")))
+        await settle(bot)
+        mgr.join_desired()
+
+        assert fake_irc.sent == [("JOIN", ("#test", "secret"))]
 
     async def test_op_gain_requeries_channel_modes(self) -> None:
         """Once opped, query modes for a hidden key and enforce them, once."""

@@ -1340,8 +1340,16 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         delays: list[float] = []
         both_waiting = asyncio.Event()
         release = asyncio.Event()
+        real_sleep = asyncio.sleep
 
         async def gated_sleep(delay: float) -> None:
+            # The patch reaches every caller of asyncio.sleep: hold only the
+            # help delay, and let settle() yield as usual.
+            task = asyncio.current_task()
+            if task is None or task.get_name() != "peer-help":
+                await real_sleep(delay)
+                return
+
             delays.append(delay)
             if len(delays) == len(peers):
                 both_waiting.set()
