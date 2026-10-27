@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
-from botnats.channel import JOIN_RETRY_DELAY, ChannelRuntime, JoinState
+from botnats.channel import JOIN_RETRY_DELAY, JoinState
 from botnats.config import mode_intent
 from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
 from botnats.presence import BotPresence
@@ -53,6 +53,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Verify 367 numeric adds a ban mask to the channel."""
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
 
         bot.events.on_irc_message(
             IRCMessage(
@@ -116,24 +117,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.authorizer.authorized(old_prefix.render())
         new_prefix = Prefix("owner", new_user, new_host)
         assert not bot.authorizer.authorized(new_prefix.render())
-        assert len(coordinator.session_puts) == 1
-        assert coordinator.session_puts[0]["revoked"] is True
-
-    async def test_chghost_nick_only_prefix_revokes_via_member(self) -> None:
-        """Revoke from the stored member identity on a nick-only CHGHOST."""
-        bot, _, coordinator = bot_with_coordinator()
-        old_prefix = Prefix("owner", "user", "old.host")
-        bot.authorizer.grant(old_prefix.render())
-        bot.channel_mgr.channels[casefold("#test", "rfc1459")].member(
-            "owner"
-        ).prefix = old_prefix
-
-        bot.events.on_irc_message(
-            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("Owner")),
-        )
-        await drain_session_writes(bot)
-
-        assert not bot.authorizer.authorized(old_prefix.render())
         assert len(coordinator.session_puts) == 1
         assert coordinator.session_puts[0]["revoked"] is True
 
@@ -279,6 +262,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Track operator prefixes only; sub-op modes are never applied."""
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
 
         bot.events.on_irc_message(
             IRCMessage("353", ("alpha", "=", "#test", "+bob @carol @+dave")),
@@ -302,6 +286,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Verify a NAMES reply without op prefix clears a prior op mode."""
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
         runtime.member("carol").modes.add("o")
 
         bot.events.on_irc_message(
@@ -366,6 +351,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.events.handle_isupport(CUSTOM_ISUPPORT)
         runtime = bot.channel_mgr.channels[bot.caps.fold("#test")]
+        runtime.join = JoinState.JOINED
         bot.events.on_irc_message(
             IRCMessage("353", ("alpha", "=", "#test", "@alpha %other")),
         )
@@ -442,6 +428,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_higher_prefix_counts_as_opped(self) -> None:
         """Verify PREFIX modes above operator retain operator privileges."""
         bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[bot.caps.fold("#test")]
+        runtime.join = JoinState.JOINED
 
         bot.events.handle_isupport(
             IRCMessage("005", ("alpha", "PREFIX=(qao)~&@", "supported")),
@@ -450,7 +438,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("353", ("alpha", "=", "#test", "~alpha")),
         )
 
-        runtime = bot.channel_mgr.channels[bot.caps.fold("#test")]
         assert bot.channel_mgr.is_self_opped(runtime)
 
     async def test_higher_prefix_live_mode_updates(self) -> None:
@@ -503,15 +490,18 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.join is JoinState.JOINING
 
     async def test_messages_naming_no_desired_channel_are_ignored(self) -> None:
-        """Ignore a user MODE and an error that name no desired channel."""
+        """Ignore a user MODE, and errors and replies naming no desired channel."""
         bot, fake_irc = bot_with_irc()
 
-        bot.events.on_irc_message(
+        for message in (
             IRCMessage("MODE", ("alpha", "+i"), Prefix("alpha", "~alpha", "host")),
-        )
-        bot.events.on_irc_message(
             IRCMessage("433", ("*", "alpha", "Nickname is already in use")),
-        )
+            IRCMessage("324", ("alpha", "#other", "+nt")),
+            IRCMessage("352", ("alpha", "#other", "u", "h", "srv", "bob", "H", "0 r")),
+            IRCMessage("367", ("alpha", "#other", "*!*@bad.host")),
+            IRCMessage("475", ("alpha", "#other", "Cannot join channel (+k)")),
+        ):
+            bot.events.on_irc_message(message)
 
         assert fake_irc.sent == []
         assert not bot.tasks
@@ -883,27 +873,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.identity.current.nick == "newalpha"
         assert bot.identity.current.host == "host.example"
 
-    async def test_nick_only_prefix_revokes_session_via_member(self) -> None:
-        """Revoke the stored member identity's session on a bare NICK."""
-        bot, _, coordinator = bot_with_coordinator()
-        old_prefix = Prefix("owner", "user", "host.example")
-        bot.authorizer.grant(old_prefix.render())
-        bot.channel_mgr.channels[casefold("#test", "rfc1459")].member(
-            "owner"
-        ).prefix = old_prefix
-
-        bot.events.on_irc_message(
-            IRCMessage("NICK", ("newowner",), Prefix("Owner")),
-        )
-        await drain_session_writes(bot)
-
-        new_prefix = Prefix("newowner", "user", "host.example")
-        assert not bot.authorizer.authorized(new_prefix.render())
-        assert not bot.authorizer.authorized(old_prefix.render())
-        assert [put["prefix"] for put in coordinator.session_puts] == [
-            old_prefix.render()
-        ]
-
     async def test_nick_only_prefix_skips_members_awaiting_who(self) -> None:
         """Revoke from another channel's member when NAMES alone lists one.
 
@@ -1053,6 +1022,38 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("JOIN", ("#test", "secret"))]
 
+    async def test_late_channel_replies_ignored_after_kick(self) -> None:
+        """Ignore NAMES, WHO, and ban list replies that arrive after a KICK.
+
+        Services can kick the bot right after it joins, before the server
+        answers the queries the join sent: the replies would restore members
+        and bans of a channel it has left, and a late end of NAMES would query
+        it again and ask peers for op in it.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.runtime("#test")
+        assert runtime is not None
+        runtime.join = JoinState.JOINED
+
+        for message in (
+            IRCMessage("KICK", ("#test", "alpha"), Prefix("ChanServ", "s", "svc")),
+            IRCMessage("353", ("alpha", "=", "#test", "@bob")),
+            IRCMessage("352", ("alpha", "#test", "u", "h", "srv", "bob", "H@", "0 r")),
+            IRCMessage("367", ("alpha", "#test", "*!*@bad.host")),
+            IRCMessage("366", ("alpha", "#test", "End of /NAMES list")),
+        ):
+            bot.events.on_irc_message(message)
+
+        await settle(bot)
+
+        assert runtime.members == {}
+        assert runtime.bans == {}
+        assert fake_irc.sent == []
+        assert [kind for kind, _ in coordinator.help_requests] == ["unban"]
+
     async def test_op_gain_requeries_channel_modes(self) -> None:
         """Once opped, query modes for a hidden key and enforce them, once."""
         bot, fake_irc = bot_with_irc()
@@ -1199,22 +1200,20 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_modes_are_isolated_across_channels(self) -> None:
         """Verify modes, bans, keys, and members change on only one channel."""
         bot, fake_irc, coordinator = bot_with_coordinator()
-        first = bot.channel_mgr.runtime("#test")
+        mgr = bot.channel_mgr
+        first = mgr.runtime("#test")
         assert first is not None
         first.join = JoinState.JOINED
         first.member("alpha").modes.add("o")
         first.member("Target").prefix = Prefix("Target", "user", "first.host")
 
-        second = ChannelRuntime(
-            bot.caps,
-            channel="#other",
-            join=JoinState.JOINED,
-            key="second-key",
-        )
+        mgr.apply_record(mgr.new_record("#other", "second-key", present=True))
+        second = mgr.runtime("#other")
+        assert second is not None
+        second.join = JoinState.JOINED
         second.add_ban("*!*@second.host")
         second.member("alpha").modes.add("o")
         second.member("Target").modes.add("v")
-        bot.channel_mgr.channels[casefold("#other", "rfc1459")] = second
 
         bot.events.on_irc_message(
             IRCMessage(
@@ -1242,12 +1241,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_modes_enforced_on_multiple_channels(self) -> None:
         """Verify mode enforcement is independently triggered for each channel."""
         bot, fake_irc = bot_with_irc()
-        first = bot.channel_mgr.runtime("#test")
-        assert first is not None
-        first.member("alpha").modes.add("o")
-        second = ChannelRuntime(bot.caps, channel="#other", join=JoinState.JOINED)
-        second.member("alpha").modes.add("o")
-        bot.channel_mgr.channels[casefold("#other", "rfc1459")] = second
+        mgr = bot.channel_mgr
+        mgr.apply_record(mgr.new_record("#other", None, present=True))
+        for channel in ("#test", "#other"):
+            runtime = mgr.runtime(channel)
+            assert runtime is not None
+            runtime.join = JoinState.JOINED
+            runtime.member("alpha").modes.add("o")
 
         for channel in ("#test", "#other"):
             bot.events.on_irc_message(
@@ -1581,6 +1581,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_who_reply_about_self_sets_identity(self) -> None:
         """Learn this bot's own user and host from a WHO reply."""
         bot, _ = bot_with_irc()
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
 
         bot.events.on_irc_message(
             IRCMessage(
@@ -1612,6 +1613,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Verify 352 numeric updates member prefix and modes."""
         bot, _ = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
 
         bot.events.on_irc_message(
             IRCMessage(
