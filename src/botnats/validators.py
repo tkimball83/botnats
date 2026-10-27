@@ -4,7 +4,7 @@
 """Validation of IRC names and keys, server URLs, and durable channel records."""
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from botnats.irc.protocol import format_message
@@ -75,12 +75,8 @@ def validate_channel_revision(value: object) -> str:
     return value
 
 
-def parse_channel_record(value: object) -> ChannelFields:
+def parse_channel_record(value: dict[str, Any]) -> ChannelFields:
     """Validate and extract a durable channel record."""
-    if not isinstance(value, dict):
-        msg = "channel record must be an object"
-        raise TypeError(msg)
-
     channel = value.get("channel")
     key = value.get("key")
     present = value.get("present")

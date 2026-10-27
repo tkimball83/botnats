@@ -546,6 +546,26 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert len(coordinator.session_puts) == 1
         assert not bot.sessions.watched_identities
 
+    async def test_quit_without_queued_command_leaves_no_watch(self) -> None:
+        """Grant an AUTH sent after a QUIT that had no command to invalidate.
+
+        A QUIT must not start a watch: every user's QUIT would leave one
+        behind, and its flag would refuse the AUTH of a user who reconnects
+        as the same prefix.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+        assert not bot.sessions.watched_identities
+        await send_command(bot, prefix, f"AUTH {valid_code}")
+
+        assert bot.authorizer.authorized(prefix.render())
+        assert fake_irc.privmsgs == [("owner", "Authorized")]
+        assert len(coordinator.session_puts) == 1
+        assert not bot.sessions.watched_identities
+
     async def test_auth_success_grants_session(self) -> None:
         """Grant a session for a valid TOTP code, then op the user where opped."""
         bot, fake_irc, coordinator = bot_with_coordinator()
@@ -980,19 +1000,19 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
     async def test_revocation_uses_session_prefix_across_case_folding(self) -> None:
         """File a revocation under its session's prefix, not the observed one.
 
-        Under rfc1459, foo[ and foo{ fold together, so a QUIT seen as foo{
-        revokes the session granted to foo[. The store keys a record by its
-        own prefix, so only a revocation carrying foo[ replaces that session's
-        durable record.
+        Under rfc1459, foo{ and foo[ fold together, so a QUIT seen as foo[
+        revokes the session granted to foo{; an ASCII fold would miss it. The
+        store keys a record by its own prefix, so only a revocation carrying
+        foo{ replaces that session's durable record.
         """
         bot, _, coordinator = bot_with_coordinator()
-        assert await bot.sessions.sync(bot.authorizer.grant("foo[!u@h"))
+        assert await bot.sessions.sync(bot.authorizer.grant("foo{!u@h"))
 
-        bot.sessions.revoke(Prefix("foo{", "u", "h"))
+        bot.sessions.revoke(Prefix("foo[", "u", "h"))
         await drain_session_writes(bot)
 
         puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
-        assert puts == [("foo[!u@h", False), ("foo[!u@h", True)]
+        assert puts == [("foo{!u@h", False), ("foo{!u@h", True)]
         assert not bot.sessions.pending
 
     async def test_requeued_revocation_does_not_block_later_writes(self) -> None:
@@ -1350,8 +1370,8 @@ class SessionSyncWatchTests(unittest.TestCase):
     def test_session_delete_keeps_colliding_live_identity(self) -> None:
         """Delete only the ASCII durable identity represented by a KV key."""
         bot, _ = bot_with_irc()
-        first = "Owner[!user@host"
-        second = "Owner{!user@host"
+        first = "Owner{!user@host"
+        second = "Owner[!user@host"
         # The prefixes collide under the IRC fold but not under the ASCII fold.
         assert bot.caps.fold_identity(first) == bot.caps.fold_identity(second)
         assert casefold(first, "ascii") != casefold(second, "ascii")
@@ -1368,5 +1388,6 @@ class SessionSyncWatchTests(unittest.TestCase):
         assert [s.prefix for s in bot.authorizer.records.values()] == [second]
         assert bot.authorizer.authorized(second)
 
+        # The live session is held under second's IRC fold, not its ASCII fold.
         bot.sessions.forget("second-key")
         assert not bot.authorizer.records

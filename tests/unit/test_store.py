@@ -10,7 +10,7 @@ import re
 import time
 import unittest
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from nats.errors import Error as NatsError
@@ -834,8 +834,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         record = channel_record(1)
         assert channels.parse(key, record) is not None
 
-        malformed: dict[str, object] = {
-            "not an object": ["#test"],
+        malformed: dict[str, dict[str, object]] = {
             "non-string channel": {**record, "channel": ["#test", "#other"]},
             "missing key": {k: v for k, v in record.items() if k != "key"},
             "non-string key": {**record, "key": 5},
@@ -843,7 +842,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         }
         for label, value in malformed.items():
             with self.subTest(label):
-                assert channels.parse(key, cast("dict[str, Any]", value)) is None
+                assert channels.parse(key, value) is None
 
     async def test_channel_parse_rejects_unusable_key(self) -> None:
         """Reject a correctly signed record whose channel key IRC cannot use."""
