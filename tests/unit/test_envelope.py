@@ -88,13 +88,6 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "size limit"):
             envelope.encode(SUBJECT, {"big": "x" * 262_144})
 
-    def test_encode_rejects_reserved_field(self) -> None:
-        """Verify encoding rejects payloads containing the reserved subject field."""
-        envelope = Envelope("alpha", COORDINATION_KEY)
-
-        with self.assertRaisesRegex(ValueError, "reserved"):
-            envelope.encode(SUBJECT, {"_botnats_subject": "spoofed"})
-
     def test_envelope_security(self) -> None:
         """Verify envelope signing, replay rejection, and tamper detection."""
         key = COORDINATION_KEY

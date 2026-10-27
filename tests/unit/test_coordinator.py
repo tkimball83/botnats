@@ -22,7 +22,7 @@ from nats.js.kv import KV_DEL
 
 from botnats.channel import ChannelRecord
 from botnats.nats.claim import PresenceState
-from botnats.nats.coordinator import Coordinator, NATSConfig
+from botnats.nats.coordinator import RECONNECT_WAIT, Coordinator, NATSConfig
 from botnats.nats.envelope import Envelope
 from botnats.nats.store import (
     AttemptStore,
@@ -1390,7 +1390,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 partial(fail_once, "watch-presence"),
             ),
             patch.object(coordinator, "watch_sessions", hang),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()) as sleep,
             self.assertLogs("botnats.nats.coordinator", level="DEBUG") as logs,
         ):
             async with asyncio.timeout(5):
@@ -1400,6 +1400,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
                 await coordinator.cancel_watches()
 
+        # Each failed watch waits before its one restart instead of spinning.
+        assert sleep.await_args_list == [call(RECONNECT_WAIT)] * len(restarted)
         # A restarted watch must replay again before readiness returns.
         assert stale_markers == {"watch-channels": False, "watch-presence": False}
         # Each failure is a rate-limited warning, never a crash traceback.

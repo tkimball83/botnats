@@ -111,10 +111,6 @@ class Envelope:
 
     def encode(self, subject: str, payload: dict[str, Any]) -> bytes:
         """Wrap a payload in a signed, nonce-protected envelope."""
-        if SUBJECT_FIELD in payload:
-            msg = f"payload field {SUBJECT_FIELD!r} is reserved"
-            raise ValueError(msg)
-
         signed_payload = {**payload, SUBJECT_FIELD: subject}
         nonce = secrets.token_hex(16)
         timestamp = int(time.time())
