@@ -166,7 +166,7 @@ class ISupportState:
             return
 
         modes, symbols = value[1:].split(")", 1)
-        if not modes or len(modes) != len(symbols):
+        if len(modes) != len(symbols):
             return
 
         self.member_prefixes = dict(zip(symbols, modes, strict=True))
@@ -391,19 +391,10 @@ def parse_message(line: str) -> IRCMessage:
     prefix: Prefix | None = None
 
     if rest.startswith("@"):
-        _, separator, rest = rest.partition(" ")
-        if not separator:
-            msg = "IRC tags were not followed by a command"
-            raise ValueError(msg)
-
-        rest = rest.lstrip(" ")
+        rest = rest.partition(" ")[2].lstrip(" ")
 
     if rest.startswith(":"):
-        raw_prefix, separator, rest = rest[1:].partition(" ")
-        if not separator:
-            msg = "IRC prefix was not followed by a command"
-            raise ValueError(msg)
-
+        raw_prefix, _, rest = rest[1:].partition(" ")
         prefix = Prefix.parse(raw_prefix)
 
     middle, separator, trailing = rest.partition(" :")

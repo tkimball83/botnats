@@ -86,6 +86,8 @@ class IRCProtocolTests(unittest.TestCase):
         assert mask_matches("a????!*@*", prefix, "rfc1459")
         assert mask_matches("*!*@host.example", prefix, "rfc1459")
         assert mask_matches("*", prefix, "rfc1459")
+        # A trailing wildcard also matches nothing at all.
+        assert mask_matches("alice*!*@*", prefix, "rfc1459")
         assert not mask_matches("a???!*@*", prefix, "rfc1459")
         assert not mask_matches("bob!*@*", prefix, "rfc1459")
         # A literal "*" in an ident must not consume the mask's wildcard.
@@ -137,6 +139,15 @@ class IRCProtocolTests(unittest.TestCase):
             (True, "o", "two"),
             (False, "v", "voice"),
         ]
+        # A limit takes its argument only when it is set.
+        assert list(
+            iter_mode_changes(
+                "-l+o",
+                ("nick",),
+                DEFAULT_CHANMODES,
+                DEFAULT_MEMBERSHIP_MODES,
+            ),
+        ) == [(False, "l", None), (True, "o", "nick")]
 
     def test_mode_parser_bare_unset_key_keeps_pairing(self) -> None:
         """Verify a stripped -k argument does not steal later arguments."""
@@ -192,6 +203,16 @@ class IRCProtocolTests(unittest.TestCase):
 
         assert message.command == "PRIVMSG"
         assert message.params[0] == "#chan"
+
+    def test_parse_rejects_message_without_command(self) -> None:
+        """Reject tags or a prefix that no command follows."""
+        for line in ("@a=b", ":srv", "@a=b :srv", ":srv   ", "@a=b  "):
+            for ending in ("", "\r\n"):
+                with (
+                    self.subTest(line=line + ending),
+                    self.assertRaisesRegex(ValueError, "no command"),
+                ):
+                    parse_message(line + ending)
 
     def test_parse_splits_params_on_space_only(self) -> None:
         """Verify a tab inside a param does not fragment it."""
@@ -258,7 +279,7 @@ class IRCProtocolTests(unittest.TestCase):
 
     def test_isupport_malformed_prefix_ignored(self) -> None:
         """Keep the advertised membership prefixes when PREFIX is malformed."""
-        for value in ("(ov", "(ov)@", "(ov)@+%"):
+        for value in ("(ov", "(ov)@", "(ov)@+%", "()+", "()@+", "()x"):
             with self.subTest(value=value):
                 caps = ISupportState()
                 caps.apply("PREFIX", "(yov)@%+")

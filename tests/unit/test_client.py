@@ -8,12 +8,12 @@ import socket
 import ssl
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 from botnats.irc.client import (
     FALLBACK_NICK_LENGTH,
     NICK_COLLISION_LIMIT,
-    SEND_BURST,
     SEND_RATE,
     IRCClient,
     IRCClientConfig,
@@ -138,13 +138,15 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert len(inflating) <= MAX_IRC_MESSAGE_BYTES
         assert pong_reply(inflating) == b"PONG :" + b"\xe9" * 400 + b"\r\n"
 
-    def test_tls_verification_can_be_disabled(self) -> None:
-        """Configure an IRCS context that accepts an unverified certificate."""
-        client = irc_client(tls=True, verify_tls=False)
+    def test_tls_context_verifies_as_configured(self) -> None:
+        """Verify IRCS certificates and hostnames unless configured not to."""
+        for verify, mode in ((True, ssl.CERT_REQUIRED), (False, ssl.CERT_NONE)):
+            with self.subTest(verify=verify):
+                client = irc_client(tls=True, verify_tls=verify)
 
-        assert client.tls_context is not None
-        assert not client.tls_context.check_hostname
-        assert client.tls_context.verify_mode == ssl.CERT_NONE
+                assert client.tls_context is not None
+                assert client.tls_context.check_hostname is verify
+                assert client.tls_context.verify_mode == mode
 
     def test_nickname_collision(self) -> None:
         """Verify collision nicknames have correct length and are alphabetic."""
@@ -270,10 +272,14 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         for message in messages:
             outbound.put_nowait(message)
 
+        # Only the sender reads this clock, which moves by the time it sleeps.
+        clock = 0.0
         timeline: list[bytes | float] = []
         all_sent = asyncio.Event()
 
         async def record_sleep(delay: float) -> None:
+            nonlocal clock
+            clock += delay
             timeline.append(delay)
 
         async def record_send(encoded: bytes, target: asyncio.StreamWriter) -> None:
@@ -283,6 +289,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 all_sent.set()
 
         with (
+            patch(
+                "botnats.irc.client.asyncio.get_running_loop",
+                return_value=SimpleNamespace(time=lambda: clock),
+            ),
+            patch("botnats.irc.client.SEND_BURST", 4.5),
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
             patch.object(client, "send_immediate", record_send),
         ):
@@ -294,17 +305,16 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
-        # The burst allowance goes out untouched; each later send first
-        # waits about a token's worth of time.
-        burst = int(SEND_BURST)
-        assert timeline[:burst] == messages[:burst]
-        assert timeline[burst + 1 :: 2] == messages[burst:]
-        waits = timeline[burst::2]
-        assert len(waits) == len(messages) - burst
-        assert all(
-            isinstance(delay, float) and delay > 1.0 / (2 * SEND_RATE)
-            for delay in waits
-        )
+        # Four whole tokens go out at once, and the half token left over
+        # shortens only the first wait. Each later send waits a whole token:
+        # neither that half token nor the time slept may be counted twice.
+        assert timeline == [
+            *messages[:4],
+            0.5 / SEND_RATE,
+            messages[4],
+            1.0 / SEND_RATE,
+            messages[5],
+        ]
 
     async def test_registration_nick_rejections_retry(self) -> None:
         """Verify registration retries every nickname rejection numeric."""
@@ -459,6 +469,28 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert await dispatch(b":server PONG server :other\r\n") == "token"
         assert await dispatch(b":server PONG server :token\r\n") is None
+
+    async def test_short_lines_keep_ping_token_and_nick(self) -> None:
+        """Pass over lines without the parameters or source a handler reads.
+
+        run_forever does not catch the IndexError or AttributeError that
+        reading them would raise, so the process would exit.
+        """
+        client = irc_client()
+        for raw in (
+            b":server PONG\r\n",
+            b":server CAP *\r\n",
+            b":server 001\r\n",
+            b"NICK beta\r\n",
+            b":alpha!u@h NICK\r\n",
+        ):
+            with self.subTest(raw=raw):
+                result = await client.dispatch_line(
+                    parse_message(raw.decode()), raw, mock_writer(), "token"
+                )
+
+                assert result == "token"
+                assert client.current_nick == "alpha"
 
     async def test_cap_ls_multiline(self) -> None:
         """Verify multiline CAP LS accumulates before requesting."""

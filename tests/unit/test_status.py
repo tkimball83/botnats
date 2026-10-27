@@ -32,7 +32,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 cluster=ClusterInfo(
                     leader="nats-1",
                     replicas=[
-                        PeerInfo(current=True, lag=0, name="nats-2"),
+                        PeerInfo(current=True, name="nats-2"),
                         # A stale current flag does not count an offline peer.
                         PeerInfo(
                             current=True,
@@ -68,9 +68,10 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             stream_info=SimpleNamespace(
                 cluster=ClusterInfo(
                     leader="nats-1",
+                    # NATS omits a zero lag, so a current peer carries none.
                     replicas=[
-                        PeerInfo(current=True, lag=0, name="nats-2"),
-                        PeerInfo(current=True, lag=0, name="nats-3"),
+                        PeerInfo(current=True, name="nats-2"),
+                        PeerInfo(current=True, name="nats-3"),
                     ],
                 ),
                 config=SimpleNamespace(num_replicas=3),

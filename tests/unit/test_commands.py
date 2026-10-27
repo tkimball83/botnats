@@ -215,6 +215,17 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
                 assert fake_irc.privmsgs == [("owner", "#test +b ok")]
 
+    async def test_reply_drops_unsendable_line(self) -> None:
+        """Log and drop a reply too long to send instead of raising."""
+        bot, fake_irc = bot_with_irc()
+
+        with self.assertLogs("botnats.commands", level="WARNING") as logs:
+            bot.commands.reply("owner", "x" * MAX_IRC_MESSAGE_BYTES)
+
+        assert fake_irc.privmsgs == []
+        assert len(logs.output) == 1
+        assert "dropped PRIVMSG to owner: IRC message exceeds" in logs.output[0]
+
     async def test_getbans_packs_long_ban_lists(self) -> None:
         """Pack a long ban list many masks to a line, not one line per mask."""
         bot, fake_irc = bot_with_irc()

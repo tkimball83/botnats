@@ -174,12 +174,7 @@ class IRCClient:
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Open a connection to the given server and begin registration."""
         context = self.tls_context if server.tls else None
-        connect = asyncio.open_connection(
-            server.host,
-            server.port,
-            ssl=context,
-            server_hostname=server.host if context else None,
-        )
+        connect = asyncio.open_connection(server.host, server.port, ssl=context)
         async with asyncio.timeout(self.config.connect_timeout):
             reader, writer = await connect
         self.writer = writer
