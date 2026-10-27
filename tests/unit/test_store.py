@@ -99,6 +99,26 @@ async def stale_presence(instance_id: str) -> tuple[PresenceStore, DeletableKV]:
 class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
     """Tests for reclaiming an occupied presence key after reconnect."""
 
+    async def test_create_and_reclaim_sign_heartbeat(self) -> None:
+        """Store the unsigned heartbeat a claim passes as a signed record."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        kv = FakeKV()
+        store.kv = cast("KeyValue", kv)
+        heartbeat = {
+            "bot_id": "Alpha",
+            "host": "host",
+            "instance_id": "inst",
+            "nick": "Alpha",
+            "user": "user",
+        }
+
+        assert await store.create("Alpha", heartbeat) is not None
+        assert store.valid("alpha", json.loads(kv.entries["alpha"][1]))
+
+        kv.store("alpha", b'{"garbage": true}')
+        assert await store.reclaim("Alpha", heartbeat, "inst") is not None
+        assert store.valid("alpha", json.loads(kv.entries["alpha"][1]))
+
     async def test_reclaim_adopts_own_record(self) -> None:
         """Adopt the key without a write when this instance signed it."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
@@ -674,14 +694,15 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await presence.update("Alpha", data, 8) is None
 
     async def test_channel_put_creates_missing_record(self) -> None:
-        """Create the first record for a channel and return it as written."""
+        """Create the first record for a channel, signed, and return it as written."""
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
         channels.kv.get.side_effect = KeyNotFoundError()
         channels.kv.create.return_value = 1
         record = channel_record(1)
+        unsigned = {k: v for k, v in record.items() if k != "signature"}
 
-        assert await channels.put(record, after=None) == channel_fields(1)
+        assert await channels.put(unsigned, after=None) == channel_fields(1)
         key, value = channels.kv.create.await_args.args
         assert key == channels.key("#test")
         assert json.loads(value) == record

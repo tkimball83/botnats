@@ -155,7 +155,7 @@ def presence_entry(*, signed: bool = True) -> SimpleNamespace:
 
     return SimpleNamespace(
         key="alpha",
-        operation="PUT",
+        operation=None,
         revision=1,
         value=json.dumps(record).encode(),
     )
@@ -483,10 +483,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.nats.coordinator.nats.connect", connect),
             patch.object(coordinator, "init_stores", open_stores),
         ):
-            await coordinator.on_closed()
-            restart = coordinator.resync_task
-            assert restart is not None
             async with asyncio.timeout(5):
+                await coordinator.on_closed()
+                restart = coordinator.resync_task
+                assert restart is not None
                 await opening.wait()
                 await coordinator.on_disconnected()
                 await asyncio.gather(restart, return_exceptions=True)
@@ -550,11 +550,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         with patch("botnats.nats.coordinator.nats.connect", connect):
-            await coordinator.on_closed()
-            restart = coordinator.resync_task
-            assert restart is not None
             # Without the cancel, the restart never finishes: fail, not hang.
             async with asyncio.timeout(5):
+                await coordinator.on_closed()
+                restart = coordinator.resync_task
+                assert restart is not None
                 await connecting.wait()
                 await coordinator.close()
                 await asyncio.gather(restart, return_exceptions=True)
@@ -903,7 +903,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 stopping.set()
-                await release.wait()
+                async with asyncio.timeout(5):
+                    await release.wait()
+
                 raise
 
         with patch.object(coordinator, "resync", slow_to_stop):
@@ -931,11 +933,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.nc = MagicMock()
 
         with patch.object(coordinator, "resync", hang):
-            await coordinator.on_reconnected()
-            task = coordinator.resync_task
-            assert task is not None
             # Without the cancel, the resync never finishes: fail, not hang.
             async with asyncio.timeout(5):
+                await coordinator.on_reconnected()
+                task = coordinator.resync_task
+                assert task is not None
                 await coordinator.on_disconnected()
                 await asyncio.gather(task, return_exceptions=True)
 
@@ -970,16 +972,18 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         signed = coordinator.channels_store.sign(astuple(record))
         entry = SimpleNamespace(
             key=coordinator.channels_store.key("#test"),
-            operation="PUT",
+            operation=None,
             value=json.dumps(signed).encode(),
         )
         kv, _ = watcher(entry, None)
         coordinator.channels_store.kv = kv
+        synced = MagicMock()
 
         with patch.object(coordinator.callbacks, "on_channel", callback):
-            await coordinator.watch_channels(MagicMock())
+            await coordinator.watch_channels(synced)
 
         callback.assert_called_once_with(astuple(record))
+        synced.assert_called_once_with()
 
     async def test_watch_channel_rejects_mismatched_key(self) -> None:
         """Ignore a valid channel record stored under the wrong opaque key."""
@@ -989,7 +993,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         signed = coordinator.channels_store.sign(astuple(record))
         entry = SimpleNamespace(
             key=coordinator.channels_store.key("#other"),
-            operation="PUT",
+            operation=None,
             value=json.dumps(signed).encode(),
         )
         kv, _ = watcher(entry, None)
@@ -1008,7 +1012,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         delete = MagicMock()
         misplaced = SimpleNamespace(
             key="beta",
-            operation="PUT",
+            operation=None,
             revision=1,
             value=presence_entry().value,
         )
@@ -1037,7 +1041,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         entry = SimpleNamespace(
             key="beta",
-            operation="PUT",
+            operation=None,
             revision=1,
             value=json.dumps(record).encode(),
         )
@@ -1067,7 +1071,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         entry = SimpleNamespace(
             key="alpha",
-            operation="PUT",
+            operation=None,
             revision=1,
             value=json.dumps(record).encode(),
         )
@@ -1092,7 +1096,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.presence_store.valid("beta", record)
         entry = SimpleNamespace(
             key="alpha",
-            operation="PUT",
+            operation=None,
             revision=1,
             value=json.dumps(record).encode(),
         )
@@ -1146,7 +1150,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         expiry = time.time() - 1
         entry = SimpleNamespace(
             key=key,
-            operation="PUT",
+            operation=None,
             value=json.dumps(session_record(expiry)).encode(),
         )
         kv, _ = watcher(entry, None)
@@ -1165,7 +1169,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         expiry = time.time() + 60
         entry = SimpleNamespace(
             key=key,
-            operation="PUT",
+            operation=None,
             value=json.dumps(session_record(expiry)).encode(),
         )
         kv, _ = watcher(entry, None, entry)
@@ -1254,7 +1258,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         entries = [
             SimpleNamespace(
                 key=record_key,
-                operation="PUT",
+                operation=None,
                 value=json.dumps(valid).encode(),
             )
             for record_key in (key, coordinator.sessions.key("other!user@host"))
@@ -1275,7 +1279,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""
-        coordinator = build_coordinator("alpha")
+        # Differs from the record's bot ID in case only: claims ignore case.
+        coordinator = build_coordinator("Alpha")
         kv, _ = watcher(presence_entry(), None)
         coordinator.presence_store.kv = kv
 
@@ -1388,8 +1393,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
             self.assertLogs("botnats.nats.coordinator", level="DEBUG") as logs,
         ):
-            await coordinator.start_watches()
             async with asyncio.timeout(5):
+                await coordinator.start_watches()
                 for event in restarted.values():
                     await event.wait()
 
@@ -1413,8 +1418,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator, "watch_presence", hang),
             patch.object(coordinator, "watch_sessions", hang),
         ):
-            await coordinator.start_watches()
             async with asyncio.timeout(5):
+                await coordinator.start_watches()
                 await asyncio.gather(
                     coordinator.start_watches(),
                     coordinator.start_watches(),
@@ -1460,14 +1465,14 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
-            await coordinator.start_watches()
-            old_tasks = list(coordinator.watch_tasks)
-            with (
-                patch.object(coordinator, "watch_channels", hang),
-                patch.object(coordinator, "watch_presence", hang),
-                patch.object(coordinator, "watch_sessions", hang),
-            ):
-                async with asyncio.timeout(5):
+            async with asyncio.timeout(5):
+                await coordinator.start_watches()
+                old_tasks = list(coordinator.watch_tasks)
+                with (
+                    patch.object(coordinator, "watch_channels", hang),
+                    patch.object(coordinator, "watch_presence", hang),
+                    patch.object(coordinator, "watch_sessions", hang),
+                ):
                     await started.wait()
                     await coordinator.start_watches()
 
@@ -1513,8 +1518,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator, "watch_presence", hang_slow_cancel),
             patch.object(coordinator, "watch_sessions", hang_slow_cancel),
         ):
-            await coordinator.start_watches()
             async with asyncio.timeout(5):
+                await coordinator.start_watches()
                 await started.wait()
 
         with (
@@ -1599,8 +1604,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
             self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
         ):
-            await coordinator.start_watches()
             async with asyncio.timeout(5):
+                await coordinator.start_watches()
                 await retried.wait()
                 await coordinator.cancel_watches()
 
