@@ -4,7 +4,6 @@
 """Verify recovery from a ban, a kick, a full or invite-only channel, and a restart."""
 
 import asyncio
-import os
 from typing import TYPE_CHECKING
 
 from tests.integration.test_mesh import (
@@ -114,7 +113,7 @@ async def session_survives_restart(
 
 async def run(restart: Callable[[str], Awaitable[None]]) -> None:
     """Authenticate once, then exercise every recovery path on one connection."""
-    session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
+    session = await connect()
     try:
         await wait_for_bots(session)
         await authenticate(session, "alpha", fresh_code())
