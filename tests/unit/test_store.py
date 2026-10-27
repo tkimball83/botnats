@@ -22,6 +22,7 @@ from nats.js.errors import (
     NotFoundError,
 )
 
+from botnats.auth import TOTP_PERIOD, TOTP_WINDOW
 from botnats.nats.store import (
     ATTEMPT_LIMIT,
     ATTEMPT_WINDOW,
@@ -549,7 +550,11 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
     """Tests for fail-closed JetStream TOTP claims."""
 
     async def test_claim(self) -> None:
-        """Verify a valid counter uses a secret-derived key."""
+        """Verify a counter's claim uses its own secret-derived key.
+
+        One key for every counter would let a wrong code's claim block every
+        AUTH; a claim expiring while its code is still accepted allows replay.
+        """
         claims = ClaimStore("efnet", 3, SECRET)
         claims.kv = AsyncMock()
         claims.kv.create.return_value = 1
@@ -559,7 +564,9 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         key = claims.key(42)
         assert key == ClaimStore("efnet", 3, SECRET).key(42)
         assert key != ClaimStore("efnet", 3, OTHER_SECRET).key(42)
+        assert key != claims.key(43)
         assert len(key) == SHA256_HEX_LENGTH
+        assert claims.ttl >= (2 * TOTP_WINDOW + 1) * TOTP_PERIOD
         assert claims.ready
         claims.kv.create.assert_awaited_once_with(key, b"1")
 

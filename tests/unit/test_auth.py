@@ -1122,6 +1122,53 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert owner_puts == [True]
         assert not bot.sessions.pending
 
+    async def test_sync_settles_before_later_writes(self) -> None:
+        """Report a written grant settled though a later write queues it back.
+
+        While the drain writes an identity queued after the grant's, the watch
+        may deliver an older record for the grant's identity, such as a peer's
+        write of the revocation the grant replaced, which queues the stored
+        grant to write back. AUTH would otherwise revoke that stored grant.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        owner = "owner!user@host.example"
+        grant = bot.authorizer.grant(owner)
+        # Revocations an outage left queued, the owner's first.
+        stale = bot.authorizer.create(
+            owner,
+            grant.expires_at - 1,
+            "beta",
+            1,
+            revoked=True,
+        )
+        other = bot.authorizer.create(
+            "other!user@host.example",
+            grant.expires_at,
+            "beta",
+            1,
+            revoked=True,
+        )
+        bot.sessions.queue(stale)
+        bot.sessions.queue(other)
+        key = coordinator.sessions.key(owner)
+        put_session = coordinator.put_session
+
+        async def late_echo(record: dict[str, Any]) -> Session:
+            stored = await put_session(record)
+            if record["prefix"] == other.prefix:
+                bot.sessions.observe(key, stale, replaying=False)
+
+            return stored
+
+        with patch.object(coordinator, "put_session", late_echo):
+            assert await bot.sessions.sync(grant)
+            await drain_session_writes(bot)
+
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        assert coordinator.sessions.parse(key, json.loads(kv.entries[key][1])) == grant
+        assert bot.authorizer.authorized(owner)
+        assert not bot.sessions.pending
+
     async def test_unwritable_session_does_not_block_later_writes(self) -> None:
         """Keep a record the store refuses queued, and write the ones after it.
 
