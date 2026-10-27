@@ -17,7 +17,7 @@ dev = [
   "blank-line-after-blocks==0.1.4",
   "mypy==2.4.0",
   "pre-commit==4.7.0",
-  "ruff==0.17.2",
+  "ruff==0.17.3",
 ]
 
 [project.scripts]
