@@ -82,10 +82,10 @@ def build_coordinator(bot_id: str, network: str = "efnet") -> Coordinator:
             instance_id=uuid.uuid4().hex,
             monitor_port=8222,
             network=network,
-            presence_ttl=15.0,
-            replicas=1,
+            presence_ttl=20.0,
+            replicas=3,
             servers=("nats://localhost:4222",),
-            session_ttl=300.0,
+            session_ttl=600.0,
             token=NATS_CREDENTIAL,
         ),
         envelope=Envelope(bot_id, COORDINATION_KEY),
@@ -788,6 +788,15 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             store.bucket for store in second.stores
         )
 
+    async def test_stores_use_configured_retention(self) -> None:
+        """Open every bucket with the configured replicas and record TTLs."""
+        coordinator = build_coordinator("alpha")
+        config = coordinator.config
+
+        assert {store.replicas for store in coordinator.stores} == {config.replicas}
+        assert coordinator.presence_store.ttl == config.presence_ttl
+        assert coordinator.sessions.ttl == config.session_ttl
+
     async def test_reconnect_retries_stores(self) -> None:
         """Verify reconnect restores all stores before starting watches."""
         coordinator = build_coordinator("alpha")
@@ -956,12 +965,18 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.synced_watches.add(last)
         assert coordinator.ready
 
-        # A closed store or a dropped connection still withholds it.
+        # A closed store, a dropped connection, or an unclaimed presence key
+        # still withholds it.
         coordinator.attempts.kv = None
         assert not coordinator.ready
 
         coordinator.attempts.kv = MagicMock()
         nc.is_connected = False
+        assert not coordinator.ready
+
+        nc.is_connected = True
+        assert coordinator.ready
+        coordinator.claim.state = PresenceState.UNCLAIMED
         assert not coordinator.ready
 
     async def test_watch_channel_applies_valid_record(self) -> None:
@@ -1005,7 +1020,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         callback.assert_not_called()
 
     async def test_watch_presence_binds_key_and_applies_delete(self) -> None:
-        """Reject misplaced presence values; a peer's delete keeps this bot's claim."""
+        """Reject misplaced or undecodable values; a peer's delete keeps the claim."""
         coordinator = build_coordinator("alpha")
         coordinator.claim.adopt(5)
         update = MagicMock()
@@ -1016,8 +1031,14 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=presence_entry().value,
         )
+        undecodable = SimpleNamespace(
+            key="beta",
+            operation=None,
+            revision=2,
+            value=b"x",
+        )
         removed = SimpleNamespace(key="beta", operation="DEL", value=None)
-        kv, _ = watcher(misplaced, removed, None)
+        kv, _ = watcher(misplaced, undecodable, removed, None)
         coordinator.presence_store.kv = kv
 
         with (
@@ -1045,7 +1066,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=json.dumps(record).encode(),
         )
-        kv, _ = watcher(entry, None)
+        kv, _ = watcher(None, entry)
         coordinator.presence_store.kv = kv
 
         with patch.object(coordinator.callbacks, "on_presence", update):
@@ -1053,7 +1074,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         update.assert_called_once_with(BotPresence(**BETA_PRESENCE))
         # Another instance's record on a peer's key is no duplicate of ours.
-        assert not coordinator.claim.duplicate
+        assert coordinator.claim.owned
 
     async def test_watch_presence_detects_starting_duplicate(self) -> None:
         """Yield to another instance's placeholder claim, which is not yet a peer."""
@@ -1075,10 +1096,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=json.dumps(record).encode(),
         )
-        kv, _ = watcher(entry, None)
-        # The occupant still holds the key when the replay ends.
-        kv.create = AsyncMock(side_effect=KeyWrongLastSequenceError)
-        kv.get = AsyncMock(return_value=entry)
+        kv, _ = watcher(None, entry)
         coordinator.presence_store.kv = kv
 
         with (
@@ -1103,14 +1121,14 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=json.dumps(record).encode(),
         )
-        kv, _ = watcher(entry, None)
+        kv, _ = watcher(None, entry)
         coordinator.presence_store.kv = kv
 
         with patch.object(coordinator.callbacks, "on_presence", update):
             await coordinator.watch_presence(MagicMock())
 
         update.assert_not_called()
-        assert not coordinator.claim.duplicate
+        assert coordinator.claim.owned
 
     async def test_watch_survives_lost_reclaim_races(self) -> None:
         """Contain reclaim exhaustion to the key instead of the whole watch."""
@@ -1251,11 +1269,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         synced.assert_called_once_with()
 
     async def test_session_watch_skips_misplaced_record(self) -> None:
-        """Skip a session record that fails validation before it reaches the owner."""
+        """Skip an undecodable or misplaced session record before the owner sees it."""
         coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
         expiry = time.time() + 60
         valid = session_record(expiry)
+        undecodable = SimpleNamespace(key=key, operation=None, value=b"not json")
         # Correctly signed, but held under another identity's key. The store
         # tests cover every other way SessionStore.parse rejects a record.
         entries = [
@@ -1266,7 +1285,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             )
             for record_key in (key, coordinator.sessions.key("other!user@host"))
         ]
-        kv, _ = watcher(*entries, None)
+        kv, _ = watcher(undecodable, *entries, None)
         coordinator.sessions.kv = kv
         update = MagicMock()
         replayed = MagicMock()
@@ -1317,7 +1336,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Verify an unsigned presence record cannot demote the owner."""
         coordinator = build_coordinator("alpha")
         coordinator.claim.state = PresenceState.OWNED
-        kv, _ = watcher(presence_entry(signed=False), None)
+        kv, _ = watcher(None, presence_entry(signed=False))
         coordinator.presence_store.kv = kv
 
         await coordinator.watch_presence(MagicMock())
@@ -1383,9 +1402,36 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert not coordinator.claim.duplicate
         assert coordinator.claim.revision == CREATED_REVISION
 
+    async def test_watch_presence_keeps_own_heartbeat(self) -> None:
+        """Keep owning the key at the revision of this instance's own heartbeat."""
+        coordinator = build_coordinator("alpha")
+        record: dict[str, object] = {
+            "bot_id": "alpha",
+            "host": "host",
+            "instance_id": coordinator.config.instance_id,
+            "nick": "alpha",
+            "user": "user",
+            "timestamp": int(time.time()),
+        }
+        record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
+        heartbeat = SimpleNamespace(
+            key="alpha",
+            operation=None,
+            revision=CREATED_REVISION + 1,
+            value=json.dumps(record).encode(),
+        )
+        kv, _ = watcher(None, heartbeat)
+        coordinator.presence_store.kv = kv
+
+        await coordinator.watch_presence(MagicMock())
+
+        assert coordinator.claim.owned
+        assert coordinator.claim.revision == CREATED_REVISION + 1
+
     async def test_watch_presence_recreates_own_deleted_key(self) -> None:
         """Stop owning this bot's deleted key and create it again."""
-        coordinator = build_coordinator("alpha")
+        # Differs from the deleted key in case only: claims ignore case.
+        coordinator = build_coordinator("Alpha")
         coordinator.claim.adopt(5)
         deleted = SimpleNamespace(key="alpha", operation=KV_DEL, value=None)
         kv, _ = watcher(None, deleted)
@@ -1472,6 +1518,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             assert len(coordinator.watch_tasks) == len(coordinator.watches())
+            assert {task.get_name() for task in coordinator.watch_tasks} == {
+                "watch-channels",
+                "watch-presence",
+                "watch-sessions",
+            }
             await coordinator.cancel_watches()
 
         assert not coordinator.watch_tasks
