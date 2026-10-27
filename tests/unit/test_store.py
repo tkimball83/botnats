@@ -247,6 +247,44 @@ class PresenceValidTests(unittest.TestCase):
         # is not an identifier.
         assert not store.valid("be.ta", signed("be.ta"), now=now)
 
+    def test_presence_signature_covers_every_field(self) -> None:
+        """Refuse a record whose signed fields or network changed after signing."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        now = 1_000_000.0
+        valid: dict[str, object] = {
+            "bot_id": "alpha",
+            "host": "host",
+            "instance_id": "inst",
+            "nick": "nick",
+            "user": "user",
+            "timestamp": int(now),
+        }
+        valid["signature"] = presence_signature(SECRET, "efnet", valid)
+        assert store.valid("alpha", valid, now=now)
+        # Each change is well-formed, fresh, and keeps the "alpha" key, so
+        # only the signature rejects it.
+        changes: dict[str, dict[str, object]] = {
+            "bot_id changed": {"bot_id": "Alpha"},
+            "host changed": {"host": "other"},
+            "instance_id changed": {"instance_id": "other"},
+            "nick changed": {"nick": "other"},
+            "user changed": {"user": "other"},
+            "timestamp changed": {"timestamp": int(now) - 1},
+        }
+        for label, change in changes.items():
+            record = {**valid, **change}
+            resigned = {**record}
+            resigned["signature"] = presence_signature(SECRET, "efnet", record)
+            with self.subTest(label):
+                assert not store.valid("alpha", record, now=now)
+                assert store.valid("alpha", resigned, now=now)
+
+        undernet = PresenceStore("undernet", 1, 15.0, SECRET)
+        assert not undernet.valid("alpha", valid, now=now)
+        other_network = {**valid}
+        other_network["signature"] = presence_signature(SECRET, "undernet", valid)
+        assert undernet.valid("alpha", other_network, now=now)
+
     def test_valid_rejects_stale_and_uncrashable(self) -> None:
         """Reject stale or future-dated replays and malformed fields without raising."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
@@ -297,6 +335,12 @@ class PresenceValidTests(unittest.TestCase):
         missing_host = {k: v for k, v in surrogate.items() if k != "host"}
         assert not store.valid("alpha", missing_host, now=now)
         assert not store.valid("alpha", {**surrogate, "host": 5}, now=now)
+
+        # A string or missing timestamp is refused before the freshness
+        # comparison, which raises on one; "1000000" even signs like int(now).
+        assert not store.valid("alpha", {**fresh, "timestamp": "1000000"}, now=now)
+        missing_timestamp = {k: v for k, v in fresh.items() if k != "timestamp"}
+        assert not store.valid("alpha", missing_timestamp, now=now)
 
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
@@ -800,14 +844,19 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert channels.parse(channels.key("#test"), record) is None
 
-    async def test_channel_signature_covers_key_and_present(self) -> None:
-        """Detect tampering with the key or presence flag after signing."""
+    async def test_channel_signature_covers_every_field(self) -> None:
+        """Detect tampering with any signed field or the network after signing."""
         channels = ChannelStore("efnet", 1, SECRET)
         key = channels.key("#test")
         signed = channels.sign(("#test", "secret", True, channel_revision(1)))
         assert channels.parse(key, signed) is not None
         assert channels.parse(key, {**signed, "key": "swapped"}) is None
         assert channels.parse(key, {**signed, "present": False}) is None
+        assert channels.parse(key, {**signed, "revision": channel_revision(2)}) is None
+        # Copied under the other channel's key, so key binding cannot mask it.
+        moved = {**signed, "channel": "#other"}
+        assert channels.parse(channels.key("#other"), moved) is None
+        assert ChannelStore("undernet", 1, SECRET).parse(key, signed) is None
 
     async def test_channel_put_yields_to_concurrent_writer(self) -> None:
         """Return another bot's record when it lands between our read and write."""
