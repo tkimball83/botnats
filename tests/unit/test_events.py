@@ -346,11 +346,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert ("JOIN", ("#test",)) in fake_irc.sent
 
     async def test_isupport_parsing(self) -> None:
-        """Verify ISUPPORT tokens update server capabilities."""
+        """Verify ISUPPORT tokens update server capabilities and channel lookups."""
         bot, _ = bot_with_irc()
+        mgr = bot.channel_mgr
+        mgr.apply_record(mgr.new_record("#te[st", None, present=True))
 
         bot.events.handle_isupport(CUSTOM_ISUPPORT)
-        runtime = bot.channel_mgr.channels[bot.caps.fold("#test")]
+        runtime = mgr.channels[bot.caps.fold("#test")]
         runtime.join = JoinState.JOINED
         bot.events.on_irc_message(
             IRCMessage("353", ("alpha", "=", "#test", "@alpha %other")),
@@ -358,9 +360,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert bot.caps.casemapping == "ascii"
         assert bot.caps.fold("[") != bot.caps.fold("{")
+        # Keyed under rfc1459 as "#te{st" until the new casemapping rekeys it.
+        assert mgr.runtime("#te[st") is not None
         assert bot.caps.chanmodes == ("b", "k", "l", "imn")
         assert bot.caps.op_mode == "y"
-        assert bot.channel_mgr.is_self_opped(runtime)
+        assert mgr.is_self_opped(runtime)
         assert bot.caps.monitor
 
     async def test_isupport_removals_restore_defaults(self) -> None:

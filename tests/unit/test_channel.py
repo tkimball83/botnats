@@ -62,6 +62,19 @@ async def see_key(bot: Bot, runtime: ChannelRuntime, key: str | None) -> None:
     await settle(bot)
 
 
+def part_and_want_again(bot: Bot) -> ChannelRuntime:
+    """Leave a joined #test, and want it again before the server takes the PART.
+
+    Return the channel's new runtime: not joined, while the server still
+    sends this bot the channel's MODE changes until it takes the PART.
+    """
+    mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+    mgr.channels[folded].join = JoinState.JOINED
+    mgr.apply_record(mgr.new_record("#test", None, present=False))
+    mgr.apply_record(mgr.new_record("#test", None, present=True))
+    return mgr.channels[folded]
+
+
 def request_help(bot: Bot) -> None:
     """Deliver INVITEE's invite, unban, and room requests, and OP_REQUESTER's op."""
     bot.channel_mgr.invite_peer("#test", INVITEE)
@@ -232,6 +245,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.set_casemapping("ascii")
         assert len(bot.channel_mgr.channel_records) == 2
         assert {record.key for record in bot.channel_mgr.channel_records.values()} == {
+            "first",
+            "second",
+        }
+        # The channel split off gets a fresh runtime, which joins with its key.
+        assert {runtime.key for runtime in bot.channel_mgr.channels.values()} == {
             "first",
             "second",
         }
@@ -895,20 +913,24 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert mgr.channel_records[folded].key == "B"
         assert not runtime.key_pending
 
-    async def test_retry_dropped_once_bot_leaves_channel(self) -> None:
-        """Drop a failed key write once this bot can no longer see the key."""
-        coordinator = FailingWriteCoordinator()
-        bot = bot_with_channel(coordinator=coordinator)
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        await see_key(bot, runtime, "seen")
-        assert runtime.key_pending
-        runtime.reset()  # kicked, or the IRC connection dropped
-        # A late MODE reply shows the key again once this bot is out.
-        runtime.key_pending = True
+    async def test_key_seen_while_parting_is_not_recorded(self) -> None:
+        """Record no key shown to the membership this bot's PART is leaving.
 
-        coordinator.failing = False
-        await bot.channel_mgr.retry_pending_keys()
+        Wanted again before the server takes the PART, the channel has a
+        runtime that has not joined: the record knows best until its JOIN.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        runtime = part_and_want_again(bot)
+        assert fake_irc.sent == [("PART", ("#test",)), ("JOIN", ("#test",))]
+
+        bot.events.on_irc_message(
+            IRCMessage("MODE", ("#test", "+k", "seen"), Prefix("op", "~op", "op.host")),
+        )
+        assert runtime.key_pending
+        await settle(bot)
 
         assert coordinator.channel_puts == []
         assert not runtime.key_pending
@@ -1019,13 +1041,12 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [("JOIN", ("#new", "key"))]
 
     async def test_unjoined_channel_takes_the_recorded_key(self) -> None:
-        """Take a record's key in a channel this bot has left.
+        """Take a record's key in a channel this bot has not joined.
 
-        A key it saw before a kick is no longer pending, nor is one a late
-        reply shows once it is out.
+        A key it saw before a kick is no longer pending, nor is one shown to
+        the membership a PART still in flight is leaving.
         """
-        coordinator = FailingWriteCoordinator()
-        bot = bot_with_channel(coordinator=coordinator)
+        bot, _, _ = bot_with_coordinator(FailingWriteCoordinator())
         mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
         runtime = mgr.channels[folded]
         runtime.join = JoinState.JOINED
@@ -1040,12 +1061,12 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         mgr.apply_record(peer)
         assert runtime.key == "x"
 
-        # The reply to a MODE query sent before the kick shows another key.
-        bot.events.process_key(runtime, "late")
-        assert runtime.key_pending
-        mgr.apply_record(
-            mgr.new_record("#test", "y", present=True, after=peer.revision)
+        runtime = part_and_want_again(bot)  # once it has joined again
+        bot.events.on_irc_message(
+            IRCMessage("MODE", ("#test", "+k", "late"), Prefix("op", "~op", "op.host")),
         )
+        assert runtime.key_pending
+        mgr.apply_record(mgr.new_record("#test", "y", present=True))
         assert runtime.key == "y"
         await settle(bot)
 
