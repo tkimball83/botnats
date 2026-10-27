@@ -254,6 +254,14 @@ class IRCClient:
         )
         self.send("NICK", self.current_nick)
 
+    @property
+    def queue_delay(self) -> float:
+        """Return about how long the lines queued now take to go out."""
+        if self.outbound is None:
+            return 0.0
+
+        return self.outbound.qsize() / SEND_RATE
+
     def reconnect(self) -> None:
         """Force a reconnection by dropping the current socket."""
         if self.writer is not None:

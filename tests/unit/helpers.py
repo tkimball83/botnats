@@ -232,6 +232,8 @@ class FakeIRC:
         self.current_nick = "alpha"
         self.modes: list[tuple[str, str, tuple[str, ...]]] = []
         self.privmsgs: list[tuple[str, str]] = []
+        # Its queue delivers at once; a test sets a backlog for IRCClient's.
+        self.queue_delay = 0.0
         self.reconnects = 0
         self.sent: list[tuple[str, tuple[str, ...]]] = []
 

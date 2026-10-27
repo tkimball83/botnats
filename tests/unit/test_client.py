@@ -356,6 +356,15 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             messages[5],
         ]
 
+    async def test_queue_delay_counts_queued_lines(self) -> None:
+        """Report how long the queued lines take to go out at the send rate."""
+        client = self.cap_client(negotiating=False)
+        assert client.queue_delay == 0.0
+
+        client.send("JOIN", "#one")
+        client.send("JOIN", "#two")
+        assert client.queue_delay == 2 / SEND_RATE
+
     async def test_registration_nick_rejections_retry(self) -> None:
         """Verify registration retries every nickname rejection numeric."""
         client = irc_client()
