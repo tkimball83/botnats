@@ -114,7 +114,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 await writing.wait()
             with self.assertLogs("botnats.nats.claim", level="ERROR"):
                 # The write holds the lock; observing must not wait for it.
-                assert claim.observe("other-instance", 3)
+                claim.observe("other-instance", 3)
 
             release.set()
             async with asyncio.timeout(1):
@@ -227,11 +227,12 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         """Adopt this instance's own watched record, never moving backwards."""
         claim = build_claim()
 
-        assert not claim.observe(INSTANCE_ID, 6)
+        claim.observe(INSTANCE_ID, 6)
         assert claim.owned
         assert claim.revision == 6
 
-        assert not claim.observe(INSTANCE_ID, 5)
+        claim.observe(INSTANCE_ID, 5)
+        assert claim.owned
         assert claim.revision == 6
 
     async def test_expired_owner_reclaims_id(self) -> None:

@@ -119,17 +119,16 @@ class PresenceClaim:
 
             await self.claim()
 
-    def observe(self, instance_id: str, revision: int) -> bool:
-        """Apply a validly signed record on this bot's key; report a duplicate.
+    def observe(self, instance_id: str, revision: int) -> None:
+        """Apply a validly signed record on this bot's key.
 
         Needs no KV round trip, so it never waits behind a presence write.
         """
         if instance_id != self.instance_id:
             self.yield_key()
-            return True
+            return
 
         self.adopt(max(self.revision or 0, revision))
-        return False
 
     async def release(self) -> None:
         """Delete the owned key on shutdown so a replacement can claim it."""
