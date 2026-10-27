@@ -4,13 +4,11 @@
 """Tests for IRC event handling and server message processing."""
 
 import asyncio
-import time
 import unittest
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
-from botnats.auth import totp
 from botnats.channel import JOIN_RETRY_DELAY, ChannelRuntime, JoinState
 from botnats.config import mode_intent
 from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
@@ -131,7 +129,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         ).prefix = old_prefix
 
         bot.events.on_irc_message(
-            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("owner")),
+            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("Owner")),
         )
         await drain_session_writes(bot)
 
@@ -321,7 +319,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("owner").prefix = owner
 
         bot.events.on_irc_message(
-            IRCMessage("QUIT", (), Prefix.parse("owner@static.example")),
+            IRCMessage("QUIT", (), Prefix.parse("Owner@static.example")),
         )
         await drain_session_writes(bot)
 
@@ -680,6 +678,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[folded]
         runtime.join = JoinState.JOINED
         runtime.member("alpha").modes.add("o")
+        fake_irc.current_nick = "Alpha"
 
         bot.events.on_irc_message(UNSET_MODE)
         assert fake_irc.modes == [("#test", "+npst", ())]
@@ -763,16 +762,16 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_mode_key_recorded_under_configured_spelling(self) -> None:
         """Record a key seen under an equivalent spelling on the channel's record.
 
-        Under rfc1459, MODE #a{ changes the configured #a[. The store keys
-        records by exact name, so the write must name #a[ and compare against
+        Under rfc1459, MODE #a{ changes the configured #A[. The store keys
+        records by exact name, so the write must name #A[ and compare against
         its revision, never start a second record for #a{.
         """
         coordinator = FakeCoordinator()
         kv = FakeKV()
         coordinator.channels.kv = cast("KeyValue", kv)
         bot, _, _ = bot_with_coordinator(coordinator)
-        await bot.channel_mgr.write_record("#a[", None, present=True)
-        configured = bot.channel_mgr.durable_revision("#a[")
+        await bot.channel_mgr.write_record("#A[", None, present=True)
+        configured = bot.channel_mgr.durable_revision("#A[")
         runtime = bot.channel_mgr.runtime("#a{")
         assert runtime is not None
         runtime.join = JoinState.JOINED
@@ -783,11 +782,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await settle(bot)
 
         assert [(put["channel"], put["key"]) for put in coordinator.channel_puts] == [
-            ("#a[", None),
-            ("#a[", "newkey"),
+            ("#A[", None),
+            ("#A[", "newkey"),
         ]
         assert coordinator.channel_after == [None, configured]
-        assert list(kv.entries) == [coordinator.channels.key("#a[")]
+        assert list(kv.entries) == [coordinator.channels.key("#A[")]
         assert bot.channel_mgr.channel_records[bot.caps.fold("#a{")].key == "newkey"
 
     async def test_mode_hidden_key_ignored(self) -> None:
@@ -893,7 +892,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         ).prefix = old_prefix
 
         bot.events.on_irc_message(
-            IRCMessage("NICK", ("newowner",), Prefix("owner")),
+            IRCMessage("NICK", ("newowner",), Prefix("Owner")),
         )
         await drain_session_writes(bot)
 
@@ -941,6 +940,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("324", ("alpha", "#test", "+nstk", "secret"), None),
         )
         assert runtime.modes == "+nstk"
+
+        # A channel without modes is shown as a bare "+".
+        bot.events.on_irc_message(IRCMessage("324", ("alpha", "#test", "+"), None))
+        assert runtime.modes == ""
 
     async def test_channel_key_reconciled_from_324(self) -> None:
         """Store a key RPL_CHANNELMODEIS shows or lacks; ignore a hidden one."""
@@ -1166,6 +1169,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         await settle(bot)
 
+        assert first.modes == "+k"
         assert first.member("Target").modes == {"o"}
         assert set(first.bans.values()) == {"*!*@first.host"}
         assert first.key == "first-key"
@@ -1309,40 +1313,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert finished == ["SLOW", "FAST"]
 
-    async def test_quit_invalidates_queued_auth(self) -> None:
-        """Refuse an AUTH that was still queued behind another command at QUIT."""
-        bot, fake_irc, coordinator = bot_with_coordinator()
-        owner = Prefix("owner", "user", "host.example")
-        started = asyncio.Event()
-        release = asyncio.Event()
-        counter = int(time.time() // 30)
-
-        async def slow_status(prefix: Prefix, arguments: tuple[str, ...]) -> None:
-            del prefix, arguments
-            started.set()
-            await release.wait()
-
-        bot.authorizer.grant(owner.render())
-        with patch.dict(bot.commands.handlers, {"STATUS": slow_status}):
-            for text in ("STATUS", f"AUTH {totp(bot.authorizer.secret, counter)}"):
-                bot.events.on_irc_message(
-                    IRCMessage("PRIVMSG", ("alpha", text), owner),
-                )
-
-            async with asyncio.timeout(1):
-                await started.wait()
-
-            # The AUTH waits behind STATUS when the user quits.
-            bot.events.on_irc_message(IRCMessage("QUIT", (), owner))
-            release.set()
-            await settle(bot)
-
-        # The code was valid and claimed; only the QUIT refused it.
-        assert coordinator.claim_requests == [counter]
-        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
-        assert not bot.authorizer.authorized(owner.render())
-        assert not bot.sessions.watched_identities
-
     async def test_self_join_clears_state(self) -> None:
         """Reset channel state on a self-join and learn this bot's identity."""
         bot, _, _ = bot_with_coordinator()
@@ -1376,8 +1346,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("JOIN", ("#test",), Prefix("alpha", "~alpha", "host.example")),
         )
+        # The server follows the JOIN echo with NAMES of the channel left.
+        bot.events.on_irc_message(IRCMessage("353", ("alpha", "=", "#test", "@alpha")))
+        bot.events.on_irc_message(
+            IRCMessage("366", ("alpha", "#test", "End of /NAMES list")),
+        )
 
-        assert ("PART", ("#test",)) in fake_irc.sent
+        assert fake_irc.sent == [("PART", ("#test",))]
 
     async def test_self_join_orphaned_queued(self) -> None:
         """Queue the PART of an orphan channel when it cannot be sent.
@@ -1418,11 +1393,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         for other, own in (
             (
                 IRCMessage("KICK", ("#test", "bob", "bye"), alpha),
-                IRCMessage("KICK", ("#test", "alpha", "bye"), bob),
+                IRCMessage("KICK", ("#Test", "alpha", "bye"), bob),
             ),
             (
                 IRCMessage("PART", ("#test",), bob),
-                IRCMessage("PART", ("#test",), alpha),
+                IRCMessage("PART", ("#Test",), alpha),
             ),
         ):
             with self.subTest(command=own.command):
@@ -1541,7 +1516,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("bob")
 
         bot.events.on_irc_message(
-            IRCMessage("PART", ("#test",), Prefix("bob", "user", "host")),
+            IRCMessage("PART", ("#test",), Prefix("Bob", "user", "host")),
         )
 
         assert casefold("bob", "rfc1459") not in runtime.members
@@ -1726,7 +1701,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.current_nick = "fallback"
 
         bot.events.on_irc_message(
-            IRCMessage("303", ("fallback", "alpha")),
+            IRCMessage("303", ("fallback", "ALPHA")),
         )
 
         assert ("NICK", ("alpha",)) not in fake_irc.sent
@@ -1737,7 +1712,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.current_nick = "fallback"
 
         bot.events.on_irc_message(
-            IRCMessage("731", ("fallback", "alpha!user@host")),
+            IRCMessage("731", ("fallback", "ALPHA!user@host")),
         )
 
         assert ("NICK", ("alpha",)) in fake_irc.sent

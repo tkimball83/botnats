@@ -158,7 +158,8 @@ class IRCEventHandler:
         if runtime is None:
             return
 
-        runtime.modes = message.params[2]
+        # A channel without modes shows a bare "+"; no modes are tracked as "".
+        runtime.modes = message.params[2].rstrip("+")
         runtime.set_limit(None)
         key: str | None = None
         for adding, mode, argument in iter_mode_changes(
