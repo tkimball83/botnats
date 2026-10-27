@@ -3,6 +3,7 @@
 
 """Tests for NATS route and JetStream replica status."""
 
+import asyncio
 import io
 import unittest
 from types import SimpleNamespace
@@ -179,6 +180,23 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             routes = await route_count("nats-1", 8222)
 
         assert routes is None
+
+    async def test_route_count_unknown_when_unanswered(self) -> None:
+        """Give up on a monitoring port that accepts but never answers."""
+        writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+
+        with (
+            patch(
+                "botnats.nats.status.asyncio.open_connection",
+                AsyncMock(return_value=(asyncio.StreamReader(), writer)),
+            ),
+            patch("botnats.nats.status.STATUS_TIMEOUT", 0),
+        ):
+            async with asyncio.timeout(5):
+                routes = await route_count("nats-1", 8222)
+
+        assert routes is None
+        writer.close.assert_called_once_with()
 
     async def test_route_count_refuses_redirects(self) -> None:
         """Reject a redirect response instead of following it."""

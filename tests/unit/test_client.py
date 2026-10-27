@@ -148,6 +148,35 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 assert client.tls_context.check_hostname is verify
                 assert client.tls_context.verify_mode == mode
 
+    async def test_establish_uses_tls_only_for_ircs_servers(self) -> None:
+        """Connect over TLS to an ircs:// server and in plain text to irc://."""
+        servers = (
+            IRCServer.parse("ircs://irc.example.test"),
+            IRCServer.parse("irc://irc.example.test"),
+        )
+        client = IRCClient(
+            caps=ISupportState(),
+            config=IRCClientConfig(
+                connect_timeout=1,
+                nickname="alpha",
+                servers=servers,
+                verify_tls=True,
+            ),
+            on_disconnect=lambda: None,
+            on_message=ignore_message,
+        )
+        connect = AsyncMock(return_value=(asyncio.StreamReader(), mock_writer()))
+
+        with patch("botnats.irc.client.asyncio.open_connection", connect):
+            async with asyncio.timeout(5):
+                for server in servers:
+                    await client.establish(server)
+                    await client.close()
+
+        assert client.tls_context is not None
+        contexts = [call.kwargs["ssl"] for call in connect.await_args_list]
+        assert contexts == [client.tls_context, None]
+
     def test_nickname_collision(self) -> None:
         """Verify collision nicknames have correct length and are alphabetic."""
         candidates = [next_nickname(9) for _ in range(20)]
@@ -269,13 +298,16 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.writer = writer
         outbound: asyncio.Queue[bytes] = asyncio.Queue()
         messages = [b"%d" % index for index in range(6)]
-        for message in messages:
-            outbound.put_nowait(message)
-
-        # Only the sender reads this clock, which moves by the time it sleeps.
+        # Only the sender reads this clock, which moves by the time it sleeps
+        # and by the idle spell below.
         clock = 0.0
+        clock_read = asyncio.Event()
         timeline: list[bytes | float] = []
         all_sent = asyncio.Event()
+
+        def read_clock() -> float:
+            clock_read.set()
+            return clock
 
         async def record_sleep(delay: float) -> None:
             nonlocal clock
@@ -291,7 +323,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "botnats.irc.client.asyncio.get_running_loop",
-                return_value=SimpleNamespace(time=lambda: clock),
+                return_value=SimpleNamespace(time=read_clock),
             ),
             patch("botnats.irc.client.SEND_BURST", 4.5),
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
@@ -299,11 +331,19 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             task = asyncio.create_task(client.send_loop(writer, outbound))
             async with asyncio.timeout(5):
+                # The sender reads its start time and waits on the empty
+                # queue; a long idle spell must not bank more than the burst.
+                await clock_read.wait()
+                clock = 100.0
+                for message in messages:
+                    outbound.put_nowait(message)
+
                 await all_sent.wait()
 
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
-                await task
+                async with asyncio.timeout(5):
+                    await task
 
         # Four whole tokens go out at once, and the half token left over
         # shortens only the first wait. Each later send waits a whole token:
@@ -843,6 +883,45 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 server.close()
                 await server.wait_closed()
 
+    async def test_registered_session_outlives_registration_timeout(self) -> None:
+        """Idle past the registration deadline with a PING once registered."""
+        client = irc_client()
+        dispatched: list[str] = []
+
+        def record_message(message: IRCMessage) -> None:
+            dispatched.append(message.command)
+
+        client.on_message = record_message
+        writer = mock_writer()
+        client.writer = writer
+        reader = asyncio.StreamReader()
+        reader.feed_data(b":server 001 alpha :Welcome\r\n")
+        loop = asyncio.get_running_loop()
+
+        def answer_ping(encoded: bytes) -> None:
+            # Answer a loop turn later, so the client must wait for the PONG.
+            if encoded.startswith(b"PING :"):
+                token = encoded.removeprefix(b"PING :").removesuffix(b"\r\n")
+                loop.call_soon(
+                    reader.feed_data,
+                    b":server PONG server :" + token + b"\r\n:server 002 alpha :hi\r\n",
+                )
+                loop.call_soon(reader.feed_eof)
+
+        writer.write.side_effect = answer_ping
+        connection = (reader, writer)
+
+        with (
+            patch.object(client, "establish", AsyncMock(return_value=connection)),
+            patch("botnats.irc.client.REGISTRATION_TIMEOUT", 0),
+            patch("botnats.irc.client.IDLE_TIMEOUT", 0),
+            self.assertRaisesRegex(ConnectionError, "connection closed"),
+        ):
+            async with asyncio.timeout(5):
+                await client.run_connection(client.config.servers[0])
+
+        assert dispatched == ["001", "002"]
+
     async def test_reconnect_restarts_registration(self) -> None:
         """Negotiate and register afresh on the session after a registered one.
 
@@ -1041,7 +1120,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 await server.wait_closed()
 
     async def test_disconnect_callback_failure_is_contained(self) -> None:
-        """Log a failing disconnect callback and keep reconnecting."""
+        """Log a failing disconnect callback and still close and reconnect."""
         client = irc_client()
         ports: list[int] = []
         real_sleep = asyncio.sleep
@@ -1065,6 +1144,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.on_disconnect = failing_callback
         with (
             patch.object(client, "run_connection", failing_connection),
+            patch.object(client, "close", AsyncMock()) as close,
             patch("botnats.irc.client.asyncio.sleep", skip_sleep),
             self.assertLogs("botnats.irc.client", level="WARNING") as logs,
             self.assertRaises(asyncio.CancelledError),
@@ -1073,6 +1153,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 await client.run_forever()
 
         assert ports == [6667, 6667]
+        assert close.await_count == 2
         failures = [line for line in logs.output if "callback failed" in line]
         assert len(failures) == 2
 

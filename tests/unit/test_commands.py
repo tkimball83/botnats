@@ -532,7 +532,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!*@Bad.Host")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@bad.host")
+        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@BAD.host")
 
         assert fake_irc.modes == [("#test", "-b", ("*!*@Bad.Host",))]
         assert fake_irc.privmsgs == [
