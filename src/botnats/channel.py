@@ -583,7 +583,7 @@ class ChannelManager:
         except ConnectionError:
             return
         # Only a JOIN that actually reached the send queue is in flight.
-        runtime.start_join()
+        runtime.start_join(self.bot.irc.queue_delay)
 
     def set_casemapping(self, casemapping: str) -> None:
         """Rekey channel lookups under a new casemapping.
@@ -732,10 +732,16 @@ class ChannelRuntime:
             and asyncio.get_running_loop().time() >= self.join_retry_at
         )
 
-    def start_join(self) -> None:
-        """Record a JOIN queued for the server."""
+    def start_join(self, queue_delay: float) -> None:
+        """Record a JOIN queued for the server, due to go out in queue_delay.
+
+        Its reply is awaited from then on: a JOIN deep in a join burst's queue
+        is not queued again before it has even gone out.
+        """
         self.join = JoinState.JOINING
-        self.join_retry_at = asyncio.get_running_loop().time() + JOIN_REPLY_TIMEOUT
+        self.join_retry_at = (
+            asyncio.get_running_loop().time() + queue_delay + JOIN_REPLY_TIMEOUT
+        )
 
     def refuse_join(self) -> None:
         """Keep a refused JOIN pending until JOIN_RETRY_DELAY has passed.

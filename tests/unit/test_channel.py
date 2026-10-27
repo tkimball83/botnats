@@ -1534,6 +1534,24 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 2
 
+    async def test_queued_join_awaits_its_reply_from_its_send(self) -> None:
+        """Await a JOIN's reply from when the send queue gets to it."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        fake_irc.queue_delay = 100.0
+
+        bot.channel_mgr.join_desired()
+        runtime.join_retry_at -= JOIN_REPLY_TIMEOUT
+        bot.channel_mgr.join_desired()
+        assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 1
+
+        runtime.join_retry_at -= fake_irc.queue_delay
+        bot.channel_mgr.join_desired()
+        assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 2
+
     async def test_refused_join_send_stays_due(self) -> None:
         """Leave a JOIN the send queue refuses due for the next tick."""
         bot, fake_irc, _ = bot_with_coordinator()

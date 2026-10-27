@@ -84,6 +84,11 @@ class IRCProtocol(IRCSender, Protocol):
         """Return whether a nickname identifies this client."""
         ...
 
+    @property
+    def queue_delay(self) -> float:
+        """Return about how long the lines queued now take to go out."""
+        ...
+
     async def run_forever(self) -> None:
         """Maintain a persistent connection."""
         ...
