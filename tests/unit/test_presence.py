@@ -123,6 +123,8 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
         """Allow the final identity query time to receive its response."""
         fake_irc = FakeIRC()
         bot = make_bot(irc=fake_irc)
+        # USERHOST asks about the nick in use, here a fallback.
+        fake_irc.current_nick = "alpha_"
 
         async def receive_identity(delay: float) -> None:
             del delay
@@ -134,7 +136,7 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.identity.discover(bot.identity.generation)
 
-        assert fake_irc.sent == [("USERHOST", ("alpha",))]
+        assert fake_irc.sent == [("USERHOST", ("alpha_",))]
         assert fake_irc.reconnects == 0
 
     async def test_identity_discovery_stops_after_reset(self) -> None:
@@ -144,6 +146,7 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
         for attempts in (1, 2):
             fake_irc = FakeIRC()
             bot = make_bot(irc=fake_irc)
+            fake_irc.current_nick = "alpha_"
             generation = bot.identity.generation
 
             async def reset_identity(delay: float, bot: Bot = bot) -> None:
@@ -159,7 +162,7 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
                     await bot.identity.discover(generation)
 
                 assert bot.identity.generation == generation + 1
-                assert fake_irc.sent == [("USERHOST", ("alpha",))]
+                assert fake_irc.sent == [("USERHOST", ("alpha_",))]
                 assert fake_irc.reconnects == 0
 
     async def test_identity_discovery_reconnects(self) -> None:

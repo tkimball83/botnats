@@ -743,8 +743,7 @@ class ChannelRuntime:
         A refusal comes back at once, so a JOIN retried on every tick would be
         refused, and ask peers for help, on every tick.
         """
-        if self.join is JoinState.JOINING:
-            self.join_retry_at = asyncio.get_running_loop().time() + JOIN_RETRY_DELAY
+        self.join_retry_at = asyncio.get_running_loop().time() + JOIN_RETRY_DELAY
 
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""
