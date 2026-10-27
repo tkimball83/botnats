@@ -160,7 +160,7 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         store.kv = kv
 
         kv.get = AsyncMock(
-            return_value=SimpleNamespace(revision=5, value=b'{"garbage": true}'),
+            return_value=SimpleNamespace(revision=5, value=b"not json"),
         )
         kv.update = AsyncMock(return_value=reclaimed_revision)
         assert await store.reclaim("Alpha", data, "inst") == reclaimed_revision
@@ -419,7 +419,11 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await attempts.allow("host.example", now=61)
 
     async def test_keys_are_secret_derived(self) -> None:
-        """Derive attempt keys from the coordination secret, not the identity alone."""
+        """Derive per-identity, per-slot attempt keys from the coordination secret.
+
+        One key for every identity would let one guesser lock out every admin;
+        an attempt expiring inside the window would free its slot early.
+        """
         attempts = AttemptStore("efnet", 3, SECRET)
 
         key = attempts.key("host.example", 0)
@@ -427,7 +431,9 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert key == AttemptStore("efnet", 3, SECRET).key("host.example", 0)
         assert key != AttemptStore("efnet", 3, OTHER_SECRET).key("host.example", 0)
         assert key != attempts.key("host.example", 1)
+        assert key != attempts.key("other.example", 0)
         assert len(key) == SHA256_HEX_LENGTH
+        assert attempts.ttl >= ATTEMPT_WINDOW
 
     async def test_missing_store_fails_closed(self) -> None:
         """Verify authentication is denied until the bucket is open."""
@@ -514,7 +520,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts = AttemptStore("efnet", 3, SECRET)
         attempts.kv = AsyncMock()
         attempts.kv.get.side_effect = [
-            MagicMock(value=float(59).hex().encode()),
+            # A second short of a full window old.
+            MagicMock(value=float(1).hex().encode()),
             MagicMock(value=(59.5).hex().encode()),
             MagicMock(value=(59.9).hex().encode()),
         ]
@@ -1138,17 +1145,27 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_oversized_json_integer_is_replaced(self) -> None:
         """Prevent Python's integer limit from blocking valid replacements."""
-        channels = ChannelStore("efnet", 1, SECRET)
-        channels.kv = AsyncMock()
-        channels.kv.get.return_value = SimpleNamespace(
+        oversized = SimpleNamespace(
             revision=1,
             value=b'{"revision":' + b"9" * 5_000 + b"}",
         )
+        channels = ChannelStore("efnet", 1, SECRET)
+        channels.kv = AsyncMock()
+        channels.kv.get.return_value = oversized
         channels.kv.update.return_value = 2
 
         valid_channel = channel_record(2)
         assert await channels.put(valid_channel, after=None) == channel_fields(2)
         channels.kv.update.assert_awaited_once()
+
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions.kv = AsyncMock()
+        sessions.kv.get.return_value = oversized
+        sessions.kv.update.return_value = 2
+
+        valid_session = session_record(time.time() + 40)
+        assert await sessions.put(valid_session) == parsed_session(valid_session)
+        sessions.kv.update.assert_awaited_once()
 
     async def test_decode_record_rejects_non_objects_and_deep_nesting(self) -> None:
         """Decode only JSON objects; nesting too deep to parse is malformed."""
@@ -1194,7 +1211,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_session_parse_rejects_unencodable_identity(self) -> None:
-        """Reject, without raising, a record whose prefix cannot be encoded."""
+        """Reject, without raising, a record with an unencodable prefix or issuer."""
         sessions = SessionStore("efnet", 1, SECRET, 60)
         prefix = "owner!user@" + chr(0xD800)
         record = {
@@ -1207,6 +1224,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         }
 
         assert sessions.parse("opaque", record) is None
+        bad_issuer = {**record, "prefix": "owner!user@host", "issuer": chr(0xD800)}
+        assert sessions.parse("opaque", bad_issuer) is None
 
     async def test_reset_during_open(self) -> None:
         """Do not restore a stale bucket handle after a disconnect."""
