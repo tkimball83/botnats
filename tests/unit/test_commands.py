@@ -592,6 +592,31 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.privmsgs == [("owner", "Unknown command")]
 
+    async def test_bad_admin_input_gets_reply(self) -> None:
+        """Answer malformed or inapplicable admin commands instead of crashing."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.authorizer.grant(OWNER.render())
+        replies = {
+            "BAN #test": "BAN <channel> <mask>",
+            "KICK #test": "KICK <channel> <nick> [reason]",
+            "JOIN": "JOIN <channel> [key]",
+            "DEOP #test ghost": "ghost is not opped on #test",
+            "BAN #missing *!*@x": "Not opped on #missing",
+        }
+
+        for text, reply in replies.items():
+            with self.subTest(text=text):
+                fake_irc.privmsgs.clear()
+
+                await bot.commands.dispatch(OWNER, text)
+
+                assert fake_irc.privmsgs == [("owner", reply)]
+
+        assert fake_irc.modes == []
+        assert coordinator.channel_puts == []
+
     async def test_channel_update_rejects_oversized_mode_command(self) -> None:
         """Reject a channel update before storing an unusable mode command."""
         bot, _, coordinator = bot_with_coordinator()
@@ -631,3 +656,15 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key == "live-key"
         # Written against the record it replaces, so a concurrent write wins cleanly.
         assert coordinator.channel_after == [base]
+
+    async def test_join_stores_key(self) -> None:
+        """Store a JOIN's key so every bot can join the keyed channel."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+
+        await bot.commands.dispatch(OWNER, "JOIN #new hunter2")
+
+        assert fake_irc.privmsgs == [("owner", "Joining #new")]
+        payload = coordinator.channel_puts[-1]
+        assert payload["channel"] == "#new"
+        assert payload["key"] == "hunter2"

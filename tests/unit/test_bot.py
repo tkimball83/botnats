@@ -19,6 +19,8 @@ from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.nats.coordinator import Coordinator, NATSConfig
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
+    AUTH_KEY,
+    COORDINATION_KEY,
     NATS_CREDENTIAL,
     FailingWriteCoordinator,
     FakeCoordinator,
@@ -54,7 +56,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key == "good-key"
 
     async def test_irc_client_from_config(self) -> None:
-        """Build the IRC client from configuration."""
+        """Build the IRC client from configuration on the bot's caps and events."""
         server = IRCServer("irc.example.test", 6697, tls=True)
         for verify in (True, False):
             with self.subTest(verify=verify):
@@ -74,6 +76,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                     servers=(server,),
                     verify_tls=verify,
                 )
+                assert bot.irc.caps is bot.caps
+                assert bot.irc.on_message == bot.events.on_irc_message
+                assert bot.irc.on_disconnect == bot.events.on_irc_disconnect
 
     async def test_components_from_config(self) -> None:
         """Build auth, presence, health, and NATS components from configuration."""
@@ -89,10 +94,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+        # The secrets differ, so a swap of the two cannot pass.
+        assert bot.authorizer.secret == AUTH_KEY
+        assert bot.authorizer.coordination_key == COORDINATION_KEY
         assert bot.authorizer.session_ttl == 600
         assert bot.authorizer.network == "libera"
         assert bot.presence.ttl == 10
         assert bot.health_check.port == 9080
+        assert bot.health_check.ready == bot.ready
         assert isinstance(bot.coordinator, Coordinator)
         assert bot.coordinator.config == NATSConfig(
             instance_id=bot.identity.instance_id,
@@ -105,6 +114,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             token=NATS_CREDENTIAL,
         )
         assert bot.coordinator.envelope.bot_id == "alpha-id"
+        assert bot.coordinator.envelope.coordination_key == COORDINATION_KEY
 
     async def test_close_reaps_task_spawned_during_shutdown(self) -> None:
         """Drain a task a coordinator callback spawns mid-shutdown."""

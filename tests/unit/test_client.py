@@ -1106,7 +1106,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
         try:
-            await client.establish(client.config.servers[0])
+            async with asyncio.timeout(5):
+                await client.establish(client.config.servers[0])
+
             for index in range(250):
                 channel = f"#channel{index}"
                 client.send("JOIN", channel)
