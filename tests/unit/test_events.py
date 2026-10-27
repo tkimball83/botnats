@@ -71,7 +71,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
@@ -98,7 +98,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!*@Bad.Host")
 
         bot.events.on_irc_message(
-            IRCMessage("MODE", ("#test", "-b", "*!*@bad.host"), Prefix("op", "u", "h")),
+            IRCMessage("MODE", ("#test", "-b", "*!*@BAD.HOST"), Prefix("op", "u", "h")),
         )
 
         assert runtime.bans == {}
@@ -172,7 +172,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Verify CHGHOST on the bot itself refreshes its identity."""
         bot, _ = bot_with_irc()
         bot.identity.current = BotPresence(
-            "alpha", "old.host", "inst", "alpha", "~alpha"
+            bot.config.bot_id, "old.host", "inst", "alpha", "~alpha"
         )
 
         bot.events.on_irc_message(
@@ -228,7 +228,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
-        peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
@@ -631,7 +631,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
         # An opped peer is present, so a spurious op request would be sent.
-        peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
@@ -659,7 +659,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
-        peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
@@ -871,7 +871,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Advertise the new nick when a NICK prefix omits user@host."""
         bot, fake_irc = bot_with_irc()
         bot.identity.current = BotPresence(
-            "alpha", "host.example", "inst", "alpha", "~alpha"
+            bot.config.bot_id, "host.example", "inst", "alpha", "~alpha"
         )
         fake_irc.current_nick = "newalpha"
 
@@ -1205,7 +1205,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Verify nick change updates identity and channel member tracking."""
         bot, fake_irc = bot_with_irc()
         bot.identity.current = BotPresence(
-            "alpha", "host.example", "inst", "alpha", "~alpha"
+            bot.config.bot_id, "host.example", "inst", "alpha", "~alpha"
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "host.example")
@@ -1361,7 +1361,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert casefold("stale", "rfc1459") not in runtime.members
         assert casefold("alpha", "rfc1459") in runtime.members
         assert bot.identity.current == BotPresence(
-            "alpha", "host.example", bot.identity.instance_id, "alpha", "~alpha"
+            bot.config.bot_id,
+            "host.example",
+            bot.identity.instance_id,
+            "alpha",
+            "~alpha",
         )
 
     async def test_self_join_orphaned(self) -> None:
@@ -1566,7 +1570,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await bot.tasks.drain()
 
         assert bot.identity.current == BotPresence(
-            "alpha", "alpha.host", bot.identity.instance_id, "alpha", "~alpha"
+            bot.config.bot_id,
+            "alpha.host",
+            bot.identity.instance_id,
+            "alpha",
+            "~alpha",
         )
 
     async def test_who_reply_updates_member(self) -> None:

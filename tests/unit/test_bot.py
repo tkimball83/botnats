@@ -15,7 +15,7 @@ from nats.errors import Error as NatsError
 
 from botnats.bot import Bot
 from botnats.channel import JoinState
-from botnats.irc.client import IRCClient, IRCServer
+from botnats.irc.client import IRCClient, IRCClientConfig, IRCServer
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
@@ -52,16 +52,30 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.callbacks.on_channel(astuple(record))
         assert runtime.key == "good-key"
 
-    async def test_irc_client_verifies_tls(self) -> None:
-        """Build the IRC client from configuration with verified TLS."""
+    async def test_irc_client_from_config(self) -> None:
+        """Build the IRC client from configuration, verifying TLS as configured."""
         server = IRCServer("irc.example.test", 6697, tls=True)
-        bot = Bot(replace(config(), irc_servers=(server,)))
+        for verify, mode in ((True, ssl.CERT_REQUIRED), (False, ssl.CERT_NONE)):
+            with self.subTest(verify=verify):
+                bot = Bot(
+                    replace(
+                        config(),
+                        irc_connect_timeout=45,
+                        irc_servers=(server,),
+                        irc_verify_tls=verify,
+                    ),
+                )
 
-        assert isinstance(bot.irc, IRCClient)
-        assert bot.irc.config.nickname == "alpha"
-        assert bot.irc.tls_context is not None
-        assert bot.irc.tls_context.check_hostname
-        assert bot.irc.tls_context.verify_mode == ssl.CERT_REQUIRED
+                assert isinstance(bot.irc, IRCClient)
+                assert bot.irc.config == IRCClientConfig(
+                    connect_timeout=45,
+                    nickname="alpha",
+                    servers=(server,),
+                    verify_tls=verify,
+                )
+                assert bot.irc.tls_context is not None
+                assert bot.irc.tls_context.check_hostname is verify
+                assert bot.irc.tls_context.verify_mode == mode
 
     async def test_close_reaps_task_spawned_during_shutdown(self) -> None:
         """Drain a task a coordinator callback spawns mid-shutdown."""

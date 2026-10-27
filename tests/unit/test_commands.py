@@ -545,6 +545,8 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_cmd_status(self) -> None:
         """Verify STATUS command returns bot identity and channel count."""
         bot, fake_irc, _ = bot_with_coordinator()
+        # Registered under a fallback nick, unlike the configured one.
+        fake_irc.current_nick = "alpha_"
         bot.authorizer.grant(OWNER.render())
         bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
         # A channel still joining is desired but not counted.
@@ -552,15 +554,15 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             bot.caps, channel="#other", join=JoinState.JOINING
         )
         bot.presence.update(
-            BotPresence("Alpha", "host.example", "inst", "alpha", "~alpha"),
+            BotPresence("Alpha-ID", "host.example", "inst", "alpha_", "~alpha"),
         )
         bot.presence.update(
-            BotPresence("beta", "peer.example", "inst2", "beta", "~beta"),
+            BotPresence("beta-id", "peer.example", "inst2", "beta", "~beta"),
         )
 
         await bot.commands.dispatch(OWNER, "STATUS")
         assert fake_irc.privmsgs == [
-            ("owner", "bot id=alpha nick=alpha peers=1 channels=1"),
+            ("owner", "bot id=alpha-id nick=alpha_ peers=1 channels=1"),
             (
                 "owner",
                 (

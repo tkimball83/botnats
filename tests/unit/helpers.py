@@ -196,7 +196,7 @@ def config() -> BotConfig:
     """Build a default test configuration."""
     return BotConfig(
         auth_session_ttl=3600,
-        bot_id="alpha",
+        bot_id="alpha-id",
         channel_modes="+npst",
         coordination_secret=COORDINATION_KEY,
         enforced_modes=(frozenset("npst"), frozenset()),
@@ -363,7 +363,7 @@ class FakeCoordinator:
         for store in (self.attempts, self.channels, self.claims, self.sessions):
             store.kv = cast("KeyValue", FakeKV())
 
-        self.bot_id = "alpha"
+        self.bot_id = "alpha-id"
         self.channel_after: list[str | None] = []
         self.channel_puts: list[dict[str, Any]] = []
         self.claim_requests: list[int] = []

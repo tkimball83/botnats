@@ -106,6 +106,8 @@ class IRCProtocolTests(unittest.TestCase):
             ("NOTICE", ("owner",), "safe\nQUIT"),
             # A leading colon would turn a middle parameter into the trailing one.
             ("INVITE", (":owner", "#safe"), None),
+            # An empty middle parameter would vanish, moving the trailing one up.
+            ("KICK", ("#safe", ""), "reason"),
         )
 
         for command, params, trailing in unsafe:
