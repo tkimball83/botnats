@@ -250,6 +250,7 @@ class IRCProtocolTests(unittest.TestCase):
         prefix = Prefix("Owner", "user", "Host.Example")
 
         assert prefix.matches(Prefix("owner", "user", "host.example"), "rfc1459")
+        assert not prefix.matches(Prefix("other", "user", "host.example"), "rfc1459")
         assert not prefix.matches(Prefix("owner", "other", "host.example"), "rfc1459")
         assert not prefix.matches(Prefix("owner", "user", "other.example"), "rfc1459")
         assert not prefix.matches(Prefix("owner", "user", "straße.example"), "rfc1459")

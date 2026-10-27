@@ -97,7 +97,12 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.outbound = asyncio.Queue(maxsize=64)
         client.sender_task = asyncio.create_task(hang())
         client.writer = mock_writer()
-        self.addAsyncCleanup(client.stop_sender)
+
+        async def stop_sender() -> None:
+            async with asyncio.timeout(5):
+                await client.stop_sender()
+
+        self.addAsyncCleanup(stop_sender)
         return client
 
     async def unread_connection(
@@ -1190,6 +1195,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Re-raise cancellation aimed at the caller, not only the sender's own."""
         client = irc_client()
         sender_stopping = asyncio.Event()
+        released = asyncio.Event()
+        self.addCleanup(released.set)
 
         async def slow_sender() -> None:
             try:
@@ -1197,7 +1204,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 # Still winding down when the caller is cancelled in turn.
                 sender_stopping.set()
-                await hang()
+                await released.wait()
 
         client.sender_task = asyncio.create_task(slow_sender())
         stopper = asyncio.create_task(client.stop_sender())

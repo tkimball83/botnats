@@ -422,8 +422,8 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.privmsgs.clear()
         with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
             await bot.commands.dispatch(OWNER, "KICK #test ghost")
-            await bot.commands.dispatch(OWNER, "KICK #test target")
-            await bot.commands.dispatch(OWNER, "KICK #test target go  away")
+            await bot.commands.dispatch(OWNER, "KICK #test TARGET")
+            await bot.commands.dispatch(OWNER, "KICK #test TARGET go  away")
 
         kicks = [c for c in send.call_args_list if c.args[0] == "KICK"]
         assert kicks == [
