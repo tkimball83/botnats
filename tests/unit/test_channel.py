@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, call, patch
 
 from nats.errors import Error as NatsError
 
-from botnats.bot import Bot
 from botnats.channel import (
     JOIN_REPLY_TIMEOUT,
     JOIN_RETRY_DELAY,
@@ -36,7 +35,6 @@ from tests.unit.helpers import (
     bot_with_channel,
     bot_with_coordinator,
     bot_with_irc,
-    config,
     make_bot,
     settle,
 )
@@ -44,6 +42,7 @@ from tests.unit.helpers import (
 if TYPE_CHECKING:
     from nats.js.kv import KeyValue
 
+    from botnats.bot import Bot
     from botnats.validators import ChannelFields
 
 # A banned peer asking into a full #test, and one already in it asking for op.
@@ -207,7 +206,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_older_colliding_record_does_not_replace_newer(self) -> None:
         """Keep the newer record when an older one folds onto the same channel."""
-        bot = Bot(config())
+        bot = make_bot()
         older = bot.channel_mgr.new_record("#room{", "older", present=True)
         newer = bot.channel_mgr.new_record("#room[", "newer", present=True)
 
@@ -222,7 +221,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_casemapping_change_preserves_colliding_records(self) -> None:
         """Keep records that collide temporarily under one server casemapping."""
-        bot = Bot(config())
+        bot = make_bot()
         first = bot.channel_mgr.new_record("#room[", "first", present=True)
         second = bot.channel_mgr.new_record("#room{", "second", present=True)
 
@@ -271,7 +270,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        bot.identity.registered = True
         first = bot.channel_mgr.new_record("#first", "first-key", present=True)
         second = bot.channel_mgr.new_record("#second", "second-key", present=True)
 
@@ -504,7 +502,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        bot.identity.registered = True
         join = bot.channel_mgr.new_record("#test", None, present=True)
         tombstone = bot.channel_mgr.new_record(
             "#test",
@@ -951,6 +948,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 runtime.hide_key()
                 release.set()
                 await settle(bot)
+
+        # The KV watch delivers the write again after its reply, as does a
+        # watch replay after a reconnect.
+        bot.callbacks.on_channel(astuple(mgr.channel_records[folded]))
 
         assert [put["key"] for put in coordinator.channel_puts] == ["A"]
         assert runtime.key == "B"
@@ -1446,7 +1447,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
-        runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
         runtime.member("alpha").modes.add("o")
 
         peers = (
@@ -1620,7 +1620,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
-        runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
         runtime.member("beta").modes.add("o")
 
         await bot.channel_mgr.request_ops()

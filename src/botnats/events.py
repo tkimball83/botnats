@@ -141,7 +141,7 @@ class IRCEventHandler:
         channel = message.params[1]
         mask = message.params[2]
         runtime = self.bot.channel_mgr.runtime(channel)
-        if runtime is not None:
+        if runtime is not None and runtime.joined:
             runtime.add_ban(mask)
 
     def handle_channel_modes(self, message: IRCMessage) -> None:
@@ -303,7 +303,9 @@ class IRCEventHandler:
 
         channel = message.params[1]
         runtime = self.bot.channel_mgr.runtime(channel)
-        if runtime is None:
+        # A NAMES answered after a KICK or PART names a channel this bot has
+        # left: neither query it nor ask peers for op in it.
+        if runtime is None or not runtime.joined:
             return
 
         # A failed send means the connection is gone or the send queue is
@@ -533,7 +535,7 @@ class IRCEventHandler:
 
         channel = message.params[-2]
         runtime = self.bot.channel_mgr.runtime(channel)
-        if runtime is None:
+        if runtime is None or not runtime.joined:
             return
         # A prefix symbol the server never advertised stays attached to the
         # nick, leaving a phantom member under the decorated name; WHO
@@ -658,7 +660,7 @@ class IRCEventHandler:
             message.params[6],
         )
         runtime = self.bot.channel_mgr.runtime(channel)
-        if runtime is None:
+        if runtime is None or not runtime.joined:
             return
 
         member = runtime.member(nick)
