@@ -702,7 +702,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Keep retrying JetStream initialization for as long as it fails."""
         coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
-        coordinator.nc.jetstream.return_value = MagicMock()
+        js = coordinator.nc.jetstream.return_value
         failures = [OSError("unavailable")] * 11
         open_attempt = AsyncMock(side_effect=[*failures, None])
         open_store = AsyncMock()
@@ -718,7 +718,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         ):
             await coordinator.init_stores()
 
-        assert open_attempt.await_count == 12
+        # Every store opens on the client's JetStream context.
+        assert open_attempt.await_args_list == [call(js)] * 12
+        assert open_store.await_args_list == [call(js)] * 4
         assert sleep.await_count == 11
 
     async def test_init_stores_surfaces_programming_errors(self) -> None:
@@ -1078,7 +1080,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_presence_detects_starting_duplicate(self) -> None:
         """Yield to another instance's placeholder claim, which is not yet a peer."""
-        coordinator = build_coordinator("alpha")
+        # Differs from the record's bot ID in case only: claims ignore case.
+        coordinator = build_coordinator("Alpha")
         update = MagicMock()
         # A starting process claims its key before it knows its IRC identity.
         record: dict[str, object] = {
@@ -1737,6 +1740,24 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert len(channels.entries) == 1
         assert len(sessions.entries) == 1
+
+    async def test_presence_heartbeat_reclaims_unowned_key(self) -> None:
+        """Reclaim a free presence key on a heartbeat, which needs no ownership.
+
+        A duplicate's record expiring by TTL emits no watch event, and a
+        failed watch reclaim waits for this heartbeat to retry it.
+        """
+        coordinator = build_coordinator("alpha")
+        instance_id = coordinator.claim.instance_id
+        presence = asdict(BotPresence("alpha", "host", instance_id, "alpha", "user"))
+
+        for state in (PresenceState.UNCLAIMED, PresenceState.DUPLICATE):
+            coordinator.presence_store.kv = cast("KeyValue", FakeKV())
+            coordinator.claim.state = state
+            with self.subTest(state=state):
+                await coordinator.put_presence(presence)
+
+                assert coordinator.claim.owned
 
     async def test_start_retries_failed_connection(self) -> None:
         """Close and retry a connection whose setup failed, even if closing fails."""

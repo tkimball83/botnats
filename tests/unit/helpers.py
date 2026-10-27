@@ -398,9 +398,17 @@ class FakeCoordinator:
         return await self.channels.put(record, after=after)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
-        """Record a presence write."""
-        self.require_writable()
+        """Record a presence write, which needs no ownership, unlike the others.
+
+        As the real claim does on a free key, a write that lands reclaims the
+        bot ID from a duplicate; only a disconnect refuses it.
+        """
+        if not self.connected:
+            msg = "JetStream is unavailable"
+            raise StoreUnavailableError(msg)
+
         self.presence_puts.append(presence)
+        self.duplicate = False
 
     async def put_session(self, session: dict[str, Any]) -> Session:
         """Record a session write and store it as SessionStore would."""
