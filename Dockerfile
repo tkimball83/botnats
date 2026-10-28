@@ -8,8 +8,7 @@ COPY pyproject.toml .
 RUN python -c "import tomllib; \
     print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" \
     | python -m pip install --no-cache-dir -r /dev/stdin
-COPY . .
-RUN python -m pip install --no-cache-dir --no-deps .
+RUN --mount=type=bind,target=/src,rw python -m pip install --no-cache-dir --no-deps /src
 
 USER 65534:65534
 ENTRYPOINT ["botnats"]
