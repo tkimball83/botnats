@@ -21,6 +21,7 @@ from nats.js.errors import (
     KeyWrongLastSequenceError,
     NotFoundError,
 )
+from nats.js.kv import KV_DEL, KV_PURGE
 
 from botnats.auth import TOTP_PERIOD, TOTP_WINDOW
 from botnats.nats.store import (
@@ -39,6 +40,7 @@ from botnats.nats.store import (
     StoreUnavailableError,
     channel_signature,
     decode_record,
+    is_delete,
     parse_session_record,
     presence_signature,
     session_signature,
@@ -1187,6 +1189,14 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             assert decode_record(b"[[]]") is None
 
         parser.loads.assert_called_once_with(b"[[]]")
+
+    async def test_is_delete_matches_delete_and_purge(self) -> None:
+        """Treat both KV delete markers as deletions and a plain put as live."""
+        for operation in (KV_DEL, KV_PURGE):
+            with self.subTest(operation=operation):
+                assert is_delete(operation)
+
+        assert not is_delete(None)
 
     async def test_state_keys_do_not_depend_on_irc_casemapping(self) -> None:
         """Keep RFC1459-only equivalents in distinct durable KV entries."""
