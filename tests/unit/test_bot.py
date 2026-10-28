@@ -343,6 +343,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(config())
         calls = 0
         sleeps = 0
+        real_sleep = asyncio.sleep
 
         async def counting_tick() -> None:
             nonlocal calls
@@ -350,6 +351,9 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             if calls == 1:
                 msg = "transient failure"
                 raise RuntimeError(msg)
+
+            # Yield, so the timeout can end a loop that stops sleeping.
+            await real_sleep(0)
 
         async def immediate(delay: float) -> None:
             del delay
@@ -361,12 +365,15 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
                 msg = "stop"
                 raise asyncio.CancelledError(msg)
 
+            await real_sleep(0)
+
         with (
             patch("botnats.bot.asyncio.sleep", immediate),
             self.assertLogs("botnats.bot", level="ERROR"),
             self.assertRaises(asyncio.CancelledError),
         ):
-            await bot.maintenance_loop(counting_tick, "maintenance tick")
+            async with asyncio.timeout(5):
+                await bot.maintenance_loop(counting_tick, "maintenance tick")
 
         assert calls == 2
 

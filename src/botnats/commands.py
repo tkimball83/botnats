@@ -443,7 +443,7 @@ class RateLimiter:
     def evict_stale(self, cutoff: float) -> bool:
         """Evict the least-recently-used bucket only if it has fully expired."""
         key, bucket = next(iter(self.buckets.items()))
-        if bucket and bucket[-1] > cutoff:
+        if bucket[-1] > cutoff:
             return False
 
         del self.buckets[key]
