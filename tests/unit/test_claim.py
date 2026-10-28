@@ -201,7 +201,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(NatsError),
         ):
-            await claim.expired()
+            await claim.deleted()
 
         assert not claim.owned
         assert claim.revision is None

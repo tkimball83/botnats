@@ -191,7 +191,7 @@ class NATSCallbackHandler:
         self.bot.presence.update(presence)
 
     def on_presence_delete(self, bot_id: str) -> None:
-        """Remove an expired peer presence from the local registry."""
+        """Remove a deleted peer presence from the local registry."""
         self.bot.presence.remove(bot_id)
 
     def on_session_delete(self, key: str) -> None:

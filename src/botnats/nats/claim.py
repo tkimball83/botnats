@@ -91,7 +91,7 @@ class PresenceClaim:
         async with self.lock:
             self.last = presence
             generation = self.generation
-            if self.owned and self.revision is not None:
+            if self.revision is not None:
                 revision = await self.store.update(self.bot_id, presence, self.revision)
                 if generation != self.generation:
                     return
@@ -111,7 +111,7 @@ class PresenceClaim:
             if not self.owned:
                 await self.claim()
 
-    async def expired(self) -> None:
+    async def deleted(self) -> None:
         """Handle this bot's key being deleted, then try to reclaim it."""
         async with self.lock:
             if self.owned:
@@ -134,7 +134,7 @@ class PresenceClaim:
         """Delete the owned key on shutdown so a replacement can claim it."""
         async with self.lock:
             revision = self.revision
-            if self.owned and revision is not None:
+            if revision is not None:
                 with suppress(*PUBLISH_ERRORS):
                     await self.store.delete(self.bot_id, revision, self.instance_id)
 

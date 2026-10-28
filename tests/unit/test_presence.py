@@ -95,7 +95,7 @@ class PresenceTests(unittest.TestCase):
         assert list(registry.entries) == ["new"]
 
     def test_presence_remove(self) -> None:
-        """Remove an expired presence immediately from a watch deletion."""
+        """Remove a presence immediately on a watch deletion."""
         registry = PresenceRegistry(ttl=10)
         presence = BotPresence("Vhagar", "host", "instance", "Vhagar", "user")
         registry.update(presence, now=5)
