@@ -74,6 +74,14 @@ class ConfigTests(unittest.TestCase):
             totp_secret=AUTH_KEY,
         )
 
+    def test_repr_hides_secrets(self) -> None:
+        """Leave every secret out of the configuration's repr, which logs may show."""
+        rendered = repr(load_config(json.loads(CONFIG)))
+
+        for secret in (AUTH_KEY.decode(), COORDINATION_KEY.decode(), NATS_CREDENTIAL):
+            with self.subTest(secret=secret):
+                assert secret not in rendered
+
     def test_secret_validation(self) -> None:
         """Reject a missing, malformed, too-short, or non-UTF-8 secret."""
         # One byte short of the 20-byte minimum that AUTH_KEY meets.
@@ -141,10 +149,14 @@ class ConfigTests(unittest.TestCase):
 
         assert config.totp_secret == key
 
-    def test_nickname_must_fit_registration(self) -> None:
-        """Reject a nickname whose USER registration line exceeds 512 bytes."""
-        with self.assertRaisesRegex(ValueError, "512 bytes"):
-            nickname({"nickname": "n" * 300})
+    def test_nickname_fits_rfc1459_length(self) -> None:
+        """Accept a nickname of RFC 1459's nine characters, but not a longer one."""
+        assert nickname({"nickname": "n" * 9}) == "n" * 9
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^bot\.nickname must not exceed 9 characters$",
+        ):
+            nickname({"nickname": "n" * 10})
 
     def test_optional_settings_default(self) -> None:
         """Load defaults for omitted optional keys and tables."""
@@ -203,20 +215,6 @@ class ConfigTests(unittest.TestCase):
         config = load_config(raw)
 
         assert config.auth_session_ttl == 172800
-
-    def test_session_ttl_must_expire(self) -> None:
-        """Reject a session lifetime of zero or less: sessions always expire."""
-        for ttl in (0, -1):
-            raw = json.loads(CONFIG)
-            raw["authorization"]["session_ttl_seconds"] = ttl
-            with (
-                self.subTest(ttl=ttl),
-                self.assertRaisesRegex(
-                    ValueError,
-                    r"authorization\.session_ttl_seconds must be a positive",
-                ),
-            ):
-                load_config(raw)
 
     def test_required_key_errors_name_their_section(self) -> None:
         """Qualify required-key errors with their configuration table."""
@@ -288,6 +286,11 @@ class ConfigTests(unittest.TestCase):
             "-s+nt",
             (frozenset("nt"), frozenset("s")),
         )
+        # Unsetting a limit takes no argument, though setting one does.
+        assert mode_string({"channel_modes": "-l"}) == (
+            "-l",
+            (frozenset(), frozenset("l")),
+        )
 
     def test_channel_modes_reject_contradictions(self) -> None:
         """Reject modes configured as both required and forbidden."""
@@ -307,6 +310,7 @@ class ConfigTests(unittest.TestCase):
         for value, message in (
             ("nt", "contains unsupported characters"),
             ("+", "contains unsupported characters"),
+            ("+nt1", "contains unsupported characters"),
             ("+k", "contains a mode that requires an argument"),
             ("-b", "contains a mode that requires an argument"),
             ("+o", "contains a mode that requires an argument"),

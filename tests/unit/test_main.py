@@ -30,8 +30,8 @@ class MainTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["botnats", "--config", str(config_path)]),
             patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": log_level}),
-            patch("botnats.__main__.logging.basicConfig"),
-            patch("botnats.__main__.asyncio.run") as run_loop,
+            patch("logging.basicConfig"),
+            patch("asyncio.run") as run_loop,
             patch("botnats.__main__.run") as run_bot,
             redirect_stderr(stderr),
             self.assertRaises(SystemExit) as raised,
@@ -87,9 +87,10 @@ class MainTests(unittest.TestCase):
             path.write_bytes(CONFIG)
             with (
                 patch.object(sys, "argv", ["botnats", "--config", str(path)]),
-                patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": "debug"}),
-                patch("botnats.__main__.logging.basicConfig") as basic_config,
-                patch("botnats.__main__.asyncio.run") as run_loop,
+                # A shell or env file may leave whitespace around the level.
+                patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": " debug\n"}),
+                patch("logging.basicConfig") as basic_config,
+                patch("asyncio.run") as run_loop,
                 patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
             ):
                 main()
@@ -99,25 +100,28 @@ class MainTests(unittest.TestCase):
         run_loop.assert_called_once_with(run_bot.return_value)
         assert basic_config.call_args.kwargs["level"] == logging.DEBUG
 
-    def test_sigterm_exits_cleanly(self) -> None:
-        """Return normally when SIGTERM cancels the bot, as docker stop does."""
+    def test_interrupt_exits_cleanly(self) -> None:
+        """Return normally when SIGTERM, as docker stop sends, or Ctrl-C stops it."""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "bot.json")
             path.write_bytes(CONFIG)
-            with (
-                patch.object(sys, "argv", ["botnats", "--config", str(path)]),
-                patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": "INFO"}),
-                patch("botnats.__main__.logging.basicConfig"),
-                # The SIGTERM handler cancels the main task; asyncio.run raises.
-                patch(
-                    "botnats.__main__.asyncio.run",
-                    side_effect=asyncio.CancelledError,
-                ) as run_loop,
-                patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
-            ):
-                main()
+            # The SIGTERM handler cancels the main task, so asyncio.run raises.
+            for interrupt in (asyncio.CancelledError, KeyboardInterrupt):
+                with (
+                    self.subTest(interrupt=interrupt.__name__),
+                    patch.object(sys, "argv", ["botnats", "--config", str(path)]),
+                    patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": "INFO"}),
+                    patch("logging.basicConfig"),
+                    patch("asyncio.run", side_effect=interrupt) as run_loop,
+                    patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
+                ):
+                    try:
+                        main()
+                    except KeyboardInterrupt:
+                        # Raised on, it would stop the whole test run.
+                        self.fail("main() let KeyboardInterrupt escape")
 
-        run_loop.assert_called_once_with(run_bot.return_value)
+                    run_loop.assert_called_once_with(run_bot.return_value)
 
 
 class RunTests(unittest.IsolatedAsyncioTestCase):

@@ -7,6 +7,7 @@ import asyncio
 import logging
 import secrets
 import ssl
+from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -28,9 +29,6 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 DESIRED_CAPS = frozenset({"chghost", "multi-prefix"})
-# RFC 1459's NICKLEN: a collision happens during registration, before the
-# server advertises its own limit.
-FALLBACK_NICK_LENGTH = 9
 # A quiet connection gets a PING after IDLE_TIMEOUT and must answer it
 # within PONG_TIMEOUT.
 IDLE_TIMEOUT = 120.0
@@ -42,8 +40,9 @@ NICK_COLLISION_LIMIT = 20
 OUTBOUND_LIMIT = 1024
 PONG_TIMEOUT = 30.0
 REGISTRATION_TIMEOUT = 60.0
-SEND_BURST = 4.0
-SEND_RATE = 1.0
+# ircu and UnrealIRCd stop reading a client whose line costs run this many
+# seconds ahead of the clock; send_cost prices each line.
+SEND_CREDIT = 10.0
 STABLE_SESSION_SECONDS = 60.0
 WRITE_TIMEOUT = 30.0
 
@@ -92,12 +91,18 @@ class IRCClient:
         self.cap_negotiating = False
         self.cap_ls_done = False
         self.caps = caps
+        # The loop time that the lines sent on this connection are charged
+        # up to; the credit is spent once it runs SEND_CREDIT ahead.
+        self.charged_until = 0.0
         self.config = config
         self.current_nick = config.nickname
         self.nickname_attempts = 0
         self.on_disconnect = on_disconnect
         self.on_message = on_message
         self.outbound: asyncio.Queue[bytes] | None = None
+        self.queued_cost = 0
+        # The lines queued but not yet written, counted: copies may wait.
+        self.queued_lines: Counter[bytes] = Counter()
         self.sender_task: asyncio.Task[None] | None = None
         self.registered_with_server = False
         needs_tls = any(s.tls for s in config.servers)
@@ -177,6 +182,8 @@ class IRCClient:
         async with asyncio.timeout(self.config.connect_timeout):
             reader, writer = await connect
         self.writer = writer
+        # The server charges each connection afresh.
+        self.charged_until = 0.0
         outbound: asyncio.Queue[bytes] = asyncio.Queue(maxsize=OUTBOUND_LIMIT)
         self.outbound = outbound
         self.sender_task = asyncio.create_task(
@@ -248,18 +255,13 @@ class IRCClient:
             msg = "IRC nickname collision limit exceeded"
             raise ConnectionError(msg)
 
-        self.current_nick = next_nickname(
-            min(len(self.config.nickname), FALLBACK_NICK_LENGTH),
-        )
+        self.current_nick = next_nickname(len(self.config.nickname))
         self.send("NICK", self.current_nick)
 
     @property
     def queue_delay(self) -> float:
         """Return about how long the lines queued now take to go out."""
-        if self.outbound is None:
-            return 0.0
-
-        return self.outbound.qsize() / SEND_RATE
+        return self.queued_cost
 
     def reconnect(self) -> None:
         """Force a reconnection by dropping the current socket."""
@@ -329,7 +331,7 @@ class IRCClient:
             session_start = loop.time()
             try:
                 await self.run_connection(server)
-            except (OSError, ValueError) as error:
+            except OSError as error:
                 LOGGER.warning(
                     "IRC connection to %s:%s ended: %s",
                     server.host,
@@ -359,18 +361,25 @@ class IRCClient:
         command: str,
         *params: str,
         trailing: str | None = None,
-    ) -> None:
-        """Enqueue an IRC command for rate-limited delivery."""
+        unless_waiting: bool = False,
+    ) -> bool:
+        """Enqueue an IRC command for rate-limited delivery; return whether queued.
+
+        With unless_waiting, a copy of a line still waiting to be written is
+        skipped instead.
+        """
         encoded = format_message(command, params, trailing)
         outbound = self.outbound
-        if (
-            not self.connected
-            or outbound is None
-            or self.sender_task is None
-            or self.sender_task.done()
-        ):
+        if not self.connected or outbound is None:
             msg = "IRC is not connected"
             raise ConnectionError(msg)
+
+        # Only peer help asks for this. Under flood pacing a queued copy costs
+        # seconds, and IRC state cannot show a command still queued. A copy
+        # skipped before a line that reverses it heals only for help: the
+        # peer asks again until it sees the result.
+        if unless_waiting and self.queued_lines[encoded]:
+            return False
 
         try:
             outbound.put_nowait(encoded)
@@ -378,16 +387,25 @@ class IRCClient:
             msg = "IRC outbound queue is full"
             raise ConnectionError(msg) from error
 
+        self.queued_cost += send_cost(encoded)
+        self.queued_lines[encoded] += 1
+        return True
+
     async def send_immediate(
         self,
         encoded: bytes,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Write a pre-encoded message to the socket without queuing."""
+        """Write a pre-encoded message to the socket without queuing.
+
+        The line still spends flood credit, so the queued lines after it wait.
+        """
         if writer.is_closing():
             msg = "IRC is not connected"
             raise ConnectionError(msg)
 
+        now = asyncio.get_running_loop().time()
+        self.charged_until = max(self.charged_until, now) + send_cost(encoded)
         writer.write(encoded)
         try:
             async with asyncio.timeout(WRITE_TIMEOUT):
@@ -403,22 +421,25 @@ class IRCClient:
         writer: asyncio.StreamWriter,
         outbound: asyncio.Queue[bytes],
     ) -> None:
-        """Drain the outbound queue at the configured send rate."""
+        """Drain the outbound queue as fast as the flood credit allows."""
         loop = asyncio.get_running_loop()
-        tokens = SEND_BURST
-        updated = loop.time()
         try:
             while True:
                 encoded = await outbound.get()
-                now = loop.time()
-                tokens = min(SEND_BURST, tokens + (now - updated) * SEND_RATE)
-                updated = now
-                if tokens < 1.0:
-                    await asyncio.sleep((1.0 - tokens) / SEND_RATE)
-                    updated = loop.time()
-                    tokens = 0.0
-                else:
-                    tokens -= 1.0
+                cost = send_cost(encoded)
+                # Checked again after each wait: a PONG sent meanwhile spends
+                # the same credit.
+                while True:
+                    delay = self.charged_until + cost - SEND_CREDIT - loop.time()
+                    if delay <= 0:
+                        break
+
+                    await asyncio.sleep(delay)
+
+                self.queued_cost -= cost
+                self.queued_lines[encoded] -= 1
+                if self.queued_lines[encoded] <= 0:
+                    del self.queued_lines[encoded]
 
                 await self.send_immediate(encoded, writer)
         except OSError:
@@ -431,6 +452,8 @@ class IRCClient:
         task = self.sender_task
         self.sender_task = None
         self.outbound = None
+        self.queued_cost = 0
+        self.queued_lines.clear()
         if task is not None:
             task.cancel()
             try:
@@ -504,3 +527,12 @@ def pong_reply(line: bytes) -> bytes:
 def next_nickname(length: int) -> str:
     """Generate a random alphabetic nickname of the given length."""
     return "".join(secrets.choice(NICK_ALPHABET) for _ in range(length))
+
+
+def send_cost(encoded: bytes) -> int:
+    """Return the seconds of flood credit one encoded line spends.
+
+    ircu charges 2 + len / 120 seconds a line, and UnrealIRCd 1 + len / 90
+    before registration; the larger of the two satisfies both.
+    """
+    return max(2 + len(encoded) // 120, 1 + len(encoded) // 90)

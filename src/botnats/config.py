@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     from collections.abc import Collection
 
 MODE_STRING_RE = re.compile(r"(?:[+-][A-Za-z]+)+")
+# RFC 1459's NICKLEN, which every server family accepts: some truncate a
+# longer NICK and others refuse it, so the bot could never hold its nick.
+MAX_NICKNAME_LENGTH = 9
 MIN_COORDINATION_KEY_BYTES = 32
 MIN_TOTP_SECRET_BYTES = 20
 NATS_SCHEMES = frozenset({"nats", "tls"})
@@ -261,8 +264,10 @@ def nickname(section: dict[str, Any]) -> str:
         msg = "bot.nickname is not a valid IRC nickname"
         raise ValueError(msg)
 
-    # The nickname also fills the USER line, which must fit in 512 bytes.
-    format_message("USER", (value, "0", "*"), value)
+    if len(value) > MAX_NICKNAME_LENGTH:
+        msg = f"bot.nickname must not exceed {MAX_NICKNAME_LENGTH} characters"
+        raise ValueError(msg)
+
     return value
 
 

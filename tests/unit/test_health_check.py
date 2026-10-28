@@ -68,7 +68,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
             return real_timeout(0)
 
         async with real_timeout(5):
-            with patch("botnats.health_check.asyncio.timeout", short_timeout):
+            with patch("asyncio.timeout", short_timeout):
                 await health_check.handle(asyncio.StreamReader(), writer)
 
         assert delays == [5.0]
