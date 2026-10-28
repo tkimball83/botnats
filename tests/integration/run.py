@@ -153,14 +153,14 @@ async def live_coordinator() -> None:
 
 async def node_failover() -> None:
     """Kill the claim-stream leader; claims must survive on the remaining quorum."""
-    leader = await test_failover.stream_leader()
+    leader = await test_failover.claim_before_failover()
     if leader not in NATS_NODES:
         msg = f"unexpected JetStream leader: {leader}"
         raise AssertionError(msg)
 
     await compose("kill", leader)
     await wait_all_ready()
-    await test_failover.claim_after_failover(leader)
+    await test_failover.check_after_failover(leader)
     await compose(*UP, leader)
     await publish_nats_addresses()
 
