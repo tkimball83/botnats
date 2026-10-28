@@ -97,21 +97,15 @@ Example `bot.json`:
 Plain IRC exposes commands and responses, so use a trusted network when IRCS is
 unavailable. JetStream requires file storage; persist each peer's directory.
 
-Give the NATS token only to bot processes. Signatures on channel, session, and
-presence records mean a holder of the token but not the coordination secret
-cannot forge state a bot will accept, and the attempt and claim buckets use
-secret-derived keys such a holder cannot compute. None of that stops a writer
-from deleting or overwriting existing bucket entries, so a hostile token holder
-can still churn state (for example, repeatedly clobbering a presence key to
-stall a bot's readiness). NATS wildcards match whole subject tokens and each
-bucket name is one token, so when the token is shared more widely, restrict the
-buckets by their concrete names via server permissions. For a network named
-`efnet`, deny `$KV.botnats_v1_efnet_presence.>` and the JetStream API subjects
-that purge, delete, or edit its backing stream
-(`$JS.API.STREAM.*.KV_botnats_v1_efnet_presence` and
-`$JS.API.STREAM.MSG.DELETE.KV_botnats_v1_efnet_presence`), and ideally the same
-for the other four buckets (`auth_attempts`, `channels`, `sessions`, and
-`used_totp` under the same `botnats_v1_efnet_` prefix).
+Give the NATS token only to bot processes. NATS attaches no permissions to a
+token and refuses one alongside configured users, so every token holder has the
+bots' own permissions and other clients need a separate NATS deployment.
+Signatures on channel, session, and presence records mean a holder of the token
+but not the coordination secret cannot forge state a bot will accept, and the
+attempt and claim buckets use secret-derived keys such a holder cannot compute.
+None of that stops a writer from deleting or overwriting existing bucket
+entries, so a hostile token holder can still churn state (for example,
+repeatedly clobbering a presence key to stall a bot's readiness).
 
 ## Health
 
