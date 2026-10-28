@@ -482,15 +482,13 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         valid_code = totp(bot.authorizer.secret, counter)
 
         async with asyncio.timeout(1):
-            # The held lock keeps both commands queued while their sender quits.
-            async with bot.events.command_lock:
-                for text in ("XYZZY", f"AUTH {valid_code}"):
-                    bot.events.on_irc_message(
-                        IRCMessage("PRIVMSG", ("alpha", text), prefix),
-                    )
+            # Nothing yields before the QUIT, so both commands are still queued.
+            for text in ("XYZZY", f"AUTH {valid_code}"):
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", text), prefix),
+                )
 
-                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-
+            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
             await asyncio.gather(*tuple(bot.tasks))
 
         # The code was valid and claimed; only the QUIT refused it.
@@ -510,17 +508,15 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
 
         async with asyncio.timeout(1):
-            # The held lock keeps the AUTH queued while its sender quits,
-            # reconnects as the same prefix, and sends another message.
-            async with bot.events.command_lock:
-                bot.events.on_irc_message(
-                    IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
-                )
-                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-                bot.events.on_irc_message(
-                    IRCMessage("PRIVMSG", ("alpha", "XYZZY"), prefix),
-                )
-
+            # Nothing yields, so the AUTH is still queued while its sender
+            # quits, reconnects as the same prefix, and sends another message.
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
+            )
+            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", "XYZZY"), prefix),
+            )
             await asyncio.gather(*tuple(bot.tasks))
 
         assert not bot.authorizer.authorized(prefix.render())
