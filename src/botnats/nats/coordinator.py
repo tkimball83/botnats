@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 DECODE_WARNING_INTERVAL = 5.0
+MAX_OUTSTANDING_PINGS = 2
 TRANSIENT_WARNING_INTERVAL = 60.0
 RECONNECT_WAIT = 1
 
@@ -224,7 +225,7 @@ class Coordinator:
         self.store_generation += 1
         generation = self.store_generation
         js = nc.jetstream()
-        while self.nc is nc and nc.is_connected and self.store_generation == generation:
+        while nc.is_connected and self.store_generation == generation:
             try:
                 for store in self.stores:
                     await store.open(js)
@@ -464,6 +465,14 @@ class Coordinator:
             if self.nc is not None:
                 return
 
+            # nats-py drops a silent server on the ping after
+            # MAX_OUTSTANDING_PINGS unanswered ones. Spacing those pings across
+            # the presence TTL fails over by about when peers expire this bot;
+            # nats-py takes whole seconds.
+            ping_interval = max(
+                1,
+                int(self.config.presence_ttl / (MAX_OUTSTANDING_PINGS + 1)),
+            )
             # nats-py retries the connection itself. A client it closes for
             # good while the stores open is dropped by on_closed; connect again.
             while self.nc is None:
@@ -472,7 +481,9 @@ class Coordinator:
                     token=self.config.token,
                     name=f"botnats-{self.envelope.bot_id}",
                     allow_reconnect=True,
+                    max_outstanding_pings=MAX_OUTSTANDING_PINGS,
                     max_reconnect_attempts=-1,
+                    ping_interval=ping_interval,
                     reconnect_time_wait=RECONNECT_WAIT,
                     closed_cb=self.on_closed,
                     disconnected_cb=self.on_disconnected,

@@ -410,15 +410,16 @@ class PresenceStore(KVStore):
     ) -> int | None:
         """Reclaim an occupied presence key, re-reading after a lost race.
 
-        Returns the current revision when this instance's own signed record
-        still holds the key; overwrites an unsigned, forged, or misplaced
-        clobber (written by a party without the coordination secret, or
-        copied from another bot's key) to reclaim it; and returns None only
-        when a validly signed record of this bot ID from another instance
-        holds the key, which is a genuine duplicate this process must yield
-        to. Repeated lost races prove nothing about ownership, so exhaustion
-        raises for the caller's transient retry path instead of reporting a
-        duplicate.
+        Overwrites the occupant at its revision and returns the new one: this
+        instance's own signed record, left unowned by a reset or by a
+        heartbeat that landed after it timed out, is refreshed like any
+        heartbeat; an unsigned, forged, or misplaced clobber (written by a
+        party without the coordination secret, or copied from another bot's
+        key) is replaced. Returns None only when a validly signed record of
+        this bot ID from another instance holds the key, which is a genuine
+        duplicate this process must yield to. Repeated lost races prove
+        nothing about ownership, so exhaustion raises for the caller's
+        transient retry path instead of reporting a duplicate.
         """
         kv = await self.open()
         # Deliberately tighter than CAS_ATTEMPT_LIMIT: one create race plus
@@ -439,12 +440,12 @@ class PresenceStore(KVStore):
                 continue
 
             current = decode_record(entry.value)
-            if current is not None and self.valid(self.key(bot_id), current):
-                return (
-                    entry.revision
-                    if current.get("instance_id") == instance_id
-                    else None
-                )
+            if (
+                current is not None
+                and self.valid(self.key(bot_id), current)
+                and current.get("instance_id") != instance_id
+            ):
+                return None
 
             try:
                 return await kv.update(

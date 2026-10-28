@@ -146,8 +146,8 @@ async def route_count(host: str | None, port: int) -> int | None:
         if len(response) > MAX_RESPONSE_BYTES:
             return None
 
-        header, separator, body = response.partition(b"\r\n\r\n")
-        if not separator or not header.startswith((b"HTTP/1.0 200", b"HTTP/1.1 200")):
+        header, _, body = response.partition(b"\r\n\r\n")
+        if not header.startswith((b"HTTP/1.0 200", b"HTTP/1.1 200")):
             return None
 
         payload = json.loads(body)

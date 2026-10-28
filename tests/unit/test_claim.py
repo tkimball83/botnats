@@ -266,3 +266,80 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         delete.assert_awaited_once_with("alpha", 3, INSTANCE_ID)
         assert not claim.owned
         assert claim.revision is None
+
+    async def test_release_survives_failed_delete(self) -> None:
+        """Stop owning the key on shutdown even when deleting it fails."""
+        claim = build_claim()
+        claim.adopt(3)
+        delete = AsyncMock(side_effect=NatsError("timeout"))
+
+        with patch.object(claim.store, "delete", delete):
+            await claim.release()
+
+        delete.assert_awaited_once_with("alpha", 3, INSTANCE_ID)
+        assert not claim.owned
+        assert claim.revision is None
+
+    def test_reset_keeps_duplicate(self) -> None:
+        """Report a duplicate once across reconnects, and its resolution later."""
+        claim = build_claim()
+        with self.assertLogs("botnats.nats.claim", level="ERROR"):
+            claim.observe("other-instance", 1)
+
+        claim.reset()
+        # The watch replay after the reconnect shows the duplicate again.
+        with self.assertNoLogs("botnats.nats.claim", level="ERROR"):
+            claim.observe("other-instance", 1)
+
+        with self.assertLogs("botnats.nats.claim", level="INFO") as logs:
+            claim.observe(INSTANCE_ID, 2)
+
+        assert [log.getMessage() for log in logs.records] == [
+            "duplicate bot ID conflict resolved: alpha",
+        ]
+
+    async def test_deleted_key_keeps_duplicate_until_resolved(self) -> None:
+        """Report a duplicate resolved when its occupant deletes the key."""
+        claim = build_claim()
+        with self.assertLogs("botnats.nats.claim", level="ERROR"):
+            claim.observe("other-instance", 1)
+
+        with (
+            patch.object(claim.store, "create", AsyncMock(return_value=2)),
+            self.assertLogs("botnats.nats.claim", level="INFO") as logs,
+        ):
+            await claim.deleted()
+
+        assert [log.getMessage() for log in logs.records] == [
+            "duplicate bot ID conflict resolved: alpha",
+        ]
+        assert claim.owned
+        assert claim.revision == 2
+
+    async def test_own_record_observed_during_write_keeps_its_revision(self) -> None:
+        """Record a heartbeat's revision when the watch shows the last one meanwhile.
+
+        Observing this instance's own record while owned changes no ownership,
+        so the write in flight still counts.
+        """
+        claim = build_claim()
+        claim.adopt(1)
+        writing = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_update(*arguments: object) -> int:
+            del arguments
+            writing.set()
+            await release.wait()
+            return 2
+
+        with patch.object(claim.store, "update", slow_update):
+            write = asyncio.create_task(claim.put(PRESENCE))
+            async with asyncio.timeout(5):
+                await writing.wait()
+                claim.observe(INSTANCE_ID, 1)
+                release.set()
+                await write
+
+        assert claim.owned
+        assert claim.revision == 2
