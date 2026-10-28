@@ -82,18 +82,6 @@ class PresenceTests(unittest.TestCase):
         assert active[0].host == "new.host"
         assert registry.active(now=22.1) == ()
 
-    def test_presence_prune_removes_expired(self) -> None:
-        """Drop only entries whose heartbeat deadline has passed."""
-        registry = PresenceRegistry(ttl=10)
-        stale = BotPresence("old", "host", "one", "old", "user")
-        live = BotPresence("new", "host", "two", "new", "user")
-        registry.update(stale, now=0)
-        registry.update(live, now=5)
-
-        registry.prune(now=12)
-
-        assert list(registry.entries) == ["new"]
-
     def test_presence_remove(self) -> None:
         """Remove a presence immediately on a watch deletion."""
         registry = PresenceRegistry(ttl=10)

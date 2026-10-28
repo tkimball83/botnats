@@ -82,12 +82,6 @@ class PresenceRegistry:
         own = bot_id.casefold()
         return tuple(peer for peer in self.active() if peer.bot_id.casefold() != own)
 
-    def prune(self, *, now: float | None = None) -> None:
-        """Remove entries whose heartbeat deadline has passed."""
-        current = time.monotonic() if now is None else now
-        for key in [k for k, v in self.entries.items() if v[1] <= current]:
-            del self.entries[key]
-
     def remove(self, bot_id: str) -> None:
         """Remove a bot presence by stable ID."""
         self.entries.pop(bot_id.casefold(), None)
