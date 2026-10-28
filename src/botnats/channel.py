@@ -35,7 +35,8 @@ LOGGER = logging.getLogger(__name__)
 # such as 477 (registered nicks only). A duplicate JOIN is harmless.
 JOIN_REPLY_TIMEOUT = 60.0
 # Resend a JOIN refused as full, invite-only, banned, or keyed this long
-# after the refusal: soon after a peer's help, but not on every tick.
+# after its first refusal: soon after a peer's help, but not on every tick.
+# Each refusal in a row doubles the delay, up to JOIN_REPLY_TIMEOUT.
 JOIN_RETRY_DELAY = 10.0
 # Upper bound of the random wait before answering a peer's help request.
 PEER_HELP_DELAY = 1.0
@@ -725,11 +726,13 @@ class ChannelRuntime:
     channel: str = ""
     cooldowns: dict[str, float] = field(default_factory=dict)
     join: JoinState = JoinState.IDLE
-    # The last refusal logged for a pending JOIN, so it logs once. An INVITE
-    # does not resend a JOIN last forwarded (470).
+    # The last error reply to a pending JOIN: a logged error repeated is not
+    # logged again, and an INVITE does not resend a JOIN last forwarded (470).
     join_error: str | None = None
     # When a pending JOIN, unanswered or refused, is due to be sent again.
     join_retry_at: float = 0.0
+    # How long the next refusal holds a pending JOIN back.
+    join_retry_delay: float = JOIN_RETRY_DELAY
     key: str | None = None
     # A key seen on IRC that this bot has yet to record: its write is queued,
     # in flight, or failed. Each write takes the key seen at that moment, so
@@ -769,12 +772,16 @@ class ChannelRuntime:
         )
 
     def refuse_join(self) -> None:
-        """Keep a refused JOIN pending until JOIN_RETRY_DELAY has passed.
+        """Keep a refused JOIN pending until its retry delay has passed.
 
         A refusal comes back at once, so a JOIN retried on every tick would be
-        refused, and ask peers for help, on every tick.
+        refused, and ask peers for help, on every tick. Each refusal before a
+        JOIN or reconnect doubles the delay, from JOIN_RETRY_DELAY up to
+        JOIN_REPLY_TIMEOUT, so a channel no peer can help into spends little
+        of the paced send budget.
         """
-        self.join_retry_at = asyncio.get_running_loop().time() + JOIN_RETRY_DELAY
+        self.join_retry_at = asyncio.get_running_loop().time() + self.join_retry_delay
+        self.join_retry_delay = min(2 * self.join_retry_delay, JOIN_REPLY_TIMEOUT)
 
     def add_ban(self, mask: str) -> None:
         """Track a ban mask keyed by its folded form for O(1) lookup."""
@@ -829,6 +836,7 @@ class ChannelRuntime:
         self.cooldowns.clear()
         self.join = JoinState.IDLE
         self.join_error = None
+        self.join_retry_delay = JOIN_RETRY_DELAY
         self.key_pending = False
         self.limit = None
         self.members.clear()

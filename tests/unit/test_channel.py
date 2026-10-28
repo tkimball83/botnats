@@ -74,6 +74,12 @@ def part_and_want_again(bot: Bot) -> ChannelRuntime:
     return mgr.channels[folded]
 
 
+async def tick(bot: Bot) -> None:
+    """Run one maintenance tick; fail, rather than hang, on a lock it awaits."""
+    async with asyncio.timeout(5):
+        await bot.maintenance_tick()
+
+
 async def request_help(bot: Bot) -> None:
     """Deliver INVITEE's invite, unban, and room requests, and OP_REQUESTER's op.
 
@@ -481,7 +487,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [("NAMES", ("#test",))]
 
         fake_irc.failing = False
-        await bot.maintenance_tick()
+        await tick(bot)
         assert fake_irc.sent == [("NAMES", ("#test",))]
 
         # The NAMES reply restores the membership the fresh runtime lacks.
@@ -526,8 +532,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.joined
         assert fake_irc.sent == []
 
-        await bot.maintenance_tick()
-        await bot.maintenance_tick()
+        await tick(bot)
+        await tick(bot)
         assert fake_irc.sent == [("NAMES", ("#test",))]
 
     async def test_rejoin_after_part_starts_fresh(self) -> None:
@@ -575,11 +581,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert casefold("#test", "rfc1459") not in bot.channel_mgr.channels
         assert "#test" in bot.channel_mgr.pending_parts
 
-        await bot.maintenance_tick()
+        await tick(bot)
         assert "#test" in bot.channel_mgr.pending_parts
 
         fake_irc.failing = False
-        await bot.maintenance_tick()
+        await tick(bot)
 
         assert "#test" not in bot.channel_mgr.pending_parts
         assert ("PART", ("#test",)) in fake_irc.sent
@@ -1669,7 +1675,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator()
         bot.identity.on_registered()  # 001
 
-        await bot.maintenance_tick()
+        await tick(bot)
         assert fake_irc.sent == []
 
         bot.events.on_irc_message(
@@ -1708,6 +1714,39 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("JOIN", ("#test",), Prefix("alpha", "~alpha", "alpha.host")),
         )
         assert runtime.join is JoinState.JOINED
+
+    async def test_refusals_back_off_until_joined(self) -> None:
+        """Double a refused JOIN's retry delay per refusal, up to the reply timeout.
+
+        A JOIN, or a reconnect, starts over from the first delay.
+        """
+        bot, _, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+
+        def refuse(delay: float) -> None:
+            """Send a JOIN and refuse it; it is due again after delay, not sooner."""
+            bot.channel_mgr.safe_join(runtime)
+            runtime.refuse_join()
+            runtime.join_retry_at -= delay - 5
+            assert not runtime.join_due()
+            runtime.join_retry_at -= 5
+            assert runtime.join_due()
+
+        refuse(JOIN_RETRY_DELAY)
+        refuse(2 * JOIN_RETRY_DELAY)
+        refuse(4 * JOIN_RETRY_DELAY)
+        refuse(JOIN_REPLY_TIMEOUT)
+        refuse(JOIN_REPLY_TIMEOUT)
+
+        bot.events.on_irc_message(
+            IRCMessage("JOIN", ("#test",), Prefix("alpha", "~alpha", "alpha.host")),
+        )
+        refuse(JOIN_RETRY_DELAY)
+        refuse(2 * JOIN_RETRY_DELAY)
+
+        bot.channel_mgr.reset()
+        refuse(JOIN_RETRY_DELAY)
+        await settle(bot)
 
     async def test_queued_join_awaits_its_reply_from_its_send(self) -> None:
         """Await a JOIN's reply from when the send queue gets to it."""
@@ -1890,8 +1929,13 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!~beta@beta.host")
         runtime.limit = 1
         bot.presence.update(INVITEE)
-        # As IRCClient answers for a copy of a line still waiting.
-        skip = MagicMock(return_value=False)
+        # As IRCClient answers while a copy of every line still waits: help
+        # is skipped, and any other line is queued.
+        skip = MagicMock(
+            side_effect=lambda *_args, unless_waiting=False, **_kwargs: (
+                not unless_waiting
+            ),
+        )
 
         with (
             patch.object(fake_irc, "send", skip),

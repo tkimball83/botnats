@@ -22,14 +22,22 @@ class ValidatorTests(unittest.TestCase):
 
     def test_validate_channel(self) -> None:
         """Verify channel name validation accepts and rejects correctly."""
-        for valid in ("#general", "&local", "+modeless", "!ABCDEsafe"):
+        # A safe channel takes its full name, the server's channel ID first.
+        for valid in ("#general", "&local", "+modeless", "!ABCDEsafe", "!0Z9A8s"):
             assert validate_channel(valid) == valid
 
+        bad_start = "channel must start with #, &, +, or ! and a 5-character channel ID"
         for invalid, message in (
             ("#", "channel name is empty"),
-            ("", "channel must start with #, &, +, or !"),
-            ("x", "channel must start with #, &, +, or !"),
-            ("general", "channel must start with #, &, +, or !"),
+            ("", bad_start),
+            ("x", bad_start),
+            ("general", bad_start),
+            # Short names, a creation request, and an ID with no short name.
+            ("!safe", bad_start),
+            ("!ABCDsafe", bad_start),
+            ("!!safe", bad_start),
+            ("!", bad_start),
+            ("!ABCDE", bad_start),
             ("#bad channel", "channel contains unsupported characters"),
             ("#bad\tchannel", "channel contains unsupported characters"),
             ("#bad,channel", "channel contains unsupported characters"),

@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+")
 MAX_CHANNEL_REVISION = (1 << 63) - 1
 CHANNEL_REVISION_RE = re.compile(r"[0-9]{20}-[0-9a-f]{32}")
+# A safe channel's full name starts with its 5-character channel ID (RFC 2811
+# 3.2 and 5.2.1). The server answers a JOIN by short name under the full name,
+# which would match no desired channel.
+SAFE_CHANNEL_RE = re.compile(r"![A-Z0-9]{5}.")
 
 # A durable channel record's channel, key, presence flag, and revision.
 type ChannelFields = tuple[str, str | None, bool, str]
@@ -26,8 +30,8 @@ def _has_space_or_nul(value: str) -> bool:
 
 def validate_channel(value: str) -> str:
     """Verify an IRC channel name is well-formed and return it."""
-    if not value.startswith(("#", "&", "+", "!")):
-        msg = "channel must start with #, &, +, or !"
+    if not value.startswith(("#", "&", "+")) and not SAFE_CHANNEL_RE.match(value):
+        msg = "channel must start with #, &, +, or ! and a 5-character channel ID"
         raise ValueError(msg)
 
     if len(value) < 2:
