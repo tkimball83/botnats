@@ -273,6 +273,21 @@ class SessionSync:
         async with self.lock:
             await self.drain()
 
+    async def flush(self) -> None:
+        """Write everything queued at shutdown, escalations included.
+
+        A drain leaves an escalated revocation for the next retry, which
+        shutdown never makes, so drain again until the queue is empty or a
+        pass changes nothing, as when JetStream fails or the store refuses
+        the rest.
+        """
+        async with self.lock:
+            while self.pending:
+                queued = dict(self.pending)
+                await self.drain()
+                if self.pending == queued:
+                    return
+
     def revoke(self, prefix: Prefix) -> None:
         """Revoke a session locally now and write the revocation in background."""
         identity = prefix.render()
@@ -470,9 +485,9 @@ class TotpAuthorizer:
 
         return None
 
-    def prune(self, current: float | None = None) -> None:
+    def prune(self) -> None:
         """Remove expired sessions and revocations."""
-        cutoff = time.time() if current is None else current
+        cutoff = time.time()
         for key in [k for k, r in self.records.items() if r.expires_at <= cutoff]:
             del self.records[key]
 
@@ -501,8 +516,8 @@ class TotpAuthorizer:
 
 
 def limit_identity(prefix: Prefix) -> str:
-    """Return the rate-limit key for a prefix, shared by both limiters."""
-    return casefold(prefix.host or prefix.render(), "ascii")
+    """Return the rate-limit key for a complete prefix, shared by both limiters."""
+    return casefold(prefix.host or "", "ascii")
 
 
 def totp(secret: bytes, counter: int) -> str:
