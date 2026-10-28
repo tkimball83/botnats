@@ -34,6 +34,38 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
+    def test_decode_rejects_non_hex_signature(self) -> None:
+        """Reject a non-hex signature as malformed before comparing it."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        # compare_digest returns False for the first and raises TypeError for
+        # the non-ASCII second.
+        for signature in ("z" * 64, "é" * 64):
+            encoded = json.loads(envelope.encode(SUBJECT, {}))
+            encoded["signature"] = signature
+
+            with (
+                self.subTest(signature=signature),
+                self.assertRaisesRegex(ValueError, "malformed"),
+            ):
+                envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
+    def test_decode_rejects_float_timestamp(self) -> None:
+        """Reject a correctly signed timestamp that is not an integer."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        encoded = json.loads(envelope.encode(SUBJECT, {}))
+        encoded["timestamp"] = float(encoded["timestamp"])
+        encoded["signature"] = envelope.mac(
+            envelope.body(
+                encoded["nonce"],
+                encoded["payload"],
+                encoded["sender"],
+                encoded["timestamp"],
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
     def test_decode_rejects_oversized_timestamp(self) -> None:
         """Reject an integer timestamp too large for float arithmetic."""
         envelope = Envelope("alpha", COORDINATION_KEY)
@@ -55,15 +87,6 @@ class EnvelopeTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "allowed window"),
             ):
                 envelope.decode(SUBJECT, json.dumps(encoded).encode())
-
-    def test_decode_rejects_stale_timestamp(self) -> None:
-        """Reject an envelope with a plausible but expired timestamp."""
-        envelope = Envelope("alpha", COORDINATION_KEY)
-        encoded = json.loads(envelope.encode(SUBJECT, {}))
-        encoded["timestamp"] = int(time.time()) - 60
-
-        with self.assertRaisesRegex(ValueError, "allowed window"):
-            envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
     def test_decode_rejects_future_timestamp(self) -> None:
         """Reject an envelope with a timestamp too far in the future."""

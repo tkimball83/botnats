@@ -73,7 +73,6 @@ class Envelope:
             or NONCE_RE.fullmatch(nonce) is None
             or not isinstance(payload, dict)
             or not isinstance(sender, str)
-            or not sender
             or not isinstance(signature, str)
             or SIGNATURE_RE.fullmatch(signature) is None
             or not isinstance(timestamp, int)
