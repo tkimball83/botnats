@@ -131,8 +131,10 @@ window; users sharing a hostname share that budget. Each TOTP counter can be
 claimed once. An attempt over the limit, or made while NATS is unavailable, gets
 no reply.
 
-Use private messages for every command. All commands except `AUTH` require an
-active session.
+Use private messages for every command. Each bot accepts eight private messages
+per host in a sliding 10-second window and drops the rest without reply, `AUTH`
+included. Commands other than `AUTH` require an active session and are ignored
+without one, as are commands from a nick, user, or host that is not valid UTF-8.
 
 | Command    | Arguments                   | Action                       |
 | ---------- | --------------------------- | ---------------------------- |

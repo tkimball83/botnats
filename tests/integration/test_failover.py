@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Verify TOTP claims remain available during one NATS-node failure."""
+"""Verify TOTP claims survive and remain available during one NATS-node failure."""
 
 import asyncio
 import os
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 CONNECT_TIMEOUT = 30.0
 COUNTER = 987_654_320
+FRESH_COUNTER = 987_654_319
 # The bots' jetstream_replicas in config/*.json; their buckets set it.
 JETSTREAM_REPLICAS = 3
 LEADER_TIMEOUT = 30.0
@@ -108,10 +109,11 @@ async def open_claims() -> tuple[nats.NATS, ClaimStore, KeyValue]:
     return nc, claims, kv
 
 
-async def stream_leader() -> str:
-    """Return the NATS node that leads the claim stream."""
-    nc, _, kv = await open_claims()
+async def claim_before_failover() -> str:
+    """Claim COUNTER and return the NATS node that leads the claim stream."""
+    nc, claims, kv = await open_claims()
     try:
+        assert await claims.claim(COUNTER)
         cluster = (await kv.status()).stream_info.cluster
         if cluster is None or not cluster.leader:
             msg = "claim stream has no leader"
@@ -122,12 +124,15 @@ async def stream_leader() -> str:
         await nc.drain()
 
 
-async def claim_after_failover(previous: str) -> None:
-    """Claim a counter once a replacement leader is elected."""
+async def check_after_failover(previous: str) -> None:
+    """Once a new leader is elected, expect COUNTER refused and a fresh one claimed."""
     nc, claims, kv = await open_claims()
     try:
         await wait_leader(kv, previous)
-        assert await claims.claim(COUNTER)
+        # The fresh claim shows the store accepts writes, so the refusal
+        # that follows is replay dedup rather than a failed publish.
+        assert await claims.claim(FRESH_COUNTER)
+        assert not await claims.claim(COUNTER)
     finally:
         await nc.drain()
 
