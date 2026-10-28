@@ -233,13 +233,17 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key == "newer"
 
     async def test_casemapping_change_preserves_colliding_records(self) -> None:
-        """Keep records that collide temporarily under one server casemapping."""
+        """Keep records that collide temporarily under one server casemapping.
+
+        The newer record arrives first, so only revision order, not arrival,
+        keeps it when the records collide again.
+        """
         bot = make_bot()
         first = bot.channel_mgr.new_record("#room[", "first", present=True)
         second = bot.channel_mgr.new_record("#room{", "second", present=True)
 
-        bot.channel_mgr.apply_record(first)
         bot.channel_mgr.apply_record(second)
+        bot.channel_mgr.apply_record(first)
         assert len(bot.channel_mgr.channel_records) == 1
 
         bot.channel_mgr.set_casemapping("ascii")
@@ -255,7 +259,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         }
 
         bot.channel_mgr.set_casemapping("rfc1459")
-        assert len(bot.channel_mgr.channel_records) == 1
+        assert list(bot.channel_mgr.channel_records.values()) == [second]
+        assert [runtime.key for runtime in bot.channel_mgr.channels.values()] == [
+            "second",
+        ]
 
         bot.channel_mgr.set_casemapping("ascii")
         assert len(bot.channel_mgr.channel_records) == 2
@@ -495,7 +502,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert rejoined.limit is None
 
     async def test_part_queued_on_failure(self) -> None:
-        """Verify failed part is queued and retried on next maintenance tick."""
+        """Keep a failed part queued, retrying it each maintenance tick until sent."""
         fake_irc = FailingPartIRC()
         bot = bot_with_channel(irc=fake_irc)
         bot.identity.registered = True
@@ -505,6 +512,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.apply_record(tombstone)
 
         assert casefold("#test", "rfc1459") not in bot.channel_mgr.channels
+        assert "#test" in bot.channel_mgr.pending_parts
+
+        await bot.maintenance_tick()
         assert "#test" in bot.channel_mgr.pending_parts
 
         fake_irc.failing = False
@@ -1670,7 +1680,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """Request op only in joined channels where this bot lacks it.
 
         A peer bot is opped in every channel, so only this bot's own state
-        decides: #opped needs no op, and #waiting is not joined yet.
+        decides: #test and #unopped need op, #opped needs none, and #waiting
+        is not joined yet.
         """
         bot, _, coordinator = bot_with_coordinator()
         bot.identity.current = BotPresence(
@@ -1678,13 +1689,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         bot.presence.update(peer)
-        for channel in ("#opped", "#waiting"):
+        for channel in ("#opped", "#unopped", "#waiting"):
             record = bot.channel_mgr.new_record(channel, None, present=True)
             bot.channel_mgr.apply_record(record)
 
         for channel, state in (
             ("#test", JoinState.JOINED),
             ("#opped", JoinState.JOINED),
+            ("#unopped", JoinState.JOINED),
             ("#waiting", JoinState.JOINING),
         ):
             runtime = bot.channel_mgr.channels[casefold(channel, "rfc1459")]
@@ -1698,7 +1710,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         await bot.channel_mgr.request_ops()
 
         op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
-        assert [payload["channel"] for _, payload in op_requests] == ["#test"]
+        assert [payload["channel"] for _, payload in op_requests] == [
+            "#test",
+            "#unopped",
+        ]
 
     async def test_skips_op_request_when_only_user_opped(self) -> None:
         """Request no op while only a non-peer user, and no peer bot, holds it."""

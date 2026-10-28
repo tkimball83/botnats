@@ -417,9 +417,12 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
         bot.identity.registered = True
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha")
+        runtime.member("beta").prefix = peer.to_prefix()
         runtime.member("beta").modes.add("o")
 
         await bot.maintenance_tick()

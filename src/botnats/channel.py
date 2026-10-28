@@ -824,11 +824,10 @@ class ChannelRuntime:
         but unusable, so the IRC MODE path rejects it the same way the store
         rejects an unusable record.
         """
-        if key is not None:
-            try:
-                validate_join(self.channel, key)
-            except ValueError:
-                return False
+        try:
+            validate_join(self.channel, key)
+        except ValueError:
+            return False
 
         self.key = key
         return True
