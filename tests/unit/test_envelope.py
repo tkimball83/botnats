@@ -42,6 +42,19 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allowed window"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
+    def test_decode_rejects_boolean_timestamp(self) -> None:
+        """Reject a boolean timestamp, an int the drift window refuses."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        for timestamp in (True, False):
+            encoded = json.loads(envelope.encode(SUBJECT, {}))
+            encoded["timestamp"] = timestamp
+
+            with (
+                self.subTest(timestamp=timestamp),
+                self.assertRaisesRegex(ValueError, "allowed window"),
+            ):
+                envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
     def test_decode_rejects_stale_timestamp(self) -> None:
         """Reject an envelope with a plausible but expired timestamp."""
         envelope = Envelope("alpha", COORDINATION_KEY)

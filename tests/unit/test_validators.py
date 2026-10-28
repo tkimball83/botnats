@@ -96,6 +96,7 @@ class ValidatorTests(unittest.TestCase):
             "nats://host/stream",
             "nats://user@host:4222",
             "nats://user:secret@host:4222",
+            "nats://:secret@host:4222",
             "nats://ho\x1bst:4222",
             "nats://ho\x7fst:4222",
             "nats://" + chr(0xD800) + ":4222",

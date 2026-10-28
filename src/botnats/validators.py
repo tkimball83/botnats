@@ -117,7 +117,6 @@ def validate_server_url(
         or not hostname
         or port == 0
         or parsed.username is not None
-        or parsed.password is not None
         or parsed.path
         or parsed.query
         or parsed.fragment
