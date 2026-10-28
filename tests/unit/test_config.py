@@ -76,10 +76,12 @@ class ConfigTests(unittest.TestCase):
 
     def test_secret_validation(self) -> None:
         """Reject a missing, malformed, too-short, or non-UTF-8 secret."""
+        # One byte short of the 20-byte minimum that AUTH_KEY meets.
+        short_totp = base64.b32encode(AUTH_KEY[:19]).decode()
         for variable, value, message in (
             ("BOTNATS_TOTP_SECRET", "", "BOTNATS_TOTP_SECRET is required"),
             ("BOTNATS_TOTP_SECRET", "not base32!", "valid base32"),
-            ("BOTNATS_TOTP_SECRET", "GEZDGNBV", "at least 160 bits"),
+            ("BOTNATS_TOTP_SECRET", short_totp, "at least 160 bits"),
             ("BOTNATS_NATS_TOKEN", "", "BOTNATS_NATS_TOKEN is required"),
             ("BOTNATS_COORDINATION_SECRET", "x" * 31, "at least 32 bytes"),
         ):

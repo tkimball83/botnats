@@ -275,17 +275,16 @@ class IRCClient:
         pong_deadline = 0.0
         registration_deadline = loop.time() + REGISTRATION_TIMEOUT
         while True:
-            now = loop.time()
             if ping_token is None:
-                timeout = IDLE_TIMEOUT
+                deadline = loop.time() + IDLE_TIMEOUT
             else:
-                timeout = max(0.0, pong_deadline - now)
+                deadline = pong_deadline
 
             if not self.registered_with_server:
-                timeout = min(timeout, max(0.0, registration_deadline - now))
+                deadline = min(deadline, registration_deadline)
 
             try:
-                async with asyncio.timeout(timeout):
+                async with asyncio.timeout_at(deadline):
                     raw = await reader.readline()
             except TimeoutError as error:
                 if (
@@ -479,7 +478,7 @@ def check_line(raw: bytes) -> bool:
 def pong_reply(line: bytes) -> bytes:
     """Build a PONG that echoes a PING's raw token bytes.
 
-    Tags and prefix, with any repeated separators after them, are dropped
+    Tags, with any repeated separators after them, and prefix are dropped
     first, mirroring parse_message, so a leading prefix's space-colon is not
     mistaken for the trailing-parameter marker.
     The token is kept verbatim, so the reply never exceeds the wire length of
@@ -492,7 +491,6 @@ def pong_reply(line: bytes) -> bytes:
 
     if rest.startswith(b":"):
         _, _, rest = rest.partition(b" ")
-        rest = rest.lstrip(b" ")
 
     head, trailing_sep, trailing = rest.partition(b" :")
     tokens = [token for token in head.split(b" ") if token][1:]

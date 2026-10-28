@@ -246,7 +246,7 @@ class IRCProtocolTests(unittest.TestCase):
         assert not prefix.complete
 
     def test_prefix_match(self) -> None:
-        """Verify prefix matching is case-insensitive on nick and host."""
+        """Verify prefix matching ignores nick and host case, and needs all parts."""
         prefix = Prefix("Owner", "user", "Host.Example")
 
         assert prefix.matches(Prefix("owner", "user", "host.example"), "rfc1459")
@@ -258,6 +258,16 @@ class IRCProtocolTests(unittest.TestCase):
             Prefix("owner", "user", "strasse.example"),
             "rfc1459",
         )
+        # An incomplete prefix identifies no one, not even itself.
+        for incomplete in (
+            Prefix("owner"),
+            Prefix("owner", "user"),
+            Prefix("owner", host="host.example"),
+        ):
+            with self.subTest(incomplete=incomplete):
+                assert not incomplete.matches(incomplete, "rfc1459")
+                assert not prefix.matches(incomplete, "rfc1459")
+                assert not incomplete.matches(prefix, "rfc1459")
 
     def test_isupport_chanmodes_extra_groups(self) -> None:
         """Verify CHANMODES with more than four groups keeps the first four."""
