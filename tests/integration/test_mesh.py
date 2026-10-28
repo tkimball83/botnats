@@ -29,10 +29,12 @@ POLL_INTERVAL = 0.25
 # the first channel's WHO, MODE, MODE +b, enforced modes and +o for each peer,
 # then that JOIN: eight lines, or 16 seconds. This doubles it.
 REPLY_TIMEOUT = 32.0
-# Convergence polls. The slowest, a kicked bot's JOIN refused, then retried
-# after the bots' 10-second JOIN_RETRY_DELAY behind its queued lines, takes
-# about 20 seconds.
-STARTUP_TIMEOUT = 45.0
+# Convergence polls. The slowest, a kicked bot's JOIN sent behind its queued
+# lines and refused twice before a peer's help lands, then retried 10 and 20
+# seconds after those refusals, takes about 37.5 seconds. This doubles it.
+# Nick reclaims follow Ergo's MONITOR notices, not the bots' 60-second ISON
+# poll.
+STARTUP_TIMEOUT = 75.0
 TEST_BAN = "*!*@blocked.example"
 # TOTP counters this run has spent: each counter authenticates only once.
 USED_COUNTERS: set[int] = set()

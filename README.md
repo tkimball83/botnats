@@ -61,7 +61,7 @@ Example `bot.json`:
     "presence_ttl_seconds": 15
   },
   "irc": {
-    "channel_modes": "+npst",
+    "channel_modes": "+nst",
     "connect_timeout_seconds": 30,
     "servers": [
       "irc://us.undernet.org:6667"
@@ -83,7 +83,7 @@ Example `bot.json`:
 | `bot.health_port`                           | HTTP liveness and readiness port; 8080 by default                         |
 | `bot.id`                                    | Unique mesh ID; compared case-insensitively; required                     |
 | `bot.network`                               | One IRC network per process; namespaces shared NATS state; required       |
-| `bot.nickname`                              | IRC nickname and connection identity; at most 9 characters; required      |
+| `bot.nickname`                              | Nickname and realname; username `botnats`; at most 9 characters; required |
 | `coordination.maintenance_interval_seconds` | Seconds between maintenance cycles and presence heartbeats; 3 by default  |
 | `coordination.presence_ttl_seconds`         | Must exceed the maintenance interval; 15 seconds by default               |
 | `irc.channel_modes`                         | Required (`+`) and forbidden (`-`) modes; empty by default                |
@@ -152,6 +152,9 @@ without one, as are commands from a nick, user, or host that is not valid UTF-8.
 | `PART`     | `<channel>`                 | Remove a desired channel     |
 | `STATUS`   |                             | Show bot and NATS status     |
 | `UNBAN`    | `<channel> <mask>`          | Remove a tracked ban         |
+
+Name an IRCnet safe channel in full, with its five-character ID (`!ABCDEchat`,
+not `!chat`).
 
 ## Development
 
