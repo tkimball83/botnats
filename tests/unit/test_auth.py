@@ -53,6 +53,8 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth = authorizer()
 
         assert totp(AUTH_KEY, 1) == "287082"
+        # A code keeps its leading zeros.
+        assert totp(AUTH_KEY, 36) == "003784"
         assert auth.match("not-a-code", now=59) is None
         assert auth.match("000000", now=59) is None
         assert auth.match("²" * 6, now=59) is None
@@ -70,7 +72,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth.identity_fold = lambda p: p.casefold().translate(
             str.maketrans("[]\\^", "{}|~"),
         )
-        auth.rekey(now=20)
+        auth.rekey()
 
         assert len(auth.records) == 1
         session = next(iter(auth.records.values()))
@@ -86,7 +88,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth.identity_fold = lambda p: p.casefold().translate(
             str.maketrans("[]\\^", "{}|~"),
         )
-        auth.rekey(now=15)
+        auth.rekey()
 
         assert [record.revoked for record in auth.records.values()] == [True]
         assert not auth.authorized("Owner[!user@host", now=15)
@@ -147,16 +149,6 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert auth.authorized(prefix, now=40.9)
         assert not auth.authorized(prefix, now=41)
         assert not auth.records
-
-    def test_session_identity_uses_ascii_folding(self) -> None:
-        """Keep Unicode identities distinct while folding IRC ASCII case."""
-        # The bot's authorizer folds identities as Bot wires it.
-        auth = bot_with_irc()[0].authorizer
-        prefix = "Owner!user@straße.example"
-        auth.grant(prefix, now=10)
-
-        assert auth.authorized("owner!USER@straße.example", now=20)
-        assert not auth.authorized("owner!user@strasse.example", now=20)
 
     def test_session_import(self) -> None:
         """Keep a session granted by another authorizer until it expires."""
@@ -364,9 +356,16 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
 
         The cancelled write has already landed, so shutdown's final flush
         must write a revocation over it, not leave or rewrite the grant.
+        An earlier session's revocation is still held: the grant must
+        replace it, or the cancellation would find no session to revoke.
         """
         bot, _, coordinator = bot_with_coordinator()
         prefix = Prefix("owner", "user", "host.example")
+        bot.authorizer.keep(
+            bot.authorizer.create(
+                prefix.render(), time.time() + 60, "alpha", revoked=True
+            ),
+        )
         put_session = coordinator.put_session
         writing = asyncio.Event()
 
@@ -445,7 +444,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_refuses_identity_invalidated_mid_auth(self) -> None:
         """Grant nothing when the user quits while AUTH waits on JetStream."""
         bot, fake_irc, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
+        # Mixed case, as watches key identities ASCII-folded.
+        prefix = Prefix("Owner", "user", "host.example")
         claiming = asyncio.Event()
         release = asyncio.Event()
 
@@ -467,7 +467,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
                 await auth
 
         assert not bot.authorizer.authorized(prefix.render())
-        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert fake_irc.privmsgs == [("Owner", "Authorization failed")]
         assert coordinator.session_puts == []
 
     async def test_quit_invalidates_queued_auth(self) -> None:
@@ -477,7 +477,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         invalidation the QUIT left for the AUTH still queued.
         """
         bot, fake_irc, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
+        prefix = Prefix("Owner", "user", "host.example")
         counter = int(time.time() // TOTP_PERIOD)
         valid_code = totp(bot.authorizer.secret, counter)
 
@@ -493,7 +493,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
 
         # The code was valid and claimed; only the QUIT refused it.
         assert coordinator.claim_requests == [counter]
-        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert fake_irc.privmsgs == [("Owner", "Authorization failed")]
         assert not bot.authorizer.authorized(prefix.render())
         assert not bot.sessions.watched_identities
 
@@ -566,18 +566,18 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_success_grants_session(self) -> None:
         """Grant a session for a valid TOTP code, then op the user where opped."""
         bot, fake_irc, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
+        prefix = Prefix("Owner", "user", "host.example")
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        runtime.member("owner").prefix = prefix
+        runtime.member("Owner").prefix = prefix
         counter = int(time.time() // 30)
         valid_code = totp(bot.authorizer.secret, counter)
 
         await send_command(bot, prefix, f"AUTH {valid_code}")
 
         assert bot.authorizer.authorized(prefix.render())
-        assert fake_irc.privmsgs == [("owner", "Authorized")]
-        assert fake_irc.modes == [("#test", "+o", ("owner",))]
+        assert fake_irc.privmsgs == [("Owner", "Authorized")]
+        assert fake_irc.modes == [("#test", "+o", ("Owner",))]
         assert len(coordinator.session_puts) == 1
 
     async def test_auth_refuses_replayed_code(self) -> None:
@@ -668,7 +668,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """Answer only the AUTH attempts the limit allows, however nicks cycle.
 
         The limit keys on the host, so a new nick on the same host gets no
-        fresh attempts. Only ASCII case folds, so été is another host than Été.
+        fresh attempts, whatever its ASCII case. Only ASCII case folds, so été
+        is another host than Été.
         """
         fake_irc = FakeIRC()
         coordinator = FakeCoordinator()
@@ -679,7 +680,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         # coordinator's AttemptStore can silence the surplus.
         with patch.object(bot.authorizer, "match", return_value=None):
             for nick in nicks:
-                prefix = Prefix(nick, "user", "Été.example")
+                host = "Été.EXAMPLE" if nick[-1] in "13" else "Été.example"
+                prefix = Prefix(nick, "user", host)
                 await send_command(bot, prefix, "AUTH 000000")
 
             other = Prefix("other", "user", "été.example")
@@ -1086,7 +1088,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         signed grant; a bot started later would replay only that grant.
         """
         bot, _, coordinator = bot_with_coordinator()
-        prefix = "owner!user@host.example"
+        # Mixed case, as the write-back compares identities ASCII-folded.
+        prefix = "Owner!user@host.example"
         grant = bot.authorizer.grant(prefix)
         async with asyncio.timeout(1):
             assert await bot.sessions.sync(grant)
