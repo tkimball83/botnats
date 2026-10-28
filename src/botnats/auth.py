@@ -382,7 +382,8 @@ class TotpAuthorizer:
         self.identity_fold = identity_fold
         self.issuer, self.network = scope
         self.secret = secret
-        # The highest-ranked session or revocation per identity.
+        # Each identity's highest-ranked session or revocation, except that a
+        # grant replaces a held live session whatever its rank.
         self.records: dict[str, Session] = {}
         self.session_ttl = session_ttl
 
@@ -449,7 +450,9 @@ class TotpAuthorizer:
         session = self.create(prefix, expires_at, self.issuer)
         key = self.identity_fold(prefix)
         existing = self.records.get(key)
-        # Only a revocation that outranks the new session blocks it.
+        # Only a revocation that outranks the new session blocks it. A held
+        # live session gives way even to a lower-ranked grant, so revoking
+        # the prefix when AUTH fails revokes this grant under its own key.
         if existing is None or not existing.revoked or session.order > existing.order:
             self.records[key] = session
 
