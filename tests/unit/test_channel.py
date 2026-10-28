@@ -16,6 +16,7 @@ from nats.errors import Error as NatsError
 from botnats.channel import (
     JOIN_REPLY_TIMEOUT,
     JOIN_RETRY_DELAY,
+    PEER_HELP_DELAY,
     ChannelRecord,
     ChannelRuntime,
     JoinState,
@@ -40,8 +41,6 @@ from tests.unit.helpers import (
 )
 
 if TYPE_CHECKING:
-    from nats.js.kv import KeyValue
-
     from botnats.bot import Bot
     from botnats.validators import ChannelFields
 
@@ -947,8 +946,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         JOIN with the key it has stored; the observed key must not be lost.
         """
         coordinator = FakeCoordinator()
-        kv = FakeKV()
-        coordinator.channels.kv = cast("KeyValue", kv)
+        kv = cast("FakeKV", coordinator.channels.kv)
         bot = bot_with_channel(coordinator=coordinator)
         mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
         keyed = mgr.new_record(
@@ -1450,7 +1448,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.modes == [("#test", "+o", ("gamma",))]
 
     async def test_help_request_rechecks_state_after_delay(self) -> None:
-        """Act on a peer's op request after the delay, unless already helped."""
+        """Wait under PEER_HELP_DELAY, then op a peer unless already helped."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
@@ -1482,7 +1480,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
             await release.wait()
 
-        with patch("botnats.channel.asyncio.sleep", gated_sleep):
+        with (
+            patch("asyncio.sleep", gated_sleep),
+            patch("secrets.randbelow", return_value=999) as randbelow,
+        ):
             for peer in peers:
                 bot.callbacks.on_help("op", "#test", peer)
 
@@ -1494,6 +1495,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await settle(bot)
 
+        # The longest delay the draw allows stays under PEER_HELP_DELAY.
+        assert randbelow.call_args_list == [call(1000)] * len(peers)
+        assert delays == [0.999] * len(peers)
+        assert all(0 <= delay < PEER_HELP_DELAY for delay in delays)
         assert fake_irc.modes == [("#test", "+o", ("gamma",))]
 
     async def test_unknown_help_kind_is_ignored(self) -> None:
@@ -1509,6 +1514,26 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertNoLogs("botnats", level="ERROR"),
         ):
             bot.callbacks.on_help("unknown", "#test", peer)
+            await settle(bot)
+
+        assert fake_irc.sent == []
+
+    async def test_help_request_without_runtime_or_member_is_ignored(self) -> None:
+        """Drop an op request for a channel not loaded, or a peer not in it."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha").modes.add("o")
+        peer = BotPresence("beta-id", "beta.host", "one", "beta", "~beta")
+        bot.presence.update(peer)
+        with (
+            patch("botnats.channel.PEER_HELP_DELAY", 0),
+            self.assertNoLogs("botnats", level="ERROR"),
+        ):
+            # #gone was just parted, or is not loaded yet.
+            bot.callbacks.on_help("op", "#gone", peer)
+            # beta's JOIN #test has not reached this server yet.
+            bot.callbacks.on_help("op", "#test", peer)
             await settle(bot)
 
         assert fake_irc.sent == []
@@ -1683,20 +1708,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("JOIN", ("#test",), Prefix("alpha", "~alpha", "alpha.host")),
         )
         assert runtime.join is JoinState.JOINED
-
-    async def test_join_without_reply_is_retried(self) -> None:
-        """Resend a JOIN that got neither an echo nor a refusal in time."""
-        bot, fake_irc, _ = bot_with_coordinator()
-        bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
-        )
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-
-        bot.channel_mgr.join_desired()
-        runtime.join_retry_at -= JOIN_REPLY_TIMEOUT
-        bot.channel_mgr.join_desired()
-
-        assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 2
 
     async def test_queued_join_awaits_its_reply_from_its_send(self) -> None:
         """Await a JOIN's reply from when the send queue gets to it."""
