@@ -6,7 +6,7 @@
 import asyncio
 import time
 import unittest
-from dataclasses import astuple, replace
+from dataclasses import asdict, astuple, replace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
@@ -98,6 +98,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert bot.authorizer.secret == AUTH_KEY
         assert bot.authorizer.coordination_key == COORDINATION_KEY
         assert bot.authorizer.session_ttl == 600
+        assert bot.authorizer.issuer == "alpha-id"
         assert bot.authorizer.network == "libera"
         # Only the nick folds under the server casemapping: rfc1459 folding
         # of user@host would merge nick!~user@host and nick!^user@host.
@@ -210,6 +211,36 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
         assert puts == [(prefix.render(), True)]
+        assert not bot.sessions.pending
+
+    async def test_close_writes_escalated_revocation(self) -> None:
+        """Write the escalation a queued revocation meets at shutdown.
+
+        A peer granted the identity again, unseen by this bot, so the QUIT's
+        revocation loses to that grant. Its escalation would wait for the
+        next retry, which shutdown never makes.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        grant = bot.authorizer.grant(prefix.render())
+        newer = bot.authorizer.create(prefix.render(), grant.expires_at + 30, "beta")
+        async with asyncio.timeout(1):
+            assert await bot.sessions.sync(grant)
+            await coordinator.sessions.put(asdict(newer))
+
+        # close() cancels the QUIT's background write before it starts.
+        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+        async with asyncio.timeout(5):
+            await bot.close()
+
+        escalated = bot.authorizer.create(
+            prefix.render(),
+            newer.expires_at,
+            newer.issuer,
+            newer.version + 1,
+            revoked=True,
+        )
+        assert coordinator.session_puts[-1] == asdict(escalated)
         assert not bot.sessions.pending
 
     async def test_close_bounds_queued_revocation_write(self) -> None:
@@ -395,7 +426,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             await real_sleep(0)
 
         with (
-            patch("botnats.bot.asyncio.sleep", immediate),
+            patch("asyncio.sleep", immediate),
             self.assertLogs("botnats.bot", level="ERROR"),
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -433,13 +464,11 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
 
             self.fail("presence heartbeat stalled behind the maintenance tick")
 
-        # The channel key retry stalls, not the session retry: shutdown makes
-        # one bounded session retry of its own, which would wait out its bound.
         with (
             patch.object(bot.channel_mgr, "retry_pending_keys", stall),
             patch.object(bot.health_check, "start", AsyncMock()),
             patch.object(fake_irc, "run_forever", run_until_heartbeats),
-            patch("botnats.bot.asyncio.sleep", yield_once),
+            patch("asyncio.sleep", yield_once),
         ):
             async with asyncio.timeout(5):
                 await bot.run()

@@ -444,8 +444,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_refuses_identity_invalidated_mid_auth(self) -> None:
         """Grant nothing when the user quits while AUTH waits on JetStream."""
         bot, fake_irc, coordinator = bot_with_coordinator()
-        # Mixed case, as watches key identities ASCII-folded.
-        prefix = Prefix("Owner", "user", "host.example")
+        # Mixed case and "[", as watches key identities ASCII-folded.
+        prefix = Prefix("Owner[", "user", "host.example")
         claiming = asyncio.Event()
         release = asyncio.Event()
 
@@ -467,7 +467,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
                 await auth
 
         assert not bot.authorizer.authorized(prefix.render())
-        assert fake_irc.privmsgs == [("Owner", "Authorization failed")]
+        assert fake_irc.privmsgs == [("Owner[", "Authorization failed")]
         assert coordinator.session_puts == []
 
     async def test_quit_invalidates_queued_auth(self) -> None:
@@ -566,18 +566,18 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_success_grants_session(self) -> None:
         """Grant a session for a valid TOTP code, then op the user where opped."""
         bot, fake_irc, coordinator = bot_with_coordinator()
-        prefix = Prefix("Owner", "user", "host.example")
+        prefix = Prefix("Owner[", "user", "host.example")
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        runtime.member("Owner").prefix = prefix
+        runtime.member("Owner[").prefix = prefix
         counter = int(time.time() // 30)
         valid_code = totp(bot.authorizer.secret, counter)
 
         await send_command(bot, prefix, f"AUTH {valid_code}")
 
         assert bot.authorizer.authorized(prefix.render())
-        assert fake_irc.privmsgs == [("Owner", "Authorized")]
-        assert fake_irc.modes == [("#test", "+o", ("Owner",))]
+        assert fake_irc.privmsgs == [("Owner[", "Authorized")]
+        assert fake_irc.modes == [("#test", "+o", ("Owner[",))]
         assert len(coordinator.session_puts) == 1
 
     async def test_auth_refuses_replayed_code(self) -> None:
@@ -773,30 +773,33 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.session_puts == [asdict(session)]
         assert not bot.sessions.pending
 
-    async def test_queue_keeps_non_ascii_case_variants_apart(self) -> None:
-        """Queue mutations of identities differing in non-ASCII case apart.
+    async def test_queue_keeps_ascii_distinct_identities_apart(self) -> None:
+        """Keep queued mutations of identities with distinct ASCII folds apart.
 
-        Only ASCII case folds, so Été and été are different users: a
+        The store keys sessions ASCII-folded, so Été and été, and foo{ and
+        foo[, which rfc1459 folds together, each have their own key: a
         revocation for one must not replace the other's queued grant.
         """
-        bot, _, coordinator = bot_with_coordinator()
-        coordinator.duplicate = True
-        grant = bot.authorizer.grant("été!u@h")
-        revocation = bot.authorizer.create(
-            "Été!u@h",
-            grant.expires_at,
-            grant.issuer,
-            grant.version + 1,
-            revoked=True,
-        )
+        for granted, revoked in (("été!u@h", "Été!u@h"), ("foo{!u@h", "foo[!u@h")):
+            bot, _, coordinator = bot_with_coordinator()
+            with self.subTest(granted=granted):
+                coordinator.duplicate = True
+                grant = bot.authorizer.grant(granted)
+                revocation = bot.authorizer.create(
+                    revoked,
+                    grant.expires_at,
+                    grant.issuer,
+                    grant.version + 1,
+                    revoked=True,
+                )
 
-        async with asyncio.timeout(1):
-            assert not await bot.sessions.sync(grant)
-            assert not await bot.sessions.sync(revocation)
-            coordinator.duplicate = False
-            await bot.sessions.retry()
+                async with asyncio.timeout(1):
+                    assert not await bot.sessions.sync(grant)
+                    assert not await bot.sessions.sync(revocation)
+                    coordinator.duplicate = False
+                    await bot.sessions.retry()
 
-        assert coordinator.session_puts == [asdict(grant), asdict(revocation)]
+                assert coordinator.session_puts == [asdict(grant), asdict(revocation)]
 
     async def test_pending_revocation_blocks_later_session_writes(self) -> None:
         """Never write a queued grant past an earlier still-pending revocation."""
@@ -1088,8 +1091,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         signed grant; a bot started later would replay only that grant.
         """
         bot, _, coordinator = bot_with_coordinator()
-        # Mixed case, as the write-back compares identities ASCII-folded.
-        prefix = "Owner!user@host.example"
+        # Mixed case and "[", as the write-back compares identities ASCII-folded.
+        prefix = "Owner[!user@host.example"
         grant = bot.authorizer.grant(prefix)
         async with asyncio.timeout(1):
             assert await bot.sessions.sync(grant)
@@ -1331,21 +1334,45 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             grant.prefix,
         ]
 
+    async def test_flush_stops_when_jetstream_fails(self) -> None:
+        """End the shutdown flush at a pass that writes nothing, not at its bound."""
+        bot, _, coordinator = bot_with_coordinator()
+        bot.sessions.queue(bot.authorizer.grant("owner!user@host.example"))
+        attempts = 0
+
+        async def unavailable(record: dict[str, Any]) -> Session:
+            del record
+            nonlocal attempts
+            attempts += 1
+            # Yield, so the timeout ends a flush that keeps retrying.
+            await asyncio.sleep(0)
+            msg = "NATS unavailable"
+            raise NatsError(msg)
+
+        with patch.object(coordinator, "put_session", unavailable):
+            async with asyncio.timeout(1):
+                await bot.sessions.flush()
+
+        assert attempts == 1
+        assert bot.sessions.pending
+
 
 class SessionSyncWatchTests(unittest.TestCase):
     """Tests for the watched session records SessionSync owns."""
 
     def test_identity_watch_survives_casemapping_change(self) -> None:
         """Release a watch taken before the casemapping changed."""
-        bot, _ = bot_with_irc()
         identity = "nick[!user@host"
-        bot.channel_mgr.set_casemapping("ascii")
-        bot.sessions.watch_identity(identity)
+        for first, second in (("ascii", "rfc1459"), ("rfc1459", "ascii")):
+            bot, _ = bot_with_irc()
+            with self.subTest(first=first):
+                bot.channel_mgr.set_casemapping(first)
+                bot.sessions.watch_identity(identity)
 
-        bot.channel_mgr.set_casemapping("rfc1459")
-        bot.sessions.unwatch_identity(identity)
+                bot.channel_mgr.set_casemapping(second)
+                bot.sessions.unwatch_identity(identity)
 
-        assert not bot.sessions.watched_identities
+                assert not bot.sessions.watched_identities
 
     def test_session_identity_cache_prunes_during_updates(self) -> None:
         """Prune expired key mappings during normal watch traffic."""
@@ -1398,6 +1425,23 @@ class SessionSyncWatchTests(unittest.TestCase):
         assert sessions.watched == {"kept-key": (kept.prefix, expiry)}
         assert auth.authorized(kept.prefix)
         assert not auth.authorized(gone.prefix)
+
+    def test_replay_keeps_grant_behind_expired_key(self) -> None:
+        """Keep a newer local grant for a prefix an expired, unreplayed key held.
+
+        An expired record gets no TTL delete and is missing from the replay;
+        forgetting its key would drop the grant this bot has yet to write.
+        """
+        auth = authorizer()
+        sessions = SessionSync(auth, FakeCoordinator(), Tasks())
+        prefix = "owner!user@host"
+        sessions.watched["expired-key"] = (prefix, time.time() - 1)
+        auth.grant(prefix)
+
+        sessions.replayed(set())
+
+        assert sessions.watched == {}
+        assert auth.authorized(prefix)
 
     def test_session_identity_cache_does_not_prune_during_replay(self) -> None:
         """Avoid rescanning the growing cache for every replayed session."""

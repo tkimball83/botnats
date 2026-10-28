@@ -106,10 +106,10 @@ class Bot:
         await self.tasks.drain()
         try:
             # A revocation still queued would stay valid until it expires for
-            # peers that never saw its QUIT or NICK; give it one bounded try.
+            # peers that never saw its QUIT or NICK; flush it within one bound.
             with suppress(TimeoutError):
                 async with asyncio.timeout(SHUTDOWN_SYNC_TIMEOUT):
-                    await self.sessions.retry()
+                    await self.sessions.flush()
 
             await self.coordinator.close()
         finally:
@@ -138,11 +138,9 @@ class Bot:
         """
         self.authorizer.prune()
         self.presence.prune()
-        if self.identity.registered:
-            self.channel_mgr.retry_pending_parts()
-            self.channel_mgr.join_desired()
-            await self.channel_mgr.request_ops()
-
+        self.channel_mgr.retry_pending_parts()
+        self.channel_mgr.join_desired()
+        await self.channel_mgr.request_ops()
         if self.coordinator.ready:
             await self.sessions.retry()
             await self.channel_mgr.retry_pending_keys()
