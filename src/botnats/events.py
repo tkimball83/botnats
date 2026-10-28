@@ -33,6 +33,10 @@ LOGGER = logging.getLogger(__name__)
 # A bad key (475) asks none: an invite does not get past +k, and the next
 # attempt uses the stored key, which peers in the channel keep current.
 REFUSAL_HELP = {"471": "limit", "473": "invite", "474": "unban"}
+# A forwarded JOIN (470) does not say what refused it, so it asks for all the
+# help one could need: an invite gets past most refusals that servers forward,
+# but not a ban, nor on some servers a full channel.
+FORWARD_HELP = ("invite", "limit", "unban")
 
 
 class IRCEventHandler:
@@ -55,6 +59,7 @@ class IRCEventHandler:
             "353": self.handle_names,
             "366": self.handle_end_of_names,
             "367": self.handle_ban_list,
+            "470": self.handle_join_forward,
             "471": self.handle_join_refusal,
             "473": self.handle_join_refusal,
             "474": self.handle_join_refusal,
@@ -186,10 +191,11 @@ class IRCEventHandler:
             self.process_key(runtime, key)
 
     def log_join_error(self, message: IRCMessage) -> None:
-        """Log, once, an unhandled error naming a channel this bot is joining.
+        """Log, once, an error naming a channel this bot is joining.
 
-        Refusals such as 477 (registered nicks only) vary by server; the JOIN
-        stays pending and is resent after JOIN_REPLY_TIMEOUT.
+        Refusals such as 477 (registered nicks only) vary by server, and a
+        forward (470) gives no reason; the JOIN stays pending and is resent
+        after JOIN_REPLY_TIMEOUT.
         """
         if len(message.params) < 3:
             return
@@ -230,6 +236,23 @@ class IRCEventHandler:
         if kind is not None:
             self.bot.tasks.spawn(
                 self.bot.channel_mgr.request_peer(kind, channel),
+                f"{kind}-request",
+            )
+
+    def handle_join_forward(self, message: IRCMessage) -> None:
+        """Log a JOIN the server forwarded elsewhere and ask peers for help.
+
+        Each attempt also joins the forward target, which handle_join leaves,
+        so the JOIN stays pending until JOIN_REPLY_TIMEOUT, even when invited:
+        the help, an invite included, applies to that attempt.
+        """
+        if len(message.params) < 2:
+            return
+
+        self.log_join_error(message)
+        for kind in FORWARD_HELP:
+            self.bot.tasks.spawn(
+                self.bot.channel_mgr.request_peer(kind, message.params[1]),
                 f"{kind}-request",
             )
 
@@ -280,6 +303,8 @@ class IRCEventHandler:
         if (
             prefix is None
             or not prefix.complete
+            # Bytes lost to U+FFFD in decoding: another sender can render the same.
+            or "\ufffd" in prefix.render()
             or len(message.params) < 2
             or not self.bot.irc.is_self(message.params[0])
             or message.params[-1].startswith("\x01")
@@ -341,13 +366,21 @@ class IRCEventHandler:
             )
 
     def handle_invite(self, message: IRCMessage) -> None:
-        """Join a configured channel when invited."""
+        """Join a configured channel when invited, unless its JOIN was forwarded.
+
+        The server keeps the invite for the forwarded JOIN's paced resend.
+        """
         if len(message.params) < 2:
             return
 
         target, channel = message.params[0], message.params[1]
         runtime = self.bot.channel_mgr.runtime(channel)
-        if runtime is not None and not runtime.joined and self.bot.irc.is_self(target):
+        if (
+            runtime is not None
+            and not runtime.joined
+            and runtime.join_error != "470"
+            and self.bot.irc.is_self(target)
+        ):
             self.bot.channel_mgr.safe_join(runtime)
 
     def handle_ison_reply(self, message: IRCMessage) -> None:

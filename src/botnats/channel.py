@@ -701,7 +701,8 @@ class ChannelRuntime:
     channel: str = ""
     cooldowns: dict[str, float] = field(default_factory=dict)
     join: JoinState = JoinState.IDLE
-    # The last unhandled refusal logged for a pending JOIN, so it logs once.
+    # The last refusal logged for a pending JOIN, so it logs once. An INVITE
+    # does not resend a JOIN last forwarded (470).
     join_error: str | None = None
     # When a pending JOIN, unanswered or refused, is due to be sent again.
     join_retry_at: float = 0.0
