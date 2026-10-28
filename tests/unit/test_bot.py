@@ -99,6 +99,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert bot.authorizer.coordination_key == COORDINATION_KEY
         assert bot.authorizer.session_ttl == 600
         assert bot.authorizer.network == "libera"
+        # Only the nick folds under the server casemapping: rfc1459 folding
+        # of user@host would merge nick!~user@host and nick!^user@host.
+        assert bot.authorizer.identity_fold == bot.caps.fold_identity
         assert bot.presence.ttl == 10
         assert bot.health_check.port == 9080
         assert bot.health_check.ready == bot.ready
@@ -318,6 +321,30 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         health_start.assert_awaited_once()
         # close() cancelled the blocked start and both maintenance loops.
         assert not bot.tasks
+
+    async def test_run_closes_when_cancelled(self) -> None:
+        """Close every service when SIGTERM cancels the IRC loop.
+
+        IRCClient.run_forever never returns: it ends by an exception, or by
+        the cancellation SIGTERM delivers.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+
+        async def cancelled() -> None:
+            raise asyncio.CancelledError
+
+        with (
+            patch.object(fake_irc, "run_forever", cancelled),
+            patch.object(bot.health_check, "start", AsyncMock()),
+            patch.object(bot.health_check, "close", AsyncMock()) as health_close,
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            async with asyncio.timeout(5):
+                await bot.run()
+
+        health_close.assert_awaited_once()
+        assert not bot.tasks
+        assert not fake_irc.connected
 
     async def test_ready(self) -> None:
         """Verify readiness requires IRC registration, connection, and NATS."""

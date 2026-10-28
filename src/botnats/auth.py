@@ -171,7 +171,7 @@ class SessionSync:
         reconnecting as the same prefix meanwhile fails closed until then.
         """
         key = casefold(identity, "ascii")
-        count, invalidated = self.watched_identities.pop(key, (1, True))
+        count, invalidated = self.watched_identities.pop(key)
         if count > 1:
             self.watched_identities[key] = (count - 1, invalidated)
 
@@ -476,9 +476,8 @@ class TotpAuthorizer:
         for key in [k for k, r in self.records.items() if r.expires_at <= cutoff]:
             del self.records[key]
 
-    def rekey(self, *, now: float | None = None) -> None:
+    def rekey(self) -> None:
         """Collapse records onto a new identity fold, keeping the highest rank."""
-        self.prune(now)
         records, self.records = self.records, {}
         for record in records.values():
             self.keep(record)
