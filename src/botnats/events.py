@@ -17,6 +17,7 @@ from botnats.irc.protocol import (
     DEFAULT_CASEMAPPING,
     IRCMessage,
     Prefix,
+    casefold,
     iter_mode_changes,
     mask_matches,
 )
@@ -39,7 +40,10 @@ class IRCEventHandler:
 
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
-        self.command_lock = asyncio.Lock()
+        # ASCII-folded identity -> (FIFO lock, commands holding or awaiting
+        # it), keyed like SessionSync.watched_identities. One sender's command
+        # waiting on JetStream, such as an AUTH, never holds up another's.
+        self.command_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self.nick_watch_task: asyncio.Task[None] | None = None
         self.handlers: dict[str, Callable[[IRCMessage], None]] = {
             "001": self.handle_welcome,
@@ -263,10 +267,11 @@ class IRCEventHandler:
             self.bot.channel_mgr.join_desired()
 
     def queue_command(self, message: IRCMessage) -> None:
-        """Run a private-message command in background, in arrival order.
+        """Run a private-message command in background, in order per sender.
 
         AUTH and the durable JOIN/PART commands wait on JetStream; the IRC
-        read loop must not. The FIFO lock keeps an admin's commands in order.
+        read loop must not. A FIFO lock per sender keeps an admin's commands
+        in order.
         """
         prefix = message.prefix
         # Channel chatter, CTCP, anonymous senders, and senders over their
@@ -289,12 +294,21 @@ class IRCEventHandler:
         )
 
     async def run_command(self, prefix: Prefix, text: str) -> None:
-        """Handle one queued command after every command queued before it."""
+        """Handle one queued command after every earlier one from its sender."""
+        identity = prefix.render()
+        key = casefold(identity, "ascii")
+        lock, count = self.command_locks.get(key, (asyncio.Lock(), 0))
+        self.command_locks[key] = (lock, count + 1)
         try:
-            async with self.command_lock:
+            async with lock:
                 await self.bot.commands.dispatch(prefix, text)
         finally:
-            self.bot.sessions.unwatch_identity(prefix.render())
+            # The sender's last command drops its lock.
+            lock, count = self.command_locks.pop(key)
+            if count > 1:
+                self.command_locks[key] = (lock, count - 1)
+
+            self.bot.sessions.unwatch_identity(identity)
 
     def handle_end_of_names(self, message: IRCMessage) -> None:
         """Finalize channel join by requesting WHO data and enforcing modes."""

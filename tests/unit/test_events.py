@@ -14,6 +14,7 @@ from botnats.config import mode_intent
 from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
+    OWNER,
     FailingPartIRC,
     FailingWriteCoordinator,
     FakeCoordinator,
@@ -173,14 +174,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot, _ = bot_with_irc()
         prefix = Prefix("flooder", "user", "host.example")
 
-        async with bot.events.command_lock:
-            for _ in range(100):
-                bot.events.on_irc_message(
-                    IRCMessage("PRIVMSG", ("alpha", "AUTH 000000"), prefix),
-                )
+        for _ in range(100):
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", "AUTH 000000"), prefix),
+            )
 
-            queued = len(bot.tasks)
-            watched = bot.sessions.watched_identities[prefix.render()]
+        queued = len(bot.tasks)
+        watched = bot.sessions.watched_identities[prefix.render()]
         async with asyncio.timeout(5):
             await bot.tasks.drain()
 
@@ -1372,6 +1372,61 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await settle(bot)
 
         assert finished == ["SLOW", "FAST"]
+
+    async def test_command_waits_only_for_its_own_sender(self) -> None:
+        """Run an admin's OP while a stranger's AUTH waits on JetStream.
+
+        The stranger's commands still run one at a time in arrival order, and
+        each sender's last command drops its lock.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha").modes.add("o")
+        runtime.member("owner").prefix = OWNER
+        bot.authorizer.grant(OWNER.render())
+        stranger = Prefix("mallory", "user", "evil.example")
+        # Each attempt check waits for one release, as a stalled JetStream
+        # round trip would.
+        gate = asyncio.Semaphore(0)
+        checks: list[str] = []
+
+        async def slow_auth(identity: str) -> bool:
+            checks.append(identity)
+            await gate.acquire()
+            return False
+
+        def send(prefix: Prefix, text: str) -> asyncio.Task[None]:
+            queued = set(bot.tasks)
+            bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
+            (task,) = bot.tasks - queued
+            return task
+
+        with patch.object(coordinator, "request_auth", slow_auth):
+            first = send(stranger, "AUTH 000000")
+            send(stranger, "AUTH 000000")
+            op = send(OWNER, "OP #test owner")
+            async with asyncio.timeout(1):
+                await op
+
+            assert fake_irc.modes == [("#test", "+o", ("owner",))]
+            # The stranger's second AUTH waits for its first.
+            assert checks == ["evil.example"]
+            gate.release()
+            async with asyncio.timeout(1):
+                await first
+
+            assert checks == ["evil.example"] * 2
+            # A third, sent while the second runs, waits for the second.
+            send(stranger, "AUTH 000000")
+            await asyncio.sleep(0)
+            assert checks == ["evil.example"] * 2
+            gate.release()
+            gate.release()
+            await settle(bot)
+
+        assert checks == ["evil.example"] * 3
+        assert bot.events.command_locks == {}
 
     async def test_self_join_clears_state(self) -> None:
         """Reset channel state on a self-join and learn this bot's identity."""
