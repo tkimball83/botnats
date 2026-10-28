@@ -78,6 +78,9 @@ class IRCSender(Protocol):
 class IRCProtocol(IRCSender, Protocol):
     """Interface for IRC client implementations."""
 
+    # About how long the lines queued now take to go out.
+    queue_delay: float
+
     async def close(self) -> None:
         """Close the connection."""
         ...
@@ -89,11 +92,6 @@ class IRCProtocol(IRCSender, Protocol):
 
     def is_self(self, nickname: str) -> bool:
         """Return whether a nickname identifies this client."""
-        ...
-
-    @property
-    def queue_delay(self) -> float:
-        """Return about how long the lines queued now take to go out."""
         ...
 
     async def run_forever(self) -> None:
@@ -234,10 +232,7 @@ class Prefix:
         return cls(nick=nick, user=user or None, host=host or None)
 
     def render(self) -> str:
-        """Format the prefix as a nick!user@host string."""
-        if not self.complete:
-            return self.nick
-
+        """Format a complete prefix as a nick!user@host string."""
         return f"{self.nick}!{self.user}@{self.host}"
 
 
