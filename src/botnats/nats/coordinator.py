@@ -249,15 +249,14 @@ class Coordinator:
         """Start over when nats-py closes the client for good.
 
         A server error, such as one for a rotated token, closes the client
-        without reconnecting. close() drops the client first, so a closed
-        client still held here was not closed on purpose.
+        without reconnecting. close() drops the client first, so a client
+        still held here was not closed on purpose. nats-py runs the
+        disconnect callback just before this one, so no resync is left.
         """
-        nc = self.nc
-        if nc is None or not nc.is_closed:
+        if self.nc is None:
             return
 
         self.nc = None
-        await self.cancel_resync()
         self.resync_task = asyncio.create_task(self.start(), name="nats-restart")
         self.resync_task.add_done_callback(self.resync_done)
 
@@ -281,10 +280,10 @@ class Coordinator:
 
         Runs as a background task: init_stores retries for as long as
         JetStream stays down, and blocking here would park the nats-py
-        callback runner for the whole outage.
+        callback runner for the whole outage. The disconnect callback that
+        began this reconnect left no resync behind.
         """
         LOGGER.info("reconnected to Core NATS")
-        await self.cancel_resync()
         self.resync_task = asyncio.create_task(self.resync(), name="nats-resync")
         self.resync_task.add_done_callback(self.resync_done)
 
@@ -301,13 +300,9 @@ class Coordinator:
         await self.start_watches()
 
     async def cancel_resync(self) -> None:
-        """Cancel an in-flight resynchronization or restart task.
-
-        A restart that closes its own failed client reaches this through the
-        disconnect callback; it must go on retrying, not cancel itself.
-        """
+        """Cancel an in-flight resynchronization or restart task."""
         task = self.resync_task
-        if task is None or task is asyncio.current_task():
+        if task is None:
             return
 
         self.resync_task = None
@@ -469,37 +464,26 @@ class Coordinator:
             if self.nc is not None:
                 return
 
+            # nats-py retries the connection itself. A client it closes for
+            # good while the stores open is dropped by on_closed; connect again.
             while self.nc is None:
-                try:
-                    nc = await nats.connect(
-                        servers=list(self.config.servers),
-                        token=self.config.token,
-                        name=f"botnats-{self.envelope.bot_id}",
-                        allow_reconnect=True,
-                        max_reconnect_attempts=-1,
-                        reconnect_time_wait=RECONNECT_WAIT,
-                        closed_cb=self.on_closed,
-                        disconnected_cb=self.on_disconnected,
-                        error_cb=self.on_error,
-                        reconnected_cb=self.on_reconnected,
-                    )
-                    self.nc = nc
-                    # Before JetStream: a drop while it is down cancels a
-                    # restart, and nats-py replays only subscriptions it holds.
-                    await self.subscribe_help(nc)
-                    await self.init_stores()
-                except CONNECT_ERRORS as error:
-                    LOGGER.warning(
-                        "NATS connection failed; retrying: %s",
-                        error_label(error),
-                    )
-                    # Dropped first, so on_closed knows this close is ours.
-                    failed, self.nc = self.nc, None
-                    if failed is not None:
-                        with suppress(*PUBLISH_ERRORS):
-                            await failed.close()
-
-                    await asyncio.sleep(RECONNECT_WAIT)
+                nc = await nats.connect(
+                    servers=list(self.config.servers),
+                    token=self.config.token,
+                    name=f"botnats-{self.envelope.bot_id}",
+                    allow_reconnect=True,
+                    max_reconnect_attempts=-1,
+                    reconnect_time_wait=RECONNECT_WAIT,
+                    closed_cb=self.on_closed,
+                    disconnected_cb=self.on_disconnected,
+                    error_cb=self.on_error,
+                    reconnected_cb=self.on_reconnected,
+                )
+                self.nc = nc
+                # Before JetStream: a drop while it is down cancels a restart,
+                # and nats-py replays only subscriptions it holds.
+                await self.subscribe_help(nc)
+                await self.init_stores()
 
             await self.start_watches()
 

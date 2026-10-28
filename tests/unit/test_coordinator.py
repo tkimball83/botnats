@@ -8,7 +8,7 @@ import json
 import time
 import unittest
 import uuid
-from dataclasses import asdict, astuple
+from dataclasses import asdict, astuple, replace
 from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -407,17 +407,30 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.nc is None
 
     async def test_closed_client_restarts(self) -> None:
-        """Drop a client nats-py closed for good and connect again in the background."""
+        """Drop a client nats-py closed for good and connect again in the background.
+
+        The new client subscribes to help requests, then the stores open, and
+        the watches start last.
+        """
         coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_closed=True)
+        steps: list[str] = []
         nc = MagicMock(is_connected=True)
-        nc.subscribe = AsyncMock()
+        nc.subscribe = AsyncMock(side_effect=lambda *_, **__: steps.append("subscribe"))
         connect = AsyncMock(return_value=nc)
 
         with (
             patch("botnats.nats.coordinator.nats.connect", connect),
-            patch.object(coordinator, "init_stores", AsyncMock()),
-            patch.object(coordinator, "start_watches", AsyncMock()) as start_watches,
+            patch.object(
+                coordinator,
+                "init_stores",
+                AsyncMock(side_effect=lambda: steps.append("stores")),
+            ),
+            patch.object(
+                coordinator,
+                "start_watches",
+                AsyncMock(side_effect=lambda: steps.append("watches")),
+            ),
         ):
             await coordinator.on_closed()
             restart = coordinator.resync_task
@@ -428,45 +441,18 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         connect.assert_awaited_once()
         assert connect.await_args is not None
-        assert connect.await_args.kwargs["closed_cb"] == coordinator.on_closed
+        callbacks = {
+            name: connect.await_args.kwargs.get(name)
+            for name in ("closed_cb", "disconnected_cb", "error_cb", "reconnected_cb")
+        }
+        assert callbacks == {
+            "closed_cb": coordinator.on_closed,
+            "disconnected_cb": coordinator.on_disconnected,
+            "error_cb": coordinator.on_error,
+            "reconnected_cb": coordinator.on_reconnected,
+        }
         assert coordinator.nc is nc
-        nc.subscribe.assert_awaited_once()
-        start_watches.assert_awaited_once_with()
-
-    async def test_restart_survives_closing_its_failed_client(self) -> None:
-        """Keep restarting after the restart closes a client whose setup failed."""
-        coordinator = build_coordinator("alpha")
-        coordinator.nc = MagicMock(is_closed=True)
-        # Closing it runs the disconnect callback, which cancels the resync
-        # slot, from inside the restart that slot holds.
-        failed = closing_client(coordinator)
-        failed.subscribe = AsyncMock(side_effect=ConnectionClosedError)
-        nc = MagicMock(is_connected=True)
-        nc.subscribe = AsyncMock()
-        connect = AsyncMock(side_effect=[failed, nc])
-        watching = asyncio.Event()
-        start_watches = AsyncMock(side_effect=watching.set)
-
-        with (
-            patch("botnats.nats.coordinator.nats.connect", connect),
-            patch.object(coordinator, "init_stores", AsyncMock()),
-            patch.object(coordinator, "start_watches", start_watches),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
-            self.assertLogs("botnats.nats.coordinator", level="WARNING"),
-        ):
-            await coordinator.on_closed()
-            restart = coordinator.resync_task
-            assert restart is not None
-            async with asyncio.timeout(5):
-                # Wait for the outcome, not the task: a restart stuck
-                # cancelling itself cannot be awaited or cancelled.
-                await watching.wait()
-                await restart
-
-        failed.close.assert_awaited_once_with()
-        assert connect.await_count == 2
-        assert coordinator.nc is nc
-        start_watches.assert_awaited_once_with()
+        assert steps == ["subscribe", "stores", "watches"]
 
     async def test_cancelled_restart_keeps_help_subscription(self) -> None:
         """Subscribe to help requests before a restart waits for JetStream.
@@ -944,41 +930,51 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert sum("crashed" in line for line in logs.output) == 1
 
     async def test_replaced_resync_keeps_new_task(self) -> None:
-        """Keep the new resync task when a superseded one finishes after it."""
+        """Keep a restart that took the slot while a superseded resync stopped.
+
+        A drop's disconnect callback, in the nats-py reconnect task, waits for
+        a resync that is slow to stop when nats-py closes the client for good:
+        that close cancels the reconnect task and then runs its own callbacks,
+        whose restart takes the slot before the resync finishes.
+        """
         coordinator = build_coordinator("alpha")
-        coordinator.nc = MagicMock()
+        nc = MagicMock(is_closed=False)
+        coordinator.nc = nc
         stopping = asyncio.Event()
-        release = asyncio.Event()
 
         async def slow_to_stop() -> None:
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 stopping.set()
-                async with asyncio.timeout(5):
-                    await release.wait()
+                # Its cleanup still awaits; the next cancellation ends it.
+                await asyncio.Event().wait()
 
-                raise
-
-        with patch.object(coordinator, "resync", slow_to_stop):
+        with (
+            patch.object(coordinator, "resync", slow_to_stop),
+            patch.object(coordinator, "start", hang),
+        ):
             async with asyncio.timeout(5):
                 await coordinator.on_reconnected()
                 first = coordinator.resync_task
-                # A disconnect cancels the first resync, which is slow to stop,
-                # and a reconnect starts the second before the first finishes.
-                disconnect = asyncio.create_task(coordinator.on_disconnected())
+                reconnect = asyncio.create_task(coordinator.on_disconnected())
                 await stopping.wait()
-                await coordinator.on_reconnected()
+                nc.is_closed = True
+                reconnect.cancel()
+                await coordinator.on_disconnected()
+                await coordinator.on_closed()
                 second = coordinator.resync_task
-                release.set()
-                await disconnect
+                await asyncio.gather(reconnect, return_exceptions=True)
 
             assert first is not None
             assert first.cancelled()
             assert second is not None
+            assert second is not first
             assert coordinator.resync_task is second
             async with asyncio.timeout(5):
                 await coordinator.cancel_resync()
+
+        assert second.cancelled()
 
     async def test_disconnect_cancels_resync(self) -> None:
         """Cancel an in-flight resynchronization when Core NATS drops."""
@@ -1533,6 +1529,72 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             ("WARNING", "watch watch-presence failed: JetStream is unavailable"),
         ]
 
+    async def test_closed_client_ends_watches_quietly(self) -> None:
+        """End every watch at once when nats-py closes the client for good.
+
+        nats-py marks the client closed before its disconnect callback cancels
+        the watches, so stopping each watcher raises ConnectionClosedError, or
+        a crash, in place of the cancellation: no failure to report or to wait
+        out.
+        """
+        coordinator = build_coordinator("alpha")
+        nc = MagicMock(is_closed=False, is_connected=True)
+        coordinator.nc = nc
+        started = asyncio.Event()
+        runs = 0
+        errors = {
+            "watch-channels": ConnectionClosedError,
+            "watch-presence": RuntimeError,
+            "watch-sessions": ConnectionClosedError,
+        }
+
+        async def watch_until_closed(name: str, synced: Callable[[], None]) -> None:
+            del synced
+            nonlocal runs
+            runs += 1
+            if runs == len(errors):
+                started.set()
+
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # watcher.stop() unsubscribes, which a closed client refuses.
+                if nc.is_closed:
+                    raise errors[name] from None
+
+                raise
+
+        with (
+            patch.object(
+                coordinator,
+                "watch_channels",
+                partial(watch_until_closed, "watch-channels"),
+            ),
+            patch.object(
+                coordinator,
+                "watch_presence",
+                partial(watch_until_closed, "watch-presence"),
+            ),
+            patch.object(
+                coordinator,
+                "watch_sessions",
+                partial(watch_until_closed, "watch-sessions"),
+            ),
+            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()) as sleep,
+            self.assertNoLogs("botnats.nats.coordinator", level="WARNING"),
+        ):
+            async with asyncio.timeout(5):
+                await coordinator.start_watches()
+                await started.wait()
+                tasks = list(coordinator.watch_tasks)
+                nc.is_closed = True
+                nc.is_connected = False
+                await coordinator.on_disconnected()
+
+        assert all(task.done() for task in tasks)
+        sleep.assert_not_awaited()
+        assert runs == len(tasks)
+
     async def test_concurrent_start_watches_keeps_single_watcher_set(self) -> None:
         """Verify overlapping start_watches calls leave exactly one watcher set."""
         coordinator = build_coordinator("alpha")
@@ -1791,88 +1853,17 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
                 assert coordinator.claim.owned
 
-    async def test_start_retries_failed_connection(self) -> None:
-        """Close and retry a connection whose setup failed, even if closing fails."""
+    async def test_start_fails_on_server_url_nats_rejects(self) -> None:
+        """Fail once, unready, on a server URL nats-py rejects before connecting.
+
+        nats-py retries every other connection failure itself, for good.
+        """
         coordinator = build_coordinator("alpha")
-        steps: list[str] = []
+        coordinator.config = replace(coordinator.config, servers=("nats://none:4222",))
 
-        def step(name: str, error: Exception | None = None) -> AsyncMock:
-            """Return a coroutine mock that records its step, then may raise."""
-
-            def effect(*arguments: object, **options: object) -> None:
-                del arguments, options
-                steps.append(name)
-                if error is not None:
-                    raise error
-
-            return AsyncMock(side_effect=effect)
-
-        # nats-py retries the connect itself; a closed connection fails setup.
-        failed = MagicMock(
-            close=step("close", OSError("connection reset")),
-            is_connected=True,
-            subscribe=step("subscribe", ConnectionClosedError()),
-        )
-        nc = MagicMock(is_connected=True, subscribe=step("subscribe"))
-        clients = [failed, nc]
-
-        def connect(**options: object) -> MagicMock:
-            del options
-            steps.append("connect")
-            return clients.pop(0)
-
-        with (
-            patch(
-                "botnats.nats.coordinator.nats.connect",
-                AsyncMock(side_effect=connect),
-            ),
-            patch.object(coordinator, "init_stores", step("stores")),
-            patch.object(coordinator, "start_watches", step("watches")),
-            patch("botnats.nats.coordinator.asyncio.sleep", step("sleep")),
-            self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs,
-        ):
-            await coordinator.start()
-
-        assert coordinator.nc is nc
-        assert steps == [
-            "connect",
-            "subscribe",
-            "close",
-            "sleep",
-            "connect",
-            "subscribe",
-            "stores",
-            "watches",
-        ]
-        assert [log.getMessage() for log in logs.records] == [
-            "NATS connection failed; retrying: nats: connection closed",
-        ]
-
-    async def test_failed_start_closes_client_without_restart(self) -> None:
-        """Drop a half-open client before closing it, so its close starts nothing."""
-        coordinator = build_coordinator("alpha")
-        half_open = closing_client(coordinator)
-        half_open.subscribe = AsyncMock(side_effect=ConnectionClosedError)
-        nc = MagicMock(is_connected=True)
-        nc.subscribe = AsyncMock()
-        connect = AsyncMock(side_effect=[half_open, nc])
-
-        with (
-            patch("botnats.nats.coordinator.nats.connect", connect),
-            patch.object(coordinator, "init_stores", AsyncMock()),
-            patch.object(coordinator, "start_watches", AsyncMock()) as start_watches,
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
-            self.assertLogs("botnats.nats.coordinator", level="WARNING"),
-        ):
-            async with asyncio.timeout(5):
+        async with asyncio.timeout(5):
+            with self.assertRaisesRegex(NatsError, "invalid hostname"):
                 await coordinator.start()
-                # nats-py ran on_closed inside close(); only start() reconnects.
-                restart = coordinator.resync_task
-                await coordinator.cancel_resync()
 
-        assert restart is None
-        half_open.close.assert_awaited_once_with()
-        assert connect.await_count == 2
-        assert coordinator.nc is nc
-        nc.subscribe.assert_awaited_once()
-        start_watches.assert_awaited_once_with()
+        assert coordinator.nc is None
+        assert not coordinator.ready
