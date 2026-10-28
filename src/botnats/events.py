@@ -52,7 +52,6 @@ class IRCEventHandler:
         self.handlers: dict[str, Callable[[IRCMessage], None]] = {
             "001": self.handle_welcome,
             "005": self.handle_isupport,
-            "302": self.handle_userhost,
             "303": self.handle_ison_reply,
             "324": self.handle_channel_modes,
             "352": self.handle_who,
@@ -653,21 +652,6 @@ class IRCEventHandler:
         if prefix.complete:
             self.bot.sessions.revoke(prefix)
 
-    def handle_userhost(self, message: IRCMessage) -> None:
-        """Extract the bot's user and host from a USERHOST reply."""
-        if not message.params:
-            return
-
-        for entry in message.params[-1].split():
-            nickname, _, userhost = entry.partition("=")
-            userhost = userhost.lstrip("+-")
-            user, at, host = userhost.partition("@")
-            if at and self.bot.irc.is_self(nickname.rstrip("*")):
-                self.set_identity(
-                    Prefix(self.bot.irc.current_nick, user, host),
-                )
-                return
-
     def on_irc_disconnect(self) -> None:
         """Clear connection-scoped state when the IRC connection drops."""
         self.stop_nick_watch()
@@ -699,19 +683,23 @@ class IRCEventHandler:
             message.params[5],
             message.params[6],
         )
+        entry = Prefix(nick, user, host)
+        # Identity discovery asks WHO about this bot's own nick, whose reply
+        # names "*" or any channel the bot is in.
+        if self.bot.irc.is_self(nick):
+            self.set_identity(entry)
+
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is None or not runtime.joined:
             return
 
         member = runtime.member(nick)
-        member.prefix = Prefix(nick, user, host)
+        member.prefix = entry
         member.modes = {
             mode
             for prefix, mode in self.bot.caps.member_prefixes.items()
             if prefix in flags and mode in self.bot.caps.operator_modes
         }
-        if self.bot.irc.is_self(nick):
-            self.set_identity(member.prefix)
 
     def on_irc_message(self, message: IRCMessage) -> None:
         """Route an IRC message to its registered handler."""

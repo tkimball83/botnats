@@ -1637,7 +1637,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_join_waits_for_identity(self) -> None:
-        """Join nothing between 001 and the USERHOST reply naming this bot.
+        """Join nothing between 001 and the WHO reply naming this bot.
 
         A JOIN refused before then could ask no peer for help.
         """
@@ -1648,7 +1648,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == []
 
         bot.events.on_irc_message(
-            IRCMessage("302", ("alpha", "alpha=+~alpha@alpha.host")),
+            IRCMessage(
+                "352",
+                ("alpha", "*", "~alpha", "alpha.host", "srv", "alpha", "H", "0 r"),
+            ),
         )
         await settle(bot)
 
