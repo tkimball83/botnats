@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+STRICT_RFC1459_TABLE = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\",
+    "abcdefghijklmnopqrstuvwxyz{}|",
+)
 CASEMAP_TABLES = {
     "ascii": str.maketrans(
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -18,10 +22,9 @@ CASEMAP_TABLES = {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\^",
         "abcdefghijklmnopqrstuvwxyz{}|~",
     ),
-    "strict-rfc1459": str.maketrans(
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\",
-        "abcdefghijklmnopqrstuvwxyz{}|",
-    ),
+    # The modern ISUPPORT spelling, which Ergo advertises.
+    "rfc1459-strict": STRICT_RFC1459_TABLE,
+    "strict-rfc1459": STRICT_RFC1459_TABLE,
 }
 CASEMAPPINGS = frozenset(CASEMAP_TABLES)
 DEFAULT_CASEMAPPING = "rfc1459"
@@ -63,8 +66,12 @@ class IRCSender(Protocol):
         command: str,
         *params: str,
         trailing: str | None = None,
-    ) -> None:
-        """Enqueue an IRC command."""
+        unless_waiting: bool = False,
+    ) -> bool:
+        """Enqueue an IRC command, unless asked to skip a copy still waiting.
+
+        Return whether it was queued.
+        """
         ...
 
 
@@ -143,10 +150,7 @@ class ISupportState:
 
     def fold_identity(self, prefix: str) -> str:
         """Normalize a nick!user@host identity for case-insensitive comparison."""
-        nick, bang, rest = prefix.partition("!")
-        if not bang:
-            return self.fold(nick)
-
+        nick, _, rest = prefix.partition("!")
         return self.fold(nick) + "!" + casefold(rest, "ascii")
 
     def is_opped(self, modes: set[str]) -> bool:
@@ -248,10 +252,6 @@ def format_message(
     trailing: str | None,
 ) -> bytes:
     """Encode an IRC command, parameters, and trailing text into bytes."""
-    if not command.isascii() or not command.isalnum():
-        msg = "IRC command contains unsupported characters"
-        raise ValueError(msg)
-
     for param in params:
         if not param or param[0] == ":" or not ILLEGAL_PARAM_CHARS.isdisjoint(param):
             msg = "IRC parameter contains unsupported characters"

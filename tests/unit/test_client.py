@@ -12,9 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 from botnats.irc.client import (
-    FALLBACK_NICK_LENGTH,
     NICK_COLLISION_LIMIT,
-    SEND_RATE,
     IRCClient,
     IRCClientConfig,
     IRCServer,
@@ -29,6 +27,53 @@ from botnats.irc.protocol import (
     parse_message,
 )
 from tests.unit.helpers import hang
+
+
+class FakeClock:
+    """A loop clock that moves only by the time the sender waits.
+
+    Its timeline records each line written and each wait, in order.
+    """
+
+    def __init__(self, client: IRCClient) -> None:
+        self.client = client
+        self.drained = asyncio.Event()
+        # Long past the zero a fresh client is charged up to, so an idle
+        # spell must bank no more than the whole credit.
+        self.now = 100.0
+        # A test clears it to hold the sender in a wait.
+        self.resume = asyncio.Event()
+        self.resume.set()
+        self.sleeping = asyncio.Event()
+        self.timeline: list[bytes | float] = []
+
+    async def sleep(self, delay: float) -> None:
+        """Pass the time waited, then hold the sender while it is paused."""
+        self.now += delay
+        self.timeline.append(delay)
+        self.sleeping.set()
+        await self.resume.wait()
+
+    def time(self) -> float:
+        """Return the fake loop time."""
+        return self.now
+
+    def write(self, encoded: bytes) -> None:
+        """Record a written line, noting when it leaves the queue empty."""
+        self.timeline.append(encoded)
+        if self.client.outbound is not None and self.client.outbound.empty():
+            self.drained.set()
+
+
+async def dispatch(
+    client: IRCClient,
+    raw: bytes,
+    ping_token: str | None = None,
+) -> str | None:
+    """Parse and dispatch one server line as run_connection does, bounded."""
+    message = parse_message(raw.decode(errors="replace"))
+    async with asyncio.timeout(5):
+        return await client.dispatch_line(message, raw, mock_writer(), ping_token)
 
 
 def fill_send_buffer(writer: asyncio.StreamWriter) -> None:
@@ -69,6 +114,12 @@ def mock_writer() -> MagicMock:
     return writer
 
 
+def queue_notice(client: IRCClient, text: str) -> bytes:
+    """Queue a NOTICE and return the line it puts on the wire."""
+    client.send("NOTICE", "owner", trailing=text)
+    return format_message("NOTICE", ("owner",), text)
+
+
 class IRCServerTests(unittest.TestCase):
     """Tests for IRC server URL parsing."""
 
@@ -104,6 +155,33 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.addAsyncCleanup(stop_sender)
         return client
+
+    def paced_client(self) -> tuple[IRCClient, FakeClock]:
+        """Return a connected client whose sender runs on a fake clock."""
+        client = irc_client()
+        clock = FakeClock(client)
+        writer = mock_writer()
+        writer.write.side_effect = clock.write
+        client.outbound = asyncio.Queue()
+        client.writer = writer
+        self.enterContext(
+            patch(
+                "asyncio.get_running_loop",
+                return_value=SimpleNamespace(time=clock.time),
+            ),
+        )
+        self.enterContext(patch("asyncio.sleep", clock.sleep))
+        client.sender_task = asyncio.create_task(
+            client.send_loop(writer, client.outbound),
+        )
+
+        async def stop_sender() -> None:
+            clock.resume.set()
+            async with asyncio.timeout(5):
+                await client.stop_sender()
+
+        self.addAsyncCleanup(stop_sender)
+        return client, clock
 
     async def unread_connection(
         self,
@@ -173,7 +251,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         )
         connect = AsyncMock(return_value=(asyncio.StreamReader(), mock_writer()))
 
-        with patch("botnats.irc.client.asyncio.open_connection", connect):
+        with patch("asyncio.open_connection", connect):
             async with asyncio.timeout(5):
                 for server in servers:
                     await client.establish(server)
@@ -192,7 +270,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             del arguments, options
             await hang()
 
-        with patch("botnats.irc.client.asyncio.open_connection", unanswered):
+        with patch("asyncio.open_connection", unanswered):
             # The bound sits outside assertRaises: an unenforced connect
             # timeout ends in the bound's cancellation, not a TimeoutError.
             async with asyncio.timeout(5):
@@ -228,9 +306,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(client, "run_connection", failing_connection),
-            patch("botnats.irc.client.asyncio.sleep", record_sleep),
+            patch("asyncio.sleep", record_sleep),
             # The largest jitter, so its scale is pinned too.
-            patch("botnats.irc.client.secrets.randbelow", return_value=999),
+            patch("secrets.randbelow", return_value=999),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -265,8 +343,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(client, "run_connection", connection),
-            patch("botnats.irc.client.asyncio.sleep", record_sleep),
-            patch("botnats.irc.client.secrets.randbelow", return_value=0),
+            patch("asyncio.sleep", record_sleep),
+            patch("secrets.randbelow", return_value=0),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -298,9 +376,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(client, "run_connection", connection),
-            patch("botnats.irc.client.asyncio.sleep", record_sleep),
+            patch("asyncio.sleep", record_sleep),
             patch("botnats.irc.client.STABLE_SESSION_SECONDS", 0.0),
-            patch("botnats.irc.client.secrets.randbelow", return_value=0),
+            patch("secrets.randbelow", return_value=0),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -312,79 +390,154 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert ports == [6667, 6668, 6668]
         assert delays == [1.5, 1.0]
 
-    async def test_send_loop_rate_limits_after_burst(self) -> None:
-        """Delay sends once the token-bucket burst allowance is spent."""
-        client = irc_client()
+    async def test_send_loop_spends_flood_credit_then_waits(self) -> None:
+        """Send a burst that fits the flood credit at once, then wait each cost."""
+        client, clock = self.paced_client()
+        # Each short line costs two seconds of the ten-second credit.
+        lines = [queue_notice(client, str(index)) for index in range(7)]
+        assert client.queue_delay == 14.0
+
+        async with asyncio.timeout(5):
+            await clock.drained.wait()
+
+        assert clock.timeline == [*lines[:5], 2.0, lines[5], 2.0, lines[6]]
+        assert client.queue_delay == 0.0
+
+    async def test_send_loop_charges_long_lines_more(self) -> None:
+        """Charge a long line the larger of ircu's and UnrealIRCd's costs."""
+        client, clock = self.paced_client()
+        burst = [queue_notice(client, str(index)) for index in range(5)]
+        # UnrealIRCd's 1 + len / 90 is the larger cost of the 460-byte line,
+        # ircu's 2 + len / 120 that of the 150-byte one.
+        longer = queue_notice(client, "x" * 444)
+        shorter = queue_notice(client, "x" * 134)
+        assert (len(longer), len(shorter)) == (460, 150)
+
+        async with asyncio.timeout(5):
+            await clock.drained.wait()
+
+        assert clock.timeline == [*burst, 6.0, longer, 3.0, shorter]
+
+    async def test_ping_and_pong_spend_flood_credit(self) -> None:
+        """Write a PING or PONG at once, and make the queued lines wait its cost."""
+        client, clock = self.paced_client()
+        writer = client.writer
+        assert writer is not None
+        ping = format_message("PING", (), "token")
+        pong = pong_reply(b"PING :token\r\n")
+        burst = [queue_notice(client, str(index)) for index in range(5)]
+        async with asyncio.timeout(5):
+            await clock.drained.wait()
+            # The credit is spent, yet the PING goes out without waiting.
+            await client.send_immediate(ping, writer)
+            clock.resume.clear()
+            later = queue_notice(client, "later")
+            await clock.sleeping.wait()
+            # A PONG sent while that line waits on the PING lengthens its wait.
+            await client.send_immediate(pong, writer)
+            clock.drained.clear()
+            clock.resume.set()
+            await clock.drained.wait()
+
+        assert clock.timeline == [*burst, ping, 4.0, pong, 2.0, later]
+
+    async def test_send_unless_waiting_skips_a_waiting_copy(self) -> None:
+        """Skip a copy of a line not yet written when asked, and only then."""
+        client, clock = self.paced_client()
+        burst = [queue_notice(client, str(index)) for index in range(5)]
+        op = format_message("MODE", ("#chan", "+o", "beta"), None)
+        async with asyncio.timeout(5):
+            await clock.drained.wait()
+            clock.drained.clear()
+            clock.resume.clear()
+            assert client.send("MODE", "#chan", "+o", "beta", unless_waiting=True)
+            await clock.sleeping.wait()
+            # The first copy waits on the credit: a help copy is skipped, and
+            # any other caller's copy still queues.
+            assert not client.send("MODE", "#chan", "+o", "beta", unless_waiting=True)
+            assert client.queue_delay == 2
+            assert client.send("MODE", "#chan", "+o", "beta")
+            assert client.queue_delay == 2 + 2
+            # Wake the sender, which writes the first copy and then waits to
+            # write the second: a help copy is still skipped.
+            clock.sleeping.clear()
+            clock.resume.set()
+            clock.resume.clear()
+            await clock.sleeping.wait()
+            assert not client.send("MODE", "#chan", "+o", "beta", unless_waiting=True)
+            clock.resume.set()
+            await clock.drained.wait()
+            clock.drained.clear()
+            # Once every copy is written, the line queues again.
+            assert client.send("MODE", "#chan", "+o", "beta", unless_waiting=True)
+            await clock.drained.wait()
+
+        assert clock.timeline == [*burst, 2.0, op, 2.0, op, 2.0, op]
+
+    async def test_stop_sender_forgets_waiting_lines(self) -> None:
+        """Queue a help line on the next connection, though its copy never went out."""
+        client, clock = self.paced_client()
+        burst = [queue_notice(client, str(index)) for index in range(5)]
+        op = format_message("MODE", ("#chan", "+o", "beta"), None)
         writer = mock_writer()
-        client.writer = writer
-        outbound: asyncio.Queue[bytes] = asyncio.Queue()
-        messages = [b"%d" % index for index in range(6)]
-        # Only the sender reads this clock, which moves by the time it sleeps
-        # and by the idle spell below.
-        clock = 0.0
-        clock_read = asyncio.Event()
-        timeline: list[bytes | float] = []
-        all_sent = asyncio.Event()
+        writer.write.side_effect = clock.write
+        connect = AsyncMock(return_value=(asyncio.StreamReader(), writer))
+        async with asyncio.timeout(5):
+            await clock.drained.wait()
+            clock.resume.clear()
+            assert client.send("MODE", "#chan", "+o", "beta", unless_waiting=True)
+            assert not client.send("MODE", "#chan", "+o", "beta", unless_waiting=True)
+            await clock.sleeping.wait()
+            await client.close()
+            clock.drained.clear()
+            clock.resume.set()
+            with patch("asyncio.open_connection", connect):
+                await client.establish(client.config.servers[0])
 
-        def read_clock() -> float:
-            clock_read.set()
-            return clock
+            assert client.send("MODE", "#chan", "+o", "beta", unless_waiting=True)
+            await clock.drained.wait()
 
-        async def record_sleep(delay: float) -> None:
-            nonlocal clock
-            clock += delay
-            timeline.append(delay)
-
-        async def record_send(encoded: bytes, target: asyncio.StreamWriter) -> None:
-            del target
-            timeline.append(encoded)
-            if outbound.empty():
-                all_sent.set()
-
-        with (
-            patch(
-                "botnats.irc.client.asyncio.get_running_loop",
-                return_value=SimpleNamespace(time=read_clock),
-            ),
-            patch("botnats.irc.client.SEND_BURST", 4.5),
-            patch("botnats.irc.client.asyncio.sleep", record_sleep),
-            patch.object(client, "send_immediate", record_send),
-        ):
-            task = asyncio.create_task(client.send_loop(writer, outbound))
-            async with asyncio.timeout(5):
-                # The sender reads its start time and waits on the empty
-                # queue; a long idle spell must not bank more than the burst.
-                await clock_read.wait()
-                clock = 100.0
-                for message in messages:
-                    outbound.put_nowait(message)
-
-                await all_sent.wait()
-
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                async with asyncio.timeout(5):
-                    await task
-
-        # Four whole tokens go out at once, and the half token left over
-        # shortens only the first wait. Each later send waits a whole token:
-        # neither that half token nor the time slept may be counted twice.
-        assert timeline == [
-            *messages[:4],
-            0.5 / SEND_RATE,
-            messages[4],
-            1.0 / SEND_RATE,
-            messages[5],
+        assert clock.timeline == [
+            *burst,
+            2.0,
+            b"CAP LS 302\r\n",
+            b"NICK alpha\r\n",
+            b"USER alpha 0 * :alpha\r\n",
+            op,
         ]
 
-    async def test_queue_delay_counts_queued_lines(self) -> None:
-        """Report how long the queued lines take to go out at the send rate."""
+    async def test_queue_delay_counts_queued_cost(self) -> None:
+        """Report the flood credit the queued lines spend, long lines costing more."""
         client = self.cap_client(negotiating=False)
         assert client.queue_delay == 0.0
 
+        # The short JOIN costs two seconds, the 460-byte PRIVMSG six.
         client.send("JOIN", "#one")
-        client.send("JOIN", "#two")
-        assert client.queue_delay == 2 / SEND_RATE
+        client.send("PRIVMSG", "#chan", trailing="x" * 443)
+        assert client.queue_delay == 2 + 6
+
+    async def test_establish_starts_with_whole_flood_credit(self) -> None:
+        """Send registration at once, though the last connection spent its credit."""
+        client, clock = self.paced_client()
+        burst = [queue_notice(client, str(index)) for index in range(5)]
+        writer = mock_writer()
+        writer.write.side_effect = clock.write
+        connect = AsyncMock(return_value=(asyncio.StreamReader(), writer))
+        async with asyncio.timeout(5):
+            await clock.drained.wait()
+            await client.close()
+            clock.drained.clear()
+            with patch("asyncio.open_connection", connect):
+                await client.establish(client.config.servers[0])
+
+            await clock.drained.wait()
+
+        assert clock.timeline == [
+            *burst,
+            b"CAP LS 302\r\n",
+            b"NICK alpha\r\n",
+            b"USER alpha 0 * :alpha\r\n",
+        ]
 
     async def test_registration_nick_rejections_retry(self) -> None:
         """Verify registration retries every nickname rejection numeric."""
@@ -395,9 +548,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(IRCClient, "nick_collision", retry):
             for numeric in numerics:
                 raw = f":server {numeric} * alpha :nickname rejected\r\n".encode()
-                await client.dispatch_line(
-                    parse_message(raw.decode()), raw, mock_writer(), None
-                )
+                await dispatch(client, raw)
 
         assert retry.call_count == len(numerics)
 
@@ -417,9 +568,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(IRCClient, "nick_collision", retry):
             for numeric in numerics:
                 raw = f":server {numeric} alpha beta :nickname rejected\r\n".encode()
-                await client.dispatch_line(
-                    parse_message(raw.decode()), raw, mock_writer(), None
-                )
+                await dispatch(client, raw)
 
         retry.assert_not_called()
         assert dispatched == numerics
@@ -441,10 +590,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("botnats.irc.client", level="ERROR") as logs:
             for raw in lines:
-                result = await client.dispatch_line(
-                    parse_message(raw.decode()), raw, mock_writer(), "token"
-                )
-                assert result == "token"
+                assert await dispatch(client, raw, "token") == "token"
 
         assert dispatched == ["002"]
         assert len(logs.output) == 1
@@ -455,11 +601,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = self.cap_client()
         handler = MagicMock()
         client.on_message = handler
-        raw = b":server CAP * LS :chghost\r\n"
-
-        await client.dispatch_line(
-            parse_message(raw.decode()), raw, mock_writer(), None
-        )
+        await dispatch(client, b":server CAP * LS :chghost\r\n")
 
         handler.assert_not_called()
         assert client.cap_available == {"chghost"}
@@ -487,39 +629,30 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Follow the server-assigned nick and this client's own NICK changes."""
         client = self.cap_client()
 
-        async def dispatch(raw: bytes) -> None:
-            await client.dispatch_line(
-                parse_message(raw.decode()),
-                raw,
-                mock_writer(),
-                None,
-            )
-
-        await dispatch(b":server 001 Alpha[ :Welcome\r\n")
+        await dispatch(client, b":server 001 Alpha[ :Welcome\r\n")
         assert client.registered_with_server
         assert not client.cap_negotiating
         assert client.current_nick == "Alpha["
 
         # rfc1459 folds [ and { together, so this NICK is this client's own.
-        await dispatch(b":alpha{!user@host NICK :beta\r\n")
+        await dispatch(client, b":alpha{!user@host NICK :beta\r\n")
         assert client.current_nick == "beta"
         assert client.is_self("BETA")
 
-        await dispatch(b":other!user@host NICK :gamma\r\n")
+        await dispatch(client, b":other!user@host NICK :gamma\r\n")
         assert client.current_nick == "beta"
 
-    async def test_nick_collision_fits_rfc1459_nick_length(self) -> None:
-        """Pick a fallback nick no longer than RFC 1459 allows.
+    async def test_nick_collision_keeps_configured_length(self) -> None:
+        """Pick a fallback nick as long as the configured one.
 
         A collision happens during registration, before ISUPPORT advertises
-        the server's own limit.
+        the server's own limit; configuration keeps the nick within RFC 1459's.
         """
         client = self.cap_client()
-        client.config = replace(client.config, nickname="alphabetsoup")
 
         client.nick_collision()
 
-        assert len(client.current_nick) == FALLBACK_NICK_LENGTH
+        assert len(client.current_nick) == len("alpha")
         assert client.outbound is not None
         assert (
             client.outbound.get_nowait() == f"NICK {client.current_nick}\r\n".encode()
@@ -529,16 +662,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Clear the outstanding PING only for a PONG carrying its token."""
         client = irc_client()
 
-        async def dispatch(raw: bytes) -> str | None:
-            return await client.dispatch_line(
-                parse_message(raw.decode()),
-                raw,
-                mock_writer(),
-                "token",
-            )
-
-        assert await dispatch(b":server PONG server :other\r\n") == "token"
-        assert await dispatch(b":server PONG server :token\r\n") is None
+        other = b":server PONG server :other\r\n"
+        matching = b":server PONG server :token\r\n"
+        assert await dispatch(client, other, "token") == "token"
+        assert await dispatch(client, matching, "token") is None
 
     async def test_short_lines_keep_ping_token_and_nick(self) -> None:
         """Pass over lines without the parameters or source a handler reads.
@@ -555,11 +682,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             b":alpha!u@h NICK\r\n",
         ):
             with self.subTest(raw=raw):
-                result = await client.dispatch_line(
-                    parse_message(raw.decode()), raw, mock_writer(), "token"
-                )
-
-                assert result == "token"
+                assert await dispatch(client, raw, "token") == "token"
                 assert client.current_nick == "alpha"
 
     async def test_cap_ls_multiline(self) -> None:
@@ -588,14 +711,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         for raw, reply in cases:
-            message = parse_message(raw.decode(errors="replace"))
             with (
-                self.subTest(params=len(message.params)),
+                self.subTest(reply=reply[:6]),
                 patch.object(client, "send_immediate", AsyncMock()) as send,
             ):
-                result = await client.dispatch_line(message, raw, mock_writer(), "tok")
-
-                assert result == "tok"
+                assert await dispatch(client, raw, "tok") == "tok"
                 send.assert_awaited_once()
                 assert send.await_args is not None
                 assert send.await_args.args[0] == reply
@@ -690,11 +810,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.outbound.put_nowait(b"JOIN #queued\r\n")
         raw = b":server CAP alpha NEW :chghost\r\n"
 
-        result = await client.dispatch_line(
-            parse_message(raw.decode()), raw, mock_writer(), "token"
-        )
-
-        assert result == "token"
+        assert await dispatch(client, raw, "token") == "token"
         assert client.outbound.get_nowait() == b"JOIN #queued\r\n"
         assert client.outbound.empty()
 
@@ -1016,9 +1132,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(port,))
         client.on_message = join_on_welcome
         try:
-            # Lift the send rate limit so neither session waits on it.
+            # Lift the flood credit so neither session waits on it.
             with (
-                patch("botnats.irc.client.SEND_BURST", 64.0),
+                patch("botnats.irc.client.SEND_CREDIT", 1000.0),
                 patch("botnats.irc.client.next_nickname", return_value="bravo"),
             ):
                 async with asyncio.timeout(5):
@@ -1193,7 +1309,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(client, "run_connection", failing_connection),
             patch.object(client, "close", AsyncMock()) as close,
-            patch("botnats.irc.client.asyncio.sleep", skip_sleep),
+            patch("asyncio.sleep", skip_sleep),
             self.assertLogs("botnats.irc.client", level="WARNING") as logs,
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -1253,9 +1369,14 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client()
         client.sender_task = asyncio.create_task(hang())
         client.outbound = asyncio.Queue()
+        client.writer = mock_writer()
+        client.send("JOIN", "#one")
+        assert client.queue_delay == 2.0
 
         async with asyncio.timeout(5):
             await client.stop_sender()
 
         assert client.sender_task is None
         assert client.outbound is None
+        # The discarded lines no longer delay anything.
+        assert client.queue_delay == 0.0

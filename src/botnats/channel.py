@@ -415,11 +415,17 @@ class ChannelManager:
             return
 
         try:
-            self.bot.irc.send("INVITE", presence.nick, channel)
+            queued = self.bot.irc.send(
+                "INVITE",
+                presence.nick,
+                channel,
+                unless_waiting=True,
+            )
         except ConnectionError:
             return
 
-        LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
+        if queued:
+            LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
     def op_peer(self, channel: str, presence: BotPresence) -> None:
         """Grant operator status to a peer bot."""
@@ -427,16 +433,18 @@ class ChannelManager:
             return
 
         try:
-            self.bot.irc.send(
+            queued = self.bot.irc.send(
                 "MODE",
                 channel,
                 f"+{self.bot.caps.op_mode}",
                 presence.nick,
+                unless_waiting=True,
             )
         except ConnectionError:
             return
 
-        LOGGER.info("opped %s on %s", presence.nick, channel)
+        if queued:
+            LOGGER.info("opped %s on %s", presence.nick, channel)
 
     def unban_peer(self, channel: str, presence: BotPresence) -> None:
         """Remove channel bans matching a peer bot's hostmask."""
@@ -450,13 +458,20 @@ class ChannelManager:
                 continue
 
             try:
-                self.bot.irc.send("MODE", channel, "-b", mask)
+                queued = self.bot.irc.send(
+                    "MODE",
+                    channel,
+                    "-b",
+                    mask,
+                    unless_waiting=True,
+                )
             except ConnectionError:
                 return
 
-            LOGGER.info(
-                "removed ban %s for bot %s on %s", mask, presence.bot_id, channel
-            )
+            if queued:
+                LOGGER.info(
+                    "removed ban %s for bot %s on %s", mask, presence.bot_id, channel
+                )
 
     async def help_after_delay(
         self,
@@ -495,11 +510,20 @@ class ChannelManager:
             return
 
         try:
-            self.bot.irc.send("MODE", channel, "+l", str(target))
+            queued = self.bot.irc.send(
+                "MODE",
+                channel,
+                "+l",
+                str(target),
+                unless_waiting=True,
+            )
         except ConnectionError:
             return
 
-        LOGGER.info("raised limit on %s to %d for %d bot(s)", channel, target, left_out)
+        if queued:
+            LOGGER.info(
+                "raised limit on %s to %d for %d bot(s)", channel, target, left_out
+            )
 
     async def request_peer(self, kind: str, channel: str) -> None:
         """Send a coordination request to peers, respecting cooldown limits."""

@@ -97,7 +97,11 @@ class IRCProtocolTests(unittest.TestCase):
     def test_casefold(self) -> None:
         """Verify casefold applies correct mapping for each mode."""
         assert casefold("Nick[\\]^", "rfc1459") == "nick{|}~"
-        assert casefold("Nick[\\]^", "strict-rfc1459") == "nick{|}^"
+        # Ergo advertises the strict mapping under its modern spelling.
+        for strict in ("rfc1459-strict", "strict-rfc1459"):
+            with self.subTest(casemapping=strict):
+                assert casefold("Nick[\\]^", strict) == "nick{|}^"
+
         assert casefold("Nick[\\]^", "ascii") == "nick[\\]^"
 
     def test_format_injection(self) -> None:

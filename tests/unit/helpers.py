@@ -259,8 +259,11 @@ class FakeIRC:
         command: str,
         *params: str,
         trailing: str | None = None,
-    ) -> None:
+        unless_waiting: bool = False,
+    ) -> bool:
         """Validate and record a raw command, failing when disconnected."""
+        # Each command is delivered at once, so no copy waits to be skipped.
+        del unless_waiting
         format_message(command, params, trailing)
         if not self.connected:
             msg = "IRC is not connected"
@@ -273,6 +276,8 @@ class FakeIRC:
             self.privmsgs.append((params[0], trailing))
         else:
             self.sent.append((command, params))
+
+        return True
 
 
 class FailingPartIRC(FakeIRC):
@@ -288,13 +293,19 @@ class FailingPartIRC(FakeIRC):
         command: str,
         *params: str,
         trailing: str | None = None,
-    ) -> None:
+        unless_waiting: bool = False,
+    ) -> bool:
         """Raise ConnectionError for PART commands while failing."""
         if self.failing and command == "PART":
             msg = "IRC outbound queue is full"
             raise ConnectionError(msg)
 
-        super().send(command, *params, trailing=trailing)
+        return super().send(
+            command,
+            *params,
+            trailing=trailing,
+            unless_waiting=unless_waiting,
+        )
 
 
 class FakeKV:

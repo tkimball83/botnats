@@ -1390,10 +1390,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         # Each action reached IRC, so each swallowed its own ConnectionError.
         assert send.call_args_list == [
-            call("INVITE", "beta", "#test"),
-            call("MODE", "#test", "+l", "2"),
-            call("MODE", "#test", "-b", "*!~beta@beta.host"),
-            call("MODE", "#test", "+o", "beta"),
+            call("INVITE", "beta", "#test", unless_waiting=True),
+            call("MODE", "#test", "+l", "2", unless_waiting=True),
+            call("MODE", "#test", "-b", "*!~beta@beta.host", unless_waiting=True),
+            call("MODE", "#test", "+o", "beta", unless_waiting=True),
         ]
 
     async def test_help_needs_active_peer_presence(self) -> None:
@@ -1863,6 +1863,37 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
         assert len(op_requests) == 0
+
+    async def test_only_help_skips_a_copy_still_waiting(self) -> None:
+        """Let help skip a copy of a line still waiting, and log no skipped help.
+
+        A peer asks again until it sees the result; the JOIN an admin asks
+        for has no such retry, so it always queues.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.add_ban("*!~beta@beta.host")
+        runtime.limit = 1
+        bot.presence.update(INVITEE)
+        # As IRCClient answers for a copy of a line still waiting.
+        skip = MagicMock(return_value=False)
+
+        with (
+            patch.object(fake_irc, "send", skip),
+            self.assertNoLogs("botnats.channel", level="INFO"),
+        ):
+            bot.channel_mgr.invite_peer("#test", INVITEE)
+            bot.channel_mgr.make_room("#test", INVITEE)
+            bot.channel_mgr.unban_peer("#test", INVITEE)
+            runtime.member("beta").prefix = INVITEE.to_prefix()
+            bot.channel_mgr.op_peer("#test", INVITEE)
+            bot.channel_mgr.safe_join(runtime)
+
+        assert [entry.kwargs for entry in skip.call_args_list] == [
+            {"unless_waiting": True},
+        ] * 4 + [{}]
+        assert skip.call_args == call("JOIN", "#test")
 
 
 class ChannelStateTests(unittest.TestCase):

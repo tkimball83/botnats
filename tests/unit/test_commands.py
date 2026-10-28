@@ -3,9 +3,11 @@
 
 """Tests for admin command parsing, dispatch, replies, and rate limiting."""
 
+import asyncio
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, call, patch
 
 from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
@@ -21,6 +23,15 @@ from tests.unit.helpers import (
     make_bot,
     send_command,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
+
+async def bounded[T](awaitable: Awaitable[T]) -> T:
+    """Await a call through the real store locks, so a deadlock fails the test."""
+    async with asyncio.timeout(5):
+        return await awaitable
 
 
 class CommandTests(unittest.TestCase):
@@ -112,7 +123,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host")
+        await bounded(bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host"))
 
         assert fake_irc.modes == [("#test", "+b", ("*!*@bad.host",))]
         assert fake_irc.privmsgs == [
@@ -124,8 +135,8 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator(FailingWriteCoordinator())
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "JOIN #new")
-        await bot.commands.dispatch(OWNER, "PART #test")
+        await bounded(bot.commands.dispatch(OWNER, "JOIN #new"))
+        await bounded(bot.commands.dispatch(OWNER, "PART #test"))
 
         assert casefold("#new", "rfc1459") not in bot.channel_mgr.channels
         assert casefold("#test", "rfc1459") in bot.channel_mgr.channels
@@ -141,27 +152,30 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot.authorizer.grant(OWNER.render())
         # Stored by a peer, but not yet watched here.
         winner = ChannelRecord.new("#new", None, present=False, floor=1_000)
-        await coordinator.channels.put(asdict(winner), after=None)
+        await bounded(coordinator.channels.put(asdict(winner), after=None))
 
-        await bot.commands.dispatch(OWNER, "JOIN #new")
+        await bounded(bot.commands.dispatch(OWNER, "JOIN #new"))
 
         assert fake_irc.privmsgs == [("owner", "Update superseded for #new")]
 
     async def test_part_reports_parting(self) -> None:
         """Tell the admin a PART whose write won is under way."""
-        bot, fake_irc, _ = bot_with_coordinator()
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].key = "live-key"
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "PART #test")
+        await bounded(bot.commands.dispatch(OWNER, "PART #test"))
 
         assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        # Unlike a JOIN's record, the PART's keeps no live key.
+        assert coordinator.channel_puts[-1]["key"] is None
 
     async def test_parse_error_reaches_authenticated_admin(self) -> None:
         """Explain an unparseable command to a sender who is authenticated."""
         bot, fake_irc = bot_with_irc()
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "   ")
+        await bounded(bot.commands.dispatch(OWNER, "   "))
 
         assert fake_irc.privmsgs == [("owner", "empty command")]
 
@@ -171,7 +185,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot.authorizer.grant(OWNER.render())
 
         for command in ("GETBANS", "GETMODES", "GETUSERS"):
-            await bot.commands.dispatch(OWNER, f"{command} #missing")
+            await bounded(bot.commands.dispatch(OWNER, f"{command} #missing"))
 
         assert fake_irc.privmsgs == [("owner", "No record for #missing")] * 3
 
@@ -180,7 +194,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host")
+        await bounded(bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host"))
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
@@ -191,14 +205,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "GETBANS #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETBANS #test"))
         assert fake_irc.privmsgs == [("owner", "No bans tracked for #test")]
 
         fake_irc.privmsgs.clear()
         for mask in ("*!*@bad.host", "*!*@evil.host"):
             runtime.add_ban(mask)
 
-        await bot.commands.dispatch(OWNER, "GETBANS #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETBANS #test"))
         assert fake_irc.privmsgs == [("owner", "#test +b *!*@bad.host *!*@evil.host")]
 
     async def test_reply_list_drops_items_too_long_to_relay(self) -> None:
@@ -235,7 +249,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         for mask in masks:
             runtime.add_ban(mask)
 
-        await bot.commands.dispatch(OWNER, "GETBANS #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETBANS #test"))
 
         assert len(fake_irc.privmsgs) <= 6
         listed = [word for _, text in fake_irc.privmsgs for word in text.split()[2:]]
@@ -247,24 +261,24 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
         assert fake_irc.privmsgs == [("owner", "No modes tracked for #test")]
 
         fake_irc.privmsgs.clear()
         runtime.modes = "+nst"
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
         assert fake_irc.privmsgs == [("owner", "#test +nst")]
 
         fake_irc.privmsgs.clear()
         runtime.modes = "+nstlk"
         runtime.key = "secret"
         runtime.limit = 5
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
         assert fake_irc.privmsgs == [("owner", "#test +nstlk 5 secret")]
 
         fake_irc.privmsgs.clear()
         runtime.modes = "+nstkl"
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
         assert fake_irc.privmsgs == [("owner", "#test +nstkl secret 5")]
 
     async def test_admin_getusers(self) -> None:
@@ -273,14 +287,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "GETUSERS #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETUSERS #test"))
         assert fake_irc.privmsgs == [("owner", "No users tracked for #test")]
 
         fake_irc.privmsgs.clear()
         runtime.member("alpha").modes.add("o")
         runtime.member("beta")
         runtime.member("gamma").modes.add("o")
-        await bot.commands.dispatch(OWNER, "GETUSERS #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETUSERS #test"))
         assert fake_irc.privmsgs == [
             ("owner", "#test @alpha beta @gamma"),
         ]
@@ -291,7 +305,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot.authorizer.grant(OWNER.render())
         bot.channel_mgr.channels.clear()
 
-        await bot.commands.dispatch(OWNER, "GETCHANS")
+        await bounded(bot.commands.dispatch(OWNER, "GETCHANS"))
         assert fake_irc.privmsgs == [("owner", "No channels tracked")]
 
         for name, state in (
@@ -307,7 +321,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             "alpha"
         ).modes.add("o")
         fake_irc.privmsgs.clear()
-        await bot.commands.dispatch(OWNER, "GETCHANS")
+        await bounded(bot.commands.dispatch(OWNER, "GETCHANS"))
         assert fake_irc.privmsgs == [("owner", "Channels @#alpha -#beta -#gamma #Zeta")]
 
     async def test_admin_getusers_chunked(self) -> None:
@@ -319,7 +333,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         for i in range(80):
             runtime.member(f"longernickname{i:03d}")
 
-        await bot.commands.dispatch(OWNER, "GETUSERS #test")
+        await bounded(bot.commands.dispatch(OWNER, "GETUSERS #test"))
         assert len(fake_irc.privmsgs) > 1
         all_nicks = []
         for _, text in fake_irc.privmsgs:
@@ -340,11 +354,42 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.connected = False
 
         with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
-            await bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host")
+            await bounded(bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host"))
 
         assert send.call_args_list == [
             call("MODE", "#test", "+b", "*!*@bad.host"),
             call("PRIVMSG", "owner", trailing="IRC is not connected"),
+        ]
+
+    async def test_admin_commands_always_queue(self) -> None:
+        """Ask IRC to queue every admin command, even a copy of one waiting.
+
+        A skipped copy could leave a ban, unban, and ban again unbanned.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
+        runtime.add_ban("*!*@bad.host")
+        bot.authorizer.grant(OWNER.render())
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            for text in (
+                "BAN #test *!*@bad.host",
+                "UNBAN #test *!*@bad.host",
+                "OP #test Target",
+                "INVITE #test guest",
+            ):
+                await bounded(bot.commands.dispatch(OWNER, text))
+
+        commands = [
+            entry for entry in send.call_args_list if entry.args[0] != "PRIVMSG"
+        ]
+        assert commands == [
+            call("MODE", "#test", "+b", "*!*@bad.host"),
+            call("MODE", "#test", "-b", "*!*@bad.host"),
+            call("MODE", "#test", "+o", "Target"),
+            call("INVITE", "guest", "#test"),
         ]
 
     async def test_admin_deop(self) -> None:
@@ -356,7 +401,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("Target").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "DEOP #test Target")
+        await bounded(bot.commands.dispatch(OWNER, "DEOP #test Target"))
 
         assert fake_irc.modes == [("#test", "-o", ("Target",))]
         assert fake_irc.privmsgs == [("owner", "Deopped Target on #test")]
@@ -370,7 +415,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("Target").modes.add("q")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "DEOP #test Target")
+        await bounded(bot.commands.dispatch(OWNER, "DEOP #test Target"))
 
         assert fake_irc.modes == [
             ("#test", "-q", ("Target",)),
@@ -386,7 +431,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "DEOP #test Target")
+        await bounded(bot.commands.dispatch(OWNER, "DEOP #test Target"))
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [("owner", "Target is not opped on #test")]
@@ -397,13 +442,13 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "INVITE #test guest")
+        await bounded(bot.commands.dispatch(OWNER, "INVITE #test guest"))
         assert fake_irc.sent == []
         assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
         runtime.member("alpha").modes.add("o")
         fake_irc.privmsgs.clear()
-        await bot.commands.dispatch(OWNER, "INVITE #test guest")
+        await bounded(bot.commands.dispatch(OWNER, "INVITE #test guest"))
 
         assert fake_irc.sent == [("INVITE", ("guest", "#test"))]
         assert fake_irc.privmsgs == [("owner", "Invited guest to #test")]
@@ -415,15 +460,15 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("Target")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "KICK #test target")
+        await bounded(bot.commands.dispatch(OWNER, "KICK #test target"))
         assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
         runtime.member("alpha").modes.add("o")
         fake_irc.privmsgs.clear()
         with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
-            await bot.commands.dispatch(OWNER, "KICK #test ghost")
-            await bot.commands.dispatch(OWNER, "KICK #test TARGET")
-            await bot.commands.dispatch(OWNER, "KICK #test TARGET go  away")
+            await bounded(bot.commands.dispatch(OWNER, "KICK #test ghost"))
+            await bounded(bot.commands.dispatch(OWNER, "KICK #test TARGET"))
+            await bounded(bot.commands.dispatch(OWNER, "KICK #test TARGET go  away"))
 
         kicks = [c for c in send.call_args_list if c.args[0] == "KICK"]
         assert kicks == [
@@ -444,7 +489,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "OP #test Target")
+        await bounded(bot.commands.dispatch(OWNER, "OP #test Target"))
 
         assert fake_irc.modes == [("#test", "+o", ("Target",))]
         assert fake_irc.privmsgs == [("owner", "Opped Target on #test")]
@@ -458,7 +503,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("Target").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "OP #test Target")
+        await bounded(bot.commands.dispatch(OWNER, "OP #test Target"))
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [
@@ -472,7 +517,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "OP #test ghost")
+        await bounded(bot.commands.dispatch(OWNER, "OP #test ghost"))
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [("owner", "ghost not found on #test")]
@@ -486,8 +531,8 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("Partial").prefix = Prefix("Partial", "user")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "OP #test Unseen")
-        await bot.commands.dispatch(OWNER, "OP #test Partial")
+        await bounded(bot.commands.dispatch(OWNER, "OP #test Unseen"))
+        await bounded(bot.commands.dispatch(OWNER, "OP #test Partial"))
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [
@@ -503,26 +548,11 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot.authorizer.grant("other!user@real.host")
 
         for text in ("BAN #test *!*@bad.host", "XYZZY", "   "):
-            await bot.commands.dispatch(OWNER, text)
+            await bounded(bot.commands.dispatch(OWNER, text))
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == []
         assert fake_irc.sent == []
-
-    async def test_admin_unban(self) -> None:
-        """Verify UNBAN command removes a ban mode directly."""
-        bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.member("alpha").modes.add("o")
-        runtime.add_ban("*!*@bad.host")
-        bot.authorizer.grant(OWNER.render())
-
-        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@bad.host")
-
-        assert fake_irc.modes == [("#test", "-b", ("*!*@bad.host",))]
-        assert fake_irc.privmsgs == [
-            ("owner", "Unbanned *!*@bad.host on #test"),
-        ]
 
     async def test_admin_unban_case_insensitive(self) -> None:
         """Verify UNBAN matches ban masks case-insensitively."""
@@ -532,7 +562,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!*@Bad.Host")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@BAD.host")
+        await bounded(bot.commands.dispatch(OWNER, "UNBAN #test *!*@BAD.host"))
 
         assert fake_irc.modes == [("#test", "-b", ("*!*@Bad.Host",))]
         assert fake_irc.privmsgs == [
@@ -546,7 +576,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@unknown.host")
+        await bounded(bot.commands.dispatch(OWNER, "UNBAN #test *!*@unknown.host"))
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [
@@ -571,7 +601,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             BotPresence("beta-id", "peer.example", "inst2", "beta", "~beta"),
         )
 
-        await bot.commands.dispatch(OWNER, "STATUS")
+        await bounded(bot.commands.dispatch(OWNER, "STATUS"))
         assert fake_irc.privmsgs == [
             ("owner", "bot id=alpha-id nick=alpha_ peers=1 channels=1"),
             (
@@ -588,7 +618,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "XYZZY")
+        await bounded(bot.commands.dispatch(OWNER, "XYZZY"))
 
         assert fake_irc.privmsgs == [("owner", "Unknown command")]
 
@@ -610,7 +640,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 fake_irc.privmsgs.clear()
 
-                await bot.commands.dispatch(OWNER, text)
+                await bounded(bot.commands.dispatch(OWNER, text))
 
                 assert fake_irc.privmsgs == [("owner", reply)]
 
@@ -642,7 +672,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 fake_irc.privmsgs.clear()
 
-                await bot.commands.dispatch(OWNER, text)
+                await bounded(bot.commands.dispatch(OWNER, text))
 
                 assert fake_irc.privmsgs == [("owner", reply)]
 
@@ -655,7 +685,9 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot.config = replace(bot.config, channel_modes="+" + "n" * 499)
 
         with self.assertRaisesRegex(ValueError, "exceeds 512 bytes"):
-            await bot.commands.channel_update(OWNER, "#test", None, present=True)
+            await bounded(
+                bot.commands.channel_update(OWNER, "#test", None, present=True)
+            )
 
         assert coordinator.channel_puts == []
 
@@ -668,7 +700,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             enforced_modes=(frozenset(), frozenset()),
         )
 
-        await bot.commands.cmd_join(OWNER, ("#new",))
+        await bounded(bot.commands.cmd_join(OWNER, ("#new",)))
 
         assert fake_irc.privmsgs == [("owner", "Joining #new")]
         assert coordinator.channel_puts[-1]["channel"] == "#new"
@@ -680,7 +712,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.key = "live-key"
         base = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")].revision
 
-        await bot.commands.cmd_join(OWNER, ("#test",))
+        await bounded(bot.commands.cmd_join(OWNER, ("#test",)))
 
         assert fake_irc.privmsgs == [("owner", "Joining #test")]
         payload = coordinator.channel_puts[-1]
@@ -694,7 +726,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, coordinator = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "JOIN #new hunter2")
+        await bounded(bot.commands.dispatch(OWNER, "JOIN #new hunter2"))
 
         assert fake_irc.privmsgs == [("owner", "Joining #new")]
         payload = coordinator.channel_puts[-1]
