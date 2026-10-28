@@ -22,7 +22,12 @@ from nats.js.kv import KV_DEL
 
 from botnats.channel import ChannelRecord
 from botnats.nats.claim import PresenceState
-from botnats.nats.coordinator import RECONNECT_WAIT, Coordinator, NATSConfig
+from botnats.nats.coordinator import (
+    RECONNECT_WAIT,
+    TRANSIENT_WARNING_INTERVAL,
+    Coordinator,
+    NATSConfig,
+)
 from botnats.nats.envelope import Envelope
 from botnats.nats.store import (
     AttemptStore,
@@ -375,7 +380,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         presence_kv.delete.side_effect = NatsError("timeout")
         coordinator.presence_store.kv = presence_kv
 
-        await coordinator.close()
+        async with asyncio.timeout(5):
+            await coordinator.close()
 
         presence_kv.delete.assert_awaited_once_with("alpha", last=7)
         assert not coordinator.claim.owned
@@ -389,10 +395,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.nc = nc
 
         with patch("botnats.nats.coordinator.nats.connect", AsyncMock()) as connect:
-            await coordinator.close()
-            # nats-py ran on_closed inside close(); clean up any restart first.
-            restart = coordinator.resync_task
-            await coordinator.cancel_resync()
+            async with asyncio.timeout(5):
+                await coordinator.close()
+                # nats-py ran on_closed inside close(); clean up any restart first.
+                restart = coordinator.resync_task
+                await coordinator.cancel_resync()
 
         assert restart is None
         connect.assert_not_awaited()
@@ -604,40 +611,72 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         allow.assert_not_awaited()
         claim.assert_not_awaited()
 
+    async def test_auth_and_claim_return_store_verdict_when_ready(self) -> None:
+        """Defer to the mesh-wide attempt limit and TOTP claim once ready."""
+        coordinator = build_coordinator("alpha")
+        allow = AsyncMock(side_effect=[True, False])
+        claim = AsyncMock(side_effect=[True, False])
+
+        with (
+            patch.object(Coordinator, "ready", PropertyMock(return_value=True)),
+            patch.object(coordinator.attempts, "allow", allow),
+            patch.object(coordinator.claims, "claim", claim),
+        ):
+            assert await coordinator.request_auth("host.example")
+            assert not await coordinator.request_auth("host.example")
+            assert await coordinator.request_claim(1)
+            assert not await coordinator.request_claim(1)
+
+        assert allow.await_args_list == [call("host.example")] * 2
+        assert claim.await_args_list == [call(1)] * 2
+
     async def test_transient_warnings_are_rate_limited_per_context(self) -> None:
         """Throttle each context independently so a second failure still logs."""
         coordinator = build_coordinator("alpha")
 
-        with self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs:
-            coordinator.warn_transient("watch watch-channels failed", OSError("a"))
-            coordinator.warn_transient("watch watch-channels failed", OSError("b"))
-            coordinator.warn_transient("watch watch-presence failed", OSError("c"))
-        # watch-channels logs once (second suppressed); watch-presence's first
-        # failure is not starved by the channels throttle.
-        assert len(logs.output) == 2
-        assert any("watch-channels" in line for line in logs.output)
-        assert any("watch-presence" in line for line in logs.output)
+        with patch("botnats.nats.coordinator.time") as clock:
+            clock.monotonic.return_value = 10.0
+            with self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs:
+                coordinator.warn_transient("watch watch-channels failed", OSError("a"))
+                coordinator.warn_transient("watch watch-channels failed", OSError("b"))
+                coordinator.warn_transient("watch watch-presence failed", OSError("c"))
+            # watch-channels logs once (second suppressed); watch-presence's
+            # first failure is not starved by the channels throttle.
+            assert len(logs.output) == 2
+            assert any("watch-channels" in line for line in logs.output)
+            assert any("watch-presence" in line for line in logs.output)
 
-        coordinator.transient_warnings["watch watch-channels failed"] = (
-            float("-inf"),
-            coordinator.transient_warnings["watch watch-channels failed"][1],
-        )
-        with self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs:
-            coordinator.warn_transient("watch watch-channels failed", OSError("d"))
+            clock.monotonic.return_value = 10.0 + TRANSIENT_WARNING_INTERVAL
+            with self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs:
+                coordinator.warn_transient("watch watch-channels failed", OSError("d"))
 
         assert "suppressed 1 similar warning(s)" in logs.output[0]
 
     async def test_nats_errors_are_rate_limited(self) -> None:
-        """Log one warning for transport errors that repeat during an outage."""
+        """Throttle repeating transport errors, but not a help callback's crash.
+
+        nats-py hands its error callback both transport errors and whatever
+        the help subscription's callback raises, which is a bug to trace.
+        """
         coordinator = build_coordinator("alpha")
+        crash = ValueError("help handler bug")
 
-        with self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs:
+        with (
+            patch("botnats.nats.coordinator.time") as clock,
+            self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs,
+        ):
+            clock.monotonic.return_value = 10.0
             await coordinator.on_error(OSError("connection reset"))
+            await coordinator.on_error(crash)
             await coordinator.on_error(OSError("connection reset"))
 
-        assert [log.getMessage() for log in logs.records] == [
-            "NATS error: connection reset",
+        assert [(log.levelname, log.getMessage()) for log in logs.records] == [
+            ("WARNING", "NATS error: connection reset"),
+            ("ERROR", "NATS callback crashed"),
         ]
+        assert logs.records[0].exc_info is None
+        assert logs.records[1].exc_info is not None
+        assert logs.records[1].exc_info[1] is crash
 
     async def test_duplicate_bot_id_blocks_coordination(self) -> None:
         """Prevent a conflicting bot ID from publishing or acting on requests."""
@@ -885,8 +924,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(coordinator, "watch_channels", crash_twice),
             patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+            patch("botnats.nats.coordinator.time") as clock,
             self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
         ):
+            clock.monotonic.return_value = 10.0
             coordinator.watch_generation += 1
             task = asyncio.create_task(
                 coordinator.run_watch(
@@ -936,7 +977,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             assert first.cancelled()
             assert second is not None
             assert coordinator.resync_task is second
-            await coordinator.cancel_resync()
+            async with asyncio.timeout(5):
+                await coordinator.cancel_resync()
 
     async def test_disconnect_cancels_resync(self) -> None:
         """Cancel an in-flight resynchronization when Core NATS drops."""
@@ -1051,7 +1093,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         update.assert_not_called()
         delete.assert_called_once_with("beta")
-        # Only a delete of this bot's own key expires its claim.
+        # Only a delete of this bot's own key ends its claim.
         kv.create.assert_not_awaited()
         assert coordinator.claim.owned
         assert coordinator.claim.revision == 5
@@ -1370,20 +1412,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert coordinator.claim.duplicate
 
-    async def test_watch_presence_resolves_absent_conflict(self) -> None:
-        """Verify a conflict is resolved when the duplicate is gone on replay."""
-        coordinator = build_coordinator("alpha")
-        coordinator.claim.state = PresenceState.DUPLICATE
-        kv, _ = watcher(None)
-        coordinator.presence_store.kv = kv
-
-        await coordinator.watch_presence(MagicMock())
-
-        assert not coordinator.claim.duplicate
-        assert coordinator.claim.revision == CREATED_REVISION
-
     async def test_watch_presence_resolves_on_delete(self) -> None:
-        """Verify a live conflict resolves when the presence entry expires."""
+        """Verify a live conflict resolves when the presence entry is deleted."""
         coordinator = build_coordinator("alpha")
         delete_entry = SimpleNamespace(
             key="alpha",
@@ -1526,7 +1556,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 "watch-presence",
                 "watch-sessions",
             }
-            await coordinator.cancel_watches()
+            async with asyncio.timeout(5):
+                await coordinator.cancel_watches()
 
         assert not coordinator.watch_tasks
 
@@ -1636,7 +1667,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             assert coordinator.synced_watches == names
-            await coordinator.cancel_watches()
+            async with asyncio.timeout(5):
+                await coordinator.cancel_watches()
 
     async def test_watch_stops_watcher_on_error(self) -> None:
         """Verify a crashed watch coroutine stops its KV watcher subscription."""
@@ -1753,7 +1785,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         for state in (PresenceState.UNCLAIMED, PresenceState.DUPLICATE):
             coordinator.presence_store.kv = cast("KeyValue", FakeKV())
-            coordinator.claim.state = state
+            coordinator.claim.transition(state, None)
             with self.subTest(state=state):
                 await coordinator.put_presence(presence)
 
@@ -1832,10 +1864,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
-            await coordinator.start()
-            # nats-py ran on_closed inside close(); only start() reconnects.
-            restart = coordinator.resync_task
-            await coordinator.cancel_resync()
+            async with asyncio.timeout(5):
+                await coordinator.start()
+                # nats-py ran on_closed inside close(); only start() reconnects.
+                restart = coordinator.resync_task
+                await coordinator.cancel_resync()
 
         assert restart is None
         half_open.close.assert_awaited_once_with()

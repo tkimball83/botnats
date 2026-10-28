@@ -262,8 +262,19 @@ class Coordinator:
         self.resync_task.add_done_callback(self.resync_done)
 
     async def on_error(self, error: Exception) -> None:
-        """Log a NATS transport error, which repeats during an outage."""
-        self.warn_transient("NATS error", error)
+        """Log a NATS error, tracing one the help callback raised.
+
+        nats-py reports transport errors, which repeat during an outage, and
+        exceptions from subscription callbacks, which are bugs. Each keeps its
+        own throttle, so an outage cannot hide a bug.
+        """
+        if isinstance(error, CONNECT_ERRORS):
+            self.warn_transient("NATS error", error)
+            return
+
+        suffix = self.should_warn("NATS callback crashed")
+        if suffix is not None:
+            LOGGER.error("NATS callback crashed%s", suffix, exc_info=error)
 
     async def on_reconnected(self) -> None:
         """Resynchronize state after a NATS reconnection.
@@ -609,7 +620,7 @@ class Coordinator:
                 if is_delete(entry.operation):
                     self.callbacks.on_presence_delete(entry.key)
                     if entry.key == self.claim.key:
-                        await self.try_reclaim(self.claim.expired)
+                        await self.try_reclaim(self.claim.deleted)
 
                     continue
 
