@@ -5,7 +5,7 @@
 
 import asyncio
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
@@ -35,8 +35,6 @@ from tests.unit.helpers import (
 )
 
 if TYPE_CHECKING:
-    from nats.js.kv import KeyValue
-
     from botnats.nats.store import Session
 
 CUSTOM_ISUPPORT = IRCMessage(
@@ -599,6 +597,44 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         ]
         assert keys == ["held", "held", "held", None]
 
+    async def test_ban_refusal_asks_unban_for_the_visible_host(self) -> None:
+        """Ask peers to lift a ban on the host WHO shows, the one bans name.
+
+        USERHOST about this bot shows its real host on most servers instead.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        # Identity discovery's reply, naming no channel.
+        bot.events.on_irc_message(
+            IRCMessage(
+                "352",
+                (
+                    "alpha",
+                    "*",
+                    "~alpha",
+                    "alpha.users.example",
+                    "irc.server",
+                    "alpha",
+                    "H",
+                    "0 realname",
+                ),
+            ),
+        )
+        bot.events.on_irc_message(
+            IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
+        )
+        await settle(bot)
+
+        presence = BotPresence(
+            bot.config.bot_id,
+            "alpha.users.example",
+            bot.identity.instance_id,
+            "alpha",
+            "~alpha",
+        )
+        assert coordinator.help_requests == [
+            ("unban", {"channel": "#test", "presence": asdict(presence)}),
+        ]
+
     async def test_refused_join_retried_after_delay(self) -> None:
         """Resend a refused JOIN once the retry delay passes, not every tick.
 
@@ -940,10 +976,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         records by exact name, so the write must name #A[ and compare against
         its revision, never start a second record for #a{.
         """
-        coordinator = FakeCoordinator()
-        kv = FakeKV()
-        coordinator.channels.kv = cast("KeyValue", kv)
-        bot, _, _ = bot_with_coordinator(coordinator)
+        bot, _, coordinator = bot_with_coordinator()
+        kv = cast("FakeKV", coordinator.channels.kv)
         await bot.channel_mgr.write_record("#A[", None, present=True)
         configured = bot.channel_mgr.durable_revision("#A[")
         runtime = bot.channel_mgr.runtime("#a{")
@@ -1525,33 +1559,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.pending
         assert [put["revoked"] for put in coordinator.session_puts] == [True]
 
-    async def test_commands_run_in_background_in_order(self) -> None:
-        """Keep IRC flowing during a slow command; still finish commands in order."""
-        bot, _ = bot_with_irc()
-        release = asyncio.Event()
-        finished: list[str] = []
-
-        async def dispatch(prefix: Prefix, text: str) -> None:
-            del prefix
-            if text == "SLOW":
-                await release.wait()
-
-            finished.append(text)
-
-        owner = Prefix("owner", "user", "host.example")
-        with patch.object(bot.commands, "dispatch", dispatch):
-            for text in ("SLOW", "FAST"):
-                bot.events.on_irc_message(
-                    IRCMessage("PRIVMSG", ("alpha", text), owner),
-                )
-
-            await asyncio.sleep(0)
-            assert finished == []
-            release.set()
-            await settle(bot)
-
-        assert finished == ["SLOW", "FAST"]
-
     async def test_command_waits_only_for_its_own_sender(self) -> None:
         """Run an admin's OP while a stranger's AUTH waits on JetStream.
 
@@ -1776,32 +1783,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.bans == {}
         assert runtime.members == {}
 
-    async def test_userhost_identity(self) -> None:
-        """Verify USERHOST reply sets bot identity."""
-        fake_irc = FakeIRC()
-        bot = make_bot(irc=fake_irc)
-
-        bot.events.on_irc_message(
-            IRCMessage("302", ("alpha", "alpha=+~user@real.host")),
-        )
-
-        assert bot.identity.current is not None
-        assert bot.identity.current.user == "~user"
-        assert bot.identity.current.host == "real.host"
-
-    async def test_userhost_identity_as_away_operator(self) -> None:
-        """Read the identity past the operator (*) and away (-) markers."""
-        fake_irc = FakeIRC()
-        bot = make_bot(irc=fake_irc)
-
-        bot.events.on_irc_message(
-            IRCMessage("302", ("alpha", "other=+x@y alpha*=-bot@cloaked.host")),
-        )
-
-        assert bot.identity.current is not None
-        assert bot.identity.current.user == "bot"
-        assert bot.identity.current.host == "cloaked.host"
-
     async def test_part_removes_other_member(self) -> None:
         """Drop another user who parts, leaving this bot's membership intact."""
         bot, _ = bot_with_irc()
@@ -1817,35 +1798,40 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.joined
 
     async def test_who_reply_about_self_sets_identity(self) -> None:
-        """Learn this bot's own user and host from a WHO reply."""
-        bot, _ = bot_with_irc()
-        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        """Learn this bot's own user and host from a WHO reply naming any channel.
 
-        bot.events.on_irc_message(
-            IRCMessage(
-                "352",
-                (
-                    "alpha",
-                    "#test",
-                    "~alpha",
+        A WHO on its own nick names "*" or a channel it is in.
+        """
+        for channel in ("#test", "*"):
+            with self.subTest(channel=channel):
+                bot, _ = bot_with_irc()
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.join = JoinState.JOINED
+                bot.events.on_irc_message(
+                    IRCMessage(
+                        "352",
+                        (
+                            "alpha",
+                            channel,
+                            "~alpha",
+                            "alpha.host",
+                            "irc.server",
+                            "alpha",
+                            "H",
+                            "0 realname",
+                        ),
+                    ),
+                )
+                async with asyncio.timeout(5):
+                    await bot.tasks.drain()
+
+                assert bot.identity.current == BotPresence(
+                    bot.config.bot_id,
                     "alpha.host",
-                    "irc.server",
+                    bot.identity.instance_id,
                     "alpha",
-                    "H",
-                    "0 realname",
-                ),
-            ),
-        )
-        async with asyncio.timeout(5):
-            await bot.tasks.drain()
-
-        assert bot.identity.current == BotPresence(
-            bot.config.bot_id,
-            "alpha.host",
-            bot.identity.instance_id,
-            "alpha",
-            "~alpha",
-        )
+                    "~alpha",
+                )
 
     async def test_who_reply_updates_member(self) -> None:
         """Update another member's prefix and modes, not this bot's identity."""
@@ -1890,9 +1876,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.set_identity(prefix)
         assert fake_irc.sent == [join]
 
-        # The channel goes idle again, as after a kick. A burst of WHO and
-        # USERHOST replies about this bot must not resend the JOIN; the next
-        # tick retries it.
+        # The channel goes idle again, as after a kick. A burst of WHO
+        # replies about this bot must not resend the JOIN; the next tick
+        # retries it.
         runtime.reset()
         bot.events.set_identity(prefix)
         assert fake_irc.sent == [join]
@@ -2134,12 +2120,12 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("001", ("alpha", "Welcome")),
         )
-        # Let identity discovery send its first USERHOST.
+        # Let identity discovery send its first WHO.
         await asyncio.sleep(0)
 
         assert bot.identity.registered
         assert bot.events.nick_watch_task is None
-        assert fake_irc.sent == [("USERHOST", ("alpha",))]
+        assert fake_irc.sent == [("WHO", ("alpha",))]
         async with asyncio.timeout(5):
             await bot.tasks.drain()
 

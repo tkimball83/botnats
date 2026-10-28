@@ -117,8 +117,8 @@ class SelfIdentity:
         self.bot_id = bot_id
         self.coordinator = coordinator
         self.current: BotPresence | None = None
-        # Bumped on every registration and disconnect, so a discovery started
-        # for an older connection stops instead of acting on this one.
+        # Bumped on every disconnect, so a discovery started for an older
+        # connection stops instead of acting on this one.
         self.generation = 0
         self.instance_id = instance_id
         self.irc = irc
@@ -137,9 +137,10 @@ class SelfIdentity:
                 return
 
             try:
-                # USERHOST alone: its one-line reply carries exactly the user
-                # and visible host peers match against.
-                self.irc.send("USERHOST", self.irc.current_nick)
+                # WHO, not USERHOST: about oneself, USERHOST shows the real
+                # host on most servers, not the visible one peers see and
+                # match bans against.
+                self.irc.send("WHO", self.irc.current_nick)
             except ConnectionError:
                 return
 
@@ -150,8 +151,7 @@ class SelfIdentity:
             self.irc.reconnect()
 
     def on_registered(self) -> None:
-        """Start a new registration, whose identity is not yet known."""
-        self.reset()
+        """Start a new registration; disconnecting already forgot any old identity."""
         self.registered = True
         LOGGER.info("registered on IRC as %s", self.irc.current_nick)
 

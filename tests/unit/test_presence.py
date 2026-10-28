@@ -9,8 +9,9 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from botnats.irc.protocol import Prefix
 from botnats.presence import BotPresence, PresenceRegistry
-from tests.unit.helpers import FakeIRC, make_bot
+from tests.unit.helpers import FakeCoordinator, FakeIRC, make_bot
 
 if TYPE_CHECKING:
     from botnats.bot import Bot
@@ -118,29 +119,66 @@ class PresenceTests(unittest.TestCase):
 class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
     """Tests for discovering this bot's own IRC identity."""
 
+    async def test_announce_skips_refused_write(self) -> None:
+        """Skip a presence write refused during an outage; the next one retries.
+
+        Raised, the refusal would log a traceback on every heartbeat.
+        """
+        coordinator = FakeCoordinator()
+        bot = make_bot(irc=FakeIRC(), coordinator=coordinator)
+        presence = BotPresence("alpha", "host", "one", "alpha", "user")
+        bot.identity.current = presence
+        coordinator.connected = False
+        async with asyncio.timeout(1):
+            await bot.identity.announce()
+
+        coordinator.connected = True
+        async with asyncio.timeout(1):
+            await bot.identity.announce()
+
+        assert coordinator.presence_puts == [asdict(presence)]
+
+    def test_identity_ignores_incomplete_prefix(self) -> None:
+        """Record no identity from a prefix lacking its user or host.
+
+        A nick-only JOIN carries one; peers match bans against both parts.
+        """
+        bot = make_bot(irc=FakeIRC())
+        for prefix in (Prefix("alpha"), Prefix("alpha", host="host")):
+            assert not bot.identity.set(prefix)
+
+        assert bot.identity.current is None
+
     async def test_identity_discovery_accepts_final_response(self) -> None:
-        """Allow the final identity query time to receive its response."""
-        fake_irc = FakeIRC()
-        bot = make_bot(irc=fake_irc)
-        # USERHOST asks about the nick in use, here a fallback.
-        fake_irc.current_nick = "alpha_"
+        """Stop querying once a response arrives, even to the final query."""
+        # With two attempts the check before the second WHO sees the
+        # identity; with one, only the check before reconnecting does.
+        for attempts in (1, 2):
+            fake_irc = FakeIRC()
+            bot = make_bot(irc=fake_irc)
+            # WHO asks about the nick in use, here a fallback.
+            fake_irc.current_nick = "alpha_"
 
-        async def receive_identity(delay: float) -> None:
-            del delay
-            bot.identity.current = BotPresence("alpha", "host", "one", "alpha", "user")
+            async def receive_identity(delay: float, bot: Bot = bot) -> None:
+                del delay
+                bot.identity.current = BotPresence(
+                    "alpha", "host", "one", "alpha", "user"
+                )
 
-        with (
-            patch("botnats.presence.IDENTITY_RETRY_ATTEMPTS", 1),
-            patch("botnats.presence.asyncio.sleep", receive_identity),
-        ):
-            await bot.identity.discover(bot.identity.generation)
+            with (
+                self.subTest(attempts=attempts),
+                patch("botnats.presence.IDENTITY_RETRY_ATTEMPTS", attempts),
+                patch("asyncio.sleep", receive_identity),
+            ):
+                async with asyncio.timeout(1):
+                    await bot.identity.discover(bot.identity.generation)
 
-        assert fake_irc.sent == [("USERHOST", ("alpha_",))]
-        assert fake_irc.reconnects == 0
+                assert fake_irc.sent == [("WHO", ("alpha_",))]
+                assert fake_irc.reconnects == 0
 
     async def test_identity_discovery_stops_after_reset(self) -> None:
         """Stop a discovery whose connection reset while it waited for a reply."""
-        # With two attempts the check before the second USERHOST sees the
+        # With two attempts the check before the second WHO sees the
         # reset; with one, only the check before reconnecting does.
         for attempts in (1, 2):
             fake_irc = FakeIRC()
@@ -155,13 +193,13 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
             with (
                 self.subTest(attempts=attempts),
                 patch("botnats.presence.IDENTITY_RETRY_ATTEMPTS", attempts),
-                patch("botnats.presence.asyncio.sleep", reset_identity),
+                patch("asyncio.sleep", reset_identity),
             ):
                 async with asyncio.timeout(1):
                     await bot.identity.discover(generation)
 
                 assert bot.identity.generation == generation + 1
-                assert fake_irc.sent == [("USERHOST", ("alpha_",))]
+                assert fake_irc.sent == [("WHO", ("alpha_",))]
                 assert fake_irc.reconnects == 0
 
     async def test_identity_discovery_reconnects(self) -> None:
@@ -176,5 +214,5 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(1):
                 await bot.identity.discover(bot.identity.generation)
 
-        assert fake_irc.sent == [("USERHOST", ("alpha",))]
+        assert fake_irc.sent == [("WHO", ("alpha",))]
         assert fake_irc.reconnects == 1
