@@ -427,11 +427,7 @@ class IRCEventHandler:
 
     def handle_isupport(self, message: IRCMessage) -> None:
         """Apply advertised and withdrawn RPL_ISUPPORT tokens."""
-        tokens = message.params[1:]
-        if tokens and " " in tokens[-1]:
-            tokens = tokens[:-1]
-
-        for token in tokens:
+        for token in message.params[1:]:
             # "TOKEN" and "TOKEN=" are equivalent: an empty value.
             name, _, value = token.partition("=")
             withdrawn = name.startswith("-")
@@ -616,10 +612,7 @@ class IRCEventHandler:
             return
 
         for entry in message.params[-1].split():
-            nickname, separator, userhost = entry.partition("=")
-            if not separator:
-                continue
-
+            nickname, _, userhost = entry.partition("=")
             userhost = userhost.lstrip("+-")
             user, at, host = userhost.partition("@")
             if at and self.bot.irc.is_self(nickname.rstrip("*")):

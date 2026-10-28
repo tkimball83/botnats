@@ -314,6 +314,23 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.session_puts[0]["prefix"] == owner.render()
         assert coordinator.session_puts[0]["revoked"] is True
 
+    async def test_quit_before_who_revokes_the_quit_identity(self) -> None:
+        """Revoke the QUIT's own identity for a member WHO has not filled yet."""
+        bot, _, coordinator = bot_with_coordinator()
+        owner = Prefix("owner", "user", "static.example")
+        bot.authorizer.grant(owner.render())
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("owner")
+
+        bot.events.on_irc_message(IRCMessage("QUIT", (), owner))
+        await drain_session_writes(bot)
+
+        assert casefold("owner", "rfc1459") not in runtime.members
+        assert not bot.authorizer.authorized(owner.render())
+        assert len(coordinator.session_puts) == 1
+        assert coordinator.session_puts[0]["prefix"] == owner.render()
+        assert coordinator.session_puts[0]["revoked"] is True
+
     async def test_invite_ignores_joined_channel(self) -> None:
         """Verify an INVITE to an already-joined channel is ignored."""
         bot, fake_irc = bot_with_irc()
@@ -511,12 +528,18 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.tasks
 
     async def test_refusals_request_matching_help(self) -> None:
-        """Ask for a raised limit, an invite, or an unban; retry a bad key alone."""
+        """Ask for a raised limit, an invite, or an unban; retry a bad key alone.
+
+        Only a bad-key refusal replaces the key this bot holds, a key it saw
+        on IRC, with the stored one.
+        """
         bot, _, coordinator = bot_with_coordinator()
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.key = "held"
+        keys: list[str | None] = []
 
         for numeric in ("471", "473", "474", "475"):
             # A pending JOIN already due for a resend.
@@ -529,12 +552,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
             # Every refusal paces the JOIN: the next tick does not resend it.
             assert not runtime.join_due()
+            keys.append(runtime.key)
 
         assert [kind for kind, _ in coordinator.help_requests] == [
             "limit",
             "invite",
             "unban",
         ]
+        assert keys == ["held", "held", "held", None]
 
     async def test_refused_join_retried_after_delay(self) -> None:
         """Resend a refused JOIN once the retry delay passes, not every tick.
@@ -665,6 +690,34 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await settle(bot)
 
         assert [kind for kind, _ in coordinator.help_requests] == ["op"]
+
+    async def test_voice_and_list_modes_are_not_op_changes(self) -> None:
+        """Change no op state or members for a voice or a list mode's mask."""
+        bot, _, coordinator = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        # An opped peer is present, so a spurious op request would be sent.
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
+        bot.presence.update(peer)
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha")
+        runtime.member("beta").prefix = peer.to_prefix()
+        runtime.member("beta").modes.add("o")
+
+        bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "+ve", "beta", "*!*@exempt.host"),
+                Prefix("chanserv"),
+            ),
+        )
+        await settle(bot)
+
+        assert set(runtime.members) == {"alpha", "beta"}
+        assert runtime.members["beta"].modes == {"o"}
+        assert coordinator.help_requests == []
 
     async def test_mode_enforce_on_unset(self) -> None:
         """Verify channel modes are re-enforced when unset by another user."""
@@ -1614,8 +1667,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_who_reply_updates_member(self) -> None:
-        """Verify 352 numeric updates member prefix and modes."""
-        bot, _ = bot_with_irc()
+        """Update another member's prefix and modes, not this bot's identity."""
+        bot, _, coordinator = bot_with_coordinator()
+        identity = BotPresence("alpha", "alpha.host", "inst", "alpha", "~alpha")
+        bot.identity.current = identity
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
 
@@ -1635,10 +1690,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+        await settle(bot)
+
         member = runtime.members.get(casefold("someone", "rfc1459"))
         assert member is not None
         assert member.prefix == Prefix("someone", "user", "host.example")
         assert "o" in member.modes
+        assert bot.identity.current is identity
+        assert coordinator.presence_puts == []
 
     async def test_set_identity_dedup(self) -> None:
         """Sweep pending joins when the identity changes, not when it repeats."""
@@ -1687,9 +1746,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         The channel and the session identity fold differently under ascii and
         rfc1459, so both are found again only if disconnect rekeys them onto
-        the default casemapping it restores.
+        the default casemapping it restores. Every joined channel is reset,
+        so the next connection joins each again.
         """
-        bot = make_bot()
+        bot = bot_with_channel()
+        other = bot.channel_mgr.runtime("#test")
+        assert other is not None
+        other.join = JoinState.JOINED
+        other.member("alpha")
         bot.channel_mgr.set_casemapping("ascii")
         channel = "#te[st"
         bot.channel_mgr.apply_record(
@@ -1737,6 +1801,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.limit is None
         assert not runtime.names_due
         assert runtime.cooldowns == {}
+        assert bot.channel_mgr.runtime("#test") is other
+        assert not other.joined
+        assert not other.members
         assert bot.channel_mgr.pending_parts == {}
         assert bot.authorizer.authorized(identity)
 
@@ -1855,15 +1922,18 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             await bot.tasks.drain()
 
     async def test_welcome_skips_watch_when_nick_matches(self) -> None:
-        """Register, skipping the nick watch, when given the desired nick."""
-        bot, _ = bot_with_irc()
+        """Register and start identity discovery; the desired nick needs no watch."""
+        bot, fake_irc = bot_with_irc()
 
         bot.events.on_irc_message(
             IRCMessage("001", ("alpha", "Welcome")),
         )
+        # Let identity discovery send its first USERHOST.
+        await asyncio.sleep(0)
 
         assert bot.identity.registered
         assert bot.events.nick_watch_task is None
+        assert fake_irc.sent == [("USERHOST", ("alpha",))]
         async with asyncio.timeout(5):
             await bot.tasks.drain()
 

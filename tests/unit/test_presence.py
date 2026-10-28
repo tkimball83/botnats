@@ -9,7 +9,6 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from botnats.irc.protocol import IRCMessage
 from botnats.presence import BotPresence, PresenceRegistry
 from tests.unit.helpers import FakeIRC, make_bot
 
@@ -174,10 +173,8 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
             patch("botnats.presence.IDENTITY_RETRY_DELAY", 0),
             self.assertLogs("botnats.presence", level="WARNING"),
         ):
-            bot.events.handle_welcome(IRCMessage("001", ("alpha", "welcome")))
-            tasks = tuple(bot.tasks)
             async with asyncio.timeout(1):
-                await asyncio.gather(*tasks)
+                await bot.identity.discover(bot.identity.generation)
 
         assert fake_irc.sent == [("USERHOST", ("alpha",))]
         assert fake_irc.reconnects == 1
