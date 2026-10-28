@@ -75,12 +75,21 @@ def part_and_want_again(bot: Bot) -> ChannelRuntime:
     return mgr.channels[folded]
 
 
-def request_help(bot: Bot) -> None:
-    """Deliver INVITEE's invite, unban, and room requests, and OP_REQUESTER's op."""
-    bot.channel_mgr.invite_peer("#test", INVITEE)
-    bot.channel_mgr.unban_peer("#test", INVITEE)
-    bot.channel_mgr.make_room("#test", INVITEE)
-    bot.channel_mgr.op_peer("#test", OP_REQUESTER)
+async def request_help(bot: Bot) -> None:
+    """Deliver INVITEE's invite, unban, and room requests, and OP_REQUESTER's op.
+
+    Each arrives as the coordinator hands it over, by kind, and is answered
+    with no random delay.
+    """
+    with patch("botnats.channel.PEER_HELP_DELAY", 0):
+        for kind, peer in (
+            ("invite", INVITEE),
+            ("unban", INVITEE),
+            ("limit", INVITEE),
+            ("op", OP_REQUESTER),
+        ):
+            bot.callbacks.on_help(kind, "#test", peer)
+            await settle(bot)
 
 
 class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -123,6 +132,33 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         assert fake_irc.modes == []
+
+    async def test_enforce_modes_checks_unset_modes_as_removed(self) -> None:
+        """Unset a limit, which takes no argument to remove; skip one that does."""
+        bot, fake_irc = bot_with_irc()
+        bot.caps.chanmodes = ("beI", "kx", "l", "imnst")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        bot.config = replace(
+            bot.config,
+            channel_modes="+n-l",
+            enforced_modes=mode_intent("+n-l"),
+        )
+
+        with self.assertNoLogs("botnats.channel", level="WARNING"):
+            bot.channel_mgr.enforce_modes(runtime)
+
+        assert fake_irc.sent == [("MODE", ("#test", "+n-l"))]
+
+        bot.config = replace(
+            bot.config,
+            channel_modes="+n-x",
+            enforced_modes=mode_intent("+n-x"),
+        )
+        with self.assertLogs("botnats.channel", level="WARNING") as logs:
+            bot.channel_mgr.enforce_modes(runtime)
+
+        assert fake_irc.sent == [("MODE", ("#test", "+n-l"))]
+        assert "configured mode requires an argument" in logs.output[0]
 
     async def test_enforce_modes_skips_quietly(self) -> None:
         """Send nothing without configured modes; skip a lost connection quietly."""
@@ -287,6 +323,32 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.retry_pending_parts()
         assert ("PART", ("#room[",)) in fake_irc.sent
         assert bot.channel_mgr.pending_parts == {}
+
+    async def test_casemapping_change_drops_part_of_desired_channel(self) -> None:
+        """Drop a pending PART that now folds onto a channel still desired.
+
+        Under rfc1459 the server has merged #room{, left while the send queue
+        was full, with #room[, joined after it: this bot stays.
+        """
+        fake_irc = FailingPartIRC()
+        bot = make_bot(irc=fake_irc)
+        mgr = bot.channel_mgr
+        mgr.set_casemapping("ascii")
+        mgr.apply_record(mgr.new_record("#room{", None, present=True))
+        mgr.channels[casefold("#room{", "ascii")].join = JoinState.JOINED
+        mgr.apply_record(mgr.new_record("#room{", None, present=False))
+        assert mgr.pending_parts == {"#room{": "#room{"}
+        mgr.apply_record(mgr.new_record("#room[", None, present=True))
+        joined = mgr.channels[casefold("#room[", "ascii")]
+        joined.join = JoinState.JOINED
+
+        mgr.set_casemapping("rfc1459")
+
+        assert mgr.runtime("#room{") is joined
+        assert mgr.pending_parts == {}
+        fake_irc.failing = False
+        mgr.retry_pending_parts()
+        assert fake_irc.sent == []
 
     async def test_multi_channel_join_part_isolation(self) -> None:
         """Verify keyed channels join and part without changing their peers."""
@@ -1273,6 +1335,38 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             bot.channel_mgr.channels[casefold("#test", "rfc1459")].key == "durablekey"
         )
 
+    async def test_quit_prefix_outranks_stored_member_prefix(self) -> None:
+        """Return a complete QUIT prefix over the member prefix stored for it.
+
+        A stored prefix can be stale, as after a host change this bot never
+        saw: it completes only a prefix lacking a user or host.
+        """
+        bot = bot_with_channel()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+        prefix = Prefix("owner", "user", "host.example")
+
+        assert bot.channel_mgr.forget_member(prefix) == prefix
+
+    async def test_nick_prefix_outranks_stored_member_prefix(self) -> None:
+        """Return a complete NICK prefix over the member prefix stored for it."""
+        bot = bot_with_channel()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+        prefix = Prefix("owner", "user", "host.example")
+
+        assert bot.channel_mgr.rename_member(prefix, "newowner") == prefix
+
+    async def test_chghost_prefix_outranks_stored_member_prefix(self) -> None:
+        """Return a complete CHGHOST prefix over the member prefix stored for it."""
+        bot = bot_with_channel()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+        prefix = Prefix("owner", "user", "host.example")
+        new_prefix = Prefix("owner", "newuser", "new.host")
+
+        assert bot.channel_mgr.change_member_host(prefix, new_prefix) == prefix
+
     async def test_disconnected_bot_does_not_help(self) -> None:
         """Swallow a lost connection in every help action; report no help given."""
         bot, fake_irc = bot_with_irc()
@@ -1313,13 +1407,13 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         # beta's heartbeat has lapsed; gamma has not announced itself.
         bot.presence.update(INVITEE, now=time.monotonic() - bot.presence.ttl - 1)
 
-        request_help(bot)
+        await request_help(bot)
         assert fake_irc.sent == []
 
         for peer in (INVITEE, OP_REQUESTER):
             bot.presence.update(peer)
 
-        request_help(bot)
+        await request_help(bot)
         assert fake_irc.sent == HELP_GIVEN
 
     async def test_help_needs_self_opped(self) -> None:
@@ -1333,11 +1427,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         for peer in (INVITEE, OP_REQUESTER):
             bot.presence.update(peer)
 
-        request_help(bot)
+        await request_help(bot)
         assert fake_irc.sent == []
 
         runtime.member("alpha").modes.add("o")
-        request_help(bot)
+        await request_help(bot)
         assert fake_irc.sent == HELP_GIVEN
 
     async def test_op_help_waits_for_who(self) -> None:
@@ -1473,6 +1567,24 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == []
 
+    async def test_make_room_needs_a_bot_left_out(self) -> None:
+        """Leave a limit below the member count alone while no bot is left out."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("user")
+        runtime.limit = 1
+        bot.presence.update(INVITEE)
+        # Another peer's help got beta in while this request waited.
+        runtime.member("beta")
+
+        bot.channel_mgr.make_room("#test", INVITEE)
+        assert fake_irc.sent == []
+
+        runtime.remove("beta")
+        bot.channel_mgr.make_room("#test", INVITEE)
+        assert fake_irc.sent == [("MODE", ("#test", "+l", "3"))]
+
     async def test_op_peer_one_at_a_time(self) -> None:
         """Op each requesting peer with its own MODE line."""
         bot, fake_irc = bot_with_irc()
@@ -1523,6 +1635,24 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ("#test", "-b", ("*!*@bot.host",)),
             ("#test", "-b", ("*!~beta@bot.host",)),
         ]
+
+    async def test_join_waits_for_identity(self) -> None:
+        """Join nothing between 001 and the USERHOST reply naming this bot.
+
+        A JOIN refused before then could ask no peer for help.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.identity.on_registered()  # 001
+
+        await bot.maintenance_tick()
+        assert fake_irc.sent == []
+
+        bot.events.on_irc_message(
+            IRCMessage("302", ("alpha", "alpha=+~alpha@alpha.host")),
+        )
+        await settle(bot)
+
+        assert fake_irc.sent == [("JOIN", ("#test",))]
 
     async def test_join_state_transitions(self) -> None:
         """Send JOIN when idle; resend one in flight or refused once it is due."""
