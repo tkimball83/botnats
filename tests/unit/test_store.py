@@ -343,6 +343,12 @@ class PresenceValidTests(unittest.TestCase):
         missing_timestamp = {k: v for k, v in fresh.items() if k != "timestamp"}
         assert not store.valid("alpha", missing_timestamp, now=now)
 
+        # A signed boolean is an int only the freshness window refuses.
+        for flag in (True, False):
+            with self.subTest(timestamp=flag):
+                record = sign({**fresh, "timestamp": flag})
+                assert not store.valid("alpha", record, now=now)
+
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
 
@@ -1190,11 +1196,13 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert channels.key("#room[") != channels.key("#room{")
         assert channels.key("#ROOM[") == channels.key("#room[")
         assert channels.key("#straße") != channels.key("#strasse")
+        assert channels.key("#Été") != channels.key("#été")
         assert sessions.key("Nick[!user@host") != sessions.key("Nick{!user@host")
         assert sessions.key("NICK[!user@host") == sessions.key("nick[!user@host")
         assert sessions.key("Straße!user@host") != sessions.key(
             "strasse!user@host",
         )
+        assert sessions.key("Été!user@host") != sessions.key("été!user@host")
 
     async def test_channel_and_session_keys_are_secret_derived(self) -> None:
         """Key records by a digest of the coordination secret, never the raw name."""

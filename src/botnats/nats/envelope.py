@@ -77,7 +77,6 @@ class Envelope:
             or not isinstance(signature, str)
             or SIGNATURE_RE.fullmatch(signature) is None
             or not isinstance(timestamp, int)
-            or isinstance(timestamp, bool)
         ):
             msg = "NATS envelope is malformed"
             raise ValueError(msg)
