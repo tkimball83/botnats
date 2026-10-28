@@ -89,6 +89,7 @@ class ValidatorTests(unittest.TestCase):
             "http://host:4222",
             "nats://host:4222?name=x",
             "nats://host:4222#x",
+            "nats://:4222",
             "nats://host:",
             "nats://host:bad",
             "nats://host:0",
@@ -97,6 +98,9 @@ class ValidatorTests(unittest.TestCase):
             "nats://user@host:4222",
             "nats://user:secret@host:4222",
             "nats://:secret@host:4222",
+            "nats://ho st:4222",
+            # IDNA maps an ideographic space to an ASCII one.
+            "nats://ho\u3000st:4222",
             "nats://ho\x1bst:4222",
             "nats://ho\x7fst:4222",
             "nats://" + chr(0xD800) + ":4222",
