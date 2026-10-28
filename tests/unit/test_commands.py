@@ -617,6 +617,38 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.modes == []
         assert coordinator.channel_puts == []
 
+    async def test_extra_argument_gets_usage_reply(self) -> None:
+        """Reject an argument past a command's last with its usage reply."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.authorizer.grant(OWNER.render())
+        replies = {
+            "BAN #test *!*@x extra": "BAN <channel> <mask>",
+            "DEOP #test alpha extra": "DEOP <channel> <nick>",
+            "GETBANS #test extra": "GETBANS <channel>",
+            "GETCHANS extra": "GETCHANS takes no arguments",
+            "GETMODES #test extra": "GETMODES <channel>",
+            "GETUSERS #test extra": "GETUSERS <channel>",
+            "INVITE #test ghost extra": "INVITE <channel> <nick>",
+            "JOIN #new key extra": "JOIN <channel> [key]",
+            "OP #test alpha extra": "OP <channel> <nick>",
+            "PART #test extra": "PART <channel>",
+            "STATUS extra": "STATUS takes no arguments",
+            "UNBAN #test *!*@x extra": "UNBAN <channel> <mask>",
+        }
+
+        for text, reply in replies.items():
+            with self.subTest(text=text):
+                fake_irc.privmsgs.clear()
+
+                await bot.commands.dispatch(OWNER, text)
+
+                assert fake_irc.privmsgs == [("owner", reply)]
+
+        assert fake_irc.modes == []
+        assert coordinator.channel_puts == []
+
     async def test_channel_update_rejects_oversized_mode_command(self) -> None:
         """Reject a channel update before storing an unusable mode command."""
         bot, _, coordinator = bot_with_coordinator()

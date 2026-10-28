@@ -183,6 +183,22 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         contexts = [call.kwargs["ssl"] for call in connect.await_args_list]
         assert contexts == [client.tls_context, None]
 
+    async def test_establish_gives_up_after_connect_timeout(self) -> None:
+        """Abandon a connection attempt that outlasts the connect timeout."""
+        client = irc_client()
+        client.config = replace(client.config, connect_timeout=0)
+
+        async def unanswered(*arguments: object, **options: object) -> None:
+            del arguments, options
+            await hang()
+
+        with patch("botnats.irc.client.asyncio.open_connection", unanswered):
+            # The bound sits outside assertRaises: an unenforced connect
+            # timeout ends in the bound's cancellation, not a TimeoutError.
+            async with asyncio.timeout(5):
+                with self.assertRaises(TimeoutError):
+                    await client.establish(client.config.servers[0])
+
     def test_nickname_collision(self) -> None:
         """Verify collision nicknames have correct length and are alphabetic."""
         candidates = [next_nickname(9) for _ in range(20)]
