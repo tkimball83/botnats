@@ -6,7 +6,7 @@
 import asyncio
 import time
 import unittest
-from dataclasses import asdict, astuple, replace
+from dataclasses import astuple, replace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
@@ -213,36 +213,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert puts == [(prefix.render(), True)]
         assert not bot.sessions.pending
 
-    async def test_close_writes_escalated_revocation(self) -> None:
-        """Write the escalation a queued revocation meets at shutdown.
-
-        A peer granted the identity again, unseen by this bot, so the QUIT's
-        revocation loses to that grant. Its escalation would wait for the
-        next retry, which shutdown never makes.
-        """
-        bot, _, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
-        grant = bot.authorizer.grant(prefix.render())
-        newer = bot.authorizer.create(prefix.render(), grant.expires_at + 30, "beta")
-        async with asyncio.timeout(1):
-            assert await bot.sessions.sync(grant)
-            await coordinator.sessions.put(asdict(newer))
-
-        # close() cancels the QUIT's background write before it starts.
-        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-        async with asyncio.timeout(5):
-            await bot.close()
-
-        escalated = bot.authorizer.create(
-            prefix.render(),
-            newer.expires_at,
-            newer.issuer,
-            newer.version + 1,
-            revoked=True,
-        )
-        assert coordinator.session_puts[-1] == asdict(escalated)
-        assert not bot.sessions.pending
-
     async def test_close_bounds_queued_revocation_write(self) -> None:
         """Finish shutdown when the queued revocation's write hangs."""
         bot, fake_irc, coordinator = bot_with_coordinator()
@@ -317,13 +287,17 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 coordinator, "put_channel", AsyncMock(side_effect=outage)
             ) as put_channel,
         ):
-            await bot.maintenance_tick()
+            async with asyncio.timeout(1):
+                await bot.maintenance_tick()
+
             put_session.assert_not_awaited()
             put_channel.assert_not_awaited()
 
             # Once ready, the same tick retries both queued writes.
             coordinator.connected = True
-            await bot.maintenance_tick()
+            async with asyncio.timeout(1):
+                await bot.maintenance_tick()
+
             put_session.assert_awaited_once()
             put_channel.assert_awaited_once()
 
@@ -488,7 +462,8 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("beta").prefix = peer.to_prefix()
         runtime.member("beta").modes.add("o")
 
-        await bot.maintenance_tick()
+        async with asyncio.timeout(1):
+            await bot.maintenance_tick()
 
         assert [kind for kind, _ in coordinator.help_requests] == ["op"]
 
@@ -497,6 +472,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(config())
         bot.authorizer.grant("owner!user@host.example", now=0)
 
-        await bot.maintenance_tick()
+        async with asyncio.timeout(1):
+            await bot.maintenance_tick()
 
         assert not bot.authorizer.records

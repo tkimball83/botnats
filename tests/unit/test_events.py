@@ -6,7 +6,7 @@
 import asyncio
 import unittest
 from dataclasses import asdict, replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import cast
 from unittest.mock import patch
 
 from botnats.channel import JOIN_REPLY_TIMEOUT, JOIN_RETRY_DELAY, JoinState
@@ -33,9 +33,6 @@ from tests.unit.helpers import (
     make_bot,
     settle,
 )
-
-if TYPE_CHECKING:
-    from botnats.nats.store import Session
 
 CUSTOM_ISUPPORT = IRCMessage(
     "005",
@@ -1595,28 +1592,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert "*!*@old.ban" in runtime.bans.values()
         assert casefold("alpha", "rfc1459") in runtime.members
         assert casefold("victim", "rfc1459") not in runtime.members
-
-    async def test_quit_does_not_wait_for_durable_write(self) -> None:
-        """Revoke locally at once while the durable write runs in background."""
-        bot, _, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
-        bot.authorizer.grant(prefix.render())
-        release = asyncio.Event()
-        record_put = coordinator.put_session
-
-        async def slow_put(session: dict[str, Any]) -> Session:
-            await release.wait()
-            return await record_put(session)
-
-        with patch.object(coordinator, "put_session", slow_put):
-            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-            assert not bot.authorizer.authorized(prefix.render())
-            assert bot.sessions.pending
-            release.set()
-            await drain_session_writes(bot)
-
-        assert not bot.sessions.pending
-        assert [put["revoked"] for put in coordinator.session_puts] == [True]
 
     async def test_command_waits_only_for_its_own_sender(self) -> None:
         """Run an admin's OP while a stranger's AUTH waits on JetStream.

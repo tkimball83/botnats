@@ -273,6 +273,34 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert pending.revoked
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
 
+    async def test_auth_failure_revokes_grant_over_equivalent_session(self) -> None:
+        """Revoke the failed grant itself, not an equivalent prefix's session.
+
+        foo{ and foo[ fold together under rfc1459 but have their own durable
+        keys. A peer whose clock runs ahead holds a live foo{ session that
+        outranks any grant for foo[; unless the grant replaces it, AUTH's
+        revocation lands on foo{'s key, and the retry writes the foo[ grant
+        live after AUTH reported failure.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot, fake_irc, _ = bot_with_coordinator(coordinator)
+        ttl = bot.config.auth_session_ttl
+        bot.authorizer.keep(
+            bot.authorizer.create("foo{!u@h", time.time() + ttl + 30, "beta"),
+        )
+        prefix = Prefix("foo[", "u", "h")
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+        await send_command(bot, prefix, f"AUTH {valid_code}")
+        coordinator.failing = False
+        async with asyncio.timeout(1):
+            await bot.sessions.retry()
+
+        assert fake_irc.privmsgs == [("foo[", "Authorization failed")]
+        puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
+        assert puts == [("foo[!u@h", True)]
+        assert not bot.sessions.pending
+
     async def test_auth_grant_does_not_replace_queued_revocation(self) -> None:
         """Persist a QUIT's revocation queued while AUTH waits for the lock."""
         bot, fake_irc, coordinator = bot_with_coordinator()
@@ -1036,6 +1064,24 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.pending
         assert put.await_count == 2
 
+    async def test_revoke_does_not_wait_for_durable_write(self) -> None:
+        """Revoke a QUIT's session locally at once and write it in background.
+
+        The IRC read loop calls revoke(), so it must not wait on JetStream.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        bot.authorizer.grant(prefix.render())
+
+        bot.sessions.revoke(prefix)
+        # Nothing has yielded, so the write has not started.
+        assert not bot.authorizer.authorized(prefix.render())
+        assert bot.sessions.pending
+        await drain_session_writes(bot)
+
+        assert not bot.sessions.pending
+        assert [put["revoked"] for put in coordinator.session_puts] == [True]
+
     async def test_revocation_uses_session_prefix_across_case_folding(self) -> None:
         """File a revocation under its session's prefix, not the observed one.
 
@@ -1355,6 +1401,35 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
 
         assert attempts == 1
         assert bot.sessions.pending
+
+    async def test_flush_writes_escalated_revocation(self) -> None:
+        """Write the escalation a queued revocation meets at shutdown.
+
+        A peer granted the identity again, unseen by this bot, so the queued
+        revocation loses to that grant. Its escalation would wait for the
+        next retry, which shutdown never makes.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = "owner!user@host.example"
+        grant = bot.authorizer.grant(prefix)
+        newer = bot.authorizer.create(prefix, grant.expires_at + 30, "beta")
+        async with asyncio.timeout(1):
+            assert await bot.sessions.sync(grant)
+            await coordinator.sessions.put(asdict(newer))
+            revoked = bot.authorizer.revoke(prefix)
+            assert revoked is not None
+            bot.sessions.queue(revoked)
+            await bot.sessions.flush()
+
+        escalated = bot.authorizer.create(
+            prefix,
+            newer.expires_at,
+            newer.issuer,
+            newer.version + 1,
+            revoked=True,
+        )
+        assert coordinator.session_puts[-1] == asdict(escalated)
+        assert not bot.sessions.pending
 
 
 class SessionSyncWatchTests(unittest.TestCase):
