@@ -21,8 +21,17 @@ CHANNELS = (
     ("#botnats-first", "first-key"),
     ("#botnats-second", "second-key"),
 )
+# Waits on the IRC server itself, which the bots' send pacing never delays.
 COMMAND_TIMEOUT = 15.0
 POLL_INTERVAL = 0.25
+# The bots pace IRC output by flood cost: five short lines at once, then one
+# every two seconds. The slowest reply, to run()'s second JOIN, queues behind
+# the first channel's WHO, MODE, MODE +b, enforced modes and +o for each peer,
+# then that JOIN: eight lines, or 16 seconds. This doubles it.
+REPLY_TIMEOUT = 32.0
+# Convergence polls. The slowest, a kicked bot's JOIN refused, then retried
+# after the bots' 10-second JOIN_RETRY_DELAY behind its queued lines, takes
+# about 20 seconds.
 STARTUP_TIMEOUT = 45.0
 TEST_BAN = "*!*@blocked.example"
 # TOTP counters this run has spent: each counter authenticates only once.
@@ -104,7 +113,7 @@ async def authenticate(
     await session.send("PRIVMSG", bot, trailing=f"AUTH {code}")
     await session.read_until(
         private_message(bot, expected),
-        wait_seconds=COMMAND_TIMEOUT,
+        wait_seconds=REPLY_TIMEOUT,
     )
 
 
@@ -113,7 +122,7 @@ async def command(session: IRCSession, bot: str, text: str) -> str:
     await session.send("PRIVMSG", bot, trailing=text)
     response = await session.read_until(
         private_message(bot),
-        wait_seconds=COMMAND_TIMEOUT,
+        wait_seconds=REPLY_TIMEOUT,
     )
     return response.params[-1]
 
@@ -161,8 +170,9 @@ def fresh_code() -> str:
     return totp(secret, counter)
 
 
-async def join_as_operator(session: IRCSession, channel: str, key: str) -> None:
-    """Join a channel and wait until alpha has opped the owner there."""
+async def join_as_operator(session: IRCSession) -> None:
+    """Join the second channel and wait until alpha has opped the owner there."""
+    channel, key = CHANNELS[1]
     await session.send("JOIN", channel, key)
     await wait_for_reply(
         session, "alpha", f"OP {channel} owner", f"Opped owner on {channel}"
@@ -284,7 +294,7 @@ async def run() -> None:
             )
             await wait_for_channel(session, channel, key)
 
-        await wait_for_status(session, "beta")
+        await wait_for_status(session)
 
         for channel, key in CHANNELS:
             # Key the channel with other than the key the admin supplied: later
@@ -405,18 +415,18 @@ async def wait_for_operators(
     await poll_until(opped)
 
 
-async def wait_for_status(session: IRCSession, bot: str) -> None:
-    """Poll STATUS until the bot reports the expected mesh state."""
+async def wait_for_status(session: IRCSession) -> None:
+    """Poll beta's STATUS until it reports the expected mesh state."""
 
     async def healthy() -> bool:
-        await session.send("PRIVMSG", bot, trailing="STATUS")
+        await session.send("PRIVMSG", "beta", trailing="STATUS")
         local_status = await session.read_until(
-            private_message(bot),
-            wait_seconds=COMMAND_TIMEOUT,
+            private_message("beta"),
+            wait_seconds=REPLY_TIMEOUT,
         )
         nats_status = await session.read_until(
-            private_message(bot),
-            wait_seconds=COMMAND_TIMEOUT,
+            private_message("beta"),
+            wait_seconds=REPLY_TIMEOUT,
         )
         local_text = local_status.params[-1]
         if "peers=2" not in local_text or "channels=2" not in local_text:
