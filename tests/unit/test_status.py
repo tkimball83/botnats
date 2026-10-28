@@ -125,13 +125,17 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_collect_unknown_when_monitoring_is_unavailable(self) -> None:
         """Keep connection status when cluster monitoring is unavailable."""
-        nc = MagicMock(is_connected=True, connected_url=None)
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        connect = AsyncMock(side_effect=ConnectionRefusedError("refused"))
 
-        status = await collect(nc, None, 3, 8222)
+        with patch("asyncio.open_connection", connect):
+            status = await collect(nc, None, 3, 8222)
 
         assert status.render() == (
             "nats connection=up routes=? jetstream=unknown leader=? replicas=?/3 lag=?"
         )
+        # Monitoring was asked of the connected server, on the monitoring port.
+        connect.assert_awaited_once_with("nats-1", 8222)
 
     async def test_collect_keeps_routes_without_stream_info(self) -> None:
         """Report the route count even when stream information is unavailable."""

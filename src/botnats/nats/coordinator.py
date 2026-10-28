@@ -565,15 +565,19 @@ class Coordinator:
 
         nats-py subscribes before its setup round trip and keeps the
         subscription when cancelled there, replaying it on every reconnect. The
-        setup runs shielded instead: a cancelled watch leaves at once, and a
-        background task stops the watcher once it is set up.
+        setup runs as its own task instead, which cancelling the watch leaves
+        running: a cancelled watch leaves at once, and a background task stops
+        the watcher once it is set up. Unlike asyncio.shield, waiting this way
+        logs nothing when a setup that outlived its watch fails.
         """
         setup = asyncio.create_task(kv.watchall())
         try:
-            return await asyncio.shield(setup)
+            await asyncio.wait({setup})
         except asyncio.CancelledError:
             self.watcher_stops.spawn(stop_watcher(setup), "stop-watcher")
             raise
+
+        return setup.result()
 
     async def watch_channels(self, synced: Callable[[], None]) -> None:
         """Watch the channels KV bucket and apply record updates."""

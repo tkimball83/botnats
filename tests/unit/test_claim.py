@@ -5,6 +5,7 @@
 
 import asyncio
 import unittest
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
@@ -12,6 +13,9 @@ from nats.errors import Error as NatsError
 from botnats.nats.claim import PresenceClaim, PresenceState
 from botnats.nats.store import PresenceStore, StoreUnavailableError
 from tests.unit.helpers import COORDINATION_KEY
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
 
 INSTANCE_ID = "instance"
 NOT_OWNED = "bot ID alpha does not own its presence key"
@@ -22,6 +26,12 @@ def build_claim() -> PresenceClaim:
     """Build an unclaimed presence claim over an unopened store."""
     store = PresenceStore("efnet", 1, 15.0, COORDINATION_KEY)
     return PresenceClaim(store, "alpha", INSTANCE_ID)
+
+
+async def bounded[T](awaitable: Awaitable[T]) -> T:
+    """Await a call that takes the claim's lock, failing instead of hanging."""
+    async with asyncio.timeout(5):
+        return await awaitable
 
 
 class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
@@ -51,9 +61,9 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
         ):
             with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
-                await claim.put(PRESENCE)
+                await bounded(claim.put(PRESENCE))
 
-            await claim.put(PRESENCE)
+            await bounded(claim.put(PRESENCE))
 
         assert not claim.duplicate
         assert create.await_count == 2
@@ -71,7 +81,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=reclaimed_revision),
             ) as reclaim,
         ):
-            await claim.put(PRESENCE)
+            await bounded(claim.put(PRESENCE))
 
         assert claim.owned
         assert claim.revision == reclaimed_revision
@@ -88,9 +98,10 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 "reclaim",
                 AsyncMock(side_effect=OSError("blip")),
             ),
-            self.assertRaises(OSError),
+            # By message: the bound's TimeoutError is an OSError too.
+            self.assertRaisesRegex(OSError, "blip"),
         ):
-            await claim.put(PRESENCE)
+            await bounded(claim.put(PRESENCE))
 
         assert not claim.duplicate
         assert not claim.owned
@@ -131,7 +142,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             claim.store, "create", AsyncMock(return_value=created_revision)
         ):
-            await claim.reclaim()
+            await bounded(claim.reclaim())
 
         assert claim.owned
         assert claim.revision == created_revision
@@ -147,7 +158,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
         create = AsyncMock(side_effect=create_then_reset)
         with patch.object(claim.store, "create", create):
-            await claim.reclaim()
+            await bounded(claim.reclaim())
 
         create.assert_awaited_once()
         assert not claim.owned
@@ -165,7 +176,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("botnats.nats.claim", level="ERROR"),
             self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED),
         ):
-            await claim.put(PRESENCE)
+            await bounded(claim.put(PRESENCE))
 
         assert claim.duplicate
 
@@ -183,7 +194,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             ) as update,
             patch.object(claim.store, "create", AsyncMock(return_value=None)) as create,
         ):
-            await claim.put(PRESENCE)
+            await bounded(claim.put(PRESENCE))
 
         update.assert_awaited_once_with("alpha", PRESENCE, 1)
         create.assert_not_awaited()
@@ -201,7 +212,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(NatsError),
         ):
-            await claim.deleted()
+            await bounded(claim.deleted())
 
         assert not claim.owned
         assert claim.revision is None
@@ -218,7 +229,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(NatsError),
         ):
-            await claim.put(PRESENCE)
+            await bounded(claim.put(PRESENCE))
 
         assert not claim.owned
         assert claim.revision is None
@@ -249,7 +260,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=reclaimed_revision),
             ),
         ):
-            await claim.put(PRESENCE)
+            await bounded(claim.put(PRESENCE))
 
         assert claim.owned
         assert claim.revision == reclaimed_revision
@@ -261,7 +272,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         delete = AsyncMock(return_value=None)
 
         with patch.object(claim.store, "delete", delete):
-            await claim.release()
+            await bounded(claim.release())
 
         delete.assert_awaited_once_with("alpha", 3, INSTANCE_ID)
         assert not claim.owned
@@ -274,7 +285,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         delete = AsyncMock(side_effect=NatsError("timeout"))
 
         with patch.object(claim.store, "delete", delete):
-            await claim.release()
+            await bounded(claim.release())
 
         delete.assert_awaited_once_with("alpha", 3, INSTANCE_ID)
         assert not claim.owned
@@ -308,7 +319,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             patch.object(claim.store, "create", AsyncMock(return_value=2)),
             self.assertLogs("botnats.nats.claim", level="INFO") as logs,
         ):
-            await claim.deleted()
+            await bounded(claim.deleted())
 
         assert [log.getMessage() for log in logs.records] == [
             "duplicate bot ID conflict resolved: alpha",
