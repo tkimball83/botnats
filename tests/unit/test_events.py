@@ -9,9 +9,15 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
-from botnats.channel import JOIN_RETRY_DELAY, JoinState
+from botnats.channel import JOIN_REPLY_TIMEOUT, JOIN_RETRY_DELAY, JoinState
 from botnats.config import mode_intent
-from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
+from botnats.irc.protocol import (
+    IRCMessage,
+    ISupportState,
+    Prefix,
+    casefold,
+    parse_message,
+)
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     OWNER,
@@ -202,6 +208,38 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.tasks
         assert not bot.sessions.watched_identities
+
+    async def test_commands_from_undecodable_prefixes_are_refused(self) -> None:
+        """Run no command from a prefix whose undecodable bytes became U+FFFD.
+
+        Latin-1 nicks René and Renè with one user@host decode alike, so a
+        session granted to one would run the other's commands.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        granted, other = (
+            parse_message(line.decode(errors="replace"))
+            for line in (
+                b":Ren\xe9!~ren@shared.host PRIVMSG alpha :BAN #test *!*@first",
+                b":Ren\xe8!~ren@shared.host PRIVMSG alpha :BAN #test *!*@second",
+            )
+        )
+        assert granted.prefix is not None
+        assert other.prefix == granted.prefix
+        bot.authorizer.grant(granted.prefix.render())
+        bot.authorizer.grant(OWNER.render())
+
+        for message in (
+            granted,
+            other,
+            IRCMessage("PRIVMSG", ("alpha", "BAN #test *!*@owner"), OWNER),
+        ):
+            bot.events.on_irc_message(message)
+
+        await settle(bot)
+
+        assert fake_irc.modes == [("#test", "+b", ("*!*@owner",))]
 
     async def test_end_of_names(self) -> None:
         """Query members, modes, and bans after NAMES; ask peers for op."""
@@ -593,6 +631,65 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [join, join, join]
         await settle(bot)
 
+    async def test_forwarded_join_requests_all_help(self) -> None:
+        """Ask for an invite, room, and an unban when a JOIN is forwarded.
+
+        A 470 does not say what refused the JOIN. The help names the channel
+        asked for, and the forward target the server joined instead is left.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+
+        bot.channel_mgr.join_desired()
+        with self.assertLogs("botnats.events", level="WARNING"):
+            bot.events.on_irc_message(
+                IRCMessage("470", ("alpha", "#test", "#overflow", "Forwarding")),
+            )
+
+        bot.events.on_irc_message(
+            IRCMessage("JOIN", ("#overflow",), Prefix("alpha", "~alpha", "host")),
+        )
+        await settle(bot)
+
+        assert fake_irc.sent == [("JOIN", ("#test",)), ("PART", ("#overflow",))]
+        assert [
+            (kind, payload["channel"]) for kind, payload in coordinator.help_requests
+        ] == [("invite", "#test"), ("limit", "#test"), ("unban", "#test")]
+
+    async def test_forwarded_join_resent_after_reply_timeout(self) -> None:
+        """Resend a forwarded JOIN after the reply timeout, not sooner.
+
+        Each attempt also joins the forward target, so neither the refusal
+        retry delay nor an INVITE resends it; the server keeps the invite for
+        the next attempt.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        join = ("JOIN", ("#test",))
+
+        bot.channel_mgr.join_desired()
+        with self.assertLogs("botnats.events", level="WARNING"):
+            bot.events.on_irc_message(
+                IRCMessage("470", ("alpha", "#test", "#overflow", "Forwarding")),
+            )
+
+        bot.events.on_irc_message(
+            IRCMessage("INVITE", ("alpha", "#test"), Prefix("beta", "~beta", "host")),
+        )
+        runtime.join_retry_at -= JOIN_RETRY_DELAY
+        bot.channel_mgr.join_desired()
+        assert fake_irc.sent == [join]
+
+        runtime.join_retry_at -= JOIN_REPLY_TIMEOUT
+        bot.channel_mgr.join_desired()
+        assert fake_irc.sent == [join, join]
+        await settle(bot)
+
     async def test_bad_key_refusal_takes_the_stored_key(self) -> None:
         """Join with a peer's recorded key once the server refuses this bot's.
 
@@ -689,6 +786,35 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         await settle(bot)
 
+        assert [kind for kind, _ in coordinator.help_requests] == ["op"]
+
+    async def test_other_deop_prompts_no_op_request(self) -> None:
+        """Ask for op once another member gains op, not when one loses it."""
+        bot, _, coordinator = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        # An opped peer is present, so a spurious op request would be sent.
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
+        bot.presence.update(peer)
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha")
+        runtime.member("beta").prefix = peer.to_prefix()
+        runtime.member("beta").modes.add("o")
+        runtime.member("carol").modes.add("o")
+
+        async def mode(change: str) -> None:
+            bot.events.on_irc_message(
+                IRCMessage("MODE", ("#test", change, "carol"), Prefix("chanserv")),
+            )
+            await settle(bot)
+
+        await mode("-o")
+        assert runtime.members["carol"].modes == set()
+        assert coordinator.help_requests == []
+
+        await mode("+o")
         assert [kind for kind, _ in coordinator.help_requests] == ["op"]
 
     async def test_voice_and_list_modes_are_not_op_changes(self) -> None:
@@ -1913,6 +2039,31 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert ("NICK", ("alpha",)) not in fake_irc.sent
+
+    async def test_offline_reports_ignored_once_nick_reclaimed(self) -> None:
+        """Ignore an ISON or MONITOR offline report once the nick is reclaimed.
+
+        Neither resends NICK nor restarts the nick watch.
+        """
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        ison, monitor = (
+            IRCMessage("303", ("alpha", "")),
+            IRCMessage("731", ("alpha", "alpha!user@host")),
+        )
+        bot.events.on_irc_message(monitor)
+        fake_irc.current_nick = "alpha"
+        bot.events.on_irc_message(
+            IRCMessage("NICK", ("alpha",), Prefix("fallback", "~alpha", "host")),
+        )
+
+        for message in (ison, monitor):
+            bot.events.on_irc_message(message)
+
+        assert fake_irc.sent == [("NICK", ("alpha",))]
+        assert bot.events.nick_watch_task is None
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_refused_monitor_reclaim_polls_ison(self) -> None:
         """Poll ISON, once, when the send queue refuses a NICK MONITOR prompted.
