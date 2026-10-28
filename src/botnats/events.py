@@ -27,7 +27,10 @@ if TYPE_CHECKING:
 
     from botnats.bot import Bot
 
-ISON_POLL_INTERVAL = 5.0
+# Each poll spends send credit, as does the NICK it prompts that a server
+# holding the nick refuses: once a minute keeps the cost small, and delays a
+# reclaim by at most a minute.
+ISON_POLL_INTERVAL = 60.0
 LOGGER = logging.getLogger(__name__)
 # Each JOIN refusal that a peer can help with, and the help it asks for.
 # A bad key (475) asks none: an invite does not get past +k, and the next
@@ -131,15 +134,14 @@ class IRCEventHandler:
         """Track the channel key or member limit from one mode change."""
         if mode == "l":
             runtime.set_limit(argument if adding else None)
-        elif argument is not None:
+        elif not adding:
+            self.process_key(runtime, None)
+        elif argument == "*":
             # Servers send "*" in place of a hidden key, to operators too
             # during a netsplit; a literal "*" key is set with JOIN instead.
-            if adding and argument == "*":
-                runtime.hide_key()
-            else:
-                self.process_key(runtime, argument if adding else None)
-        elif not adding and runtime.key is not None:
-            self.process_key(runtime, None)
+            runtime.hide_key()
+        elif argument is not None:
+            self.process_key(runtime, argument)
 
     def handle_ban_list(self, message: IRCMessage) -> None:
         """Record a ban mask from the channel ban list reply."""
@@ -218,8 +220,9 @@ class IRCEventHandler:
     def handle_join_refusal(self, message: IRCMessage) -> None:
         """Pace a refused JOIN's retry and ask peers for the help it needs.
 
-        A tick after JOIN_RETRY_DELAY tries the JOIN again: after the help,
-        or with the stored key. An INVITE retries it at once.
+        A later tick tries the JOIN again, after the help or with the stored
+        key, waiting longer after each consecutive refusal. An INVITE retries
+        it at once.
         """
         if len(message.params) < 2:
             return
@@ -228,6 +231,7 @@ class IRCEventHandler:
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is not None:
             runtime.refuse_join()
+            runtime.join_error = message.command
             if message.command == "475":
                 self.bot.channel_mgr.refuse_key(runtime)
 

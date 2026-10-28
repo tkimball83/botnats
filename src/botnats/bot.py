@@ -137,7 +137,6 @@ class Bot:
         here must not delay it past the presence TTL.
         """
         self.authorizer.prune()
-        self.presence.prune()
         self.channel_mgr.retry_pending_parts()
         self.channel_mgr.join_desired()
         await self.channel_mgr.request_ops()
