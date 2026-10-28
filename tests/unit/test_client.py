@@ -137,6 +137,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         # and must not corrupt the byte-level echo either.
         assert pong_reply(b":srv  PING :token\r\n") == b"PONG :token\r\n"
         assert pong_reply(b"@id=1  PING  :token\r\n") == b"PONG :token\r\n"
+        assert pong_reply(b"@id=1  :srv PING :token\r\n") == b"PONG :token\r\n"
         assert pong_reply(b" PING :token\r\n") == b"PONG :token\r\n"
 
         inflating = b"PING :" + b"\xe9" * 400 + b"\r\n"
@@ -212,6 +213,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(client, "run_connection", failing_connection),
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
+            # The largest jitter, so its scale is pinned too.
+            patch("botnats.irc.client.secrets.randbelow", return_value=999),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -220,10 +223,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert ports == [6667, 6668] * 5 + [6667]
         # The backoff grows to its cap of 8 steps and then stays there.
-        assert len(delays) == 10
-        for attempt, delay in enumerate(delays, start=1):
-            base = 1.5 ** min(attempt, 8)
-            assert base <= delay < base + 1.0
+        assert delays == [1.5 ** min(attempt, 8) + 0.999 for attempt in range(1, 11)]
 
     async def test_run_forever_keeps_backoff_after_short_session(self) -> None:
         """Rotate and keep backing off after a registered but brief session."""
@@ -250,6 +250,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(client, "run_connection", connection),
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
+            patch("botnats.irc.client.secrets.randbelow", return_value=0),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -257,8 +258,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 await client.run_forever()
 
         assert ports == [6667, 6668, 6667]
-        assert 1.5 <= delays[0] < 1.5 + 1.0
-        assert 1.5**2 <= delays[1] < 1.5**2 + 1.0
+        assert delays == [1.5, 1.5**2]
 
     async def test_run_forever_resets_backoff_after_stable_session(self) -> None:
         """Reset backoff and keep the server after a stable registered session."""
@@ -284,6 +284,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             patch.object(client, "run_connection", connection),
             patch("botnats.irc.client.asyncio.sleep", record_sleep),
             patch("botnats.irc.client.STABLE_SESSION_SECONDS", 0.0),
+            patch("botnats.irc.client.secrets.randbelow", return_value=0),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
@@ -293,8 +294,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         # Failure rotates away; the stable session keeps its server and
         # resets the backoff to the base delay.
         assert ports == [6667, 6668, 6668]
-        assert delays[0] >= 1.5
-        assert 1.0 <= delays[1] < 1.0 + 1.0
+        assert delays == [1.5, 1.0]
 
     async def test_send_loop_rate_limits_after_burst(self) -> None:
         """Delay sends once the token-bucket burst allowance is spent."""
@@ -697,6 +697,22 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert client.writer is None
         assert writer.is_closing()
+
+    async def test_close_survives_reset_socket(self) -> None:
+        """Return normally when a reset socket re-raises its error on close.
+
+        run_forever closes after every session, so the error would end it.
+        """
+        client = irc_client()
+        writer = mock_writer()
+        writer.wait_closed.side_effect = ConnectionResetError("peer reset")
+        client.writer = writer
+
+        async with asyncio.timeout(5):
+            await client.close()
+
+        assert client.writer is None
+        writer.transport.abort.assert_called_once_with()
 
     async def test_idle_ping_pong(self) -> None:
         """Verify idle timeout sends PING and raises on missing PONG."""

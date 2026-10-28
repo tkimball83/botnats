@@ -111,7 +111,7 @@ class ISupportState:
     def operator_modes(self) -> str:
         """Return membership modes with at least channel operator privileges."""
         op_index = self.membership_modes.find(self.op_mode)
-        return self.membership_modes[: op_index + 1] if op_index >= 0 else self.op_mode
+        return self.membership_modes[: op_index + 1]
 
     def apply(self, name: str, value: str) -> None:
         """Apply one advertised ISUPPORT token other than CASEMAPPING."""

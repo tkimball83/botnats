@@ -143,7 +143,6 @@ class IRCClient:
 
         if (
             message.command == "PONG"
-            and ping_token is not None
             and message.params
             and message.params[-1] == ping_token
         ):
@@ -386,7 +385,7 @@ class IRCClient:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Write a pre-encoded message to the socket without queuing."""
-        if self.writer is not writer or writer.is_closing():
+        if writer.is_closing():
             msg = "IRC is not connected"
             raise ConnectionError(msg)
 
@@ -423,7 +422,7 @@ class IRCClient:
                     tokens -= 1.0
 
                 await self.send_immediate(encoded, writer)
-        except OSError, RuntimeError:
+        except OSError:
             # Abort: a close() after an abort drops a TLS transport's protocol,
             # and the reader's next resume_reading() would then crash.
             writer.transport.abort()
