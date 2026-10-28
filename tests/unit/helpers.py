@@ -309,7 +309,11 @@ class FailingPartIRC(FakeIRC):
 
 
 class FakeKV:
-    """In-memory JetStream KV bucket with the key and revision checks of nats-py."""
+    """In-memory JetStream KV bucket with the key and revision checks of nats-py.
+
+    Each call suspends, as a network round trip does, so a test's timeout can
+    interrupt a loop of store calls.
+    """
 
     def __init__(self) -> None:
         """Start with an empty bucket."""
@@ -318,6 +322,7 @@ class FakeKV:
 
     async def create(self, key: str, value: bytes) -> int:
         """Store a new key, or fail as JetStream does when it already exists."""
+        await asyncio.sleep(0)
         check_key(key)
         if key in self.entries:
             raise KeyWrongLastSequenceError
@@ -326,6 +331,7 @@ class FakeKV:
 
     async def get(self, key: str) -> SimpleNamespace:
         """Return the stored entry, or fail as JetStream does when it is absent."""
+        await asyncio.sleep(0)
         check_key(key)
         if key not in self.entries:
             raise KeyNotFoundError
@@ -341,6 +347,7 @@ class FakeKV:
 
     async def update(self, key: str, value: bytes, last: int) -> int:
         """Replace a key only while its revision is still last."""
+        await asyncio.sleep(0)
         check_key(key)
         if key not in self.entries or self.entries[key][0] != last:
             raise KeyWrongLastSequenceError
