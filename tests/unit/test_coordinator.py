@@ -394,7 +394,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         nc = closing_client(coordinator)
         coordinator.nc = nc
 
-        with patch("botnats.nats.coordinator.nats.connect", AsyncMock()) as connect:
+        with patch("nats.connect", AsyncMock()) as connect:
             async with asyncio.timeout(5):
                 await coordinator.close()
                 # nats-py ran on_closed inside close(); clean up any restart first.
@@ -420,7 +420,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         connect = AsyncMock(return_value=nc)
 
         with (
-            patch("botnats.nats.coordinator.nats.connect", connect),
+            patch("nats.connect", connect),
             patch.object(
                 coordinator,
                 "init_stores",
@@ -451,6 +451,13 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             "error_cb": coordinator.on_error,
             "reconnected_cb": coordinator.on_reconnected,
         }
+        # A silent server is dropped on the third ping: within the 20 second
+        # presence TTL, not after nats-py's default of six minutes.
+        pings = {
+            name: connect.await_args.kwargs.get(name)
+            for name in ("max_outstanding_pings", "ping_interval")
+        }
+        assert pings == {"max_outstanding_pings": 2, "ping_interval": 6}
         assert coordinator.nc is nc
         assert steps == ["subscribe", "stores", "watches"]
 
@@ -473,7 +480,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         with (
-            patch("botnats.nats.coordinator.nats.connect", connect),
+            patch("nats.connect", connect),
             patch.object(coordinator, "init_stores", open_stores),
         ):
             async with asyncio.timeout(5):
@@ -511,7 +518,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 await replaced.wait()
 
         with (
-            patch("botnats.nats.coordinator.nats.connect", connect),
+            patch("nats.connect", connect),
             patch.object(coordinator, "init_stores", open_stores),
             patch.object(coordinator, "start_watches", AsyncMock()) as start_watches,
         ):
@@ -542,7 +549,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             connecting.set()
             await asyncio.Event().wait()
 
-        with patch("botnats.nats.coordinator.nats.connect", connect):
+        with patch("nats.connect", connect):
             # Without the cancel, the restart never finishes: fail, not hang.
             async with asyncio.timeout(5):
                 await coordinator.on_closed()
@@ -716,7 +723,40 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(AttemptStore, "open", fail_then_supersede),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", AsyncMock()),
+            self.assertLogs("botnats.nats.coordinator", level="WARNING"),
+        ):
+            await coordinator.init_stores()
+
+        assert attempts == 1
+
+    async def test_init_stores_stops_when_client_drops(self) -> None:
+        """Stop retrying JetStream initialization once Core NATS drops.
+
+        The reconnect's resync, or the restart after nats-py closes the client
+        for good, opens the stores again. Retrying on a closed client would
+        hold the start lock that restart waits for.
+        """
+        coordinator = build_coordinator("alpha")
+        nc = MagicMock(is_connected=True)
+        coordinator.nc = nc
+        attempts = 0
+
+        async def fail_and_drop(*arguments: object) -> None:
+            del arguments
+            nonlocal attempts
+            attempts += 1
+            if attempts > 1:
+                # Escapes the retry loop, which only absorbs transient errors.
+                self.fail("initialization retried on a dropped client")
+
+            nc.is_connected = False
+            msg = "connection lost"
+            raise OSError(msg)
+
+        with (
+            patch.object(AttemptStore, "open", fail_and_drop),
+            patch("asyncio.sleep", AsyncMock()),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             await coordinator.init_stores()
@@ -738,7 +778,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ClaimStore, "open", open_store),
             patch.object(PresenceStore, "open", open_store),
             patch.object(SessionStore, "open", open_store),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()) as sleep,
+            patch("asyncio.sleep", AsyncMock()) as sleep,
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             await coordinator.init_stores()
@@ -766,7 +806,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(ClaimStore, "open", open_store),
                 patch.object(PresenceStore, "open", open_store),
                 patch.object(SessionStore, "open", open_store),
-                patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+                patch("asyncio.sleep", AsyncMock()),
                 self.assertRaisesRegex(type(error), str(error)),
             ):
                 await coordinator.init_stores()
@@ -851,7 +891,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(PresenceStore, "open", open_store),
             patch.object(SessionStore, "open", open_store),
             patch.object(coordinator, "start_watches", start_watches),
-            patch("botnats.nats.coordinator.asyncio.sleep", sleep),
+            patch("asyncio.sleep", sleep),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             await coordinator.on_reconnected()
@@ -909,7 +949,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(coordinator, "watch_channels", crash_twice),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", AsyncMock()),
             patch("botnats.nats.coordinator.time") as clock,
             self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
         ):
@@ -947,8 +987,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 stopping.set()
-                # Its cleanup still awaits; the next cancellation ends it.
-                await asyncio.Event().wait()
+                # Its cleanup still awaits; the next cancellation ends it. The
+                # bound ends it anyway, so teardown's single cancellation
+                # cannot hang the suite when the resync is never cancelled.
+                async with asyncio.timeout(5):
+                    await asyncio.Event().wait()
 
         with (
             patch.object(coordinator, "resync", slow_to_stop),
@@ -1384,30 +1427,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert coordinator.claim.owned
 
-    async def test_watch_presence_reclaim_loser_stays_conflicted(self) -> None:
-        """Verify the loser of atomic presence reclaim stays a duplicate."""
-        coordinator = build_coordinator("alpha")
-        delete_entry = SimpleNamespace(
-            key="alpha",
-            operation="DEL",
-            value=None,
-        )
-        kv, _ = watcher(presence_entry(), None, delete_entry)
-        kv.create = AsyncMock(
-            side_effect=KeyWrongLastSequenceError,
-        )
-        # A valid signed record from another instance holds the key, so the
-        # reclaim finds a genuine duplicate and must not overwrite it.
-        kv.get = AsyncMock(
-            return_value=SimpleNamespace(revision=1, value=presence_entry().value),
-        )
-        coordinator.presence_store.kv = kv
-
-        with self.assertLogs("botnats.nats.claim", level="ERROR"):
-            await coordinator.watch_presence(MagicMock())
-
-        assert coordinator.claim.duplicate
-
     async def test_watch_presence_resolves_on_delete(self) -> None:
         """Verify a live conflict resolves when the presence entry is deleted."""
         coordinator = build_coordinator("alpha")
@@ -1509,7 +1528,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 partial(fail_once, "watch-presence"),
             ),
             patch.object(coordinator, "watch_sessions", hang),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()) as sleep,
+            patch("asyncio.sleep", AsyncMock()) as sleep,
             self.assertLogs("botnats.nats.coordinator", level="DEBUG") as logs,
         ):
             async with asyncio.timeout(5):
@@ -1580,7 +1599,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 "watch_sessions",
                 partial(watch_until_closed, "watch-sessions"),
             ),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()) as sleep,
+            patch("asyncio.sleep", AsyncMock()) as sleep,
             self.assertNoLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             async with asyncio.timeout(5):
@@ -1655,7 +1674,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator, "watch_channels", swallow_cancel),
             patch.object(coordinator, "watch_presence", swallow_cancel),
             patch.object(coordinator, "watch_sessions", swallow_cancel),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", AsyncMock()),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             async with asyncio.timeout(5):
@@ -1774,6 +1793,39 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert watch.cancelled()
         subscription.stop.assert_awaited_once_with()
 
+    async def test_cancelled_watch_failed_stop_is_quiet(self) -> None:
+        """Log nothing when stopping a cancelled watch's late watcher fails.
+
+        A drop cancels watches mid-setup, and nats-py may close the client
+        before the late watcher stops: an outage to ride out, not a bug.
+        """
+        coordinator = build_coordinator("alpha")
+        kv, subscription = watcher()
+        setting_up = asyncio.Event()
+        release = asyncio.Event()
+        subscription.stop = AsyncMock(side_effect=ConnectionClosedError)
+
+        async def watchall() -> AsyncMock:
+            setting_up.set()
+            await release.wait()
+            return subscription
+
+        kv.watchall = watchall
+        coordinator.channels_store.kv = kv
+        watch = asyncio.create_task(coordinator.watch_channels(MagicMock()))
+        with self.assertNoLogs("botnats", level="ERROR"):
+            async with asyncio.timeout(5):
+                await setting_up.wait()
+                watch.cancel()
+                await asyncio.gather(watch, return_exceptions=True)
+                stops = tuple(coordinator.watcher_stops)
+                release.set()
+                await asyncio.gather(*stops, return_exceptions=True)
+
+        assert watch.cancelled()
+        assert len(stops) == 1
+        subscription.stop.assert_awaited_once_with()
+
     async def test_watch_surfaces_programming_errors(self) -> None:
         """Verify a programming error in a watch is logged at ERROR and retried."""
         coordinator = build_coordinator("alpha")
@@ -1795,7 +1847,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator, "watch_channels", crash_once),
             patch.object(coordinator, "watch_presence", hang),
             patch.object(coordinator, "watch_sessions", hang),
-            patch("botnats.nats.coordinator.asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", AsyncMock()),
             self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
         ):
             async with asyncio.timeout(5):

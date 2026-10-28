@@ -122,21 +122,29 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         assert await store.reclaim("Alpha", heartbeat, "inst") is not None
         assert store.valid("alpha", json.loads(kv.entries["alpha"][1]))
 
-    async def test_reclaim_adopts_own_record(self) -> None:
-        """Adopt the key without a write when this instance signed it."""
-        store = PresenceStore("efnet", 1, 15.0, SECRET)
-        owned = signed_presence("inst")
-        entry = SimpleNamespace(
-            revision=8,
-            value=json.dumps(owned).encode(),
-        )
-        kv = AsyncMock()
-        kv.get = AsyncMock(return_value=entry)
-        store.kv = kv
+    async def test_reclaim_refreshes_own_record(self) -> None:
+        """Refresh this instance's own record at its revision, as a heartbeat does.
 
-        assert await store.reclaim("Alpha", owned, "inst") == 8
-        kv.get.assert_awaited_with("alpha")
-        kv.update.assert_not_awaited()
+        A reset, or a heartbeat that landed after it timed out, leaves the
+        record unowned; adopting it unwritten would skip a heartbeat and
+        delay an identity change.
+        """
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        kv = FakeKV()
+        store.kv = cast("KeyValue", kv)
+        stored = await kv.create("alpha", json.dumps(signed_presence("inst")).encode())
+        heartbeat = {
+            "bot_id": "Alpha",
+            "host": "new.host",
+            "instance_id": "inst",
+            "nick": "Alpha",
+            "user": "user",
+        }
+
+        assert await store.reclaim("Alpha", heartbeat, "inst") == stored + 1
+        record = json.loads(kv.entries["alpha"][1])
+        assert record["host"] == "new.host"
+        assert store.valid("alpha", record)
 
     async def test_reclaim_yields_to_valid_foreign_record(self) -> None:
         """Never overwrite a validly signed record from another instance."""

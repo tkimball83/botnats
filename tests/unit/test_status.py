@@ -19,6 +19,7 @@ from botnats.nats.status import (
     route_count,
     stream_info,
 )
+from tests.unit.helpers import hang
 
 
 class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
@@ -161,7 +162,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
                 connect = AsyncMock(return_value=(reader, writer))
 
-                with patch("botnats.nats.status.asyncio.open_connection", connect):
+                with patch("asyncio.open_connection", connect):
                     routes = await route_count(host, 8222)
 
                 assert routes == 2
@@ -174,7 +175,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
     async def test_route_count_unknown_when_unreachable(self) -> None:
         """Report no route count when the monitoring port refuses connections."""
         with patch(
-            "botnats.nats.status.asyncio.open_connection",
+            "asyncio.open_connection",
             AsyncMock(side_effect=ConnectionRefusedError("refused")),
         ):
             routes = await route_count("nats-1", 8222)
@@ -187,7 +188,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "botnats.nats.status.asyncio.open_connection",
+                "asyncio.open_connection",
                 AsyncMock(return_value=(asyncio.StreamReader(), writer)),
             ),
             patch("botnats.nats.status.STATUS_TIMEOUT", 0),
@@ -209,7 +210,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
 
         with patch(
-            "botnats.nats.status.asyncio.open_connection",
+            "asyncio.open_connection",
             AsyncMock(return_value=(reader, writer)),
         ):
             routes = await route_count("nats-1", 8222)
@@ -227,7 +228,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
 
         with patch(
-            "botnats.nats.status.asyncio.open_connection",
+            "asyncio.open_connection",
             AsyncMock(return_value=(reader, writer)),
         ):
             routes = await route_count("nats-1", 8222)
@@ -242,6 +243,18 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             await stream_info(kv)
 
+    async def test_stream_info_unknown_when_unanswered(self) -> None:
+        """Give up on JetStream when it is slow to answer or its socket fails."""
+        for status in (hang, AsyncMock(side_effect=ConnectionResetError("reset"))):
+            with self.subTest(status=status):
+                kv = MagicMock(status=status)
+
+                with patch("botnats.nats.status.STATUS_TIMEOUT", 0):
+                    async with asyncio.timeout(5):
+                        info = await stream_info(kv)
+
+                assert info is None
+
     async def test_route_count_rejects_deeply_nested_json(self) -> None:
         """Treat a monitoring payload too deep to parse as an unknown count."""
         reader = AsyncMock()
@@ -252,11 +265,11 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         # by platform, so raise its RecursionError directly.
         with (
             patch(
-                "botnats.nats.status.asyncio.open_connection",
+                "asyncio.open_connection",
                 AsyncMock(return_value=(reader, writer)),
             ),
             patch(
-                "botnats.nats.status.json.loads",
+                "json.loads",
                 side_effect=RecursionError("maximum recursion depth exceeded"),
             ) as loads,
         ):
@@ -279,7 +292,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
 
                 with patch(
-                    "botnats.nats.status.asyncio.open_connection",
+                    "asyncio.open_connection",
                     AsyncMock(return_value=(reader, writer)),
                 ):
                     routes = await route_count("nats-1", 8222)
