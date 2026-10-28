@@ -44,6 +44,10 @@ REGISTRATION_TIMEOUT = 60.0
 # seconds ahead of the clock; send_cost prices each line.
 SEND_CREDIT = 10.0
 STABLE_SESSION_SECONDS = 60.0
+# Without identd a server takes the username from USER, and hybrid, solanum,
+# and charybdis refuse one that does not start alphanumeric, as a valid
+# nickname need not; WHO, not USER, tells the bot its identity.
+USERNAME = "botnats"
 WRITE_TIMEOUT = 30.0
 
 
@@ -100,7 +104,8 @@ class IRCClient:
         self.on_disconnect = on_disconnect
         self.on_message = on_message
         self.outbound: asyncio.Queue[bytes] | None = None
-        self.queued_cost = 0
+        # About how long the lines queued now take to go out.
+        self.queue_delay = 0.0
         # The lines queued but not yet written, counted: copies may wait.
         self.queued_lines: Counter[bytes] = Counter()
         self.sender_task: asyncio.Task[None] | None = None
@@ -201,13 +206,7 @@ class IRCClient:
         LOGGER.info("connected to IRC server %s:%s", server.host, server.port)
         self.send("CAP", "LS", "302")
         self.send("NICK", self.current_nick)
-        self.send(
-            "USER",
-            self.config.nickname,
-            "0",
-            "*",
-            trailing=self.config.nickname,
-        )
+        self.send("USER", USERNAME, "0", "*", trailing=self.config.nickname)
         return reader, writer
 
     def handle_cap(self, message: IRCMessage) -> None:
@@ -257,11 +256,6 @@ class IRCClient:
 
         self.current_nick = next_nickname(len(self.config.nickname))
         self.send("NICK", self.current_nick)
-
-    @property
-    def queue_delay(self) -> float:
-        """Return about how long the lines queued now take to go out."""
-        return self.queued_cost
 
     def reconnect(self) -> None:
         """Force a reconnection by dropping the current socket."""
@@ -387,7 +381,7 @@ class IRCClient:
             msg = "IRC outbound queue is full"
             raise ConnectionError(msg) from error
 
-        self.queued_cost += send_cost(encoded)
+        self.queue_delay += send_cost(encoded)
         self.queued_lines[encoded] += 1
         return True
 
@@ -436,7 +430,7 @@ class IRCClient:
 
                     await asyncio.sleep(delay)
 
-                self.queued_cost -= cost
+                self.queue_delay -= cost
                 self.queued_lines[encoded] -= 1
                 if self.queued_lines[encoded] <= 0:
                     del self.queued_lines[encoded]
@@ -452,7 +446,7 @@ class IRCClient:
         task = self.sender_task
         self.sender_task = None
         self.outbound = None
-        self.queued_cost = 0
+        self.queue_delay = 0.0
         self.queued_lines.clear()
         if task is not None:
             task.cancel()

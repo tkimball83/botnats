@@ -28,6 +28,8 @@ from botnats.irc.protocol import (
 )
 from tests.unit.helpers import hang
 
+REAL_SLEEP = asyncio.sleep
+
 
 class FakeClock:
     """A loop clock that moves only by the time the sender waits.
@@ -51,6 +53,9 @@ class FakeClock:
         """Pass the time waited, then hold the sender while it is paused."""
         self.now += delay
         self.timeline.append(delay)
+        # Yield as a real sleep does, so a sender that stops advancing the
+        # clock spins into the test's bound instead of hanging the loop.
+        await REAL_SLEEP(0)
         self.sleeping.set()
         await self.resume.wait()
 
@@ -260,6 +265,30 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.tls_context is not None
         contexts = [call.kwargs["ssl"] for call in connect.await_args_list]
         assert contexts == [client.tls_context, None]
+
+    async def test_establish_registers_a_fixed_username(self) -> None:
+        """Register any valid nick under a username every server accepts.
+
+        Without identd the server takes the username from USER, and hybrid,
+        solanum, and charybdis refuse one that does not start alphanumeric.
+        """
+        client = irc_client()
+        client.config = replace(client.config, nickname="_bot")
+        connect = AsyncMock(return_value=(asyncio.StreamReader(), mock_writer()))
+        with patch("asyncio.open_connection", connect):
+            async with asyncio.timeout(5):
+                await client.establish(client.config.servers[0])
+
+        assert client.outbound is not None
+        lines = [client.outbound.get_nowait() for _ in range(3)]
+        async with asyncio.timeout(5):
+            await client.close()
+
+        assert lines == [
+            b"CAP LS 302\r\n",
+            b"NICK _bot\r\n",
+            b"USER botnats 0 * :_bot\r\n",
+        ]
 
     async def test_establish_gives_up_after_connect_timeout(self) -> None:
         """Abandon a connection attempt that outlasts the connect timeout."""
@@ -502,7 +531,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             2.0,
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
-            b"USER alpha 0 * :alpha\r\n",
+            b"USER botnats 0 * :alpha\r\n",
             op,
         ]
 
@@ -536,7 +565,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             *burst,
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
-            b"USER alpha 0 * :alpha\r\n",
+            b"USER botnats 0 * :alpha\r\n",
         ]
 
     async def test_registration_nick_rejections_retry(self) -> None:
@@ -1155,7 +1184,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert sessions[1] == [
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
-            b"USER alpha 0 * :alpha\r\n",
+            b"USER botnats 0 * :alpha\r\n",
             b"CAP REQ :chghost\r\n",
             b"CAP REQ :chghost\r\n",
             b"CAP END\r\n",
@@ -1249,6 +1278,39 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert client.outbound is not None
         assert client.outbound.empty()
+
+    async def test_send_refuses_while_close_stops_sender(self) -> None:
+        """Refuse a command while close waits for the sender, the socket still open.
+
+        The command would find no queue, and its caller handles only
+        ConnectionError.
+        """
+        client = irc_client()
+        client.outbound = asyncio.Queue()
+        client.writer = mock_writer()
+        sender_stopping = asyncio.Event()
+        released = asyncio.Event()
+        self.addCleanup(released.set)
+
+        async def slow_sender() -> None:
+            try:
+                await hang()
+            finally:
+                sender_stopping.set()
+                await released.wait()
+
+        client.sender_task = asyncio.create_task(slow_sender())
+        closer = asyncio.create_task(client.close())
+        async with asyncio.timeout(5):
+            await sender_stopping.wait()
+            assert client.connected
+            with self.assertRaisesRegex(ConnectionError, "not connected"):
+                client.send("NOTICE", "owner", trailing="hello")
+
+            released.set()
+            await closer
+
+        assert client.writer is None
 
     async def test_send_queue_holds_join_burst(self) -> None:
         """Queue the join burst for a few hundred channels without overflow.
