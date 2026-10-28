@@ -38,10 +38,10 @@ bot and NATS restarts; sessions and presence still expire at their configured TT
 | Variable                      | Purpose                                                                        |
 | ----------------------------- | ------------------------------------------------------------------------------ |
 | `BOTNATS_CONFIG`              | JSON config path; `--config` overrides it; defaults to `/etc/botnats/bot.json` |
-| `BOTNATS_COORDINATION_SECRET` | HMAC key; at least 32 bytes                                                    |
+| `BOTNATS_COORDINATION_SECRET` | HMAC key; at least 32 bytes; required                                          |
 | `BOTNATS_LOG_LEVEL`           | Python log level; defaults to `INFO`                                           |
-| `BOTNATS_NATS_TOKEN`          | NATS client token                                                              |
-| `BOTNATS_TOTP_SECRET`         | Base32 TOTP seed; at least 160 bits                                            |
+| `BOTNATS_NATS_TOKEN`          | NATS client token; required                                                    |
+| `BOTNATS_TOTP_SECRET`         | Base32 TOTP seed; at least 160 bits; required                                  |
 
 Example `bot.json`:
 
@@ -83,7 +83,7 @@ Example `bot.json`:
 | `bot.health_port`                           | HTTP liveness and readiness port; 8080 by default                         |
 | `bot.id`                                    | Unique mesh ID; compared case-insensitively; required                     |
 | `bot.network`                               | One IRC network per process; namespaces shared NATS state; required       |
-| `bot.nickname`                              | IRC nickname and connection identity; required                            |
+| `bot.nickname`                              | IRC nickname and connection identity; at most 9 characters; required      |
 | `coordination.maintenance_interval_seconds` | Seconds between maintenance cycles and presence heartbeats; 3 by default  |
 | `coordination.presence_ttl_seconds`         | Must exceed the maintenance interval; 15 seconds by default               |
 | `irc.channel_modes`                         | Required (`+`) and forbidden (`-`) modes; empty by default                |

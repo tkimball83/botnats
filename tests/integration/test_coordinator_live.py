@@ -29,21 +29,18 @@ if TYPE_CHECKING:
     from botnats.bot import NATSCallbackHandler
     from botnats.presence import BotPresence
 
+# The presence payload beta's help requests carry.
+BETA_PRESENCE = {
+    "bot_id": "beta",
+    "host": "host",
+    "instance_id": "instance",
+    "nick": "beta",
+    "user": "user",
+}
 EVENT_TIMEOUT = 5.0
 HELP_KINDS = ("invite", "limit", "op", "unban")
 SESSION_TTL = 300.0
 START_TIMEOUT = 30.0
-
-
-def presence(bot_id: str) -> dict[str, str]:
-    """Return a presence payload that a help request carries."""
-    return {
-        "bot_id": bot_id,
-        "host": "host",
-        "instance_id": "instance",
-        "nick": bot_id,
-        "user": "user",
-    }
 
 
 def ignore(*arguments: object, **keywords: object) -> None:
@@ -150,7 +147,7 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(kind=kind):
                 await self.beta.request_help(
                     kind,
-                    {"channel": "#shared", "presence": presence("beta")},
+                    {"channel": "#shared", "presence": BETA_PRESENCE},
                 )
                 async with asyncio.timeout(EVENT_TIMEOUT):
                     await self.events[kind].wait()

@@ -196,12 +196,11 @@ async def serial_replacement() -> None:
         await wait_ready(bot)
         await test_bot_restart.run()
 
-    new_key = "rotated-key"
     await compose("kill", killed)
-    await test_bot_restart.change_key(new_key)
+    await test_bot_restart.change_key()
     await compose(*UP, killed)
     await wait_ready(killed)
-    await test_bot_restart.run(new_key)
+    await test_bot_restart.run(test_bot_restart.ROTATED_KEY)
 
 
 # The mesh runs before the NATS phases so they put the bots' own durable

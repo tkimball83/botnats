@@ -25,21 +25,25 @@ from tests.integration.test_mesh import (
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+# The restarted bot's STATUS reply queues behind its registration, WHO, and
+# rejoin (JOIN, WHO, MODE, MODE +b, then MODE and enforced modes once
+# opped): 12 lines, sent within 16 seconds of connecting under flood pacing.
 RESTART_TIMEOUT = 90.0
+# A reply later than one poll is read by the next; this only paces resends.
 STATUS_POLL_WAIT = 3.0
 
 
-async def wait_for_authorized_status(session: IRCSession, bot: str) -> str:
-    """Poll STATUS until the bot answers; unauthorized senders get no reply.
+async def wait_for_authorized_status(session: IRCSession) -> str:
+    """Poll alpha's STATUS until it answers; unauthorized senders get no reply.
 
     Only a silent poll is retried: a closed connection fails at once.
     """
     async with asyncio.timeout(RESTART_TIMEOUT):
         while True:
-            await session.send("PRIVMSG", bot, trailing="STATUS")
+            await session.send("PRIVMSG", "alpha", trailing="STATUS")
             try:
                 reply = await session.read_until(
-                    private_message(bot),
+                    private_message("alpha"),
                     wait_seconds=STATUS_POLL_WAIT,
                 )
             except TimeoutError:
@@ -50,8 +54,8 @@ async def wait_for_authorized_status(session: IRCSession, bot: str) -> str:
 
 async def rejoin_after_ban(session: IRCSession) -> None:
     """Ban and kick a bot; the mesh must get it back in and lift the ban."""
-    channel, key = CHANNELS[1]
-    await join_as_operator(session, channel, key)
+    channel, _ = CHANNELS[1]
+    await join_as_operator(session)
 
     await session.send("MODE", channel, "+b", "gamma!*@*")
     await session.send("KICK", channel, "gamma", trailing="recovery test")
@@ -107,7 +111,7 @@ async def session_survives_restart(
 ) -> None:
     """Restart a bot; its admin session must replay from JetStream, not reset."""
     await restart("alpha")
-    reply = await wait_for_authorized_status(session, "alpha")
+    reply = await wait_for_authorized_status(session)
     assert reply.startswith("bot id=alpha"), reply
 
 

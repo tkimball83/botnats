@@ -18,8 +18,10 @@ from tests.integration.test_mesh import (
     wait_for_operators,
 )
 
+ROTATED_KEY = "rotated-key"
 
-async def change_key(new_key: str) -> None:
+
+async def change_key() -> None:
     """Change the keyed channel's key while a bot is down.
 
     The running bots must record the new key in JetStream, where the missing
@@ -29,13 +31,13 @@ async def change_key(new_key: str) -> None:
     session = await connect()
     try:
         await authenticate(session, "alpha", fresh_code())
-        await join_as_operator(session, channel, old_key)
+        await join_as_operator(session)
         await session.send("MODE", channel, "-k", old_key)
-        await session.send("MODE", channel, "+k", new_key)
+        await session.send("MODE", channel, "+k", ROTATED_KEY)
 
         async def recorded() -> bool:
             reply = await command(session, "beta", f"GETMODES {channel}")
-            return new_key in reply.split()
+            return ROTATED_KEY in reply.split()
 
         await poll_until(recorded, interval=2.0)
     finally:
