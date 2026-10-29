@@ -45,9 +45,10 @@ async def change_key() -> None:
 
 
 async def run(key: str = CHANNELS[1][1]) -> None:
-    """Check the bots hold the keyed channel with ops and stay out of the parted one."""
+    """Check the bots hold both present channels with ops, and not the parted one."""
     first, _ = CHANNELS[0]
     second, _ = CHANNELS[1]
+    third, _ = CHANNELS[2]
     session = await connect()
     try:
         await wait_for_bots(session)
@@ -58,6 +59,9 @@ async def run(key: str = CHANNELS[1][1]) -> None:
         mode_string = await modes(session, second)
         assert "k" in mode_string, mode_string
         await wait_for_operators(session, second, present=BOTS)
+        await session.send("JOIN", third)
+        await wait_for_names(session, third, present=BOTS | {"owner"})
+        await wait_for_operators(session, third, present=BOTS)
         # Checked once every bot is back, so a late rejoin is caught too. The
         # bots are invisible (+i), so only a member of the channel sees them.
         await session.send("JOIN", first)
