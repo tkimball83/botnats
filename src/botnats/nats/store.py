@@ -53,8 +53,10 @@ PUBLISH_ERRORS = (*CONNECT_ERRORS, StoreUnavailableError)
 DECODE_ERRORS = (RecursionError, TypeError, ValueError)
 
 ATTEMPT_LIMIT = 3
-ATTEMPT_TTL = 120.0
-ATTEMPT_WINDOW = 60
+ATTEMPT_WINDOW = 3600
+# A slot expiring inside the window would free it early; the margin covers
+# clock skew between the bots that stamp attempts and the server that expires them.
+ATTEMPT_TTL = 2.0 * ATTEMPT_WINDOW
 CAS_ATTEMPT_LIMIT = 8
 CLAIM_TTL = 300.0
 DUPLICATE_WINDOW = 120.0

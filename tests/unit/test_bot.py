@@ -261,7 +261,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.authorizer.authorized(session.prefix)
 
         bot.callbacks.on_session_update("opaque", session, replaying=False)
+        bot.callbacks.on_sessions_replayed({"opaque"})
+
+        assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}
         assert bot.authorizer.authorized(session.prefix)
+
         bot.callbacks.on_sessions_replayed(set())
 
         assert not bot.sessions.watched
