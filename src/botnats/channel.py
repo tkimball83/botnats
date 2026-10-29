@@ -141,10 +141,10 @@ class ChannelManager:
             )
             return
 
-        # Skip a line the tracked modes show is not needed. They are empty
-        # while unknown, and follow MODE changes only to the letters CHANMODES
-        # lists: any other letter can be stale.
-        if runtime.modes and all(
+        # Skip a line the tracked modes show is not needed. They are None
+        # until RPL_CHANNELMODEIS, and follow MODE changes only to the letters
+        # CHANMODES lists: any other letter can be stale.
+        if runtime.modes is not None and all(
             mode in caps.chanmodes[2] + caps.chanmodes[3]
             and (mode in runtime.modes) == adding
             for adding, modes in ((True, required), (False, forbidden))
@@ -751,7 +751,8 @@ class ChannelRuntime:
     key_pending: bool = False
     limit: int | None = None
     members: dict[str, ChannelMember] = field(default_factory=dict)
-    modes: str = ""
+    # None while unknown: from a reset until RPL_CHANNELMODEIS shows them.
+    modes: str | None = None
     # A NAMES, or a query or enforcement its end reply sends, that could not
     # be sent; the next tick resends NAMES, and its end reply the rest.
     names_due: bool = False
@@ -827,7 +828,14 @@ class ChannelRuntime:
         self.bans.pop(self.caps.fold(mask), None)
 
     def update_mode(self, mode: str, *, adding: bool) -> None:
-        """Add or remove a mode letter from the channel mode string."""
+        """Add or remove a mode letter from the channel mode string.
+
+        A change made while the modes are unknown is dropped: the
+        RPL_CHANNELMODEIS reply that makes them known already shows it.
+        """
+        if self.modes is None:
+            return
+
         current = self.modes.lstrip("+")
         if adding:
             if mode not in current:
@@ -851,7 +859,7 @@ class ChannelRuntime:
         self.key_pending = False
         self.limit = None
         self.members.clear()
-        self.modes = ""
+        self.modes = None
         self.names_due = False
 
     def set_limit(self, value: str | None) -> None:

@@ -229,7 +229,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [("MODE", ("#test", "+np-s"))] * 2
 
     async def test_enforce_modes_sends_while_modes_unknown(self) -> None:
-        """Send modes while none are tracked, or while their changes go untracked."""
+        """Send modes while unknown, or while their changes go untracked."""
         bot, fake_irc = bot_with_irc()
         configured = bot.config
         bot.config = replace(
@@ -239,6 +239,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
 
+        # Unknown, not known to lack +s: no 324 reply has shown the modes.
         bot.channel_mgr.enforce_modes(runtime)
         # The default CHANMODES lack p, so a MODE that removes it goes untracked.
         bot.config = configured
@@ -526,7 +527,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.bans == {}
         assert runtime.limit is None
         assert runtime.cooldowns == {}
-        assert runtime.modes == ""
+        assert runtime.modes is None
         assert mgr.pending_parts == {}
         assert fake_irc.sent == [("NAMES", ("#test",))]
 

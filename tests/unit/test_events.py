@@ -1437,6 +1437,71 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             ("NAMES", ("#test",)),
         ]
 
+    async def test_op_gain_enforces_until_324_shows_modes(self) -> None:
+        """Enforce on op gain until a 324 reply shows the modes in place.
+
+        MODE changes seen before it show only what changed, not the channel:
+        a +s set before this bot joined would stay. A rejoin makes the modes
+        unknown again.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.config = replace(
+            bot.config,
+            channel_modes="+nt-s",
+            enforced_modes=mode_intent("+nt-s"),
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        alpha = Prefix("alpha", "~alpha", "host.example")
+        services = Prefix("chanserv", "service", "services.host")
+
+        async def receive(message: IRCMessage) -> None:
+            bot.events.on_irc_message(message)
+            await settle(bot)
+
+        async def join_then_op() -> None:
+            await receive(IRCMessage("JOIN", ("#test",), alpha))
+            await receive(IRCMessage("MODE", ("#test", "+nt"), services))
+            assert runtime.modes is None
+            await receive(IRCMessage("MODE", ("#test", "+o", "alpha"), services))
+
+        async def reop_after_324() -> None:
+            await receive(IRCMessage("324", ("alpha", "#test", "+nt")))
+            for change in ("-o", "+o"):
+                await receive(IRCMessage("MODE", ("#test", change, "alpha"), services))
+
+        enforced = ("#test", "+nt-s", ())
+        await join_then_op()
+        assert fake_irc.modes == [enforced]
+        await reop_after_324()
+        assert fake_irc.modes == [enforced]
+
+        await receive(IRCMessage("PART", ("#test",), alpha))
+        await join_then_op()
+        assert fake_irc.modes == [enforced] * 2
+        await reop_after_324()
+        assert fake_irc.modes == [enforced] * 2
+        assert fake_irc.sent.count(("MODE", ("#test",))) == 4
+
+    async def test_op_gain_skips_forbidden_modes_324_shows_unset(self) -> None:
+        """Skip a forbid-only line once a 324 reply shows a channel without modes."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.config = replace(
+            bot.config,
+            channel_modes="-s",
+            enforced_modes=mode_intent("-s"),
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+
+        bot.events.on_irc_message(IRCMessage("324", ("alpha", "#test", "+")))
+        bot.events.on_irc_message(
+            IRCMessage("MODE", ("#test", "+o", "alpha"), Prefix("chanserv")),
+        )
+        await settle(bot)
+
+        # The op gain asks for the modes again, and sends nothing else.
+        assert fake_irc.sent == [("MODE", ("#test",))]
+
     async def test_channel_limit_tracked(self) -> None:
         """Track +l from RPL_CHANNELMODEIS and MODE changes."""
         bot, _ = bot_with_irc()
@@ -1536,6 +1601,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         first = mgr.runtime("#test")
         assert first is not None
         first.join = JoinState.JOINED
+        first.modes = "+nt"
         first.member("alpha").modes.add("o")
         first.member("Target").prefix = Prefix("Target", "user", "first.host")
 
@@ -1556,7 +1622,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         await settle(bot)
 
-        assert first.modes == "+k"
+        assert first.modes == "+ntk"
         assert first.member("Target").modes == {"o"}
         assert set(first.bans.values()) == {"*!*@first.host"}
         assert first.key == "first-key"
@@ -2062,7 +2128,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not runtime.joined
         assert runtime.bans == {}
         assert not runtime.members
-        assert runtime.modes == ""
+        assert runtime.modes is None
         assert runtime.limit is None
         assert not runtime.names_due
         assert runtime.cooldowns == {}
