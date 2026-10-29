@@ -10,7 +10,12 @@ from dataclasses import asdict, replace
 from typing import cast
 from unittest.mock import MagicMock, call, patch
 
-from botnats.channel import JOIN_REPLY_TIMEOUT, JOIN_RETRY_DELAY, JoinState
+from botnats.channel import (
+    JOIN_REPLY_TIMEOUT,
+    JOIN_RETRY_DELAY,
+    ChannelRecord,
+    JoinState,
+)
 from botnats.config import mode_intent
 from botnats.irc.protocol import (
     IRCMessage,
@@ -444,7 +449,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Verify ISUPPORT tokens update server capabilities and channel lookups."""
         bot, _ = bot_with_irc()
         mgr = bot.channel_mgr
-        mgr.apply_record(mgr.new_record("#te[st", None, present=True))
+        mgr.apply_record(ChannelRecord.new("#te[st", None, present=True))
 
         bot.events.handle_isupport(CUSTOM_ISUPPORT)
         runtime = mgr.channels[bot.caps.fold("#test")]
@@ -466,7 +471,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Forget each withdrawn ISUPPORT token; rekey on a withdrawn CASEMAPPING."""
         bot, _ = bot_with_irc()
         mgr = bot.channel_mgr
-        mgr.apply_record(mgr.new_record("#te[st", None, present=True))
+        mgr.apply_record(ChannelRecord.new("#te[st", None, present=True))
         bot.events.handle_isupport(CUSTOM_ISUPPORT)
 
         bot.events.handle_isupport(
@@ -806,7 +811,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         op = Prefix("op", "~op", "op.host")
         bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "A"), op))
         mgr.apply_record(
-            mgr.new_record(
+            ChannelRecord.new(
                 "#Test", "B", present=True, after=mgr.channel_records[folded].revision
             ),
         )
@@ -1097,7 +1102,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         coordinator = FailingWriteCoordinator()
         bot = bot_with_channel(coordinator=coordinator)
         mgr = bot.channel_mgr
-        mgr.apply_record(mgr.new_record("#room[", None, present=True))
+        mgr.apply_record(ChannelRecord.new("#room[", None, present=True))
         runtime = mgr.channels[casefold("#room[", "rfc1459")]
         runtime.join = JoinState.JOINED
         op = Prefix("op", "~op", "op.host")
@@ -1213,7 +1218,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 bot, _, coordinator = bot_with_coordinator()
                 bot.authorizer.grant(owner.render())
                 mgr = bot.channel_mgr
-                mgr.apply_record(mgr.new_record("#other", None, present=True))
+                mgr.apply_record(ChannelRecord.new("#other", None, present=True))
                 # Seen first, as listed by NAMES; WHO has not answered yet.
                 mgr.channels[casefold("#test", "rfc1459")].member("owner")
                 mgr.channels[casefold("#other", "rfc1459")].member(
@@ -1644,7 +1649,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         first.member("alpha").modes.add("o")
         first.member("Target").prefix = Prefix("Target", "user", "first.host")
 
-        mgr.apply_record(mgr.new_record("#other", "second-key", present=True))
+        mgr.apply_record(ChannelRecord.new("#other", "second-key", present=True))
         second = mgr.runtime("#other")
         assert second is not None
         second.join = JoinState.JOINED
@@ -1679,7 +1684,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Verify mode enforcement is independently triggered for each channel."""
         bot, fake_irc = bot_with_irc()
         mgr = bot.channel_mgr
-        mgr.apply_record(mgr.new_record("#other", None, present=True))
+        mgr.apply_record(ChannelRecord.new("#other", None, present=True))
         for channel in ("#test", "#other"):
             runtime = mgr.runtime(channel)
             assert runtime is not None
@@ -1880,7 +1885,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert mgr.pending_parts == {"#test": "#test"}
 
         mgr.apply_record(
-            mgr.new_record(
+            ChannelRecord.new(
                 "#test",
                 None,
                 present=True,
@@ -1920,7 +1925,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
                 mgr.channels[folded].join = JoinState.JOINED
-                parted = mgr.new_record(
+                parted = ChannelRecord.new(
                     "#test",
                     None,
                     present=False,
@@ -1935,7 +1940,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 assert mgr.pending_parts == {}
 
                 mgr.apply_record(
-                    mgr.new_record("#test", None, present=True, after=parted.revision),
+                    ChannelRecord.new(
+                        "#test", None, present=True, after=parted.revision
+                    ),
                 )
 
                 runtime = mgr.runtime("#test")
@@ -2143,7 +2150,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.set_casemapping("ascii")
         channel = "#te[st"
         bot.channel_mgr.apply_record(
-            bot.channel_mgr.new_record(channel, None, present=True),
+            ChannelRecord.new(channel, None, present=True),
         )
         identity = "owner[!user@host.example"
         bot.authorizer.grant(identity)

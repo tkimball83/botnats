@@ -250,7 +250,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         """
         bot, fake_irc, coordinator = bot_with_coordinator()
         mgr = bot.channel_mgr
-        mgr.apply_record(mgr.new_record("#other", "old", present=True))
+        mgr.apply_record(ChannelRecord.new("#other", "old", present=True))
         for runtime in mgr.channels.values():
             runtime.join = JoinState.JOINED
 

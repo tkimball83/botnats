@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 from nats.errors import Error as NatsError
 
 from botnats.bot import Bot
-from botnats.channel import JoinState
+from botnats.channel import ChannelRecord, JoinState
 from botnats.irc.client import IRCClient, IRCClientConfig, IRCServer
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.nats.coordinator import Coordinator, NATSConfig
@@ -46,7 +46,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         current = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
 
-        record = bot.channel_mgr.new_record(
+        record = ChannelRecord.new(
             "#test",
             "good-key",
             present=True,

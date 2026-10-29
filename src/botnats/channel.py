@@ -236,7 +236,7 @@ class ChannelManager:
         nothing.
         """
         current = self.channel_records.get(self.bot.caps.fold(channel))
-        record = self.new_record(
+        record = ChannelRecord.new(
             channel,
             key,
             present=present,
@@ -264,17 +264,6 @@ class ChannelManager:
         """
         record = self.source_records.get(casefold(channel, "ascii"))
         return record.revision if record is not None else None
-
-    def new_record(
-        self,
-        channel: str,
-        key: str | None,
-        *,
-        present: bool,
-        after: str | None = None,
-    ) -> ChannelRecord:
-        """Mint a record ordered after the revision after, if any."""
-        return ChannelRecord.new(channel, key, present=present, after=after)
 
     def any_peer_opped(self, runtime: ChannelRuntime) -> bool:
         """Return whether any known peer bot holds operator status."""
