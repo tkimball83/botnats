@@ -6,11 +6,12 @@
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, call, patch
 
 from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
 from botnats.commands import RELAY_SOURCE_BYTES, RateLimiter, parse_command
-from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, Prefix, casefold
+from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, IRCMessage, Prefix, casefold
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     OWNER,
@@ -19,9 +20,14 @@ from tests.unit.helpers import (
     bot_with_coordinator,
     bot_with_irc,
     bounded,
+    drain_session_writes,
     make_bot,
     send_command,
 )
+
+if TYPE_CHECKING:
+    from botnats.nats.status import NATSStatus
+    from botnats.validators import ChannelFields
 
 
 class CommandTests(unittest.TestCase):
@@ -136,6 +142,31 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ("owner", "NATS disconnected: channel #test"),
         ]
 
+    async def test_failure_reply_needs_live_session(self) -> None:
+        """Send no write error once the admin quit while the write was in flight.
+
+        Another user may hold the admin's old nick by the time the write fails.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot, fake_irc, _ = bot_with_coordinator(coordinator)
+        bot.authorizer.grant(OWNER.render())
+        put_channel = coordinator.put_channel
+
+        async def put_after_quit(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+            return await put_channel(record, after=after)
+
+        with patch.object(coordinator, "put_channel", put_after_quit):
+            await bounded(bot.commands.dispatch(OWNER, "JOIN #new"))
+
+        await drain_session_writes(bot)
+        assert casefold("#new", "rfc1459") not in bot.channel_mgr.channels
+        assert fake_irc.privmsgs == []
+
     async def test_join_reports_superseded_update(self) -> None:
         """Tell the admin when another bot's newer record wins the write."""
         bot, fake_irc, coordinator = bot_with_coordinator()
@@ -160,6 +191,30 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         # Unlike a JOIN's record, the PART's keeps no live key.
         assert coordinator.channel_puts[-1]["key"] is None
 
+    async def test_join_reply_needs_live_session(self) -> None:
+        """Send no JOIN reply once the admin quit while its write was in flight.
+
+        Another user may hold the admin's old nick by the time the write lands.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        put_channel = coordinator.put_channel
+
+        async def put_after_quit(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+            return await put_channel(record, after=after)
+
+        with patch.object(coordinator, "put_channel", put_after_quit):
+            await bounded(bot.commands.dispatch(OWNER, "JOIN #new"))
+
+        await drain_session_writes(bot)
+        assert casefold("#new", "rfc1459") in bot.channel_mgr.channels
+        assert fake_irc.privmsgs == []
+
     async def test_parse_error_reaches_authenticated_admin(self) -> None:
         """Explain an unparseable command to a sender who is authenticated."""
         bot, fake_irc = bot_with_irc()
@@ -179,15 +234,30 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.privmsgs == [("owner", "No record for #missing")] * 3
 
-    async def test_admin_ban_not_opped(self) -> None:
-        """Verify BAN command reports when bot is not opped."""
+    async def test_admin_commands_not_opped(self) -> None:
+        """Refuse BAN, DEOP, OP, and UNBAN on a channel where the bot is not opped."""
         bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        # Each command would act here if the bot were opped.
+        runtime.member("Chanop").modes.add("o")
+        runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
+        runtime.add_ban("*!*@bad.host")
         bot.authorizer.grant(OWNER.render())
 
-        await bounded(bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host"))
+        for text in (
+            "BAN #test *!*@bad.host",
+            "DEOP #test Chanop",
+            "OP #test Target",
+            "UNBAN #test *!*@bad.host",
+        ):
+            with self.subTest(text=text):
+                fake_irc.privmsgs.clear()
+
+                await bounded(bot.commands.dispatch(OWNER, text))
+
+                assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
         assert fake_irc.modes == []
-        assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
     async def test_admin_getbans(self) -> None:
         """Verify GETBANS command lists tracked channel bans."""
@@ -603,6 +673,28 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
         ]
 
+    async def test_status_reply_needs_live_session(self) -> None:
+        """Send no NATS status once the admin renamed while it was read.
+
+        Another user may hold the admin's old nick by the time NATS answers.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        status = coordinator.status
+
+        async def status_after_nick() -> NATSStatus:
+            bot.events.on_irc_message(IRCMessage("NICK", ("owner2",), OWNER))
+            return await status()
+
+        with patch.object(coordinator, "status", status_after_nick):
+            await bounded(bot.commands.dispatch(OWNER, "STATUS"))
+
+        await drain_session_writes(bot)
+        # Only the line sent before the await reached the admin.
+        assert fake_irc.privmsgs == [
+            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=0"),
+        ]
+
     async def test_unknown_command(self) -> None:
         """Verify an unrecognized command sends an error to the user."""
         bot, fake_irc, _ = bot_with_coordinator()
@@ -624,6 +716,9 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             "JOIN": "JOIN <channel> [key]",
             "DEOP #test ghost": "ghost is not opped on #test",
             "BAN #missing *!*@x": "Not opped on #missing",
+            "DEOP #missing ghost": "Not opped on #missing",
+            "OP #missing ghost": "Not opped on #missing",
+            "UNBAN #missing *!*@x": "Not opped on #missing",
         }
 
         for text, reply in replies.items():
@@ -689,6 +784,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             channel_modes="",
             enforced_modes=(frozenset(), frozenset()),
         )
+        bot.authorizer.grant(OWNER.render())
 
         await bounded(bot.commands.cmd_join(OWNER, ("#new",)))
 
@@ -701,6 +797,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.key = "live-key"
         base = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")].revision
+        bot.authorizer.grant(OWNER.render())
 
         await bounded(bot.commands.cmd_join(OWNER, ("#test",)))
 

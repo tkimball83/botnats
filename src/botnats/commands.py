@@ -106,7 +106,13 @@ class CommandHandler:
             if runtime is not None:
                 key = runtime.key
 
-        if not await self.bot.channel_mgr.write_record(channel, key, present=present):
+        won = await self.bot.channel_mgr.write_record(channel, key, present=present)
+        # The session may have ended during the write, and its nick passed to
+        # another user: reply only while it still holds.
+        if not self.bot.authorizer.authorized(prefix.render()):
+            return
+
+        if not won:
             self.reply(prefix.nick, f"Update superseded for {channel}")
             return
 
@@ -344,7 +350,9 @@ class CommandHandler:
             f"peers={peers} channels={joined}",
         )
         status = await self.bot.coordinator.status()
-        self.reply(prefix.nick, status.render())
+        # The session may have ended while NATS answered.
+        if self.bot.authorizer.authorized(prefix.render()):
+            self.reply(prefix.nick, status.render())
 
     async def cmd_unban(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Remove a ban mask from a channel."""
@@ -395,7 +403,9 @@ class CommandHandler:
         try:
             await handler(prefix, arguments)
         except (*PUBLISH_ERRORS, ValueError) as error:
-            self.reply(prefix.nick, str(error) or "Command failed")
+            # A handler may fail after an await that outlived the session.
+            if self.bot.authorizer.authorized(rendered):
+                self.reply(prefix.nick, str(error) or "Command failed")
 
     def opped_channel(self, channel: str) -> ChannelRuntime:
         """Return a tracked channel where this bot has operator status."""
