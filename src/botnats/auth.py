@@ -10,7 +10,12 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 from botnats.irc.protocol import casefold
-from botnats.nats.store import PUBLISH_ERRORS, Session, session_signature
+from botnats.nats.store import (
+    PUBLISH_ERRORS,
+    SESSION_TTL,
+    Session,
+    session_signature,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -381,7 +386,6 @@ class TotpAuthorizer:
         coordination_secret: bytes,
         identity_fold: Callable[[str], str],
         scope: tuple[str, str],
-        session_ttl: float,
     ) -> None:
         self.coordination_key = coordination_secret
         self.identity_fold = identity_fold
@@ -390,7 +394,6 @@ class TotpAuthorizer:
         # Each identity's highest-ranked session or revocation, except that a
         # grant replaces a held live session whatever its rank.
         self.records: dict[str, Session] = {}
-        self.session_ttl = session_ttl
 
     def authorized(self, prefix: str, *, now: float | None = None) -> bool:
         """Return whether the prefix has a valid, unexpired session.
@@ -457,7 +460,7 @@ class TotpAuthorizer:
     ) -> Session:
         """Create an authenticated session for the given IRC prefix."""
         current = time.time() if now is None else now
-        expires_at = current + self.session_ttl
+        expires_at = current + SESSION_TTL
         session = self.create(prefix, expires_at, self.issuer)
         key = self.identity_fold(prefix)
         existing = self.records.get(key)

@@ -56,9 +56,6 @@ OWNER = Prefix("owner", "user", "real.host")
 # Every value differs from its default, so a field the loader drops or
 # misroutes cannot pass as its default.
 CONFIG = b"""{
-  "authorization": {
-    "session_ttl_seconds": 600
-  },
   "bot": {
     "health_port": 9080,
     "id": "botnats-1",
@@ -204,7 +201,6 @@ def bot_with_irc() -> tuple[Bot, FakeIRC]:
 def config() -> BotConfig:
     """Build a default test configuration."""
     return BotConfig(
-        auth_session_ttl=3600,
         bot_id="alpha-id",
         channel_modes="+npst",
         coordination_secret=COORDINATION_KEY,
@@ -383,12 +379,7 @@ class FakeCoordinator:
         self.attempts = AttemptStore("efnet", 1, COORDINATION_KEY)
         self.channels = ChannelStore("efnet", 1, COORDINATION_KEY)
         self.claims = ClaimStore("efnet", 1, COORDINATION_KEY)
-        self.sessions = SessionStore(
-            "efnet",
-            1,
-            COORDINATION_KEY,
-            config().auth_session_ttl,
-        )
+        self.sessions = SessionStore("efnet", 1, COORDINATION_KEY)
         for store in (self.attempts, self.channels, self.claims, self.sessions):
             store.kv = cast("KeyValue", FakeKV())
 

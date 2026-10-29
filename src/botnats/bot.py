@@ -51,7 +51,6 @@ class Bot:
             coordination_secret=config.coordination_secret,
             identity_fold=self.caps.fold_identity,
             scope=(config.bot_id, config.network),
-            session_ttl=config.auth_session_ttl,
         )
         instance_id = uuid.uuid4().hex
         self.presence = PresenceRegistry(config.presence_ttl)
@@ -66,7 +65,6 @@ class Bot:
                 presence_ttl=config.presence_ttl,
                 replicas=config.jetstream_replicas,
                 servers=config.nats_servers,
-                session_ttl=config.auth_session_ttl,
                 token=config.nats_token,
             ),
             envelope=Envelope(config.bot_id, config.coordination_secret),

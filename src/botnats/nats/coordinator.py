@@ -62,7 +62,6 @@ class NATSConfig:
     presence_ttl: float
     replicas: int
     servers: tuple[str, ...]
-    session_ttl: float
     token: str = field(repr=False)
 
 
@@ -166,7 +165,6 @@ class Coordinator:
             config.network,
             config.replicas,
             coordination_key,
-            config.session_ttl,
         )
         self.stores = (
             self.attempts,
@@ -656,7 +654,7 @@ class Coordinator:
 
         An unauthentic value hides the record it replaced, so it is reported
         as a delete. A signed grant beyond this bot's horizon comes from a
-        peer with a longer session TTL or a faster clock: it is not applied,
+        peer whose clock runs ahead by more than the grace: it is not applied,
         but a replay still counts its key. Treated as missing, it would have
         this bot write back over that peer's record. A signed revocation is
         applied at any expiry: skipped, it would leave an older grant this

@@ -30,6 +30,7 @@ from botnats.nats.store import (
     CAS_ATTEMPT_LIMIT,
     PRESENCE_DRIFT,
     SESSION_EXPIRY_GRACE,
+    SESSION_TTL,
     AttemptStore,
     ChannelStore,
     ClaimStore,
@@ -1062,7 +1063,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_revocation_wins_equal_expiry_and_version(self) -> None:
         """Order a revocation over an active session that ties on everything else."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
         expires_at = time.time() + 40
         revocation = session_record(expires_at, 1, revoked=True)
@@ -1087,7 +1088,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_put_yields_to_concurrent_writer(self) -> None:
         """Return and keep a newer session that lands between our read and write."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
         expires_at = time.time() + 40
         concurrent = session_record(expires_at, 2)
@@ -1108,13 +1109,13 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_horizon_ends_one_ttl_plus_grace_away(self) -> None:
         """Accept a record expiring exactly at the horizon and refuse a later one."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
         key = sessions.key("owner!user@host")
         now = 1_000_000.0
-        edge = session_record(now + 60 + SESSION_EXPIRY_GRACE)
-        future = session_record(now + 60 + SESSION_EXPIRY_GRACE + 1)
+        edge = session_record(now + SESSION_TTL + SESSION_EXPIRY_GRACE)
+        future = session_record(now + SESSION_TTL + SESSION_EXPIRY_GRACE + 1)
 
         with patch("botnats.nats.store.time") as clock:
             clock.time.return_value = now
@@ -1130,9 +1131,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_verify_ignores_only_the_horizon(self) -> None:
         """Verify a signed, key-bound record beyond the horizon parse refuses."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         key = sessions.key("owner!user@host")
-        future = session_record(time.time() + 60 + SESSION_EXPIRY_GRACE + 60)
+        future = session_record(time.time() + SESSION_TTL + SESSION_EXPIRY_GRACE + 60)
         unsigned = {k: v for k, v in future.items() if k != "signature"}
 
         assert sessions.verify(key, future) == parsed_session(future)
@@ -1142,7 +1143,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_signature_covers_every_field(self) -> None:
         """Refuse a record whose signed fields changed or whose signature is bad."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
         expiry = time.time() + 30
@@ -1213,7 +1214,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_parse_binds_record_to_key(self) -> None:
         """Reject a signed session stored under another identity's key."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         key = sessions.key("owner!user@host")
         current = session_record(time.time() + 60)
 
@@ -1222,7 +1223,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_parse_rejects_non_finite_expiry(self) -> None:
         """Reject a correctly signed record whose expiry is NaN or infinite."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
 
         for expiry in (math.nan, math.inf, -math.inf):
             with self.subTest(expiry=expiry):
@@ -1249,7 +1250,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         channels.kv.update.assert_awaited_once()
 
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
         impossible = session_record(time.time() + 1_000_000, 1, revoked=True)
         sessions.kv.get.return_value = SimpleNamespace(
@@ -1281,7 +1282,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         channels.kv.update.assert_awaited_once()
 
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
         sessions.kv.get.return_value = oversized
         sessions.kv.update.return_value = 2
@@ -1319,7 +1320,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_state_keys_do_not_depend_on_irc_casemapping(self) -> None:
         """Keep RFC1459-only equivalents in distinct durable KV entries."""
         channels = ChannelStore("efnet", 1, SECRET)
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
 
         assert channels.key("#room[") != channels.key("#room{")
         assert channels.key("#ROOM[") == channels.key("#room[")
@@ -1335,19 +1336,19 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_channel_and_session_keys_are_secret_derived(self) -> None:
         """Key records by a digest of the coordination secret, never the raw name."""
         channel_key = ChannelStore("efnet", 1, SECRET).key("#test")
-        session_key = SessionStore("efnet", 1, SECRET, 60).key("owner!user@host")
+        session_key = SessionStore("efnet", 1, SECRET).key("owner!user@host")
 
         for key in (channel_key, session_key):
             assert re.fullmatch("[0-9a-f]{64}", key) is not None
 
         assert channel_key != ChannelStore("efnet", 1, OTHER_SECRET).key("#test")
-        assert session_key != SessionStore("efnet", 1, OTHER_SECRET, 60).key(
+        assert session_key != SessionStore("efnet", 1, OTHER_SECRET).key(
             "owner!user@host",
         )
 
     async def test_session_parse_rejects_unencodable_identity(self) -> None:
         """Reject, without raising, a record with an unencodable prefix or issuer."""
-        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions = SessionStore("efnet", 1, SECRET)
         prefix = "owner!user@" + chr(0xD800)
         record = {
             "expires_at": time.time() + 30,

@@ -211,7 +211,7 @@ PHASES = (
     ("three-bot mesh", test_mesh.run),
     ("NATS node failover", node_failover),
     ("full NATS restart", cluster_restart),
-    ("session TTL change", test_ttl_change.ttl_change),
+    ("presence TTL change", test_ttl_change.ttl_change),
     ("ban, kick, limit, invite, and restart recovery", recovery),
     ("serial bot replacement", serial_replacement),
 )

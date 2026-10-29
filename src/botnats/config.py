@@ -33,7 +33,6 @@ NICKNAME_RE = re.compile(r"[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]*")
 class BotConfig:
     """Validated configuration used by one bot process."""
 
-    auth_session_ttl: float
     bot_id: str
     channel_modes: str
     coordination_secret: bytes = field(repr=False)
@@ -63,7 +62,6 @@ class BotConfig:
             msg = "configuration must be an object"
             raise TypeError(msg)
 
-        authorization = table(raw, "authorization", "session_ttl_seconds")
         bot = table(raw, "bot", "health_port", "id", "network", "nickname")
         coordination = table(
             raw,
@@ -113,15 +111,7 @@ class BotConfig:
             )
             raise ValueError(msg)
 
-        session_ttl = positive_float(
-            authorization,
-            "session_ttl_seconds",
-            "authorization",
-            3600,
-        )
-
         return cls(
-            auth_session_ttl=session_ttl,
             bot_id=bot_id,
             channel_modes=channel_modes,
             coordination_secret=coordination_secret,

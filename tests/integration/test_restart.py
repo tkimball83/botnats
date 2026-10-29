@@ -9,7 +9,13 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 from botnats.channel import ChannelRecord
-from botnats.nats.store import ChannelStore, ClaimStore, SessionStore, session_signature
+from botnats.nats.store import (
+    SESSION_TTL,
+    ChannelStore,
+    ClaimStore,
+    SessionStore,
+    session_signature,
+)
 from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
     connect,
@@ -25,7 +31,6 @@ CHANNEL = "#botnats-restart"
 CHANNEL_KEY = "restart-key"
 COUNTER = 987_654_321
 SESSION_IDENTITY = "restart!user@host.example"
-SESSION_TTL = 3600.0
 
 
 def session_record(
@@ -53,7 +58,7 @@ def stores() -> tuple[ClaimStore, ChannelStore, SessionStore]:
     return (
         ClaimStore("restart-test", JETSTREAM_REPLICAS, secret),
         ChannelStore("restart-test", JETSTREAM_REPLICAS, secret),
-        SessionStore("restart-test", JETSTREAM_REPLICAS, secret, SESSION_TTL),
+        SessionStore("restart-test", JETSTREAM_REPLICAS, secret),
     )
 
 

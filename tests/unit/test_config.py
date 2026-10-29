@@ -51,7 +51,6 @@ class ConfigTests(unittest.TestCase):
         config = load_config(json.loads(CONFIG))
 
         assert config == BotConfig(
-            auth_session_ttl=600,
             bot_id="botnats-1",
             channel_modes="+nt-s",
             coordination_secret=COORDINATION_KEY,
@@ -161,7 +160,6 @@ class ConfigTests(unittest.TestCase):
     def test_optional_settings_default(self) -> None:
         """Load defaults for omitted optional keys and tables."""
         raw = json.loads(CONFIG)
-        del raw["authorization"]
         del raw["coordination"]
         del raw["bot"]["health_port"]
         for key in ("channel_modes", "connect_timeout_seconds", "verify_tls"):
@@ -173,7 +171,6 @@ class ConfigTests(unittest.TestCase):
         # CONFIG sets every optional key away from its default.
         assert load_config(raw) == replace(
             load_config(json.loads(CONFIG)),
-            auth_session_ttl=3600,
             channel_modes="",
             enforced_modes=(frozenset(), frozenset()),
             health_port=8080,
@@ -188,7 +185,6 @@ class ConfigTests(unittest.TestCase):
     def test_durations_must_be_numbers(self) -> None:
         """Reject a timeout or interval written as a string or a boolean."""
         durations = (
-            ("authorization", "session_ttl_seconds"),
             ("coordination", "maintenance_interval_seconds"),
             ("coordination", "presence_ttl_seconds"),
             ("irc", "connect_timeout_seconds"),
@@ -206,15 +202,6 @@ class ConfigTests(unittest.TestCase):
                     ),
                 ):
                     load_config(raw)
-
-    def test_session_ttl_has_no_maximum(self) -> None:
-        """Accept a session lifetime longer than a day."""
-        raw = json.loads(CONFIG)
-        raw["authorization"]["session_ttl_seconds"] = 172800
-
-        config = load_config(raw)
-
-        assert config.auth_session_ttl == 172800
 
     def test_required_key_errors_name_their_section(self) -> None:
         """Qualify required-key errors with their configuration table."""
@@ -271,8 +258,8 @@ class ConfigTests(unittest.TestCase):
     def test_non_table_section_is_rejected(self) -> None:
         """Reject a section that is present but not an object."""
         raw = json.loads(CONFIG)
-        raw["authorization"] = []
-        with self.assertRaisesRegex(TypeError, "authorization must be a JSON object"):
+        raw["coordination"] = []
+        with self.assertRaisesRegex(TypeError, "coordination must be a JSON object"):
             load_config(raw)
 
     def test_config_requires_object(self) -> None:
@@ -400,9 +387,13 @@ class ConfigTests(unittest.TestCase):
         nested["nats"]["jetsteam_replicas"] = 3
         top = json.loads(CONFIG)
         top["coordinaton"] = top.pop("coordination")
+        # The session lifetime is fixed; a config that still sets it fails.
+        removed = json.loads(CONFIG)
+        removed["authorization"] = {"session_ttl_seconds": 3600}
         for raw, message in (
             (nested, r"unsupported nats configuration key\(s\): jetsteam_replicas$"),
             (top, r"unsupported root configuration key\(s\): coordinaton$"),
+            (removed, r"unsupported root configuration key\(s\): authorization$"),
         ):
             with (
                 self.subTest(message=message),

@@ -85,7 +85,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(
             replace(
                 config(),
-                auth_session_ttl=600,
                 health_port=9080,
                 jetstream_replicas=3,
                 nats_monitor_port=9222,
@@ -97,7 +96,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         # The secrets differ, so a swap of the two cannot pass.
         assert bot.authorizer.secret == AUTH_KEY
         assert bot.authorizer.coordination_key == COORDINATION_KEY
-        assert bot.authorizer.session_ttl == 600
         assert bot.authorizer.issuer == "alpha-id"
         assert bot.authorizer.network == "libera"
         # Only the nick folds under the server casemapping: rfc1459 folding
@@ -114,7 +112,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             presence_ttl=10,
             replicas=3,
             servers=("nats://nats.internal:4222",),
-            session_ttl=600,
             token=NATS_CREDENTIAL,
         )
         assert bot.coordinator.envelope.bot_id == "alpha-id"
