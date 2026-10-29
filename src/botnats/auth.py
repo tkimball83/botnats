@@ -324,9 +324,10 @@ class SessionSync:
         """Write one queued mutation; re-queue a revocation that met a newer grant.
 
         Returns False only when JetStream fails, which stops the drain. A
-        record the store refuses, expiring past its horizon after the wall
-        clock stepped back, stays queued until the clock catches up without
-        holding later writes.
+        record the store refuses as expiring past its horizon, after the wall
+        clock stepped back or as a revocation from a peer whose clock runs
+        ahead, stays queued until the clock catches up without holding later
+        writes.
         """
         try:
             stored = await self.coordinator.put_session(asdict(session))
