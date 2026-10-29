@@ -655,10 +655,12 @@ class Coordinator:
         """Watch the sessions KV bucket and report validated records by key.
 
         An unauthentic value hides the record it replaced, so it is reported
-        as a delete. A signed record beyond this bot's horizon comes from a
+        as a delete. A signed grant beyond this bot's horizon comes from a
         peer with a longer session TTL or a faster clock: it is not applied,
         but a replay still counts its key. Treated as missing, it would have
-        this bot write back over that peer's record.
+        this bot write back over that peer's record. A signed revocation is
+        applied at any expiry: skipped, it would leave an older grant this
+        bot holds for its identity authorized.
         """
         replayed: set[str] | None = set()
         kv = await self.sessions.open()
@@ -688,7 +690,7 @@ class Coordinator:
                 if replayed is not None:
                     replayed.add(entry.key)
 
-                if not self.sessions.within_horizon(session):
+                if not session.revoked and not self.sessions.within_horizon(session):
                     continue
 
                 self.callbacks.on_session_update(

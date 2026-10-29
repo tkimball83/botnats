@@ -11,7 +11,13 @@ from typing import TYPE_CHECKING
 
 from botnats.auth import totp
 from botnats.irc.protocol import IRCMessage, format_message, parse_message
-from tests.integration.test_failover import JETSTREAM_REPLICAS
+from botnats.nats.store import AttemptStore
+from tests.integration.test_failover import (
+    JETSTREAM_REPLICAS,
+    coordination_key,
+    keep_trying,
+)
+from tests.integration.test_failover import connect as connect_nats
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -113,12 +119,31 @@ async def authenticate(
     code: str,
     expected: str = "Authorized",
 ) -> None:
-    """Send AUTH with a code and wait for the bot's exact reply."""
+    """Clear AUTH attempts, send AUTH with a code, and wait for the exact reply."""
+    await clear_attempts()
     await session.send("PRIVMSG", bot, trailing=f"AUTH {code}")
     await session.read_until(
         private_message(bot, expected),
         wait_seconds=REPLY_TIMEOUT,
     )
+
+
+async def clear_attempts() -> None:
+    """Purge the AUTH attempt bucket, so each AUTH starts a fresh budget.
+
+    Every test connection comes from one host, and a run makes more AUTH
+    attempts than the limit allows a host in an hour.
+    """
+    bucket = AttemptStore("integration", JETSTREAM_REPLICAS, coordination_key()).bucket
+    nc = await connect_nats()
+    try:
+        js = nc.jetstream()
+        await keep_trying(
+            lambda: js.purge_stream(f"KV_{bucket}"),
+            "the AUTH attempt bucket was not purged",
+        )
+    finally:
+        await nc.drain()
 
 
 async def command(session: IRCSession, bot: str, text: str) -> str:

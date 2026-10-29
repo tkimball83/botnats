@@ -26,7 +26,7 @@ stores shared durable state and atomic authentication controls.
 | ------------------------------ | ------------ | ---------------------------- |
 | Channel configuration and keys | JetStream KV | Until changed or removed     |
 | Authorization sessions         | JetStream KV | Configured session TTL       |
-| Authentication attempts        | JetStream KV | Two minutes                  |
+| Authentication attempts        | JetStream KV | Two hours                    |
 | Used TOTP counters             | JetStream KV | Five minutes                 |
 | Bot presence                   | JetStream KV | Configured presence TTL      |
 
@@ -126,7 +126,7 @@ Enroll the TOTP seed with SHA-1, six digits, and a 30-second period. Then send:
 /msg mybot AUTH <totp-code>
 ```
 
-Authentication allows three attempts per host in a mesh-wide sliding 60-second
+Authentication allows three attempts per host in a mesh-wide sliding one-hour
 window; users sharing a hostname share that budget. Each TOTP counter can be
 claimed once. An attempt over the limit, or made while NATS is unavailable, gets
 no reply.

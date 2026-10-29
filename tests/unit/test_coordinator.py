@@ -1454,8 +1454,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         update.assert_called_once_with(key, session_value(expiry), replaying=True)
         replayed.assert_called_once_with({key})
 
-    async def test_session_watch_skips_record_beyond_horizon(self) -> None:
-        """Skip a signed record beyond the horizon, reporting no update or delete.
+    async def test_session_watch_skips_grant_beyond_horizon(self) -> None:
+        """Skip a signed grant beyond the horizon, reporting no update or delete.
 
         A peer with a longer session TTL or a faster clock writes it; a delete
         would have this bot write back over it, and that peer write it again.
@@ -1486,37 +1486,46 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         update.assert_not_called()
         replayed.assert_called_once_with({key})
 
-    async def test_replayed_record_beyond_horizon_keeps_held_revocation(
-        self,
-    ) -> None:
-        """Write nothing back when a replay holds a peer's grant beyond the horizon.
+    async def test_session_watch_applies_revocation_beyond_horizon(self) -> None:
+        """Revoke a held grant with a signed revocation beyond the horizon.
 
-        The grant replaced this bot's revocation; writing the revocation back
-        would undo the peer's authentication.
+        A peer with a longer session TTL or a faster clock revokes its own
+        grant, which outranks this bot's; skipped, the revocation would leave
+        this bot's grant authorized until it expires. It applies during the
+        replay and after it, and the peer's later grant beyond the horizon
+        does not undo it.
         """
-        bot, _, _ = bot_with_coordinator()
-        coordinator = build_coordinator("alpha")
-        coordinator.callbacks = bot.callbacks
         prefix = "owner!user@host"
-        key = coordinator.sessions.key(prefix)
-        bot.authorizer.keep(bot.authorizer.create(prefix, time.time() + 60, "alpha"))
-        revocation = bot.authorizer.revoke(prefix)
-        assert revocation is not None
-        bot.sessions.observe(key, revocation, replaying=False)
-        horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
-        grant = SimpleNamespace(
-            key=key,
-            operation=None,
-            value=json.dumps(session_record(horizon + 60)).encode(),
-        )
-        kv, _ = watcher(grant, None)
-        coordinator.sessions.kv = kv
+        for replaying in (True, False):
+            with self.subTest(replaying=replaying):
+                bot, _, _ = bot_with_coordinator()
+                coordinator = build_coordinator("alpha")
+                coordinator.callbacks = bot.callbacks
+                key = coordinator.sessions.key(prefix)
+                bot.authorizer.keep(
+                    bot.authorizer.create(prefix, time.time() + 60, "alpha"),
+                )
+                horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
+                revocation, grant = (
+                    SimpleNamespace(
+                        key=key,
+                        operation=None,
+                        value=json.dumps(record).encode(),
+                    )
+                    for record in (
+                        session_record(horizon + 60, 1, revoked=True),
+                        session_record(horizon + 120),
+                    )
+                )
+                entries = (revocation, None) if replaying else (None, revocation)
+                kv, _ = watcher(*entries, grant)
+                coordinator.sessions.kv = kv
 
-        await bounded(coordinator.watch_sessions(MagicMock()))
+                await bounded(coordinator.watch_sessions(MagicMock()))
 
-        assert key in bot.sessions.watched
-        assert not bot.sessions.pending
-        assert not bot.tasks
+                assert not bot.authorizer.authorized(prefix)
+                assert key in bot.sessions.watched
+                assert not bot.sessions.pending
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""

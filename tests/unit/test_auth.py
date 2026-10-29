@@ -443,6 +443,43 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.authorizer.authorized(prefix.render())
         assert not bot.sessions.pending
 
+    async def test_auth_stays_cancelled_behind_outranking_revocation(self) -> None:
+        """End cancelled when shutdown cancels a grant write a revocation outranks.
+
+        The held revocation expires after any grant AUTH can make, so the
+        grant leaves it in place and there is no session left to revoke.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        bot.authorizer.keep(
+            bot.authorizer.create(
+                prefix.render(),
+                time.time() + bot.config.auth_session_ttl + 60,
+                "beta",
+                revoked=True,
+            ),
+        )
+        writing = asyncio.Event()
+
+        async def hang(record: dict[str, Any]) -> Session:
+            del record
+            writing.set()
+            never: asyncio.Future[Session] = asyncio.get_running_loop().create_future()
+            return await never
+
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        with patch.object(coordinator, "put_session", hang):
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
+            )
+            task = next(t for t in bot.tasks if t.get_name() == "admin-command")
+            async with asyncio.timeout(1):
+                await writing.wait()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        assert task.cancelled()
+
     async def test_auth_revocation_survives_shutdown_awaiting_lock(self) -> None:
         """Store AUTH's revocation though shutdown cancels its wait for the lock.
 

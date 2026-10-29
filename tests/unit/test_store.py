@@ -287,6 +287,11 @@ class PresenceValidTests(unittest.TestCase):
         changes: dict[str, dict[str, object]] = {
             "bot_id changed": {"bot_id": "Alpha"},
             "host changed": {"host": "other"},
+            # Without a separator between fields, this would sign alike.
+            "character moved from host to instance_id": {
+                "host": "hos",
+                "instance_id": "tinst",
+            },
             "instance_id changed": {"instance_id": "other"},
             "nick changed": {"nick": "other"},
             "user changed": {"user": "other"},
@@ -477,11 +482,12 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             value=float(0).hex().encode(),
         )
         attempts.kv.update.return_value = 8
+        now = float(ATTEMPT_WINDOW + 1)
 
-        assert await bounded(attempts.allow("host.example", now=61))
+        assert await bounded(attempts.allow("host.example", now=now))
         attempts.kv.update.assert_awaited_once_with(
             attempts.key("host.example", 0),
-            float(61).hex().encode(),
+            now.hex().encode(),
             last=7,
         )
 
@@ -502,6 +508,17 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             now.hex().encode(),
             last=7,
         )
+
+    async def test_attempts_count_for_one_hour(self) -> None:
+        """Refuse attempts over the limit until the earlier ones are an hour old."""
+        attempts = AttemptStore("efnet", 3, SECRET)
+        attempts.kv = cast("KeyValue", FakeKV())
+        start = 1_000_000.0
+        for _ in range(ATTEMPT_LIMIT):
+            assert await bounded(attempts.allow("host.example", now=start))
+
+        assert not await bounded(attempts.allow("host.example", now=start + 3599.5))
+        assert await bounded(attempts.allow("host.example", now=start + 3600.5))
 
     async def test_unreadable_attempts_fail_closed(self) -> None:
         """Count slots holding no value, non-hex, or non-UTF-8 bytes as taken."""
@@ -533,12 +550,12 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv = AsyncMock()
         attempts.kv.get.side_effect = [
             MagicMock(revision=7, value=float(0).hex().encode()),
-            MagicMock(value=float(60).hex().encode()),
-            MagicMock(value=float(60).hex().encode()),
+            MagicMock(value=float(ATTEMPT_WINDOW).hex().encode()),
+            MagicMock(value=float(ATTEMPT_WINDOW).hex().encode()),
         ]
         attempts.kv.update.side_effect = KeyWrongLastSequenceError()
 
-        assert not await bounded(attempts.allow("host.example", now=61))
+        assert not await bounded(attempts.allow("host.example", now=ATTEMPT_WINDOW + 1))
         attempts.kv.update.assert_awaited_once()
 
     async def test_sliding_window_update_conflict_tries_next_slot(self) -> None:
@@ -551,11 +568,12 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
         attempts.kv.update.side_effect = KeyWrongLastSequenceError()
         attempts.kv.create.return_value = 1
+        now = float(ATTEMPT_WINDOW + 1)
 
-        assert await bounded(attempts.allow("host.example", now=61))
+        assert await bounded(attempts.allow("host.example", now=now))
         attempts.kv.create.assert_awaited_once_with(
             attempts.key("host.example", 1),
-            float(61).hex().encode(),
+            now.hex().encode(),
         )
 
     async def test_recent_attempts_deny(self) -> None:
@@ -565,11 +583,11 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.get.side_effect = [
             # A second short of a full window old.
             MagicMock(value=float(1).hex().encode()),
-            MagicMock(value=(59.5).hex().encode()),
-            MagicMock(value=(59.9).hex().encode()),
+            MagicMock(value=(ATTEMPT_WINDOW - 0.5).hex().encode()),
+            MagicMock(value=(ATTEMPT_WINDOW - 0.1).hex().encode()),
         ]
 
-        assert not await bounded(attempts.allow("host.example", now=60))
+        assert not await bounded(attempts.allow("host.example", now=ATTEMPT_WINDOW))
 
     async def test_future_attempts_deny(self) -> None:
         """Count attempts a faster peer stamped after this peer's now."""
