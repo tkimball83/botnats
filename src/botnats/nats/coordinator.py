@@ -656,8 +656,9 @@ class Coordinator:
 
         An unauthentic value hides the record it replaced, so it is reported
         as a delete. A signed record beyond this bot's horizon comes from a
-        peer with a longer session TTL or a faster clock: it is skipped, as
-        answering it with a write-back would trade writes with that peer.
+        peer with a longer session TTL or a faster clock: it is not applied,
+        but a replay still counts its key. Treated as missing, it would have
+        this bot write back over that peer's record.
         """
         replayed: set[str] | None = set()
         kv = await self.sessions.open()
@@ -684,11 +685,11 @@ class Coordinator:
                     self.callbacks.on_session_delete(entry.key)
                     continue
 
-                if not self.sessions.within_horizon(session):
-                    continue
-
                 if replayed is not None:
                     replayed.add(entry.key)
+
+                if not self.sessions.within_horizon(session):
+                    continue
 
                 self.callbacks.on_session_update(
                     entry.key,

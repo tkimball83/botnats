@@ -44,6 +44,7 @@ from tests.unit.helpers import (
     COORDINATION_KEY,
     NATS_CREDENTIAL,
     FakeKV,
+    bot_with_coordinator,
     bounded,
     hang,
     session_record,
@@ -1429,6 +1430,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         A peer with a longer session TTL or a faster clock writes it; a delete
         would have this bot write back over it, and that peer write it again.
+        The replay still counts its key, so it is not treated as missing.
         """
         coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
@@ -1453,7 +1455,39 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         delete.assert_not_called()
         update.assert_not_called()
-        replayed.assert_called_once_with(set())
+        replayed.assert_called_once_with({key})
+
+    async def test_replayed_record_beyond_horizon_keeps_held_revocation(
+        self,
+    ) -> None:
+        """Write nothing back when a replay holds a peer's grant beyond the horizon.
+
+        The grant replaced this bot's revocation; writing the revocation back
+        would undo the peer's authentication.
+        """
+        bot, _, _ = bot_with_coordinator()
+        coordinator = build_coordinator("alpha")
+        coordinator.callbacks = bot.callbacks
+        prefix = "owner!user@host"
+        key = coordinator.sessions.key(prefix)
+        bot.authorizer.keep(bot.authorizer.create(prefix, time.time() + 60, "alpha"))
+        revocation = bot.authorizer.revoke(prefix)
+        assert revocation is not None
+        bot.sessions.observe(key, revocation, replaying=False)
+        horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
+        grant = SimpleNamespace(
+            key=key,
+            operation=None,
+            value=json.dumps(session_record(horizon + 60)).encode(),
+        )
+        kv, _ = watcher(grant, None)
+        coordinator.sessions.kv = kv
+
+        await bounded(coordinator.watch_sessions(MagicMock()))
+
+        assert key in bot.sessions.watched
+        assert not bot.sessions.pending
+        assert not bot.tasks
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""
