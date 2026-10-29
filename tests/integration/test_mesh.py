@@ -354,7 +354,7 @@ async def run() -> None:
         await wait_for_names(session, second, present=BOTS)
         await wait_for_names(session, third, present=BOTS)
         reply = await command(session, "gamma", f"GETMODES {second}")
-        assert second_key in reply
+        assert reply.split()[-1] == second_key
         assert "channels=2" in await command(session, "beta", "STATUS")
     finally:
         await session.close()

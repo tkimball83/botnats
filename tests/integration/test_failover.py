@@ -18,13 +18,14 @@ if TYPE_CHECKING:
 
     from nats.js.kv import KeyValue
 
-CONNECT_TIMEOUT = 30.0
 COUNTER = 987_654_320
 FRESH_COUNTER = 987_654_319
 # The bots' jetstream_replicas in config/*.json; their buckets set it.
 JETSTREAM_REPLICAS = 3
-LEADER_TIMEOUT = 30.0
 RETRY_INTERVAL = 0.2
+# JetStream may still be electing leaders or replaying streams just after
+# a node or the whole cluster restarts.
+RETRY_TIMEOUT = 30.0
 
 
 def coordination_key() -> bytes:
@@ -44,7 +45,6 @@ async def ignore_error(error: Exception) -> None:
 
 async def keep_trying[T](
     attempt: Callable[[], Awaitable[T | None]],
-    wait_seconds: float,
     failure: str,
 ) -> T:
     """Repeat an attempt through NATS errors until it returns a result.
@@ -54,7 +54,7 @@ async def keep_trying[T](
     """
     last_error: Exception | None = None
     try:
-        async with asyncio.timeout(wait_seconds):
+        async with asyncio.timeout(RETRY_TIMEOUT):
             while True:
                 try:
                     result = await attempt()
@@ -79,7 +79,6 @@ async def connect() -> nats.NATS:
             max_reconnect_attempts=5,
             token=os.environ["BOTNATS_TEST_NATS_TOKEN"],
         ),
-        CONNECT_TIMEOUT,
         "no NATS node accepted a connection",
     )
 
@@ -99,7 +98,6 @@ async def open_claims() -> tuple[nats.NATS, ClaimStore, KeyValue]:
     try:
         kv = await keep_trying(
             lambda: claims.open(nc.jetstream()),
-            LEADER_TIMEOUT,
             "the claim bucket did not open",
         )
     except BaseException:
@@ -148,4 +146,4 @@ async def wait_leader(kv: KeyValue, previous: str) -> None:
 
         return cluster.leader
 
-    await keep_trying(new_leader, LEADER_TIMEOUT, f"no leader replaced {previous}")
+    await keep_trying(new_leader, f"no leader replaced {previous}")

@@ -24,8 +24,6 @@ if TYPE_CHECKING:
 CHANNEL = "#botnats-restart"
 CHANNEL_KEY = "restart-key"
 COUNTER = 987_654_321
-# JetStream may still be replaying streams just after the cluster restarts.
-REPLAY_TIMEOUT = 30.0
 SESSION_IDENTITY = "restart!user@host.example"
 SESSION_TTL = 3600.0
 
@@ -98,7 +96,6 @@ async def check() -> None:
 
         entry, channel_entry, session_entry = await keep_trying(
             read,
-            REPLAY_TIMEOUT,
             "durable state missing after NATS restart",
         )
         assert entry.value == b"1"
