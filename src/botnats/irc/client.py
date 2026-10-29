@@ -29,6 +29,10 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 DESIRED_CAPS = frozenset({"chghost", "multi-prefix"})
+# RFC 8305's wait before racing the next resolved address, so one that drops
+# packets (broken IPv6, a dead round-robin member) cannot spend the whole
+# connect timeout.
+HAPPY_EYEBALLS_DELAY = 0.25
 # A quiet connection gets a PING after IDLE_TIMEOUT and must answer it
 # within PONG_TIMEOUT.
 IDLE_TIMEOUT = 120.0
@@ -183,7 +187,12 @@ class IRCClient:
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Open a connection to the given server and begin registration."""
         context = self.tls_context if server.tls else None
-        connect = asyncio.open_connection(server.host, server.port, ssl=context)
+        connect = asyncio.open_connection(
+            server.host,
+            server.port,
+            ssl=context,
+            happy_eyeballs_delay=HAPPY_EYEBALLS_DELAY,
+        )
         async with asyncio.timeout(self.config.connect_timeout):
             reader, writer = await connect
         self.writer = writer

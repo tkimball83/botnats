@@ -306,6 +306,66 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(TimeoutError):
                     await client.establish(client.config.servers[0])
 
+    async def test_establish_races_past_an_unanswered_address(self) -> None:
+        """Reach a later resolved address while an earlier one never answers.
+
+        A first address that drops packets, as broken IPv6 or a dead
+        round-robin member does, must not hold the connect until it times out.
+        """
+
+        async def server_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            # Hold the connection until the client leaves.
+            await reader.read()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
+        port = server.sockets[0].getsockname()[1]
+        unanswered = ("192.0.2.1", port)
+        live = ("127.0.0.1", port)
+        attempts: list[tuple[str, int]] = []
+        loop = asyncio.get_running_loop()
+        real_connect = loop.sock_connect
+
+        async def resolve(
+            *arguments: object, **options: object
+        ) -> list[tuple[object, ...]]:
+            del arguments, options
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", address)
+                for address in (unanswered, live)
+            ]
+
+        async def connect(sock: socket.socket, address: tuple[str, int]) -> None:
+            attempts.append(address)
+            if address == unanswered:
+                await hang()
+
+            await real_connect(sock, address)
+
+        client = irc_client()
+        try:
+            with (
+                patch.object(loop, "getaddrinfo", resolve),
+                patch.object(loop, "sock_connect", connect),
+                # Race the next address at once instead of after a real wait.
+                patch("botnats.irc.client.HAPPY_EYEBALLS_DELAY", 0),
+            ):
+                _, writer = await bounded(
+                    client.establish(IRCServer("irc.example.test", port, tls=False)),
+                )
+
+            assert attempts == [unanswered, live]
+            assert writer.get_extra_info("peername") == live
+        finally:
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
+
     def test_nickname_collision(self) -> None:
         """Verify collision nicknames have correct length and are alphabetic."""
         candidates = [next_nickname(9) for _ in range(20)]
@@ -770,14 +830,16 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cap_ls_no_desired(self) -> None:
         """Verify CAP END is sent when no desired capabilities are available."""
-        client = self.cap_client()
-        message = parse_message(":server CAP * LS :sasl\r\n")
-        client.handle_cap(message)
+        # IRCv3 allows an empty LS list.
+        for line in (":server CAP * LS :sasl\r\n", ":server CAP * LS :\r\n"):
+            with self.subTest(line=line):
+                client = self.cap_client()
+                client.handle_cap(parse_message(line))
 
-        assert not client.cap_negotiating
-        assert client.outbound is not None
-        sent = client.outbound.get_nowait()
-        assert sent == b"CAP END\r\n"
+                assert not client.cap_negotiating
+                assert client.outbound is not None
+                sent = client.outbound.get_nowait()
+                assert sent == b"CAP END\r\n"
 
     async def test_cap_ls_requests_desired(self) -> None:
         """Verify desired capabilities are requested when advertised."""
@@ -1288,6 +1350,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ConnectionError, "queue is full"):
             client.send("NOTICE", "owner", trailing="hello")
+
+        # A refused line is not waiting, so unless_waiting help still sends it.
+        assert not client.queued_lines
+        assert client.queue_delay == 0.0
 
     async def test_send_refuses_closing_socket(self) -> None:
         """Refuse a command once the socket is closing, though the sender lives."""

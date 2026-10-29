@@ -208,6 +208,12 @@ class IRCProtocolTests(unittest.TestCase):
         assert message.command == "PRIVMSG"
         assert message.params[0] == "#chan"
 
+    def test_parse_keeps_empty_trailing_param(self) -> None:
+        """Keep an empty trailing parameter, as an empty CAP LS list sends."""
+        message = parse_message(":srv CAP * LS :\r\n")
+
+        assert message.params == ("*", "LS", "")
+
     def test_parse_rejects_message_without_command(self) -> None:
         """Reject tags or a prefix that no command follows."""
         for line in ("@a=b", ":srv", "@a=b :srv", ":srv   ", "@a=b  "):
