@@ -424,12 +424,16 @@ class FakeCoordinator:
         return await self.channels.put(record, after=after)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
-        """Record a presence write, refused like the others while not writable.
+        """Record a presence write, refused while disconnected.
 
-        A duplicate here is another live instance holding the bot ID: the real
-        claim yields to its signed record, stays a duplicate, and refuses.
+        Disconnected, the real presence store has no open bucket and raises. A
+        duplicate is not refused: the real claim yields to the live instance's
+        signed record and returns, and the next heartbeat tries again.
         """
-        self.require_writable()
+        if not self.connected:
+            msg = "JetStream is unavailable"
+            raise StoreUnavailableError(msg)
+
         self.presence_puts.append(presence)
 
     async def put_session(self, session: dict[str, Any]) -> Session:

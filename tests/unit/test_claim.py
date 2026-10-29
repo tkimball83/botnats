@@ -50,8 +50,8 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             ) as create,
             patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
         ):
-            with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
-                await bounded(claim.put(PRESENCE))
+            await bounded(claim.put(PRESENCE))
+            assert claim.duplicate
 
             await bounded(claim.put(PRESENCE))
 
@@ -164,7 +164,6 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             patch.object(claim.store, "create", AsyncMock(return_value=None)),
             patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
             self.assertLogs("botnats.nats.claim", level="ERROR"),
-            self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED),
         ):
             await bounded(claim.put(PRESENCE))
 
