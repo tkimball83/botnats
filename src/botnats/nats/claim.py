@@ -103,7 +103,6 @@ class PresenceClaim:
                 self.transition(PresenceState.UNCLAIMED, None)
 
             await self.claim()
-        self.require()
 
     async def reclaim(self) -> None:
         """Reclaim the key after a watch replay, while unowned."""

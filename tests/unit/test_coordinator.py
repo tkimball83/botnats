@@ -677,10 +677,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert "suppressed 1 similar warning(s)" in logs.output[0]
 
     async def test_nats_errors_are_rate_limited(self) -> None:
-        """Throttle repeating transport errors, but not a help callback's crash.
+        """Throttle repeating transport errors apart from a help callback's crash.
 
         nats-py hands its error callback both transport errors and whatever
-        the help subscription's callback raises, which is a bug to trace.
+        the help subscription's callback raises, which is a bug to trace. The
+        crash has its own throttle, so throttled transport errors cannot hide it.
         """
         coordinator = build_coordinator("alpha")
         crash = ValueError("help handler bug")
@@ -793,6 +794,34 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.init_stores()
 
         assert attempts == 1
+
+    async def test_init_stores_absorbs_reset_while_opening(self) -> None:
+        """Warn and stop, not crash, when a disconnect resets a store it opens."""
+        coordinator = build_coordinator("alpha")
+        nc = MagicMock(is_connected=True)
+        coordinator.nc = nc
+
+        async def drop(*arguments: object) -> MagicMock:
+            del arguments
+            nc.is_connected = False
+            await coordinator.on_disconnected()
+            return MagicMock()
+
+        js = nc.jetstream.return_value
+        js.create_key_value = AsyncMock(side_effect=drop)
+        with (
+            patch("asyncio.sleep", AsyncMock()),
+            self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs,
+        ):
+            await bounded(coordinator.init_stores())
+
+        assert len(logs.records) == 1
+        assert logs.records[0].getMessage() == (
+            "JetStream reinitialization failed; retrying: "
+            "JetStream changed while opening a bucket"
+        )
+        js.create_key_value.assert_awaited_once()
+        assert not coordinator.attempts.ready
 
     async def test_init_stores_does_not_abandon_recovery(self) -> None:
         """Keep retrying JetStream initialization for as long as it fails."""
