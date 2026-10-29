@@ -1110,6 +1110,18 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert list(kv.entries) == [key]
 
+    async def test_session_verify_ignores_only_the_horizon(self) -> None:
+        """Verify a signed, key-bound record beyond the horizon parse refuses."""
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+        key = sessions.key("owner!user@host")
+        future = session_record(time.time() + 60 + SESSION_EXPIRY_GRACE + 60)
+        unsigned = {k: v for k, v in future.items() if k != "signature"}
+
+        assert sessions.verify(key, future) == parsed_session(future)
+        assert sessions.parse(key, future) is None
+        assert sessions.verify(sessions.key("other!user@host"), future) is None
+        assert sessions.verify(key, unsigned) is None
+
     async def test_session_signature_covers_every_field(self) -> None:
         """Refuse a record whose signed fields changed or whose signature is bad."""
         sessions = SessionStore("efnet", 1, SECRET, 60)

@@ -219,7 +219,7 @@ class SessionSync:
             self.forget(key)
 
     def forget(self, key: str) -> None:
-        """Drop the local session a deleted or expired KV key held.
+        """Drop the local session a deleted, unauthentic, or expired KV key held.
 
         A held unexpired revocation is written back, as over a rollback: bots
         that start later would otherwise accept the revoked grant if re-put.

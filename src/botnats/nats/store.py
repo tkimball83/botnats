@@ -529,12 +529,16 @@ class SessionStore(KVStore):
 
     def parse(self, key: str, record: dict[str, Any]) -> Session | None:
         """Validate a signed session record held under a KV key, in horizon."""
+        session = self.verify(key, record)
+        if session is None or not self.within_horizon(session):
+            return None
+
+        return session
+
+    def verify(self, key: str, record: dict[str, Any]) -> Session | None:
+        """Validate a signed session record bound to its KV key, at any expiry."""
         session = parse_session_record(self.secret, self.network, record)
-        if (
-            session is None
-            or self.key(session.prefix) != key
-            or not self.within_horizon(session)
-        ):
+        if session is None or self.key(session.prefix) != key:
             return None
 
         return session

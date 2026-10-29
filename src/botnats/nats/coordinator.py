@@ -652,7 +652,13 @@ class Coordinator:
         self.callbacks.on_presence(presence)
 
     async def watch_sessions(self, synced: Callable[[], None]) -> None:
-        """Watch the sessions KV bucket and report validated records by key."""
+        """Watch the sessions KV bucket and report validated records by key.
+
+        An unauthentic value hides the record it replaced, so it is reported
+        as a delete. A signed record beyond this bot's horizon comes from a
+        peer with a longer session TTL or a faster clock: it is skipped, as
+        answering it with a write-back would trade writes with that peer.
+        """
         replayed: set[str] | None = set()
         kv = await self.sessions.open()
         watcher = await self.open_watcher(kv)
@@ -672,9 +678,13 @@ class Coordinator:
 
                 data = decode_record(entry.value)
                 session = (
-                    self.sessions.parse(entry.key, data) if data is not None else None
+                    self.sessions.verify(entry.key, data) if data is not None else None
                 )
                 if session is None:
+                    self.callbacks.on_session_delete(entry.key)
+                    continue
+
+                if not self.sessions.within_horizon(session):
                     continue
 
                 if replayed is not None:
