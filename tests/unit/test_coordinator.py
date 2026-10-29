@@ -465,8 +465,30 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             for name in ("max_outstanding_pings", "ping_interval")
         }
         assert pings == {"max_outstanding_pings": 2, "ping_interval": 6}
+        # nats-py's default of 60 attempts closes the client for good after
+        # about two minutes of outage, and the restart's connect gives up too.
+        assert connect.await_args.kwargs.get("max_reconnect_attempts") == -1
         assert coordinator.nc is nc
         assert steps == ["subscribe", "stores", "watches"]
+
+    async def test_short_presence_ttl_pings_every_second(self) -> None:
+        """Ping every second under a presence TTL too short for whole-second spacing.
+
+        nats-py's ping loop spins on an interval of 0 and reconnects as stale.
+        """
+        coordinator = build_coordinator("alpha")
+        coordinator.config = replace(coordinator.config, presence_ttl=2.0)
+        connect = AsyncMock(return_value=MagicMock(subscribe=AsyncMock()))
+
+        with (
+            patch("nats.connect", connect),
+            patch.object(coordinator, "init_stores", AsyncMock()),
+            patch.object(coordinator, "start_watches", AsyncMock()),
+        ):
+            await bounded(coordinator.start())
+
+        assert connect.await_args is not None
+        assert connect.await_args.kwargs.get("ping_interval") == 1
 
     async def test_cancelled_restart_keeps_help_subscription(self) -> None:
         """Subscribe to help requests before a restart waits for JetStream.

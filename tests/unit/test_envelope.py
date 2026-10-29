@@ -126,7 +126,7 @@ class EnvelopeTests(unittest.TestCase):
             envelope.encode(SUBJECT, {"big": "x" * 262_144})
 
     def test_envelope_security(self) -> None:
-        """Verify envelope signing, replay rejection, and tamper detection."""
+        """Verify envelope signing, replay rejection, and malformed envelopes."""
         key = COORDINATION_KEY
         sender = Envelope("alpha", key)
         receiver = Envelope("beta", key)
@@ -146,14 +146,33 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "not an object"):
             receiver.decode(SUBJECT, b"[]")
 
-        tampered = json.loads(encoded)
-        tampered["nonce"] = "f" * 32
-        tampered["payload"] = {"channel": "#owned"}
-        with self.assertRaisesRegex(ValueError, "signature"):
-            receiver.decode(SUBJECT, json.dumps(tampered).encode())
+    def test_signature_covers_every_field(self) -> None:
+        """Reject an envelope with any one signed field changed and not re-signed.
+
+        A client holding the NATS token but not the coordination secret could
+        otherwise replay a captured envelope under a fresh nonce or timestamp.
+        """
+        sender = Envelope("alpha", COORDINATION_KEY)
+        receiver = Envelope("beta", COORDINATION_KEY)
+        for field in ("nonce", "payload", "sender", "timestamp"):
+            # Never decoded, so its nonce is not yet a replay.
+            tampered = json.loads(sender.encode(SUBJECT, {"channel": "#test"}))
+            tampered[field] = {
+                "nonce": "f" * 32,
+                "payload": {**tampered["payload"], "channel": "#owned"},
+                "sender": "gamma",
+                # Still inside the drift window.
+                "timestamp": tampered["timestamp"] - 1,
+            }[field]
+
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "signature"),
+            ):
+                receiver.decode(SUBJECT, json.dumps(tampered).encode())
 
         # Only authentic envelopes may grow the replay cache.
-        assert tampered["nonce"] not in receiver.seen_nonces
+        assert not receiver.seen_nonces
 
     def test_decode_prunes_expired_nonces(self) -> None:
         """Prune expired nonces on decode, which keeps the replay cache bounded."""

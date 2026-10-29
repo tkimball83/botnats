@@ -281,6 +281,22 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         assert not claim.owned
         assert claim.revision is None
 
+    async def test_duplicate_release_leaves_live_owner_key(self) -> None:
+        """Leave the key to its live owner when a duplicate process shuts down.
+
+        Without an owned revision, nats-py would delete it unconditionally.
+        """
+        claim = build_claim()
+        with self.assertLogs("botnats.nats.claim", level="ERROR"):
+            claim.observe("other-instance", 1)
+
+        delete = AsyncMock(return_value=None)
+
+        with patch.object(claim.store, "delete", delete):
+            await bounded(claim.release())
+
+        delete.assert_not_awaited()
+
     def test_reset_keeps_duplicate(self) -> None:
         """Report a duplicate once across reconnects, and its resolution later."""
         claim = build_claim()

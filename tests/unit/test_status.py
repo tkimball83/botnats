@@ -19,7 +19,7 @@ from botnats.nats.status import (
     route_count,
     stream_info,
 )
-from tests.unit.helpers import hang
+from tests.unit.helpers import bounded, hang
 
 
 class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
@@ -52,7 +52,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "botnats.nats.status.route_count",
             AsyncMock(return_value=1),
         ):
-            status = await collect(nc, kv, 3, 8222)
+            status = await bounded(collect(nc, kv, 3, 8222))
 
         assert status.jetstream == "degraded"
         assert status.lag == 4
@@ -84,10 +84,40 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "botnats.nats.status.route_count",
             AsyncMock(return_value=2),
         ):
-            status = await collect(nc, kv, 3, 8222)
+            status = await bounded(collect(nc, kv, 3, 8222))
 
         assert status.render() == (
             "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=3/3 lag=0"
+        )
+
+    async def test_collect_leaderless_cluster(self) -> None:
+        """Report a stream without a leader as degraded, even with current peers."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.return_value = SimpleNamespace(
+            stream_info=SimpleNamespace(
+                # During a raft election peers can still report current from
+                # the last term, but without a leader the stream takes no writes.
+                cluster=ClusterInfo(
+                    leader=None,
+                    replicas=[
+                        PeerInfo(current=True, name="nats-1"),
+                        PeerInfo(current=True, name="nats-2"),
+                        PeerInfo(current=True, name="nats-3"),
+                    ],
+                ),
+                config=SimpleNamespace(num_replicas=3),
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 3, 8222))
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=degraded leader=? replicas=3/3 lag=0"
         )
 
     async def test_collect_stream_without_cluster(self) -> None:
@@ -107,7 +137,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                     "botnats.nats.status.route_count",
                     AsyncMock(return_value=0),
                 ):
-                    status = await collect(nc, kv, replicas, 8222)
+                    status = await bounded(collect(nc, kv, replicas, 8222))
 
                 assert status.render() == (
                     f"nats connection=up routes=0 jetstream={state} leader=? "
@@ -116,12 +146,16 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_collect_unknown_when_disconnected(self) -> None:
         """Return unknown details without monitoring a disconnected client."""
-        status = await collect(None, None, 3, 8222)
+        # nats-py reports no connected URL while it reconnects.
+        reconnecting = MagicMock(is_connected=False, connected_url=None)
+        for nc in (None, reconnecting):
+            with self.subTest(nc=nc):
+                status = await bounded(collect(nc, None, 3, 8222))
 
-        assert status.render() == (
-            "nats connection=down routes=? jetstream=unknown leader=? "
-            "replicas=?/3 lag=?"
-        )
+                assert status.render() == (
+                    "nats connection=down routes=? jetstream=unknown leader=? "
+                    "replicas=?/3 lag=?"
+                )
 
     async def test_collect_unknown_when_monitoring_is_unavailable(self) -> None:
         """Keep connection status when cluster monitoring is unavailable."""
@@ -129,7 +163,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         connect = AsyncMock(side_effect=ConnectionRefusedError("refused"))
 
         with patch("asyncio.open_connection", connect):
-            status = await collect(nc, None, 3, 8222)
+            status = await bounded(collect(nc, None, 3, 8222))
 
         assert status.render() == (
             "nats connection=up routes=? jetstream=unknown leader=? replicas=?/3 lag=?"
@@ -147,7 +181,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "botnats.nats.status.route_count",
             AsyncMock(return_value=2),
         ):
-            status = await collect(nc, kv, 3, 8222)
+            status = await bounded(collect(nc, kv, 3, 8222))
 
         assert status.render() == (
             "nats connection=up routes=2 jetstream=unknown leader=? replicas=?/3 lag=?"
@@ -167,7 +201,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 connect = AsyncMock(return_value=(reader, writer))
 
                 with patch("asyncio.open_connection", connect):
-                    routes = await route_count(host, 8222)
+                    routes = await bounded(route_count(host, 8222))
 
                 assert routes == 2
                 assert connect.await_args is not None
@@ -175,16 +209,6 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 request = writer.write.call_args.args[0]
                 assert f"\r\nHost: {location}\r\n".encode() in request
                 writer.close.assert_called_once_with()
-
-    async def test_route_count_unknown_when_unreachable(self) -> None:
-        """Report no route count when the monitoring port refuses connections."""
-        with patch(
-            "asyncio.open_connection",
-            AsyncMock(side_effect=ConnectionRefusedError("refused")),
-        ):
-            routes = await route_count("nats-1", 8222)
-
-        assert routes is None
 
     async def test_route_count_unknown_when_unanswered(self) -> None:
         """Give up on a monitoring port that accepts but never answers."""
@@ -197,8 +221,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("botnats.nats.status.STATUS_TIMEOUT", 0),
         ):
-            async with asyncio.timeout(5):
-                routes = await route_count("nats-1", 8222)
+            routes = await bounded(route_count("nats-1", 8222))
 
         assert routes is None
         writer.close.assert_called_once_with()
@@ -217,7 +240,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "asyncio.open_connection",
             AsyncMock(return_value=(reader, writer)),
         ):
-            routes = await route_count("nats-1", 8222)
+            routes = await bounded(route_count("nats-1", 8222))
 
         assert routes is None
 
@@ -235,7 +258,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "asyncio.open_connection",
             AsyncMock(return_value=(reader, writer)),
         ):
-            routes = await route_count("nats-1", 8222)
+            routes = await bounded(route_count("nats-1", 8222))
 
         assert routes is None
 
@@ -245,7 +268,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         kv.status.side_effect = TypeError("bug")
 
         with self.assertRaises(TypeError):
-            await stream_info(kv)
+            await bounded(stream_info(kv))
 
     async def test_stream_info_unknown_when_unanswered(self) -> None:
         """Give up on JetStream when it is slow to answer or its socket fails."""
@@ -254,8 +277,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 kv = MagicMock(status=status)
 
                 with patch("botnats.nats.status.STATUS_TIMEOUT", 0):
-                    async with asyncio.timeout(5):
-                        info = await stream_info(kv)
+                    info = await bounded(stream_info(kv))
 
                 assert info is None
 
@@ -277,7 +299,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=RecursionError("maximum recursion depth exceeded"),
             ) as loads,
         ):
-            routes = await route_count("nats-1", 8222)
+            routes = await bounded(route_count("nats-1", 8222))
 
         assert routes is None
         loads.assert_called_once_with(b"[[]]")
@@ -299,6 +321,6 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                     "asyncio.open_connection",
                     AsyncMock(return_value=(reader, writer)),
                 ):
-                    routes = await route_count("nats-1", 8222)
+                    routes = await bounded(route_count("nats-1", 8222))
 
                 assert routes is None
