@@ -48,15 +48,11 @@ class AuthFlow:
             return
 
         counter = bot.authorizer.match(arguments[0])
-        # A wrong code still performs the claim round trip so response
-        # timing cannot distinguish it from a valid-but-replayed code.
-        claimed = await coordinator.request_claim(
-            counter if counter is not None else -1,
-        )
+        claimed = counter is not None and await coordinator.request_claim(counter)
         # AUTH runs off the IRC read loop, so the user may QUIT or change
         # identity while it waits; a grant after that would authorize an
         # identity that is already gone.
-        if counter is not None and claimed and bot.sessions.watched_valid(rendered):
+        if claimed and bot.sessions.watched_valid(rendered):
             session = bot.authorizer.grant(rendered)
             try:
                 synced = await bot.sessions.sync(session)
