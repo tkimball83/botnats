@@ -46,7 +46,7 @@ from botnats.nats.store import (
     session_signature,
 )
 from tests.unit.helpers import COORDINATION_KEY as SECRET
-from tests.unit.helpers import FakeKV, bounded, session_record
+from tests.unit.helpers import FakeKV, bounded, check_key, session_record
 
 if TYPE_CHECKING:
     from nats.js.kv import KeyValue
@@ -75,12 +75,19 @@ def signed_presence(instance_id: str) -> dict[str, object]:
 class DeletableKV(FakeKV):
     """In-memory bucket whose delete checks the last revision as nats-py does."""
 
-    async def delete(self, key: str, last: int) -> bool:
-        """Delete a key at its revision; nats-py raises a bare BadRequestError."""
-        if self.entries[key][0] != last:
+    async def delete(self, key: str, last: int | None = None) -> bool:
+        """Delete a key, checking only a positive last revision, as nats-py does.
+
+        A mismatch raises a bare BadRequestError. JetStream holds a missing
+        key at revision 0, so any positive revision mismatches it.
+        """
+        await asyncio.sleep(0)
+        check_key(key)
+        revision = self.entries[key][0] if key in self.entries else 0
+        if last and last > 0 and revision != last:
             raise BadRequestError(code=400, err_code=10071)
 
-        del self.entries[key]
+        self.entries.pop(key, None)
         return True
 
 
@@ -578,7 +585,7 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_claim(self) -> None:
         """Verify a counter's claim uses its own secret-derived key.
 
-        One key for every counter would let a wrong code's claim block every
+        One key for every counter would let the first claim block every later
         AUTH; a claim expiring while its code is still accepted allows replay.
         """
         claims = ClaimStore("efnet", 3, SECRET)
@@ -984,7 +991,11 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
         channels.kv.get.side_effect = KeyNotFoundError()
-        channels.kv.create.side_effect = KeyWrongLastSequenceError()
+        # Finite, because AsyncMock calls never suspend for bounded() to
+        # interrupt: an unbounded loop fails once the races run out.
+        channels.kv.create.side_effect = [
+            KeyWrongLastSequenceError(),
+        ] * CAS_ATTEMPT_LIMIT
 
         with self.assertRaisesRegex(NatsError, "update races"):
             await bounded(channels.put(channel_record(1), after=None))
@@ -999,7 +1010,10 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=7,
             value=json.dumps(channel_record(1)).encode(),
         )
-        channels.kv.update.side_effect = KeyWrongLastSequenceError()
+        # Finite, as for lost create races.
+        channels.kv.update.side_effect = [
+            KeyWrongLastSequenceError(),
+        ] * CAS_ATTEMPT_LIMIT
 
         with self.assertRaisesRegex(NatsError, "update races"):
             await bounded(
@@ -1035,6 +1049,27 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
 
         sessions.kv.update.assert_awaited_once()
+
+    async def test_session_put_yields_to_concurrent_writer(self) -> None:
+        """Return and keep a newer session that lands between our read and write."""
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+        sessions.kv = AsyncMock()
+        expires_at = time.time() + 40
+        concurrent = session_record(expires_at, 2)
+        sessions.kv.get.side_effect = (
+            SimpleNamespace(
+                revision=7,
+                value=json.dumps(session_record(expires_at, 0)).encode(),
+            ),
+            SimpleNamespace(revision=8, value=json.dumps(concurrent).encode()),
+        )
+        sessions.kv.update.side_effect = [KeyWrongLastSequenceError()]
+
+        stored = await bounded(sessions.put(session_record(expires_at, 1)))
+
+        assert stored == parsed_session(concurrent)
+        sessions.kv.update.assert_awaited_once()
+        assert sessions.kv.update.await_args.kwargs == {"last": 7}
 
     async def test_session_horizon_ends_one_ttl_plus_grace_away(self) -> None:
         """Accept a record expiring exactly at the horizon and refuse a later one."""
