@@ -8,7 +8,7 @@ import time
 import unittest
 from dataclasses import asdict, replace
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 from botnats.channel import JOIN_REPLY_TIMEOUT, JOIN_RETRY_DELAY, JoinState
 from botnats.config import mode_intent
@@ -838,6 +838,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         folded = casefold("#test", "rfc1459")
         runtime = bot.channel_mgr.channels[folded]
         runtime.join = JoinState.JOINED
+        runtime.modes = "+npst"
 
         bot.events.on_irc_message(
             IRCMessage(
@@ -960,6 +961,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         folded = casefold("#test", "rfc1459")
         runtime = bot.channel_mgr.channels[folded]
         runtime.join = JoinState.JOINED
+        runtime.modes = "+npst"
         runtime.member("alpha").modes.add("o")
         fake_irc.current_nick = "Alpha"
 
@@ -974,6 +976,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
+        runtime.modes = "+npst"
         runtime.member("alpha").modes.add("o")
 
         # A full send queue refuses commands as a dropped connection does.
@@ -1004,6 +1007,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         folded = casefold("#test", "rfc1459")
         runtime = bot.channel_mgr.channels[folded]
         runtime.join = JoinState.JOINED
+        runtime.modes = "+np"
         runtime.member("alpha").modes.add("o")
 
         bot.events.on_irc_message(
@@ -1276,6 +1280,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(IRCMessage("324", ("alpha", "#test", "+"), None))
         assert runtime.modes == ""
 
+    async def test_channel_modes_enforced_once_known(self) -> None:
+        """Enforce the modes a 324 makes known while opped, unless in place.
+
+        Only the first reply after a reset enforces: a later one answers a
+        query sent at an op gain or end of NAMES, which enforced already.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.caps.chanmodes = ("beI", "k", "l", "imnpst")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+
+        def channel_modes(modes: str) -> None:
+            bot.events.on_irc_message(IRCMessage("324", ("alpha", "#test", modes)))
+
+        channel_modes("+nt")
+        assert fake_irc.modes == []
+
+        runtime.member("alpha").modes.add("o")
+        for modes in ("+npst", "+nt"):
+            # Unknown again, as after a reset.
+            runtime.modes = None
+            channel_modes(modes)
+
+        channel_modes("+nt")
+        assert fake_irc.modes == [("#test", "+npst", ())]
+
     async def test_channel_key_reconciled_from_324(self) -> None:
         """Store a key RPL_CHANNELMODEIS shows or lacks; ignore a hidden one."""
         bot, _, coordinator = bot_with_coordinator()
@@ -1388,6 +1418,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
+        runtime.modes = "+nt"
         services = Prefix("chanserv", "service", "services.host")
 
         for _ in range(2):
@@ -1397,6 +1428,23 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent.count(("MODE", ("#test",))) == 1
         assert fake_irc.modes == [("#test", "+npst", ())]
+
+    async def test_op_gain_query_skips_a_copy_still_waiting(self) -> None:
+        """Skip the op gain's mode query while a copy still waits to go out.
+
+        In a join burst the end of NAMES queued one: it goes out after the op
+        gain, so its reply shows the channel as an operator sees it.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            bot.events.on_irc_message(
+                IRCMessage("MODE", ("#test", "+o", "alpha"), Prefix("chanserv")),
+            )
+
+        assert send.call_args_list == [call("MODE", "#test", unless_waiting=True)]
 
     async def test_op_gain_mode_query_resent_after_refusal(self) -> None:
         """Resend NAMES on the next tick when the MODE query on op is refused.
@@ -1432,13 +1480,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.channel_mgr.join_desired()
 
-        assert fake_irc.sent == [
-            ("MODE", ("#test", "+npst")),
-            ("NAMES", ("#test",)),
-        ]
+        assert fake_irc.sent == [("NAMES", ("#test",))]
 
-    async def test_op_gain_enforces_until_324_shows_modes(self) -> None:
-        """Enforce on op gain until a 324 reply shows the modes in place.
+    async def test_op_gain_waits_for_324_to_enforce(self) -> None:
+        """Enforce on op gain only once a 324 reply shows the modes.
 
         MODE changes seen before it show only what changed, not the channel:
         a +s set before this bot joined would stay. A rejoin makes the modes
@@ -1465,19 +1510,21 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await receive(IRCMessage("MODE", ("#test", "+o", "alpha"), services))
 
         async def reop_after_324() -> None:
-            await receive(IRCMessage("324", ("alpha", "#test", "+nt")))
+            await receive(IRCMessage("324", ("alpha", "#test", "+nst")))
+            # The server echoes the enforcement as the change it made.
+            await receive(IRCMessage("MODE", ("#test", "-s"), alpha))
             for change in ("-o", "+o"):
                 await receive(IRCMessage("MODE", ("#test", change, "alpha"), services))
 
         enforced = ("#test", "+nt-s", ())
         await join_then_op()
-        assert fake_irc.modes == [enforced]
+        assert fake_irc.modes == []
         await reop_after_324()
         assert fake_irc.modes == [enforced]
 
         await receive(IRCMessage("PART", ("#test",), alpha))
         await join_then_op()
-        assert fake_irc.modes == [enforced] * 2
+        assert fake_irc.modes == [enforced]
         await reop_after_324()
         assert fake_irc.modes == [enforced] * 2
         assert fake_irc.sent.count(("MODE", ("#test",))) == 4
@@ -1651,6 +1698,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage("366", ("alpha", channel, "End of /NAMES list")),
             )
+            bot.events.on_irc_message(IRCMessage("324", ("alpha", channel, "+nt")))
 
         assert fake_irc.modes == [
             ("#test", "+b", ()),

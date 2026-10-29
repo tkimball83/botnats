@@ -57,9 +57,10 @@ class ChannelManager:
         # Channels no longer desired whose PART could not be sent yet; this
         # bot is still in them.
         self.pending_parts: dict[str, str] = {}
-        # Key writes and their retries run one at a time, so each compares
-        # against the record the previous write left.
-        self.key_lock = asyncio.Lock()
+        # Key writes, their retries, and admin JOIN and PART writes run one
+        # at a time, so each compares against the record the previous write
+        # left.
+        self.write_lock = asyncio.Lock()
         # Highest revision this bot has minted: concurrent local changes to
         # one channel (two admin commands, say) get distinct, ordered revisions.
         self.last_revision = 0
@@ -141,10 +142,11 @@ class ChannelManager:
             )
             return
 
-        # Skip a line the tracked modes show is not needed. They are None
-        # until RPL_CHANNELMODEIS, and follow MODE changes only to the letters
-        # CHANMODES lists: any other letter can be stale.
-        if runtime.modes is not None and all(
+        # Skip a line the tracked modes show is not needed, or cannot show
+        # yet: they are None until RPL_CHANNELMODEIS, whose handler enforces
+        # them. They follow MODE changes only to the letters CHANMODES
+        # lists: any other letter can be stale.
+        if runtime.modes is None or all(
             mode in caps.chanmodes[2] + caps.chanmodes[3]
             and (mode in runtime.modes) == adding
             for adding, modes in ((True, required), (False, forbidden))
@@ -565,7 +567,7 @@ class ChannelManager:
 
     async def retry_pending_keys(self) -> None:
         """Write each pending key as this bot sees it on IRC now."""
-        async with self.key_lock:
+        async with self.write_lock:
             for runtime in tuple(self.channels.values()):
                 # Checked at its turn: IRC can hide a key during earlier writes.
                 if runtime.key_pending and not await self.write_key(runtime):

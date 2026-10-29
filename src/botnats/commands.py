@@ -101,12 +101,17 @@ class CommandHandler:
                 None,
             )
 
-        if present and key is None:
-            runtime = self.bot.channel_mgr.runtime(channel)
-            if runtime is not None:
-                key = runtime.key
+        # Take turns with this bot's key writes: one still in flight would
+        # beat this write's compare-and-set. The key is read at the turn, or
+        # the write could put back a key one of them replaced.
+        async with self.bot.channel_mgr.write_lock:
+            if present and key is None:
+                runtime = self.bot.channel_mgr.runtime(channel)
+                if runtime is not None:
+                    key = runtime.key
 
-        won = await self.bot.channel_mgr.write_record(channel, key, present=present)
+            won = await self.bot.channel_mgr.write_record(channel, key, present=present)
+
         # The session may have ended during the write, and its nick passed to
         # another user: reply only while it still holds.
         if not self.bot.authorizer.authorized(prefix.render()):

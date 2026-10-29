@@ -33,8 +33,9 @@ if TYPE_CHECKING:
 ISON_POLL_INTERVAL = 60.0
 LOGGER = logging.getLogger(__name__)
 # Each JOIN refusal that a peer can help with, and the help it asks for.
-# A bad key (475) asks none: an invite does not get past +k, and the next
-# attempt uses the stored key, which peers in the channel keep current.
+# A bad key (475) asks none: an invite gets past +k on some servers (Ergo)
+# but not on others (solanum), and the next attempt uses the stored key,
+# which peers in the channel keep current.
 REFUSAL_HELP = {"471": "limit", "473": "invite", "474": "unban"}
 # A forwarded JOIN (470) does not say what refused it, so it asks for all the
 # help one could need: an invite gets past most refusals that servers forward,
@@ -159,6 +160,7 @@ class IRCEventHandler:
 
         The reply is the channel's full state, so a key it lacks is gone and
         a key it shows replaces the stored one; a hidden key changes nothing.
+        The first reply after a reset enforces the modes it makes known.
         """
         if len(message.params) < 3:
             return
@@ -170,6 +172,7 @@ class IRCEventHandler:
         if runtime is None or not runtime.joined:
             return
 
+        unknown = runtime.modes is None
         # A channel without modes shows a bare "+", tracked as "": known, none set.
         runtime.modes = message.params[2].rstrip("+")
         runtime.set_limit(None)
@@ -190,6 +193,12 @@ class IRCEventHandler:
         # lost while it was out of the channel left only the record stale.
         if key != "*":
             self.process_key(runtime, key)
+
+        # Enforcement held back while the modes were unknown. A later reply
+        # answers a query sent at an op gain or end of NAMES, which enforced
+        # on the modes known then.
+        if unknown and self.bot.channel_mgr.is_self_opped(runtime):
+            self.bot.channel_mgr.enforce_modes(runtime)
 
     def log_join_error(self, message: IRCMessage) -> None:
         """Log, once, an error naming a channel this bot is joining.
@@ -567,9 +576,11 @@ class IRCEventHandler:
         opped = self.bot.channel_mgr.is_self_opped(runtime)
         if opped and not was_opped:
             # Operators see a key the server hides from other members; a
-            # refused query is asked again after the next tick's NAMES.
+            # copy still waiting goes out after this op gain, so its reply
+            # shows it too. A refused query is asked again after the next
+            # tick's NAMES.
             try:
-                self.bot.irc.send("MODE", channel)
+                self.bot.irc.send("MODE", channel, unless_waiting=True)
             except ConnectionError:
                 runtime.names_due = True
 
