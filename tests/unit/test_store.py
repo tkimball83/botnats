@@ -541,6 +541,23 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert not await bounded(attempts.allow("host.example", now=61))
         attempts.kv.update.assert_awaited_once()
 
+    async def test_sliding_window_update_conflict_tries_next_slot(self) -> None:
+        """Claim the next free slot when a peer claims the expired one first."""
+        attempts = AttemptStore("efnet", 3, SECRET)
+        attempts.kv = AsyncMock()
+        attempts.kv.get.side_effect = [
+            MagicMock(revision=7, value=float(0).hex().encode()),
+            KeyNotFoundError(),
+        ]
+        attempts.kv.update.side_effect = KeyWrongLastSequenceError()
+        attempts.kv.create.return_value = 1
+
+        assert await bounded(attempts.allow("host.example", now=61))
+        attempts.kv.create.assert_awaited_once_with(
+            attempts.key("host.example", 1),
+            float(61).hex().encode(),
+        )
+
     async def test_recent_attempts_deny(self) -> None:
         """Deny while every slot holds an attempt from within the window."""
         attempts = AttemptStore("efnet", 3, SECRET)
@@ -1092,6 +1109,18 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             assert await bounded(sessions.put(edge)) == parsed_session(edge)
 
         assert list(kv.entries) == [key]
+
+    async def test_session_verify_ignores_only_the_horizon(self) -> None:
+        """Verify a signed, key-bound record beyond the horizon parse refuses."""
+        sessions = SessionStore("efnet", 1, SECRET, 60)
+        key = sessions.key("owner!user@host")
+        future = session_record(time.time() + 60 + SESSION_EXPIRY_GRACE + 60)
+        unsigned = {k: v for k, v in future.items() if k != "signature"}
+
+        assert sessions.verify(key, future) == parsed_session(future)
+        assert sessions.parse(key, future) is None
+        assert sessions.verify(sessions.key("other!user@host"), future) is None
+        assert sessions.verify(key, unsigned) is None
 
     async def test_session_signature_covers_every_field(self) -> None:
         """Refuse a record whose signed fields changed or whose signature is bad."""

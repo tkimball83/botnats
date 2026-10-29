@@ -30,6 +30,7 @@ from botnats.nats.coordinator import (
 )
 from botnats.nats.envelope import Envelope
 from botnats.nats.store import (
+    SESSION_EXPIRY_GRACE,
     AttemptStore,
     ChannelStore,
     ClaimStore,
@@ -43,6 +44,7 @@ from tests.unit.helpers import (
     COORDINATION_KEY,
     NATS_CREDENTIAL,
     FakeKV,
+    bot_with_coordinator,
     bounded,
     hang,
     session_record,
@@ -1384,36 +1386,108 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         replayed.assert_called_once_with(set())
         synced.assert_called_once_with()
 
-    async def test_session_watch_skips_misplaced_record(self) -> None:
-        """Skip an undecodable or misplaced session record before the owner sees it."""
+    async def test_session_watch_reports_unauthentic_value_as_delete(self) -> None:
+        """Report an undecodable, unsigned, or misplaced value as its key's delete.
+
+        Each hides the record it replaced, during the replay or after it.
+        """
         coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
+        other = coordinator.sessions.key("other!user@host")
         expiry = time.time() + 60
         valid = session_record(expiry)
         undecodable = SimpleNamespace(key=key, operation=None, value=b"not json")
         # Correctly signed, but held under another identity's key. The store
-        # tests cover every other way SessionStore.parse rejects a record.
+        # tests cover every other way SessionStore.verify rejects a record.
         entries = [
             SimpleNamespace(
                 key=record_key,
                 operation=None,
                 value=json.dumps(valid).encode(),
             )
-            for record_key in (key, coordinator.sessions.key("other!user@host"))
+            for record_key in (key, other)
         ]
-        kv, _ = watcher(undecodable, *entries, None)
+        unsigned = SimpleNamespace(key=key, operation=None, value=b"{}")
+        kv, _ = watcher(undecodable, *entries, None, unsigned)
         coordinator.sessions.kv = kv
+        delete = MagicMock()
         update = MagicMock()
         replayed = MagicMock()
 
         with (
+            patch.object(coordinator.callbacks, "on_session_delete", delete),
             patch.object(coordinator.callbacks, "on_session_update", update),
             patch.object(coordinator.callbacks, "on_sessions_replayed", replayed),
         ):
             await bounded(coordinator.watch_sessions(MagicMock()))
 
+        assert delete.call_args_list == [call(key), call(other), call(key)]
         update.assert_called_once_with(key, session_value(expiry), replaying=True)
         replayed.assert_called_once_with({key})
+
+    async def test_session_watch_skips_record_beyond_horizon(self) -> None:
+        """Skip a signed record beyond the horizon, reporting no update or delete.
+
+        A peer with a longer session TTL or a faster clock writes it; a delete
+        would have this bot write back over it, and that peer write it again.
+        The replay still counts its key, so it is not treated as missing.
+        """
+        coordinator = build_coordinator("alpha")
+        key = coordinator.sessions.key("owner!user@host")
+        horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
+        entry = SimpleNamespace(
+            key=key,
+            operation=None,
+            value=json.dumps(session_record(horizon + 60)).encode(),
+        )
+        kv, _ = watcher(entry, None, entry)
+        coordinator.sessions.kv = kv
+        delete = MagicMock()
+        update = MagicMock()
+        replayed = MagicMock()
+
+        with (
+            patch.object(coordinator.callbacks, "on_session_delete", delete),
+            patch.object(coordinator.callbacks, "on_session_update", update),
+            patch.object(coordinator.callbacks, "on_sessions_replayed", replayed),
+        ):
+            await bounded(coordinator.watch_sessions(MagicMock()))
+
+        delete.assert_not_called()
+        update.assert_not_called()
+        replayed.assert_called_once_with({key})
+
+    async def test_replayed_record_beyond_horizon_keeps_held_revocation(
+        self,
+    ) -> None:
+        """Write nothing back when a replay holds a peer's grant beyond the horizon.
+
+        The grant replaced this bot's revocation; writing the revocation back
+        would undo the peer's authentication.
+        """
+        bot, _, _ = bot_with_coordinator()
+        coordinator = build_coordinator("alpha")
+        coordinator.callbacks = bot.callbacks
+        prefix = "owner!user@host"
+        key = coordinator.sessions.key(prefix)
+        bot.authorizer.keep(bot.authorizer.create(prefix, time.time() + 60, "alpha"))
+        revocation = bot.authorizer.revoke(prefix)
+        assert revocation is not None
+        bot.sessions.observe(key, revocation, replaying=False)
+        horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
+        grant = SimpleNamespace(
+            key=key,
+            operation=None,
+            value=json.dumps(session_record(horizon + 60)).encode(),
+        )
+        kv, _ = watcher(grant, None)
+        coordinator.sessions.kv = kv
+
+        await bounded(coordinator.watch_sessions(MagicMock()))
+
+        assert key in bot.sessions.watched
+        assert not bot.sessions.pending
+        assert not bot.tasks
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""

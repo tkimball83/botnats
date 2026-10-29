@@ -27,6 +27,7 @@ from tests.unit.helpers import (
     FakeKV,
     bot_with_coordinator,
     bot_with_irc,
+    bounded,
     drain_session_writes,
     make_bot,
     send_command,
@@ -1175,6 +1176,87 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.sessions.parse(key, stored) == revocation
         assert not bot.authorizer.authorized(prefix)
         assert not bot.sessions.pending
+
+    async def test_lost_key_rewrites_held_revocation(self) -> None:
+        """Write a held revocation again when its key is deleted or garbled.
+
+        A NATS writer without the coordination secret can drop the record,
+        wait for every bot to be replaced, then re-put the earlier signed
+        grant; bots started after the loss would accept it.
+        """
+        prefix = "owner!user@host.example"
+        for loss in ("deleted", "unreplayed", "garbled"):
+            with self.subTest(loss=loss):
+                bot, _, coordinator = bot_with_coordinator()
+                grant = bot.authorizer.grant(prefix)
+                assert await bounded(bot.sessions.sync(grant))
+                revocation = bot.authorizer.revoke(prefix)
+                assert revocation is not None
+                assert await bounded(bot.sessions.sync(revocation))
+                key = coordinator.sessions.key(prefix)
+                bot.sessions.observe(key, revocation, replaying=False)
+                kv = cast("FakeKV", coordinator.sessions.kv)
+                if loss == "garbled":
+                    kv.store(key, b"not json")
+                else:
+                    del kv.entries[key]
+
+                if loss == "deleted":
+                    bot.sessions.forget(key)
+                else:
+                    # A replay reports only the keys holding a valid record.
+                    bot.sessions.replayed(set())
+
+                await drain_session_writes(bot)
+
+                assert coordinator.session_puts[2:] == [asdict(revocation)]
+                stored = json.loads(kv.entries[key][1])
+                assert coordinator.sessions.parse(key, stored) == revocation
+                assert not bot.sessions.pending
+
+    async def test_lost_key_writes_back_only_live_revocations(self) -> None:
+        """Drop a lost key's grant or expired revocation without writing it."""
+        bot, _, coordinator = bot_with_coordinator()
+        granted = bot.authorizer.grant("granted!user@host.example")
+        expired = bot.authorizer.create(
+            "expired!user@host.example",
+            time.time() - 1,
+            "beta",
+            1,
+            revoked=True,
+        )
+        bot.authorizer.keep(expired)
+        # A delete can arrive before an expired key mapping is pruned.
+        for session in (granted, expired):
+            key = coordinator.sessions.key(session.prefix)
+            bot.sessions.watched[key] = (session.prefix, session.expires_at)
+            bot.sessions.forget(key)
+
+        assert not bot.sessions.pending
+        assert not bot.tasks
+        assert not bot.authorizer.authorized(granted.prefix)
+
+    async def test_lost_key_keeps_queued_mutation(self) -> None:
+        """Leave a queued revocation as it is when its key is lost.
+
+        Marked as a write-back, it would no longer escalate over a newer grant.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        grant = bot.authorizer.grant(prefix.render())
+        assert await bounded(bot.sessions.sync(grant))
+        key = coordinator.sessions.key(prefix.render())
+        bot.sessions.observe(key, grant, replaying=False)
+        coordinator.duplicate = True
+        bot.sessions.revoke(prefix)
+        await drain_session_writes(bot)
+        queued = dict(bot.sessions.pending)
+        assert queued
+
+        bot.sessions.forget(key)
+
+        assert bot.sessions.pending == queued
+        assert not bot.sessions.restoring
 
     async def test_written_back_revocation_yields_to_newer_grant(self) -> None:
         """Drop, never escalate, a written-back revocation a newer grant outranks.
