@@ -221,8 +221,8 @@ class IRCEventHandler:
         """Pace a refused JOIN's retry and ask peers for the help it needs.
 
         A later tick tries the JOIN again, after the help or with the stored
-        key, waiting longer after each consecutive refusal. An INVITE retries
-        it at once.
+        key, waiting longer after each consecutive refusal. A peer's INVITE
+        retries it at once.
         """
         if len(message.params) < 2:
             return
@@ -369,11 +369,14 @@ class IRCEventHandler:
             )
 
     def handle_invite(self, message: IRCMessage) -> None:
-        """Join a configured channel when invited, unless its JOIN was forwarded.
+        """Join a configured channel at once when a peer bot invites this bot.
 
-        The server keeps the invite for the forwarded JOIN's paced resend.
+        Any member who can invite could otherwise queue a paced JOIN per
+        INVITE. Another sender's invite, or one for a forwarded JOIN, still
+        helps: the server keeps it for the paced retry, at most a minute away.
         """
-        if len(message.params) < 2:
+        prefix = message.prefix
+        if prefix is None or len(message.params) < 2:
             return
 
         target, channel = message.params[0], message.params[1]
@@ -383,6 +386,10 @@ class IRCEventHandler:
             and not runtime.joined
             and runtime.join_error != "470"
             and self.bot.irc.is_self(target)
+            and any(
+                peer.to_prefix().matches(prefix, self.bot.caps.casemapping)
+                for peer in self.bot.presence.peers(self.bot.config.bot_id)
+            )
         ):
             self.bot.channel_mgr.safe_join(runtime)
 

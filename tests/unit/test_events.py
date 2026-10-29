@@ -4,6 +4,7 @@
 """Tests for IRC event handling and server message processing."""
 
 import asyncio
+import time
 import unittest
 from dataclasses import asdict, replace
 from typing import cast
@@ -29,6 +30,7 @@ from tests.unit.helpers import (
     bot_with_channel,
     bot_with_coordinator,
     bot_with_irc,
+    bounded,
     drain_session_writes,
     make_bot,
     settle,
@@ -46,6 +48,8 @@ CUSTOM_ISUPPORT = IRCMessage(
     ),
 )
 UNSET_MODE = IRCMessage("MODE", ("#test", "-n"), Prefix("someone", "user", "host"))
+# A peer bot, whose INVITEs are the help ChannelManager.invite_peer sends.
+PEER = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
@@ -365,35 +369,75 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.session_puts[0]["revoked"] is True
 
     async def test_invite_ignores_joined_channel(self) -> None:
-        """Verify an INVITE to an already-joined channel is ignored."""
+        """Verify a peer's INVITE to an already-joined channel is ignored."""
         bot, fake_irc = bot_with_irc()
+        bot.presence.update(PEER)
         bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
 
         bot.events.on_irc_message(
-            IRCMessage("INVITE", ("alpha", "#test"), Prefix("op", "u", "h")),
+            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
 
         assert ("JOIN", ("#test",)) not in fake_irc.sent
 
     async def test_invite_ignores_unknown_channel(self) -> None:
-        """Verify an INVITE to an unconfigured channel is ignored."""
+        """Verify a peer's INVITE to an unconfigured channel is ignored."""
         bot, fake_irc = bot_with_irc()
+        bot.presence.update(PEER)
 
         bot.events.on_irc_message(
-            IRCMessage("INVITE", ("alpha", "#other"), Prefix("op", "u", "h")),
+            IRCMessage("INVITE", ("alpha", "#other"), PEER.to_prefix()),
         )
 
         assert fake_irc.sent == []
 
     async def test_invite_joins_desired_channel(self) -> None:
-        """Verify an INVITE to a desired unjoined channel triggers a join."""
+        """Verify a peer's INVITE to a desired unjoined channel joins at once."""
         bot, fake_irc = bot_with_irc()
+        bot.presence.update(PEER)
 
         bot.events.on_irc_message(
-            IRCMessage("INVITE", ("alpha", "#test"), Prefix("op", "u", "h")),
+            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
 
         assert ("JOIN", ("#test",)) in fake_irc.sent
+
+    async def test_invite_from_non_peer_sends_no_join(self) -> None:
+        """Send no JOIN for an INVITE that no peer bot sent.
+
+        Each would queue a paced JOIN; the server keeps the invite for the
+        refused JOIN's paced retry.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        bot.presence.update(PEER)
+        bot.channel_mgr.join_desired()
+        bot.events.on_irc_message(
+            IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
+        )
+
+        # A member, and one who took a peer's nick from another host.
+        for sender in (
+            Prefix("mallory", "~m", "evil.example"),
+            Prefix("beta", "~m", "evil.example"),
+        ):
+            bot.events.on_irc_message(IRCMessage("INVITE", ("alpha", "#test"), sender))
+
+        assert fake_irc.sent == [("JOIN", ("#test",))]
+        await settle(bot)
+
+    async def test_invite_from_expired_peer_sends_no_join(self) -> None:
+        """Send no JOIN for an INVITE from a peer whose presence expired."""
+        bot, fake_irc = bot_with_irc()
+        bot.presence.update(PEER, now=time.monotonic() - bot.presence.ttl - 1)
+
+        bot.events.on_irc_message(
+            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
+        )
+
+        assert fake_irc.sent == []
 
     async def test_isupport_parsing(self) -> None:
         """Verify ISUPPORT tokens update server capabilities and channel lookups."""
@@ -655,11 +699,12 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.join_desired()
         assert fake_irc.sent == [join, join]
 
+        bot.presence.update(PEER)
         bot.events.on_irc_message(
             IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
         )
         bot.events.on_irc_message(
-            IRCMessage("INVITE", ("alpha", "#test"), Prefix("op", "u", "h")),
+            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
         assert fake_irc.sent == [join, join, join]
         await settle(bot)
@@ -695,13 +740,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Resend a forwarded JOIN after the reply timeout, not sooner.
 
         Each attempt also joins the forward target, so neither the refusal
-        retry delay nor an INVITE resends it; the server keeps the invite for
-        the next attempt.
+        retry delay nor a peer's INVITE resends it; the server keeps the
+        invite for the next attempt.
         """
         bot, fake_irc, _ = bot_with_coordinator()
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
+        bot.presence.update(PEER)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         join = ("JOIN", ("#test",))
 
@@ -712,7 +758,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         bot.events.on_irc_message(
-            IRCMessage("INVITE", ("alpha", "#test"), Prefix("beta", "~beta", "host")),
+            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
         runtime.join_retry_at -= JOIN_RETRY_DELAY
         bot.channel_mgr.join_desired()
@@ -732,6 +778,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
+        bot.presence.update(PEER)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         join = ("JOIN", ("#test",))
 
@@ -747,7 +794,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
         )
         bot.events.on_irc_message(
-            IRCMessage("INVITE", ("alpha", "#test"), Prefix("beta", "~beta", "host")),
+            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
         assert fake_irc.sent == [join, join, join]
         await settle(bot)
@@ -1004,7 +1051,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """
         bot, _, coordinator = bot_with_coordinator()
         kv = cast("FakeKV", coordinator.channels.kv)
-        await bot.channel_mgr.write_record("#A[", None, present=True)
+        await bounded(bot.channel_mgr.write_record("#A[", None, present=True))
         configured = bot.channel_mgr.durable_revision("#A[")
         runtime = bot.channel_mgr.runtime("#a{")
         assert runtime is not None
@@ -1065,7 +1112,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key_pending
         bot.events.on_irc_message(IRCMessage("MODE", ("#room{", "+k", "*"), op))
         coordinator.failing = False
-        await mgr.retry_pending_keys()
+        await bounded(mgr.retry_pending_keys())
 
         assert not runtime.key_pending
         assert runtime.key == "old"
@@ -1100,6 +1147,23 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.key is None
         assert runtime.member("bob").modes == {"o"}
 
+    async def test_mode_key_set_without_argument_ignored(self) -> None:
+        """Keep the key and its record when a +k arrives without its argument."""
+        bot, _, coordinator = bot_with_coordinator()
+        await bounded(bot.channel_mgr.write_record("#test", "secret", present=True))
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+
+        bot.events.on_irc_message(
+            IRCMessage("MODE", ("#test", "+k"), Prefix("op", "~op", "op.host")),
+        )
+        await settle(bot)
+
+        assert runtime.key == "secret"
+        assert [put["key"] for put in coordinator.channel_puts] == ["secret"]
+        record = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
+        assert record.key == "secret"
+
     async def test_mode_key_unset_without_argument_records_removal(self) -> None:
         """Record a -k stripped of its argument as one with it, key seen or not.
 
@@ -1107,7 +1171,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         the record holding the old key, though the channel now has none.
         """
         bot, _, coordinator = bot_with_coordinator()
-        await bot.channel_mgr.write_record("#test", "old", present=True)
+        await bounded(bot.channel_mgr.write_record("#test", "old", present=True))
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         op = Prefix("op", "~op", "op.host")
@@ -1272,7 +1336,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """
         bot, fake_irc, _ = bot_with_coordinator()
         mgr = bot.channel_mgr
-        await mgr.write_record("#test", "secret", present=True)
+        await bounded(mgr.write_record("#test", "secret", present=True))
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
@@ -2279,7 +2343,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         assert bot.events.nick_watch_task is None
 
     async def test_ison_poll_loop_polls_until_cancelled(self) -> None:
-        """Keep polling ISON, even once the nick is ours, until the watch stops.
+        """Keep polling ISON, past a refused send and once the nick is ours.
 
         A loop that ended on its own would leave nick_watch_task holding a
         finished task, so poll_ison would never start another.
@@ -2287,6 +2351,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
         record = fake_irc.send
+        refused = False
         polled_twice = asyncio.Event()
 
         def send_then_reclaim(
@@ -2295,6 +2360,12 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             trailing: str | None = None,
             unless_waiting: bool = False,
         ) -> bool:
+            nonlocal refused
+            if not refused:
+                refused = True
+                msg = "IRC outbound queue is full"
+                raise ConnectionError(msg)
+
             queued = record(
                 command, *params, trailing=trailing, unless_waiting=unless_waiting
             )
