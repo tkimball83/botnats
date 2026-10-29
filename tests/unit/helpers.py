@@ -259,8 +259,8 @@ class FakeIRC:
         self.reconnects += 1
 
     async def run_forever(self) -> None:
-        """No-op run loop."""
-        return
+        """Block until cancelled, as IRCClient.run_forever never returns."""
+        await hang()
 
     def send(
         self,

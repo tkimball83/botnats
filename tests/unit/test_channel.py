@@ -104,6 +104,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_enforce_modes_logs_invalid_command(self) -> None:
         """Keep invalid mode configuration from crashing a background task."""
         bot, fake_irc = bot_with_irc()
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].modes = ""
 
         with (
             patch.object(
@@ -144,6 +145,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc = bot_with_irc()
         bot.caps.chanmodes = ("beI", "kx", "l", "imnst")
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.modes = ""
         bot.config = replace(
             bot.config,
             channel_modes="+n-l",
@@ -169,6 +171,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_enforce_modes_skips_quietly(self) -> None:
         """Send nothing without configured modes; skip a lost connection quietly."""
         bot, fake_irc = bot_with_irc()
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].modes = ""
         configured = bot.config
         bot.config = replace(
             configured,
@@ -200,6 +203,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.modes = ""
         # A full send queue refuses commands as a dropped connection does.
         fake_irc.connected = False
 
@@ -228,8 +232,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("MODE", ("#test", "+np-s"))] * 2
 
-    async def test_enforce_modes_sends_while_modes_unknown(self) -> None:
-        """Send modes while unknown, or while their changes go untracked."""
+    async def test_enforce_modes_waits_while_modes_unknown(self) -> None:
+        """Send nothing while modes are unknown; send while changes go untracked."""
         bot, fake_irc = bot_with_irc()
         configured = bot.config
         bot.config = replace(
@@ -239,17 +243,17 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
 
-        # Unknown, not known to lack +s: no 324 reply has shown the modes.
+        # Unknown, not known to lack +s: the 324 reply that shows the modes
+        # enforces them.
         bot.channel_mgr.enforce_modes(runtime)
+        assert fake_irc.sent == []
+
         # The default CHANMODES lack p, so a MODE that removes it goes untracked.
         bot.config = configured
         runtime.modes = "+npst"
         bot.channel_mgr.enforce_modes(runtime)
 
-        assert fake_irc.sent == [
-            ("MODE", ("#test", "-s")),
-            ("MODE", ("#test", "+npst")),
-        ]
+        assert fake_irc.sent == [("MODE", ("#test", "+npst"))]
 
     async def test_new_record_orders_local_changes(self) -> None:
         """Order a bot's own changes without a shared process-wide counter."""
@@ -549,8 +553,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ("WHO", ("#test",)),
             ("MODE", ("#test",)),
             ("MODE", ("#test", "+b")),
-            ("MODE", ("#test", "+npst")),
         ]
+
+        # The query's reply shows the modes the fresh runtime lacks.
+        bot.events.on_irc_message(IRCMessage("324", ("alpha", "#test", "+nt")))
+        assert fake_irc.sent[4:] == [("MODE", ("#test", "+npst"))]
 
     async def test_rejoin_names_waits_for_send_queue(self) -> None:
         """Resend a rejoin's NAMES, once, after a full send queue drains.
@@ -777,7 +784,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             after=mgr.channel_records[folded].revision,
         )
 
-        async with mgr.key_lock:
+        async with mgr.write_lock:
             # MODE +k k queues behind a key write still in flight...
             bot.events.process_key(runtime, "k")
             assert runtime.key_pending

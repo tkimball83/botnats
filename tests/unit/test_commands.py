@@ -3,6 +3,7 @@
 
 """Tests for admin command parsing, dispatch, replies, and rate limiting."""
 
+import asyncio
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
@@ -23,6 +24,7 @@ from tests.unit.helpers import (
     drain_session_writes,
     make_bot,
     send_command,
+    settle,
 )
 
 if TYPE_CHECKING:
@@ -190,6 +192,91 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "Parting #test")]
         # Unlike a JOIN's record, the PART's keeps no live key.
         assert coordinator.channel_puts[-1]["key"] is None
+
+    async def test_part_waits_for_a_key_write_in_flight(self) -> None:
+        """Part once this bot's own key write, stored but unanswered, returns.
+
+        Written against the record before it, the PART would lose to that
+        write's compare-and-set.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        bot.authorizer.grant(OWNER.render())
+        put_channel = coordinator.put_channel
+        stored = asyncio.Event()
+        release = asyncio.Event()
+
+        async def unanswered_key_write(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            fields = await put_channel(record, after=after)
+            if record["key"] == "k":
+                stored.set()
+                await release.wait()
+
+            return fields
+
+        with patch.object(coordinator, "put_channel", unanswered_key_write):
+            bot.events.on_irc_message(
+                IRCMessage("MODE", ("#test", "+k", "k"), Prefix("op", "~op", "h")),
+            )
+            await bounded(stored.wait())
+            part = asyncio.create_task(bot.commands.cmd_part(OWNER, ("#test",)))
+            # Let the PART run until it waits for its turn.
+            await asyncio.sleep(0)
+            release.set()
+            await bounded(part)
+            await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        assert fake_irc.sent == [("PART", ("#test",))]
+
+    async def test_join_keeps_the_key_written_before_it(self) -> None:
+        """Store an admin JOIN with the key this bot's own key writes left.
+
+        Read before its turn, the key would be one that a key write ahead of
+        the JOIN replaced, and the JOIN would put it back.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        mgr = bot.channel_mgr
+        mgr.apply_record(mgr.new_record("#other", "old", present=True))
+        for runtime in mgr.channels.values():
+            runtime.join = JoinState.JOINED
+
+        bot.authorizer.grant(OWNER.render())
+        op = Prefix("op", "~op", "h")
+        put_channel = coordinator.put_channel
+        stored = asyncio.Event()
+        release = asyncio.Event()
+
+        async def unanswered_test_write(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            fields = await put_channel(record, after=after)
+            if record["channel"] == "#test":
+                stored.set()
+                await release.wait()
+
+            return fields
+
+        with patch.object(coordinator, "put_channel", unanswered_test_write):
+            # One turn writes the keys pending in #test, then in #other.
+            bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "k"), op))
+            await bounded(stored.wait())
+            join = asyncio.create_task(bot.commands.cmd_join(OWNER, ("#other",)))
+            # Let the JOIN run until it waits for its turn.
+            await asyncio.sleep(0)
+            bot.events.on_irc_message(IRCMessage("MODE", ("#other", "+k", "new"), op))
+            release.set()
+            await bounded(join)
+            await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Joining #other")]
+        assert mgr.channel_records[casefold("#other", "rfc1459")].key == "new"
 
     async def test_join_reply_needs_live_session(self) -> None:
         """Send no JOIN reply once the admin quit while its write was in flight.
