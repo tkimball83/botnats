@@ -57,9 +57,6 @@ services:
       - ./config/gamma.json:/etc/botnats/bot.json:ro
 
   irc:
-    entrypoint:
-      - /bin/sh
-      - /test/run-ergo.sh
     healthcheck:
       interval: 5s
       retries: 30
@@ -70,8 +67,6 @@ services:
     image: ghcr.io/ergochat/ergo:v2.19.1
     ports:
       - 127.0.0.1::6667
-    volumes:
-      - ./run-ergo.sh:/test/run-ergo.sh:ro
 
   nats-1:
     <<: *nats

@@ -23,18 +23,18 @@ CHANNELS = (
 )
 # Waits on the IRC server itself, which the bots' send pacing never delays.
 COMMAND_TIMEOUT = 15.0
+# Convergence polls. The slowest, a kicked bot's JOIN sent behind its queued
+# lines and refused twice before a peer's help lands, then retried 10 and 20
+# seconds after those refusals, takes about 37.5 seconds. This doubles it.
+# Nick reclaims follow Ergo's MONITOR notices, not the bots' 60-second ISON
+# poll.
+CONVERGENCE_TIMEOUT = 75.0
 POLL_INTERVAL = 0.25
 # The bots pace IRC output by flood cost: five short lines at once, then one
 # every two seconds. The slowest reply, to run()'s second JOIN, queues behind
 # the first channel's WHO, MODE, MODE +b, enforced modes and +o for each peer,
 # then that JOIN: eight lines, or 16 seconds. This doubles it.
 REPLY_TIMEOUT = 32.0
-# Convergence polls. The slowest, a kicked bot's JOIN sent behind its queued
-# lines and refused twice before a peer's help lands, then retried 10 and 20
-# seconds after those refusals, takes about 37.5 seconds. This doubles it.
-# Nick reclaims follow Ergo's MONITOR notices, not the bots' 60-second ISON
-# poll.
-STARTUP_TIMEOUT = 75.0
 TEST_BAN = "*!*@blocked.example"
 # TOTP counters this run has spent: each counter authenticates only once.
 USED_COUNTERS: set[int] = set()
@@ -266,7 +266,7 @@ def private_message(
 async def poll_until(
     check: Callable[[], Awaitable[bool]],
     *,
-    wait_seconds: float = STARTUP_TIMEOUT,
+    wait_seconds: float = CONVERGENCE_TIMEOUT,
     interval: float = POLL_INTERVAL,
 ) -> None:
     """Re-run an async check until it passes or the wait expires."""
