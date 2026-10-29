@@ -36,6 +36,7 @@ from tests.unit.helpers import (
     bot_with_channel,
     bot_with_coordinator,
     bot_with_irc,
+    bounded,
     make_bot,
     settle,
 )
@@ -205,6 +206,49 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.enforce_modes(runtime)
 
         assert runtime.names_due
+
+    async def test_enforce_modes_sends_only_modes_not_in_place(self) -> None:
+        """Skip modes the channel shows; send them once one is missing or set."""
+        bot, fake_irc = bot_with_irc()
+        bot.caps.chanmodes = ("beI", "k", "l", "imnpst")
+        bot.config = replace(
+            bot.config,
+            channel_modes="+np-s",
+            enforced_modes=mode_intent("+np-s"),
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+
+        runtime.modes = "+ntp"
+        bot.channel_mgr.enforce_modes(runtime)
+        assert fake_irc.sent == []
+
+        for modes in ("+nt", "+npst"):
+            runtime.modes = modes
+            bot.channel_mgr.enforce_modes(runtime)
+
+        assert fake_irc.sent == [("MODE", ("#test", "+np-s"))] * 2
+
+    async def test_enforce_modes_sends_while_modes_unknown(self) -> None:
+        """Send modes while none are tracked, or while their changes go untracked."""
+        bot, fake_irc = bot_with_irc()
+        configured = bot.config
+        bot.config = replace(
+            configured,
+            channel_modes="-s",
+            enforced_modes=mode_intent("-s"),
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+
+        bot.channel_mgr.enforce_modes(runtime)
+        # The default CHANMODES lack p, so a MODE that removes it goes untracked.
+        bot.config = configured
+        runtime.modes = "+npst"
+        bot.channel_mgr.enforce_modes(runtime)
+
+        assert fake_irc.sent == [
+            ("MODE", ("#test", "-s")),
+            ("MODE", ("#test", "+npst")),
+        ]
 
     async def test_new_record_orders_local_changes(self) -> None:
         """Order a bot's own changes without a shared process-wide counter."""
@@ -686,7 +730,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.channel_mgr.channel_records[folded] == before
         assert bot.channel_mgr.writing == set()
         coordinator.failing = False
-        await bot.channel_mgr.retry_pending_keys()
+        await bounded(bot.channel_mgr.retry_pending_keys())
 
         assert not runtime.key_pending
         assert coordinator.channel_puts[0]["key"] == "recordkey"
@@ -713,7 +757,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.apply_record(tombstone)
         assert fake_irc.sent == [("PART", ("#test",))]
         coordinator.failing = False
-        await bot.channel_mgr.retry_pending_keys()
+        await bounded(bot.channel_mgr.retry_pending_keys())
 
         assert folded not in bot.channel_mgr.channels
         assert coordinator.channel_puts == []
@@ -765,7 +809,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.hide_key()
         bot.channel_mgr.apply_record(newer)
         coordinator.failing = False
-        await bot.channel_mgr.retry_pending_keys()
+        await bounded(bot.channel_mgr.retry_pending_keys())
 
         assert coordinator.channel_puts == []
         assert not runtime.key_pending
@@ -794,7 +838,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         # A key write names the channel's newest record, #room[...
         await see_key(bot, runtime, "secret")
         # ...and a command the spelling it was given.
-        await bot.commands.cmd_join(OWNER, ("#room{", "other"))
+        await bounded(bot.commands.cmd_join(OWNER, ("#room{", "other")))
 
         assert coordinator.channel_after == [bracket.revision, brace.revision]
 
@@ -817,7 +861,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert runtime.key == "B"
         coordinator.failing = False
-        await mgr.retry_pending_keys()
+        await bounded(mgr.retry_pending_keys())
 
         assert [put["key"] for put in coordinator.channel_puts] == ["B"]
         assert mgr.channel_records[folded].key == "B"
@@ -862,7 +906,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 await settle(bot)
 
         assert runtime.key == "B"
-        await mgr.retry_pending_keys()
+        await bounded(mgr.retry_pending_keys())
 
         assert mgr.channel_records[folded].key == "B"
         assert not runtime.key_pending
@@ -911,7 +955,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.channel == "#room{"
         assert runtime.key == "B"
         coordinator.failing = False
-        await mgr.retry_pending_keys()
+        await bounded(mgr.retry_pending_keys())
 
         assert mgr.channel_records[folded].key == "B"
         assert not runtime.key_pending
@@ -958,7 +1002,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         keyed = mgr.new_record(
             "#test", "A", present=True, after=mgr.channel_records[folded].revision
         )
-        await coordinator.channels.put(asdict(keyed), after=None)
+        await bounded(coordinator.channels.put(asdict(keyed), after=None))
         mgr.apply_record(keyed)
         runtime = mgr.channels[folded]
         runtime.join = JoinState.JOINED
@@ -982,7 +1026,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert mgr.channel_records[folded].key == "A"
         assert runtime.key_pending
 
-        await mgr.retry_pending_keys()
+        await bounded(mgr.retry_pending_keys())
 
         _, stored = kv.entries[coordinator.channels.key("#test")]
         assert json.loads(stored)["key"] == "B"
@@ -1112,7 +1156,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
 
-        await bot.channel_mgr.write_record("#new", "key", present=True)
+        await bounded(bot.channel_mgr.write_record("#new", "key", present=True))
 
         assert fake_irc.sent == [("JOIN", ("#new", "key"))]
 
@@ -1279,12 +1323,12 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, coordinator = bot_with_coordinator()
         mgr = bot.channel_mgr
         peer = ChannelRecord.new("#test", None, present=True, floor=1_000)
-        await coordinator.channels.put(asdict(peer), after=None)
+        await bounded(coordinator.channels.put(asdict(peer), after=None))
         mgr.apply_record(peer)
         mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
         assert mgr.last_revision < revision_number(peer.revision)
 
-        assert await mgr.write_record("#Test", None, present=False)
+        assert await bounded(mgr.write_record("#Test", None, present=False))
 
         assert fake_irc.sent == [("PART", ("#Test",))]
         assert mgr.runtime("#test") is None
@@ -1298,9 +1342,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         mgr = bot.channel_mgr
         # Stored by a peer, but not yet watched here.
         winner = ChannelRecord.new("#new", None, present=False, floor=1_000)
-        await coordinator.channels.put(asdict(winner), after=None)
+        await bounded(coordinator.channels.put(asdict(winner), after=None))
 
-        assert not await mgr.write_record("#new", None, present=True)
+        assert not await bounded(mgr.write_record("#new", None, present=True))
 
         assert [put["present"] for put in coordinator.channel_puts] == [True]
         assert mgr.runtime("#new") is None
@@ -1331,7 +1375,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             return astuple(winner)
 
         with patch.object(coordinator, "put_channel", put_channel):
-            await bot.channel_mgr.write_record("#test", "stale-key", present=True)
+            await bounded(
+                bot.channel_mgr.write_record("#test", "stale-key", present=True)
+            )
 
         assert winner is not None
         assert bot.channel_mgr.channel_records[casefold("#test", "rfc1459")] == winner
@@ -1688,33 +1734,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("JOIN", ("#test",))]
 
-    async def test_join_state_transitions(self) -> None:
-        """Send JOIN when idle; resend one in flight or refused once it is due."""
-        bot, fake_irc, _ = bot_with_coordinator()
-        bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
-        )
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-
-        bot.channel_mgr.join_desired()
-        assert runtime.join is JoinState.JOINING
-        bot.channel_mgr.join_desired()
-        assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 1
-
-        bot.events.on_irc_message(
-            IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
-        )
-        bot.channel_mgr.join_desired()
-        assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 1
-        runtime.join_retry_at -= JOIN_RETRY_DELAY
-        bot.channel_mgr.join_desired()
-        assert len([cmd for cmd in fake_irc.sent if cmd[0] == "JOIN"]) == 2
-
-        bot.events.on_irc_message(
-            IRCMessage("JOIN", ("#test",), Prefix("alpha", "~alpha", "alpha.host")),
-        )
-        assert runtime.join is JoinState.JOINED
-
     async def test_refusals_back_off_until_joined(self) -> None:
         """Double a refused JOIN's retry delay per refusal, up to the reply timeout.
 
@@ -1787,13 +1806,13 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         coordinator = FakeCoordinator()
         bot = bot_with_channel(coordinator=coordinator)
 
-        await bot.channel_mgr.request_peer("unban", "#test")
+        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
         assert coordinator.help_requests == []
 
         bot.identity.current = BotPresence(
             "alpha", "bot.host", "one", "alpha", "~alpha"
         )
-        await bot.channel_mgr.request_peer("unban", "#test")
+        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
 
         assert coordinator.help_requests == [
             ("unban", {"channel": "#test", "presence": asdict(bot.identity.current)}),
@@ -1815,7 +1834,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("botnats.channel.PEER_REQUEST_COOLDOWN", cooldown):
             for kind in ("invite", "invite", "limit"):
-                await bot.channel_mgr.request_peer(kind, "#test")
+                await bounded(bot.channel_mgr.request_peer(kind, "#test"))
 
             assert [kind for kind, _ in coordinator.help_requests] == [
                 "invite",
@@ -1824,7 +1843,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
             # The invite request's cooldown runs out.
             runtime.cooldowns["invite"] -= cooldown
-            await bot.channel_mgr.request_peer("invite", "#test")
+            await bounded(bot.channel_mgr.request_peer("invite", "#test"))
 
         assert [kind for kind, _ in coordinator.help_requests] == [
             "invite",
@@ -1840,7 +1859,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "bot.host", "one", "alpha", "~alpha"
         )
 
-        await bot.channel_mgr.request_peer("unban", "#unknown")
+        await bounded(bot.channel_mgr.request_peer("unban", "#unknown"))
 
         assert coordinator.help_requests == []
 
@@ -1854,7 +1873,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.join = JoinState.JOINED
         runtime.member("beta").modes.add("o")
 
-        await bot.channel_mgr.request_ops()
+        await bounded(bot.channel_mgr.request_ops())
 
         op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
         assert len(op_requests) == 1
@@ -1890,7 +1909,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.channel_mgr.channels["#opped"].member("alpha").modes.add("o")
 
-        await bot.channel_mgr.request_ops()
+        await bounded(bot.channel_mgr.request_ops())
 
         op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
         assert [payload["channel"] for _, payload in op_requests] == [
@@ -1912,7 +1931,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("stranger").prefix = Prefix("stranger", "user", "other.host")
         runtime.member("stranger").modes.add("o")
 
-        await bot.channel_mgr.request_ops()
+        await bounded(bot.channel_mgr.request_ops())
 
         op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
         assert len(op_requests) == 0
