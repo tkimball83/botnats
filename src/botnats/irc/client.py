@@ -377,10 +377,12 @@ class IRCClient:
             msg = "IRC is not connected"
             raise ConnectionError(msg)
 
-        # Only peer help asks for this. Under flood pacing a queued copy costs
-        # seconds, and IRC state cannot show a command still queued. A copy
-        # skipped before a line that reverses it heals only for help: the
-        # peer asks again until it sees the result.
+        # Peer help and the op-gain MODE query ask for this. Under flood
+        # pacing a queued copy costs seconds, and IRC state cannot show a
+        # command still queued. A help copy skipped before a line that
+        # reverses it heals: the peer asks again until it sees the result.
+        # A skipped query is safe: the waiting copy goes out after the op
+        # gain already seen, so its 324 still shows the operator's view.
         if unless_waiting and self.queued_lines[encoded]:
             return False
 

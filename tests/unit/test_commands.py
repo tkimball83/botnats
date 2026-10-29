@@ -84,13 +84,16 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         assert not limiter.check("alice")
 
     async def test_command_window(self) -> None:
-        """Verify the command limiter forgets commands after the 10-second window."""
+        """Verify the command limiter counts commands for 10 seconds, then forgets."""
         limiter = make_bot().commands.command_limiter
+        now = asyncio.get_running_loop().time()
         # A full budget spent exactly one window ago no longer counts.
-        spent = asyncio.get_running_loop().time() - 10
-        limiter.buckets["host.example"] = deque([spent] * 8)
+        limiter.buckets["host.example"] = deque([now - 10] * 8)
+        # One spent a second inside the window still does.
+        limiter.buckets["other.example"] = deque([now - 9] * 8)
 
         assert limiter.check("host.example")
+        assert not limiter.check("other.example")
 
     async def test_window_expiry(self) -> None:
         """Verify rate limit resets after window expires."""
