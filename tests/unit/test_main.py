@@ -100,6 +100,28 @@ class MainTests(unittest.TestCase):
         run_loop.assert_called_once_with(run_bot.return_value)
         assert basic_config.call_args.kwargs["level"] == logging.DEBUG
 
+    def test_config_path_defaults_to_environment(self) -> None:
+        """Load the configuration BOTNATS_CONFIG names when --config is absent."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bot.json")
+            path.write_bytes(CONFIG)
+            environment = {
+                **SECRETS,
+                "BOTNATS_CONFIG": str(path),
+                "BOTNATS_LOG_LEVEL": "INFO",
+            }
+            with (
+                patch.object(sys, "argv", ["botnats"]),
+                patch.dict(os.environ, environment),
+                patch("logging.basicConfig"),
+                patch("asyncio.run"),
+                patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
+            ):
+                main()
+                loaded = BotConfig.load(path)
+
+        run_bot.assert_called_once_with(loaded)
+
     def test_interrupt_exits_cleanly(self) -> None:
         """Return normally when SIGTERM, as docker stop sends, or Ctrl-C stops it."""
         with tempfile.TemporaryDirectory() as directory:
