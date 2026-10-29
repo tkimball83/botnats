@@ -190,6 +190,22 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
                 assert fake_irc.sent == [("WHO", ("alpha_",))]
                 assert fake_irc.reconnects == 0
 
+    async def test_identity_discovery_stops_when_disconnected(self) -> None:
+        """Stop quietly when the connection drops before the WHO is sent.
+
+        The next registration starts a new discovery; a raise would log an
+        error traceback for a routine disconnect.
+        """
+        fake_irc = FakeIRC()
+        bot = make_bot(irc=fake_irc)
+        fake_irc.connected = False
+        with self.assertNoLogs("botnats", level="WARNING"):
+            async with asyncio.timeout(1):
+                await bot.identity.discover(bot.identity.generation)
+
+        assert fake_irc.sent == []
+        assert fake_irc.reconnects == 0
+
     async def test_identity_discovery_reconnects(self) -> None:
         """Verify bot reconnects when identity discovery exhausts retries."""
         fake_irc = FakeIRC()

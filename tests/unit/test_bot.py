@@ -375,10 +375,10 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
     """Tests for the maintenance loops and the upkeep each tick performs."""
 
     async def test_loop_continues_after_tick_error(self) -> None:
-        """Verify the maintenance loop survives a tick exception."""
+        """Verify the maintenance loop waits its interval and survives tick errors."""
         bot = Bot(config())
         calls = 0
-        sleeps = 0
+        delays: list[float] = []
         real_sleep = asyncio.sleep
 
         async def counting_tick() -> None:
@@ -392,12 +392,10 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             await real_sleep(0)
 
         async def immediate(delay: float) -> None:
-            del delay
-            nonlocal sleeps
-            sleeps += 1
+            delays.append(delay)
             # Stop on a sleep count, not a tick count, so a loop that stops
             # ticking fails the assertion below instead of spinning forever.
-            if sleeps == 3:
+            if len(delays) == 3:
                 msg = "stop"
                 raise asyncio.CancelledError(msg)
 
@@ -412,6 +410,9 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
                 await bot.maintenance_loop(counting_tick, "maintenance tick")
 
         assert calls == 2
+        # The presence heartbeat runs on this loop too; waiting the presence
+        # TTL instead would let presence lapse every cycle.
+        assert delays == [bot.config.maintenance_interval] * 3
 
     async def test_heartbeat_continues_while_retries_stall(self) -> None:
         """Keep refreshing presence while a durable-state retry hangs."""

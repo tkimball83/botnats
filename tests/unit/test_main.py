@@ -122,6 +122,24 @@ class MainTests(unittest.TestCase):
 
         run_bot.assert_called_once_with(loaded)
 
+    def test_log_level_defaults_to_info(self) -> None:
+        """Log at INFO when BOTNATS_LOG_LEVEL is unset."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "bot.json")
+            path.write_bytes(CONFIG)
+            with (
+                patch.object(sys, "argv", ["botnats", "--config", str(path)]),
+                patch.dict(os.environ, SECRETS),
+                patch("logging.basicConfig") as basic_config,
+                patch("asyncio.run"),
+                patch("botnats.__main__.run", new_callable=MagicMock),
+            ):
+                # patch.dict restores the variable if the shell set it.
+                os.environ.pop("BOTNATS_LOG_LEVEL", None)
+                main()
+
+        assert basic_config.call_args.kwargs["level"] == logging.INFO
+
     def test_interrupt_exits_cleanly(self) -> None:
         """Return normally when SIGTERM, as docker stop sends, or Ctrl-C stops it."""
         with tempfile.TemporaryDirectory() as directory:

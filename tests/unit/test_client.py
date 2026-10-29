@@ -715,8 +715,16 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
     async def test_welcome_and_own_nick_change_track_current_nick(self) -> None:
-        """Follow the server-assigned nick and this client's own NICK changes."""
+        """Follow the server-assigned nick and own NICK changes before handlers run."""
         client = self.cap_client()
+        # Handlers read the nick, so they must see each change already made.
+        seen: list[str] = []
+
+        def record_nick(message: IRCMessage) -> None:
+            del message
+            seen.append(client.current_nick)
+
+        client.on_message = record_nick
 
         await dispatch(client, b":server 001 Alpha[ :Welcome\r\n")
         assert client.registered_with_server
@@ -730,6 +738,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         await dispatch(client, b":other!user@host NICK :gamma\r\n")
         assert client.current_nick == "beta"
+        assert seen == ["Alpha[", "beta", "beta"]
 
     async def test_nick_collision_keeps_configured_length(self) -> None:
         """Pick a fallback nick as long as the configured one.
@@ -1196,6 +1205,46 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(5):
                 await client.run_connection(client.config.servers[0])
 
+        assert dispatched == ["001", "002"]
+
+    async def test_answered_ping_lets_the_next_idle_spell_ping(self) -> None:
+        """Clear an answered PING, so a quiet session PINGs again and stays up."""
+        client = irc_client()
+        dispatched: list[str] = []
+
+        def record_message(message: IRCMessage) -> None:
+            dispatched.append(message.command)
+
+        client.on_message = record_message
+        writer = mock_writer()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b":server 001 alpha :Welcome\r\n")
+        pings: list[bytes] = []
+
+        def answer_ping(encoded: bytes) -> None:
+            # Answer before the client reads again, as the PONG wait is zero:
+            # a PING its PONG did not clear then fails at once.
+            if encoded.startswith(b"PING :"):
+                pings.append(encoded)
+                token = encoded.removeprefix(b"PING :").removesuffix(b"\r\n")
+                reader.feed_data(b":server PONG server :" + token + b"\r\n")
+                if len(pings) == 2:
+                    reader.feed_data(b":server 002 alpha :hi\r\n")
+                    reader.feed_eof()
+
+        writer.write.side_effect = answer_ping
+        connection = (reader, writer)
+
+        with (
+            patch.object(client, "establish", AsyncMock(return_value=connection)),
+            patch("botnats.irc.client.IDLE_TIMEOUT", 0),
+            patch("botnats.irc.client.PONG_TIMEOUT", 0),
+            self.assertRaisesRegex(ConnectionError, "connection closed"),
+        ):
+            async with asyncio.timeout(5):
+                await client.run_connection(client.config.servers[0])
+
+        assert len(pings) == 2
         assert dispatched == ["001", "002"]
 
     async def test_reconnect_restarts_registration(self) -> None:
