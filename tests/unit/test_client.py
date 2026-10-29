@@ -26,7 +26,7 @@ from botnats.irc.protocol import (
     format_message,
     parse_message,
 )
-from tests.unit.helpers import hang
+from tests.unit.helpers import bounded, hang
 
 REAL_SLEEP = asyncio.sleep
 
@@ -815,9 +815,32 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         sent = client.outbound.get_nowait()
         assert sent == b"CAP END\r\n"
 
+    async def test_cap_ls_after_registration_is_ignored(self) -> None:
+        """Ignore a late CAP LS instead of restarting negotiation traffic.
+
+        A REQ or END it queued could find the send queue full and end the
+        registered session.
+        """
+        client = self.cap_client(negotiating=False)
+        client.cap_available = {"multi-prefix"}
+        client.cap_ls_done = True
+
+        client.handle_cap(
+            parse_message(":server CAP alpha LS :chghost multi-prefix\r\n"),
+        )
+
+        assert client.cap_available == {"multi-prefix"}
+        assert client.cap_ls_done
+        assert not client.cap_negotiating
+        assert client.outbound is not None
+        assert client.outbound.empty()
+
     async def test_cap_new_and_del_after_registration(self) -> None:
         """Verify NEW requests desired capabilities and DEL is ignored."""
         client = self.cap_client(negotiating=False)
+        # The LS phase finished before registration, so only the ended
+        # negotiation keeps this ACK from sending another CAP END.
+        client.cap_ls_done = True
         client.handle_cap(
             parse_message(":server CAP alpha NEW :multi-prefix sasl\r\n"),
         )
@@ -894,7 +917,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
 
         client = irc_client(ports=(port,))
@@ -937,7 +960,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
         client.on_message = record_message
@@ -977,7 +1000,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
         client.on_message = record_message
@@ -1031,7 +1054,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
         try:
@@ -1058,7 +1081,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
         try:
@@ -1156,7 +1179,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             if message.command == "001":
                 client.send("JOIN", "#sync")
 
-        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
         client.on_message = join_on_welcome
@@ -1326,7 +1349,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-        server = await asyncio.start_server(server_handler, "127.0.0.1", 0)
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
         try:

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import create_autospec, patch
 
 from botnats.health_check import HealthCheck
+from tests.unit.helpers import bounded
 
 
 class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
@@ -16,7 +17,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
 
     async def request(self, health_check: HealthCheck, path: str) -> bytes:
         """Request one health path and return its response."""
-        await health_check.start()
+        await bounded(health_check.start())
         try:
             assert health_check.server is not None
             port = next(
@@ -42,10 +43,10 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_is_idempotent(self) -> None:
         """Verify repeated shutdown stops and releases the listening server."""
         health_check = HealthCheck(ready=lambda: True, port=0)
-        await health_check.start()
+        await bounded(health_check.start())
         server = health_check.server
         assert server is not None
-        self.addAsyncCleanup(server.wait_closed)
+        self.addAsyncCleanup(bounded, server.wait_closed())
         self.addCleanup(server.close)
         assert server.is_serving()
 
