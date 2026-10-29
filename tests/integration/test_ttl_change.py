@@ -1,28 +1,35 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Verify a changed session TTL is applied to existing buckets."""
+"""Verify a changed presence TTL is applied to existing buckets."""
 
 import json
-import time
 import uuid
 
 from nats.js.errors import BadRequestError
 
-from botnats.nats.store import SessionStore
+from botnats.nats.store import PresenceStore
 from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
     connect,
     coordination_key,
     delete_buckets,
 )
-from tests.integration.test_restart import SESSION_IDENTITY, SESSION_TTL, session_record
+
+BOT_ID = "ttl"
+PRESENCE = {
+    "bot_id": BOT_ID,
+    "host": "host",
+    "instance_id": "instance",
+    "nick": BOT_ID,
+    "user": "user",
+}
 
 
 async def ttl_change() -> None:
-    """Reopen session buckets under new TTLs without losing their sessions."""
+    """Reopen presence buckets under new TTLs without losing their records."""
     # Below two minutes the TTL also sets the bucket's duplicate window.
-    for old, new in ((SESSION_TTL, SESSION_TTL * 2), (15.0, 30.0)):
+    for old, new in ((300.0, 600.0), (15.0, 30.0)):
         await reopen_with_ttl(old, new)
 
 
@@ -31,25 +38,25 @@ async def reopen_with_ttl(old: float, new: float) -> None:
     network = f"ttl{uuid.uuid4().hex}"
     nc = await connect()
     try:
-        before = SessionStore(network, JETSTREAM_REPLICAS, coordination_key(), old)
+        before = PresenceStore(network, JETSTREAM_REPLICAS, old, coordination_key())
         await before.open(nc.jetstream())
-        await before.put(session_record(network, time.time() + old / 2))
+        assert await before.create(BOT_ID, PRESENCE) is not None
 
-        after = SessionStore(network, JETSTREAM_REPLICAS, coordination_key(), new)
+        after = PresenceStore(network, JETSTREAM_REPLICAS, new, coordination_key())
         kv = await after.open(nc.jetstream())
 
         info = await nc.jetstream().stream_info(f"KV_{after.bucket}")
         assert info.config.max_age == new
-        entry = await kv.get(after.key(SESSION_IDENTITY))
+        entry = await kv.get(after.key(BOT_ID))
         assert entry.value is not None
-        assert json.loads(entry.value)["prefix"] == SESSION_IDENTITY
+        assert json.loads(entry.value)["bot_id"] == BOT_ID
 
         # A different replica count is not applied; it fails as before.
-        fewer = SessionStore(
+        fewer = PresenceStore(
             network,
             JETSTREAM_REPLICAS - 1,
-            coordination_key(),
             new,
+            coordination_key(),
         )
         try:
             await fewer.open(nc.jetstream())

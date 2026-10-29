@@ -39,7 +39,6 @@ BETA_PRESENCE = {
 }
 EVENT_TIMEOUT = 5.0
 HELP_KINDS = ("invite", "limit", "op", "unban")
-SESSION_TTL = 300.0
 START_TIMEOUT = 30.0
 
 
@@ -78,7 +77,6 @@ def build_coordinator(
             presence_ttl=15.0,
             replicas=JETSTREAM_REPLICAS,
             servers=tuple(nats_urls()),
-            session_ttl=SESSION_TTL,
             token=os.environ["BOTNATS_TEST_NATS_TOKEN"],
         ),
         envelope=Envelope(bot_id, coordination_key()),

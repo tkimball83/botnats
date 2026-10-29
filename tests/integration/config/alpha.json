@@ -1,7 +1,4 @@
 {
-  "authorization": {
-    "session_ttl_seconds": 300
-  },
   "bot": {
     "id": "alpha",
     "network": "integration",

@@ -17,7 +17,12 @@ from botnats import Tasks
 from botnats.auth import TOTP_PERIOD, SessionSync, TotpAuthorizer, totp
 from botnats.channel import ChannelRecord
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
-from botnats.nats.store import ATTEMPT_LIMIT, SESSION_EXPIRY_GRACE, Session
+from botnats.nats.store import (
+    ATTEMPT_LIMIT,
+    SESSION_EXPIRY_GRACE,
+    SESSION_TTL,
+    Session,
+)
 from tests.unit.helpers import (
     AUTH_KEY,
     COORDINATION_KEY,
@@ -43,7 +48,6 @@ def authorizer(issuer: str = "alpha") -> TotpAuthorizer:
         coordination_secret=COORDINATION_KEY,
         identity_fold=lambda value: casefold(value, "ascii"),
         scope=(issuer, "efnet"),
-        session_ttl=30,
     )
 
 
@@ -100,7 +104,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         """Keep a held revocation that expires after a new session would."""
         auth = authorizer()
         prefix = "owner!user@example.test"
-        auth.keep(auth.create(prefix, 10 + auth.session_ttl + 1, "beta", revoked=True))
+        auth.keep(auth.create(prefix, 10 + SESSION_TTL + 1, "beta", revoked=True))
 
         auth.grant(prefix, now=10)
 
@@ -142,21 +146,22 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert not target.authorized(prefix, now=21)
 
     def test_session_binding_and_expiry(self) -> None:
-        """Bind a session to its prefix, expire it after TTL, and prune it."""
+        """Bind a session to its prefix, expire it after an hour, and prune it."""
         auth = authorizer()
         prefix = "owner!user@example.test"
 
         auth.grant(prefix, now=11)
         assert not auth.authorized("other!user@example.test", now=12)
-        assert auth.authorized(prefix, now=40.9)
-        assert not auth.authorized(prefix, now=41)
+        # Every bot grants the same lifetime, so a changed one must fail here.
+        assert auth.authorized(prefix, now=11 + 3599.9)
+        assert not auth.authorized(prefix, now=11 + 3600)
         assert not auth.records
 
     def test_prune_drops_only_expired_records(self) -> None:
         """Prune expired sessions and revocations, and keep live ones."""
         auth = authorizer()
         now = time.time()
-        for nick, granted in (("expired", now - 60), ("live", now)):
+        for nick, granted in (("expired", now - SESSION_TTL - 30), ("live", now)):
             auth.grant(f"{nick}!user@example.test", now=granted)
             auth.grant(f"{nick}-revoked!user@example.test", now=granted)
             auth.revoke(f"{nick}-revoked!user@example.test")
@@ -177,8 +182,8 @@ class TotpAuthorizerTests(unittest.TestCase):
         session = first.grant(prefix, now=10)
         second.keep(session)
 
-        assert second.authorized(prefix, now=39.9)
-        assert not second.authorized(prefix, now=40)
+        assert second.authorized(prefix, now=10 + SESSION_TTL - 0.1)
+        assert not second.authorized(prefix, now=10 + SESSION_TTL)
 
     def test_totp_matching_windows(self) -> None:
         """Accept codes one period either side of now, and none further out."""
@@ -302,9 +307,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """
         coordinator = FailingWriteCoordinator()
         bot, fake_irc, _ = bot_with_coordinator(coordinator)
-        ttl = bot.config.auth_session_ttl
         bot.authorizer.keep(
-            bot.authorizer.create("foo{!u@h", time.time() + ttl + 30, "beta"),
+            bot.authorizer.create("foo{!u@h", time.time() + SESSION_TTL + 30, "beta"),
         )
         prefix = Prefix("foo[", "u", "h")
         valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
@@ -455,7 +459,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         bot.authorizer.keep(
             bot.authorizer.create(
                 prefix.render(),
-                time.time() + bot.config.auth_session_ttl + 60,
+                time.time() + SESSION_TTL + 60,
                 "beta",
                 revoked=True,
             ),
@@ -716,7 +720,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         # session this AUTH can grant.
         revocation = bot.authorizer.create(
             prefix.render(),
-            time.time() + bot.config.auth_session_ttl + 30,
+            time.time() + SESSION_TTL + 30,
             "beta",
             revoked=True,
         )
@@ -1497,7 +1501,7 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         bot, _, coordinator = bot_with_coordinator()
         refused = bot.authorizer.create(
             "other!user@host.example",
-            time.time() + bot.config.auth_session_ttl + SESSION_EXPIRY_GRACE + 60,
+            time.time() + SESSION_TTL + SESSION_EXPIRY_GRACE + 60,
             bot.authorizer.issuer,
             1,
             revoked=True,

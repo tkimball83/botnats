@@ -62,6 +62,9 @@ CLAIM_TTL = 300.0
 DUPLICATE_WINDOW = 120.0
 PRESENCE_DRIFT = 30.0
 SESSION_EXPIRY_GRACE = 60.0
+# The same on every bot: a bot skips grants that expire past its own horizon,
+# so it could never revoke a grant from a peer with a longer lifetime.
+SESSION_TTL = 3600.0
 
 
 class KVStore:
@@ -519,8 +522,8 @@ class PresenceStore(KVStore):
 class SessionStore(KVStore):
     """Auth sessions in JetStream KV with TTL-based expiry."""
 
-    def __init__(self, network: str, replicas: int, secret: bytes, ttl: float) -> None:
-        super().__init__(f"botnats_v1_{network}_sessions", replicas, ttl)
+    def __init__(self, network: str, replicas: int, secret: bytes) -> None:
+        super().__init__(f"botnats_v1_{network}_sessions", replicas, SESSION_TTL)
         self.network = network
         self.secret = secret
 

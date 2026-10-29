@@ -25,13 +25,13 @@ stores shared durable state and atomic authentication controls.
 | Data                           | Storage      | Lifetime                     |
 | ------------------------------ | ------------ | ---------------------------- |
 | Channel configuration and keys | JetStream KV | Until changed or removed     |
-| Authorization sessions         | JetStream KV | Configured session TTL       |
+| Authorization sessions         | JetStream KV | One hour                     |
 | Authentication attempts        | JetStream KV | Two hours                    |
 | Used TOTP counters             | JetStream KV | Five minutes                 |
 | Bot presence                   | JetStream KV | Configured presence TTL      |
 
 File-backed JetStream preserves channel state and authentication controls across
-bot and NATS restarts; sessions and presence still expire at their configured TTLs.
+bot and NATS restarts; sessions and presence still expire at their TTLs.
 
 ## Configuration
 
@@ -47,9 +47,6 @@ Example `bot.json`:
 
 ```json
 {
-  "authorization": {
-    "session_ttl_seconds": 3600
-  },
   "bot": {
     "health_port": 8080,
     "id": "mybot",
@@ -79,7 +76,6 @@ Example `bot.json`:
 
 | Setting                                     | Behavior                                                                  |
 | ------------------------------------------- | ------------------------------------------------------------------------- |
-| `authorization.session_ttl_seconds`         | Authorized session lifetime; 3,600 seconds by default                     |
 | `bot.health_port`                           | HTTP liveness and readiness port; 8080 by default                         |
 | `bot.id`                                    | Unique mesh ID; compared case-insensitively; required                     |
 | `bot.network`                               | One IRC network per process; namespaces shared NATS state; required       |

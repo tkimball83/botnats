@@ -31,6 +31,7 @@ from botnats.nats.coordinator import (
 from botnats.nats.envelope import Envelope
 from botnats.nats.store import (
     SESSION_EXPIRY_GRACE,
+    SESSION_TTL,
     AttemptStore,
     ChannelStore,
     ClaimStore,
@@ -93,7 +94,6 @@ def build_coordinator(bot_id: str, network: str = "efnet") -> Coordinator:
             presence_ttl=20.0,
             replicas=3,
             servers=("nats://localhost:4222",),
-            session_ttl=600.0,
             token=NATS_CREDENTIAL,
         ),
         envelope=Envelope(bot_id, COORDINATION_KEY),
@@ -925,7 +925,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         # Channel records never expire, so a restarting bot replays every one.
         assert coordinator.channels_store.ttl == 0
         assert coordinator.presence_store.ttl == config.presence_ttl
-        assert coordinator.sessions.ttl == config.session_ttl
+        assert coordinator.sessions.ttl == SESSION_TTL
 
     async def test_reconnect_retries_stores(self) -> None:
         """Verify reconnect restores all stores before starting watches."""
@@ -1457,7 +1457,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_watch_skips_grant_beyond_horizon(self) -> None:
         """Skip a signed grant beyond the horizon, reporting no update or delete.
 
-        A peer with a longer session TTL or a faster clock writes it; a delete
+        A peer whose clock runs ahead by more than the grace writes it; a delete
         would have this bot write back over it, and that peer write it again.
         The replay still counts its key, so it is not treated as missing.
         """
@@ -1489,7 +1489,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_watch_applies_revocation_beyond_horizon(self) -> None:
         """Revoke a held grant with a signed revocation beyond the horizon.
 
-        A peer with a longer session TTL or a faster clock revokes its own
+        A peer whose clock runs ahead by more than the grace revokes its own
         grant, which outranks this bot's; skipped, the revocation would leave
         this bot's grant authorized until it expires. It applies during the
         replay and after it, and the peer's later grant beyond the horizon
