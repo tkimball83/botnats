@@ -26,8 +26,9 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 # The restarted bot's STATUS reply queues behind its registration, WHO, and
-# rejoin (JOIN, WHO, MODE, MODE +b, then MODE and enforced modes once
-# opped): 12 lines, sent within 16 seconds of connecting under flood pacing.
+# rejoin of both present channels (each JOIN, WHO, MODE, MODE +b, then MODE
+# and enforced modes once opped): 18 lines, sent within 28 seconds of
+# connecting under flood pacing.
 RESTART_TIMEOUT = 90.0
 # A reply later than one poll is read by the next; this only paces resends.
 STATUS_POLL_WAIT = 3.0

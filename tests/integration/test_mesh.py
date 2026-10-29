@@ -20,6 +20,8 @@ BOTS = frozenset({"alpha", "beta", "gamma"})
 CHANNELS = (
     ("#botnats-first", "first-key"),
     ("#botnats-second", "second-key"),
+    # Never keyed: it keeps only the enforced modes.
+    ("#botnats-third", None),
 )
 # Waits on the IRC server itself, which the bots' send pacing never delays.
 COMMAND_TIMEOUT = 15.0
@@ -31,9 +33,9 @@ COMMAND_TIMEOUT = 15.0
 CONVERGENCE_TIMEOUT = 75.0
 POLL_INTERVAL = 0.25
 # The bots pace IRC output by flood cost: five short lines at once, then one
-# every two seconds. The slowest reply, to run()'s second JOIN, queues behind
-# the first channel's WHO, MODE, MODE +b, enforced modes and +o for each peer,
-# then that JOIN: eight lines, or 16 seconds. This doubles it.
+# every two seconds. The slowest replies, to run()'s later JOINs, queue behind
+# the previous channel's WHO, MODE, MODE +b, enforced modes and +o for each
+# peer, then that JOIN: eight lines, or 16 seconds. This doubles it.
 REPLY_TIMEOUT = 32.0
 TEST_BAN = "*!*@blocked.example"
 # TOTP counters this run has spent: each counter authenticates only once.
@@ -290,34 +292,38 @@ async def run() -> None:
         await authenticate(session, "gamma", code, "Authorization failed")
 
         for channel, key in CHANNELS:
-            supplied = f"{key}-supplied"
-            assert await command(session, "alpha", f"JOIN {channel} {supplied}") == (
+            supplied = f" {key}-supplied" if key else ""
+            assert await command(session, "alpha", f"JOIN {channel}{supplied}") == (
                 f"Joining {channel}"
             )
-            await wait_for_channel(session, channel, key)
+            await wait_for_channel(session, channel)
 
         await wait_for_status(session)
 
         for channel, key in CHANNELS:
-            # Key the channel with other than the key the admin supplied: later
-            # rejoins need the key the bots saw on IRC and stored.
-            await wait_for_reply(
-                session, "alpha", f"OP {channel} owner", f"Opped owner on {channel}"
-            )
-            await wait_for_operators(session, channel, present=frozenset({"owner"}))
-            await session.send("MODE", channel, "+k", key)
-            _, tracked, *arguments = (
-                await command(session, "gamma", f"GETMODES {channel}")
-            ).split()
-            assert "k" in tracked
-            assert arguments[-1] == key
+            if key is not None:
+                # Key the channel with other than the key the admin supplied:
+                # later rejoins need the key the bots saw on IRC and stored.
+                await wait_for_reply(
+                    session, "alpha", f"OP {channel} owner", f"Opped owner on {channel}"
+                )
+                await wait_for_operators(session, channel, present=frozenset({"owner"}))
+                await session.send("MODE", channel, "+k", key)
+                _, tracked, *arguments = (
+                    await command(session, "gamma", f"GETMODES {channel}")
+                ).split()
+                assert "k" in tracked
+                assert arguments[-1] == key
+
             channel_modes = await modes(session, channel)
+            assert ("k" in channel_modes) == (key is not None)
             assert "m" in channel_modes
             assert "n" in channel_modes
             assert "t" in channel_modes
 
         first, _ = CHANNELS[0]
         second, second_key = CHANNELS[1]
+        third, _ = CHANNELS[2]
 
         # Multiple channels with different modes: set an extra mode on the
         # first channel, then remove an enforced one. The bots must restore
@@ -346,9 +352,10 @@ async def run() -> None:
         assert await command(session, "alpha", f"PART {first}") == f"Parting {first}"
         await wait_for_names(session, first, absent=BOTS)
         await wait_for_names(session, second, present=BOTS)
+        await wait_for_names(session, third, present=BOTS)
         reply = await command(session, "gamma", f"GETMODES {second}")
         assert second_key in reply
-        assert "channels=1" in await command(session, "beta", "STATUS")
+        assert "channels=2" in await command(session, "beta", "STATUS")
     finally:
         await session.close()
 
@@ -367,9 +374,9 @@ async def wait_for_bots(session: IRCSession) -> None:
     await poll_until(online)
 
 
-async def wait_for_channel(session: IRCSession, channel: str, key: str) -> None:
-    """Join one channel and wait until all bots have converged into it."""
-    await session.send("JOIN", channel, key)
+async def wait_for_channel(session: IRCSession, channel: str) -> None:
+    """Join one channel, not yet keyed, and wait until all bots converge into it."""
+    await session.send("JOIN", channel)
     await wait_for_names(session, channel, present=BOTS)
 
 
@@ -431,7 +438,7 @@ async def wait_for_status(session: IRCSession) -> None:
             wait_seconds=REPLY_TIMEOUT,
         )
         local_text = local_status.params[-1]
-        if "peers=2" not in local_text or "channels=2" not in local_text:
+        if "peers=2" not in local_text or "channels=3" not in local_text:
             return False
 
         nats_fields = dict(
