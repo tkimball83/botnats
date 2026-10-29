@@ -119,7 +119,7 @@ class ChannelManager:
             self.part(record.channel)
 
     def enforce_modes(self, runtime: ChannelRuntime) -> None:
-        """Set the configured channel modes when the bot has operator status."""
+        """Set the configured channel modes, unless they are already in place."""
         if not self.bot.config.channel_modes:
             return
 
@@ -139,6 +139,17 @@ class ChannelManager:
                 "cannot enforce modes on %s: configured mode requires an argument",
                 runtime.channel,
             )
+            return
+
+        # Skip a line the tracked modes show is not needed. They are empty
+        # while unknown, and follow MODE changes only to the letters CHANMODES
+        # lists: any other letter can be stale.
+        if runtime.modes and all(
+            mode in caps.chanmodes[2] + caps.chanmodes[3]
+            and (mode in runtime.modes) == adding
+            for adding, modes in ((True, required), (False, forbidden))
+            for mode in modes
+        ):
             return
 
         try:
