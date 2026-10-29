@@ -164,11 +164,12 @@ class CommandHandler:
         if runtime is None:
             self.reply(prefix.nick, f"No record for {channel}")
         elif runtime.modes:
-            limit = str(runtime.limit) if runtime.limit is not None else None
-            values = {"k": runtime.key, "l": limit}
+            # "*" holds the place of an unknown value, such as a key IRC hid.
+            limit = str(runtime.limit) if runtime.limit is not None else "*"
+            values = {"k": runtime.key or "*", "l": limit}
             # Mode arguments follow their letters' order, as in a MODE line.
             parts = [channel, runtime.modes]
-            parts.extend(value for mode in runtime.modes if (value := values.get(mode)))
+            parts.extend(values[mode] for mode in runtime.modes if mode in values)
             self.reply(prefix.nick, " ".join(parts))
         else:
             self.reply(
