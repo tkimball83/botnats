@@ -17,6 +17,7 @@ from nats.js.errors import (
 from nats.js.kv import VALID_KEY_RE
 
 from botnats.bot import Bot
+from botnats.channel import ChannelRecord
 from botnats.config import BotConfig
 from botnats.irc.client import IRCServer
 from botnats.irc.protocol import (
@@ -163,7 +164,7 @@ def bot_with_channel(
 ) -> Bot:
     """Create a bot with a single test channel registered."""
     bot = make_bot(irc=irc, coordinator=coordinator)
-    record = bot.channel_mgr.new_record("#test", None, present=True)
+    record = ChannelRecord.new("#test", None, present=True)
     bot.channel_mgr.apply_record(record)
     return bot
 

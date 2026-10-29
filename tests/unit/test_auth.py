@@ -15,6 +15,7 @@ from nats.errors import Error as NatsError
 
 from botnats import Tasks
 from botnats.auth import TOTP_PERIOD, SessionSync, TotpAuthorizer, totp
+from botnats.channel import ChannelRecord
 from botnats.irc.protocol import IRCMessage, Prefix, casefold
 from botnats.nats.store import ATTEMPT_LIMIT, SESSION_EXPIRY_GRACE, Session
 from tests.unit.helpers import (
@@ -238,7 +239,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         bot = make_bot(irc=fake_irc)
         runtimes = {}
         for channel in ("#absent", "#names", "#test"):
-            record = bot.channel_mgr.new_record(channel, None, present=True)
+            record = ChannelRecord.new(channel, None, present=True)
             bot.channel_mgr.apply_record(record)
             runtime = bot.channel_mgr.channels[casefold(channel, "rfc1459")]
             runtime.member("alpha").modes.add("o")
