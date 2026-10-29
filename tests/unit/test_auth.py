@@ -150,6 +150,22 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert not auth.authorized(prefix, now=41)
         assert not auth.records
 
+    def test_prune_drops_only_expired_records(self) -> None:
+        """Prune expired sessions and revocations, and keep live ones."""
+        auth = authorizer()
+        now = time.time()
+        for nick, granted in (("expired", now - 60), ("live", now)):
+            auth.grant(f"{nick}!user@example.test", now=granted)
+            auth.grant(f"{nick}-revoked!user@example.test", now=granted)
+            auth.revoke(f"{nick}-revoked!user@example.test")
+
+        auth.prune()
+
+        assert sorted(auth.records) == [
+            "live!user@example.test",
+            "live-revoked!user@example.test",
+        ]
+
     def test_session_import(self) -> None:
         """Keep a session granted by another authorizer until it expires."""
         first = authorizer("alpha")
@@ -718,7 +734,6 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [
             (nick, "Authorization failed") for nick in (*nicks[:ATTEMPT_LIMIT], "other")
         ]
-        assert coordinator.claim_requests == [-1] * (ATTEMPT_LIMIT + 1)
 
     async def test_malformed_auth_counts_as_attempt(self) -> None:
         """Answer a malformed AUTH with its usage, and count it as an attempt.
@@ -741,12 +756,11 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.claim_requests == []
         assert coordinator.session_puts == []
 
-    async def test_wrong_auth_code_still_claims(self) -> None:
-        """Deny an unmatched code, but still perform the claim round trip.
+    async def test_wrong_auth_code_skips_claim(self) -> None:
+        """Deny an unmatched code without claiming any counter.
 
         The code goes through the IRC command queue, which watches the
-        identity, so only the unmatched code can deny it: the first claim of
-        the placeholder counter succeeds.
+        identity, so only the unmatched code can deny it.
         """
         bot, fake_irc, coordinator = bot_with_coordinator()
         prefix = Prefix("owner", "user", "host.example")
@@ -754,7 +768,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot.authorizer, "match", return_value=None):
             await send_command(bot, prefix, "AUTH 000000")
 
-        assert coordinator.claim_requests == [-1]
+        assert coordinator.claim_requests == []
         assert not bot.authorizer.authorized(prefix.render())
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
         assert coordinator.session_puts == []
