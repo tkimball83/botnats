@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-FROM python:3.14.10-alpine
+FROM python:3.15.2-alpine
 
 RUN --mount=type=bind,source=pyproject.toml,target=/tmp/pyproject.toml \
     python -c "import tomllib; \
