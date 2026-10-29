@@ -541,6 +541,23 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert not await bounded(attempts.allow("host.example", now=61))
         attempts.kv.update.assert_awaited_once()
 
+    async def test_sliding_window_update_conflict_tries_next_slot(self) -> None:
+        """Claim the next free slot when a peer claims the expired one first."""
+        attempts = AttemptStore("efnet", 3, SECRET)
+        attempts.kv = AsyncMock()
+        attempts.kv.get.side_effect = [
+            MagicMock(revision=7, value=float(0).hex().encode()),
+            KeyNotFoundError(),
+        ]
+        attempts.kv.update.side_effect = KeyWrongLastSequenceError()
+        attempts.kv.create.return_value = 1
+
+        assert await bounded(attempts.allow("host.example", now=61))
+        attempts.kv.create.assert_awaited_once_with(
+            attempts.key("host.example", 1),
+            float(61).hex().encode(),
+        )
+
     async def test_recent_attempts_deny(self) -> None:
         """Deny while every slot holds an attempt from within the window."""
         attempts = AttemptStore("efnet", 3, SECRET)

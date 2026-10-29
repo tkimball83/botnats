@@ -195,7 +195,7 @@ class SessionSync:
         }
 
     def observe(self, key: str, session: Session, *, replaying: bool) -> None:
-        """Apply a validated watched record: keep it, or drop it if expired.
+        """Apply a validated watched record: keep it, or forget its key if expired.
 
         A record below the one held for its key was rolled back, as when a
         NATS writer without the coordination secret re-puts the grant a
@@ -213,27 +213,35 @@ class SessionSync:
             held = self.authorizer.keep(session)
             # A record of an IRC-equivalent identity lives under another key.
             identity = casefold(session.prefix, "ascii")
-            if (
-                held is not None
-                and casefold(held.prefix, "ascii") == identity
-                and identity not in self.pending
-            ):
-                self.pending[identity] = self.restoring[identity] = held
-                self.tasks.spawn(self.retry(), "session-sync")
+            if held is not None and casefold(held.prefix, "ascii") == identity:
+                self.restore(held)
         else:
             self.forget(key)
 
     def forget(self, key: str) -> None:
-        """Drop the local session a deleted or expired KV key held."""
+        """Drop the local session a deleted or expired KV key held.
+
+        A held unexpired revocation is written back, as over a rollback: bots
+        that start later would otherwise accept the revoked grant if re-put.
+        """
         mapped = self.watched.pop(key, None)
         if mapped is not None:
-            self.authorizer.drop_session(mapped[0])
+            held = self.authorizer.drop_session(mapped[0])
+            if held is not None:
+                self.restore(held)
 
     def replayed(self, keys: set[str]) -> None:
-        """Drop sessions a completed watch replay no longer contains."""
+        """Forget the keys a completed watch replay held no valid record for."""
         self.prune()
         for key in self.watched.keys() - keys:
             self.forget(key)
+
+    def restore(self, held: Session) -> None:
+        """Queue a held record to write back unless its identity has a mutation."""
+        identity = casefold(held.prefix, "ascii")
+        if identity not in self.pending:
+            self.pending[identity] = self.restoring[identity] = held
+            self.tasks.spawn(self.retry(), "session-sync")
 
     def prune(self, now: float | None = None) -> None:
         """Discard expired key mappings, which receive no TTL delete event."""
@@ -423,16 +431,22 @@ class TotpAuthorizer:
             signature=session_signature(self.coordination_key, self.network, record),
         )
 
-    def drop_session(self, prefix: str) -> None:
-        """Remove a cached session whose durable record was deleted."""
+    def drop_session(self, prefix: str) -> Session | None:
+        """Remove a cached session whose durable record was deleted.
+
+        A revocation is kept, and returned while unexpired.
+        """
         key = self.identity_fold(prefix)
         record = self.records.get(key)
-        if (
-            record is not None
-            and not record.revoked
-            and casefold(record.prefix, "ascii") == casefold(prefix, "ascii")
-        ):
-            del self.records[key]
+        identity = casefold(prefix, "ascii")
+        if record is None or casefold(record.prefix, "ascii") != identity:
+            return None
+
+        if record.revoked:
+            return record if record.expires_at > time.time() else None
+
+        del self.records[key]
+        return None
 
     def grant(
         self,
