@@ -46,11 +46,9 @@ from botnats.nats.store import (
     session_signature,
 )
 from tests.unit.helpers import COORDINATION_KEY as SECRET
-from tests.unit.helpers import FakeKV, session_record
+from tests.unit.helpers import FakeKV, bounded, session_record
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
     from nats.js.kv import KeyValue
 
     from botnats.validators import ChannelFields
@@ -58,12 +56,6 @@ if TYPE_CHECKING:
 OTHER_SECRET = b"a-different-coordination-secret!"
 SHA256_HEX_LENGTH = 64
 SESSION_INVALID = "session record is invalid"
-
-
-async def bounded[T](awaitable: Awaitable[T]) -> T:
-    """Await a call that takes the store's lock, failing instead of hanging."""
-    async with asyncio.timeout(5):
-        return await awaitable
 
 
 def signed_presence(instance_id: str) -> dict[str, object]:

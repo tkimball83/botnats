@@ -3,11 +3,9 @@
 
 """Tests for admin command parsing, dispatch, replies, and rate limiting."""
 
-import asyncio
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
-from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, call, patch
 
 from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
@@ -20,18 +18,10 @@ from tests.unit.helpers import (
     FakeIRC,
     bot_with_coordinator,
     bot_with_irc,
+    bounded,
     make_bot,
     send_command,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
-
-async def bounded[T](awaitable: Awaitable[T]) -> T:
-    """Await a call through the real store locks, so a deadlock fails the test."""
-    async with asyncio.timeout(5):
-        return await awaitable
 
 
 class CommandTests(unittest.TestCase):

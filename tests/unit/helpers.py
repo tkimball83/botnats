@@ -38,6 +38,8 @@ from botnats.nats.store import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from nats.js.kv import KeyValue
 
     from botnats.irc.protocol import IRCProtocol
@@ -84,6 +86,12 @@ SECRETS = {
     "BOTNATS_NATS_TOKEN": NATS_CREDENTIAL,
     "BOTNATS_TOTP_SECRET": base64.b32encode(AUTH_KEY).decode(),
 }
+
+
+async def bounded[T](awaitable: Awaitable[T]) -> T:
+    """Await a call that takes a lock, failing instead of hanging."""
+    async with asyncio.timeout(5):
+        return await awaitable
 
 
 async def drain_session_writes(bot: Bot) -> None:

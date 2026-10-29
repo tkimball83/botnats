@@ -5,17 +5,13 @@
 
 import asyncio
 import unittest
-from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
 
 from botnats.nats.claim import PresenceClaim, PresenceState
 from botnats.nats.store import PresenceStore, StoreUnavailableError
-from tests.unit.helpers import COORDINATION_KEY
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable
+from tests.unit.helpers import COORDINATION_KEY, bounded
 
 INSTANCE_ID = "instance"
 NOT_OWNED = "bot ID alpha does not own its presence key"
@@ -26,12 +22,6 @@ def build_claim() -> PresenceClaim:
     """Build an unclaimed presence claim over an unopened store."""
     store = PresenceStore("efnet", 1, 15.0, COORDINATION_KEY)
     return PresenceClaim(store, "alpha", INSTANCE_ID)
-
-
-async def bounded[T](awaitable: Awaitable[T]) -> T:
-    """Await a call that takes the claim's lock, failing instead of hanging."""
-    async with asyncio.timeout(5):
-        return await awaitable
 
 
 class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):

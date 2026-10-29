@@ -43,13 +43,14 @@ from tests.unit.helpers import (
     COORDINATION_KEY,
     NATS_CREDENTIAL,
     FakeKV,
+    bounded,
     hang,
     session_record,
     session_value,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Callable
 
     from nats.js.kv import KeyValue
 
@@ -179,12 +180,6 @@ def watcher(*entries: object) -> tuple[AsyncMock, AsyncMock]:
     kv.create = AsyncMock(return_value=CREATED_REVISION)
     kv.watchall = AsyncMock(return_value=result)
     return kv, result
-
-
-async def bounded[T](awaitable: Awaitable[T]) -> T:
-    """Await a call that takes a claim or store lock, failing instead of hanging."""
-    async with asyncio.timeout(5):
-        return await awaitable
 
 
 class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
