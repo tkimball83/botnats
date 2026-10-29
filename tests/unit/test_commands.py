@@ -3,6 +3,7 @@
 
 """Tests for admin command parsing, dispatch, replies, and rate limiting."""
 
+import asyncio
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
@@ -80,6 +81,15 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         assert limiter.check("alice")
         assert limiter.check("bob")
         assert not limiter.check("alice")
+
+    async def test_command_window(self) -> None:
+        """Verify the command limiter forgets commands after the 10-second window."""
+        limiter = make_bot().commands.command_limiter
+        # A full budget spent exactly one window ago no longer counts.
+        spent = asyncio.get_running_loop().time() - 10
+        limiter.buckets["host.example"] = deque([spent] * 8)
+
+        assert limiter.check("host.example")
 
     async def test_window_expiry(self) -> None:
         """Verify rate limit resets after window expires."""
@@ -316,7 +326,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert listed == masks
 
     async def test_admin_getmodes(self) -> None:
-        """Verify GETMODES command reports tracked channel modes."""
+        """Verify GETMODES reports tracked modes, with "*" for unknown values."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
@@ -340,6 +350,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.modes = "+nstkl"
         await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
         assert fake_irc.privmsgs == [("owner", "#test +nstkl secret 5")]
+
+        fake_irc.privmsgs.clear()
+        # As tracked from RPL_CHANNELMODEIS "+ntkl * 10": the server hid the key.
+        runtime.modes = "+ntkl"
+        runtime.key = None
+        runtime.limit = 10
+        await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
+        assert fake_irc.privmsgs == [("owner", "#test +ntkl * 10")]
 
     async def test_admin_getusers(self) -> None:
         """Verify GETUSERS command lists channel members with op prefixes."""
