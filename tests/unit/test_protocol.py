@@ -5,6 +5,7 @@
 
 import sys
 import unittest
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from botnats.irc.protocol import (
@@ -28,6 +29,15 @@ if TYPE_CHECKING:
 
 # The linear matcher runs a few hundred lines on the adversarial mask.
 MASK_MATCH_LINE_BUDGET = 10_000
+
+
+def advertised_caps() -> ISupportState:
+    """Return capabilities a server advertised, each unlike its default."""
+    caps = ISupportState(casemapping="ascii")
+    caps.apply("CHANMODES", "b,k,l,imn")
+    caps.apply("MONITOR", "")
+    caps.apply("PREFIX", "(yov)@%+")
+    return caps
 
 
 class IRCProtocolTests(unittest.TestCase):
@@ -310,6 +320,48 @@ class IRCProtocolTests(unittest.TestCase):
                 assert caps.member_prefixes == {"@": "y", "%": "o", "+": "v"}
                 assert caps.membership_modes == "yov"
                 assert caps.op_mode == "y"
+
+    def test_isupport_monitor_with_or_without_limit(self) -> None:
+        """Use MONITOR whether or not the server advertises a target limit."""
+        for value in ("", "100"):
+            with self.subTest(value=value):
+                caps = ISupportState()
+
+                caps.apply("MONITOR", value)
+
+                assert caps.monitor
+
+    def test_isupport_forget_restores_only_its_defaults(self) -> None:
+        """Restore a withdrawn token's defaults, keeping every other token's."""
+        default = ISupportState()
+        advertised = advertised_caps()
+        for name, expected in (
+            ("CHANMODES", replace(advertised, chanmodes=default.chanmodes)),
+            ("MONITOR", replace(advertised, monitor=default.monitor)),
+            (
+                "PREFIX",
+                replace(
+                    advertised,
+                    member_prefixes=default.member_prefixes,
+                    membership_modes=default.membership_modes,
+                    op_mode=default.op_mode,
+                ),
+            ),
+        ):
+            with self.subTest(name=name):
+                caps = advertised_caps()
+
+                caps.forget(name)
+
+                assert caps == expected
+
+    def test_isupport_reset_restores_defaults(self) -> None:
+        """Forget every capability the previous server advertised."""
+        caps = advertised_caps()
+
+        caps.reset()
+
+        assert caps == ISupportState()
 
     def test_identity_fold(self) -> None:
         """Fold only protocol-defined identity equivalents."""

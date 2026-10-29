@@ -61,9 +61,6 @@ class ChannelManager:
         # at a time, so each compares against the record the previous write
         # left.
         self.write_lock = asyncio.Lock()
-        # Highest revision this bot has minted: concurrent local changes to
-        # one channel (two admin commands, say) get distinct, ordered revisions.
-        self.last_revision = 0
         # Revisions of this bot's writes in flight: the KV watch can deliver
         # one before the store's reply reaches the writer.
         self.writing: set[str] = set()
@@ -121,9 +118,6 @@ class ChannelManager:
 
     def enforce_modes(self, runtime: ChannelRuntime) -> None:
         """Set the configured channel modes, unless they are already in place."""
-        if not self.bot.config.channel_modes:
-            return
-
         required, forbidden = self.bot.config.enforced_modes
         caps = self.bot.caps
         if any(
@@ -279,16 +273,8 @@ class ChannelManager:
         present: bool,
         after: str | None = None,
     ) -> ChannelRecord:
-        """Mint a record ordered after both after and this bot's earlier records."""
-        record = ChannelRecord.new(
-            channel,
-            key,
-            present=present,
-            after=after,
-            floor=self.last_revision,
-        )
-        self.last_revision = revision_number(record.revision)
-        return record
+        """Mint a record ordered after the revision after, if any."""
+        return ChannelRecord.new(channel, key, present=present, after=after)
 
     def any_peer_opped(self, runtime: ChannelRuntime) -> bool:
         """Return whether any known peer bot holds operator status."""
@@ -702,14 +688,9 @@ class ChannelRecord:
         *,
         present: bool,
         after: str | None = None,
-        floor: int = 0,
     ) -> ChannelRecord:
-        """Create a record whose revision follows both after and floor."""
-        previous = floor
-        if after is not None:
-            previous = max(previous, revision_number(after))
-
-        number = previous + 1
+        """Create a record whose revision follows after, if any."""
+        number = revision_number(after) + 1 if after is not None else 1
         if number > MAX_CHANNEL_REVISION:
             msg = "channel revision counter is exhausted"
             raise ValueError(msg)

@@ -183,7 +183,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, coordinator = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
         # Stored by a peer, but not yet watched here.
-        winner = ChannelRecord.new("#new", None, present=False, floor=1_000)
+        winner = ChannelRecord.new("#new", None, present=False)
         await bounded(coordinator.channels.put(asdict(winner), after=None))
 
         await bounded(bot.commands.dispatch(OWNER, "JOIN #new"))

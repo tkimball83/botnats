@@ -70,8 +70,11 @@ def part_and_want_again(bot: Bot) -> ChannelRuntime:
     """
     mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
     mgr.channels[folded].join = JoinState.JOINED
-    mgr.apply_record(mgr.new_record("#test", None, present=False))
-    mgr.apply_record(mgr.new_record("#test", None, present=True))
+    parted = mgr.new_record(
+        "#test", None, present=False, after=mgr.channel_records[folded].revision
+    )
+    mgr.apply_record(parted)
+    mgr.apply_record(mgr.new_record("#test", None, present=True, after=parted.revision))
     return mgr.channels[folded]
 
 
@@ -132,6 +135,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             enforced_modes=mode_intent("+x"),
         )
         bot.caps.chanmodes = ("beI", "kx", "l", "imnst")
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].modes = ""
 
         with self.assertLogs("botnats.channel", level="WARNING"):
             bot.channel_mgr.enforce_modes(
@@ -255,19 +259,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("MODE", ("#test", "+npst"))]
 
-    async def test_new_record_orders_local_changes(self) -> None:
-        """Order a bot's own changes without a shared process-wide counter."""
-        bot = bot_with_channel()
-        other = bot_with_channel()
-
-        first = bot.channel_mgr.new_record("#x", None, present=True)
-        second = bot.channel_mgr.new_record("#x", "key", present=True)
-
-        # Equal counters would order by random suffix alone.
-        assert revision_number(second.revision) > revision_number(first.revision)
-        # The other bot has minted only its own record for #test.
-        assert other.channel_mgr.last_revision == 1
-
     async def test_casemapping_change(self) -> None:
         """Verify casemapping change migrates channel and auth state."""
         bot = bot_with_channel(irc=FakeIRC())
@@ -311,7 +302,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """Keep the newer record when an older one folds onto the same channel."""
         bot = make_bot()
         older = bot.channel_mgr.new_record("#room{", "older", present=True)
-        newer = bot.channel_mgr.new_record("#room[", "newer", present=True)
+        newer = bot.channel_mgr.new_record(
+            "#room[", "newer", present=True, after=older.revision
+        )
 
         bot.channel_mgr.apply_record(newer)
         bot.channel_mgr.apply_record(older)
@@ -330,7 +323,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """
         bot = make_bot()
         first = bot.channel_mgr.new_record("#room[", "first", present=True)
-        second = bot.channel_mgr.new_record("#room{", "second", present=True)
+        second = bot.channel_mgr.new_record(
+            "#room{", "second", present=True, after=first.revision
+        )
 
         bot.channel_mgr.apply_record(second)
         bot.channel_mgr.apply_record(first)
@@ -365,7 +360,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         joined = bot.channel_mgr.new_record("#room[", None, present=True)
         bot.channel_mgr.apply_record(joined)
         bot.channel_mgr.channels[casefold("#room[", "ascii")].join = JoinState.JOINED
-        tombstone = bot.channel_mgr.new_record("#room{", None, present=False)
+        tombstone = bot.channel_mgr.new_record(
+            "#room{", None, present=False, after=joined.revision
+        )
         bot.channel_mgr.apply_record(tombstone)
 
         bot.channel_mgr.set_casemapping("rfc1459")
@@ -388,11 +385,15 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot = make_bot(irc=fake_irc)
         mgr = bot.channel_mgr
         mgr.set_casemapping("ascii")
-        mgr.apply_record(mgr.new_record("#room{", None, present=True))
+        brace = mgr.new_record("#room{", None, present=True)
+        mgr.apply_record(brace)
         mgr.channels[casefold("#room{", "ascii")].join = JoinState.JOINED
-        mgr.apply_record(mgr.new_record("#room{", None, present=False))
+        parted = mgr.new_record("#room{", None, present=False, after=brace.revision)
+        mgr.apply_record(parted)
         assert mgr.pending_parts == {"#room{": "#room{"}
-        mgr.apply_record(mgr.new_record("#room[", None, present=True))
+        mgr.apply_record(
+            mgr.new_record("#room[", None, present=True, after=parted.revision),
+        )
         joined = mgr.channels[casefold("#room[", "ascii")]
         joined.join = JoinState.JOINED
 
@@ -450,7 +451,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.channel_mgr.join_desired()
 
-        tombstone = bot.channel_mgr.new_record("#test", None, present=False)
+        current = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
+        tombstone = bot.channel_mgr.new_record(
+            "#test", None, present=False, after=current.revision
+        )
         bot.channel_mgr.apply_record(tombstone)
 
         assert casefold("#test", "rfc1459") not in bot.channel_mgr.channels
@@ -474,9 +478,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 bot.identity.current = BotPresence(
                     "alpha", "alpha.host", "inst", "alpha", "~alpha"
                 )
-                mgr = bot.channel_mgr
-                mgr.channels[casefold("#test", "rfc1459")].join = join
-                tombstone = mgr.new_record("#test", None, present=False)
+                mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+                mgr.channels[folded].join = join
+                tombstone = mgr.new_record(
+                    "#test",
+                    None,
+                    present=False,
+                    after=mgr.channel_records[folded].revision,
+                )
                 mgr.apply_record(tombstone)
                 assert mgr.pending_parts == {}
 
@@ -514,7 +523,12 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         old.cooldowns["op"] = 1.0
         old.modes = "+ntl"
 
-        tombstone = mgr.new_record("#Test", None, present=False)
+        tombstone = mgr.new_record(
+            "#Test",
+            None,
+            present=False,
+            after=mgr.channel_records[casefold("#test", "rfc1459")].revision,
+        )
         mgr.apply_record(tombstone)
         assert mgr.pending_parts == {"#test": "#Test"}
 
@@ -569,9 +583,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
         bot.identity.registered = True
-        mgr = bot.channel_mgr
-        mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
-        tombstone = mgr.new_record("#test", None, present=False)
+        mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
+        mgr.channels[folded].join = JoinState.JOINED
+        tombstone = mgr.new_record(
+            "#test", None, present=False, after=mgr.channel_records[folded].revision
+        )
         full = ConnectionError("IRC outbound queue is full")
         with patch.object(fake_irc, "send", side_effect=full):
             mgr.apply_record(tombstone)
@@ -627,7 +643,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.registered = True
         bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
 
-        tombstone = bot.channel_mgr.new_record("#test", None, present=False)
+        current = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
+        tombstone = bot.channel_mgr.new_record(
+            "#test", None, present=False, after=current.revision
+        )
         bot.channel_mgr.apply_record(tombstone)
 
         assert casefold("#test", "rfc1459") not in bot.channel_mgr.channels
@@ -835,7 +854,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot, _, _ = bot_with_coordinator(coordinator)
         mgr = bot.channel_mgr
         brace = mgr.new_record("#room{", None, present=True)
-        bracket = mgr.new_record("#room[", None, present=True)
+        bracket = mgr.new_record("#room[", None, present=True, after=brace.revision)
         mgr.apply_record(brace)
         mgr.apply_record(bracket)
         assert mgr.channel_records[casefold("#room{", "rfc1459")] == bracket
@@ -1194,7 +1213,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("MODE", ("#test", "+k", "late"), Prefix("op", "~op", "op.host")),
         )
         assert runtime.key_pending
-        mgr.apply_record(mgr.new_record("#test", "y", present=True))
+        mgr.apply_record(
+            mgr.new_record(
+                "#test", "y", present=True, after=mgr.channel_records[folded].revision
+            ),
+        )
         assert runtime.key == "y"
         await settle(bot)
 
@@ -1322,25 +1345,29 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.channel_mgr.channel_records[folded].key == "recordkey"
 
     async def test_write_record_orders_after_current_record(self) -> None:
-        """Mint a write after a peer's record whose revision outruns this bot's.
+        """Mint a write after a peer's record under an equivalent spelling.
 
-        A record numbered from this bot's own counter alone would sort before
-        the peer's: the store would accept it, yet every bot, this one
-        included, would ignore it as stale.
+        Under rfc1459, #room[ and #room{ are one channel but two durable keys.
+        A PART #room{ numbered after its own key's record, which it lacks,
+        would sort before the peer's #room[: the store would accept it, yet
+        every bot, this one included, would ignore it as stale.
         """
         bot, fake_irc, coordinator = bot_with_coordinator()
         mgr = bot.channel_mgr
-        peer = ChannelRecord.new("#test", None, present=True, floor=1_000)
+        # A peer has written #room[ many times since this bot started.
+        peer = replace(
+            ChannelRecord.new("#room[", None, present=True),
+            revision=f"{1_000:020d}-{'0' * 32}",
+        )
         await bounded(coordinator.channels.put(asdict(peer), after=None))
         mgr.apply_record(peer)
-        mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
-        assert mgr.last_revision < revision_number(peer.revision)
+        mgr.channels[casefold("#room[", "rfc1459")].join = JoinState.JOINED
 
-        assert await bounded(mgr.write_record("#Test", None, present=False))
+        assert await bounded(mgr.write_record("#room{", None, present=False))
 
-        assert fake_irc.sent == [("PART", ("#Test",))]
-        assert mgr.runtime("#test") is None
-        record = mgr.channel_records[casefold("#test", "rfc1459")]
+        assert fake_irc.sent == [("PART", ("#room{",))]
+        assert mgr.runtime("#room[") is None
+        record = mgr.channel_records[casefold("#room[", "rfc1459")]
         assert not record.present
         assert record.revision > peer.revision
 
@@ -1349,7 +1376,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot, _, coordinator = bot_with_coordinator()
         mgr = bot.channel_mgr
         # Stored by a peer, but not yet watched here.
-        winner = ChannelRecord.new("#new", None, present=False, floor=1_000)
+        winner = ChannelRecord.new("#new", None, present=False)
         await bounded(coordinator.channels.put(asdict(winner), after=None))
 
         assert not await bounded(mgr.write_record("#new", None, present=True))
@@ -1943,6 +1970,31 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
         assert len(op_requests) == 0
+
+    async def test_skips_unban_request_when_only_this_bot_opped(self) -> None:
+        """Request no unban while only this bot holds op; it cannot serve itself.
+
+        Its own presence matches its own member entry, as a peer's would.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        identity = BotPresence("alpha-id", "alpha.host", "inst", "alpha", "~alpha")
+        bot.identity.current = identity
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
+        for presence in (identity, peer):
+            bot.presence.update(presence)
+
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha").prefix = identity.to_prefix()
+        runtime.member("alpha").modes.add("o")
+        runtime.member("beta").prefix = peer.to_prefix()
+
+        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
+        assert coordinator.help_requests == []
+
+        runtime.member("beta").modes.add("o")
+        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
+        assert [kind for kind, _ in coordinator.help_requests] == ["unban"]
 
     async def test_only_help_skips_a_copy_still_waiting(self) -> None:
         """Let help skip a copy of a line still waiting, and log no skipped help.
