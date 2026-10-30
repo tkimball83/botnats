@@ -151,6 +151,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             write = asyncio.create_task(claim.put(PRESENCE))
             async with asyncio.timeout(1):
                 await writing.wait()
+
             with self.assertLogs("botnats.nats.claim", level="ERROR"):
                 # The write holds the lock; observing must not wait for it.
                 claim.observe("other-instance", 3)
