@@ -447,7 +447,13 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.nc = MagicMock(is_closed=True)
         steps: list[str] = []
         nc = MagicMock(is_connected=True)
-        nc.subscribe = AsyncMock(side_effect=lambda *_, **__: steps.append("subscribe"))
+
+        def subscribe(*arguments: object, **options: object) -> Subscription:
+            del arguments, options
+            steps.append("subscribe")
+            return MagicMock(spec=Subscription)
+
+        nc.subscribe = AsyncMock(side_effect=subscribe)
         connect = AsyncMock(return_value=nc)
 
         with (
@@ -984,6 +990,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.presence_store.ttl == config.presence_ttl
         assert coordinator.sessions.ttl == SESSION_TTL
 
+    def test_config_repr_hides_token(self) -> None:
+        """Keep the NATS token out of the config's repr, which a log may print."""
+        coordinator = build_coordinator("alpha")
+
+        assert NATS_CREDENTIAL not in repr(coordinator.config)
+
     async def test_status_reads_claim_bucket_and_monitor_port(self) -> None:
         """Collect status over the client, the claim bucket, and the monitor port."""
         coordinator = build_coordinator("alpha")
@@ -1070,7 +1082,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(coordinator, method, failing),
                     self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
                 ):
-                    await callback(coordinator)
+                    await bounded(callback(coordinator))
                     task = coordinator.resync_task
                     assert task is not None
                     async with asyncio.timeout(5):
@@ -1505,7 +1517,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Reset at once during a slow write, which then records no ownership."""
         coordinator = build_coordinator("alpha")
         coordinator.claim.adopt(1)
-        presence = {"bot_id": "alpha", "instance_id": coordinator.claim.instance_id}
+        instance_id = coordinator.claim.instance_id
+        presence = asdict(BotPresence("alpha", "host", instance_id, "alpha", "user"))
         writing = asyncio.Event()
         release = asyncio.Event()
 
