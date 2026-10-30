@@ -478,7 +478,6 @@ class Coordinator:
                     servers=list(self.config.servers),
                     token=self.config.token,
                     name=f"botnats-{self.envelope.bot_id}",
-                    allow_reconnect=True,
                     max_outstanding_pings=MAX_OUTSTANDING_PINGS,
                     max_reconnect_attempts=-1,
                     ping_interval=ping_interval,
