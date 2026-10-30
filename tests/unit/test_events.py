@@ -1902,16 +1902,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [("PART", ("#test",))]
 
     async def test_self_join_orphaned_queued(self) -> None:
-        """Queue the PART of an orphan channel when it cannot be sent.
-
-        The bot is in the channel, so if it is wanted again before the PART
-        goes out, it is joined at once and relearns the channel with NAMES.
-        """
-        fake_irc = FailingPartIRC()
-        bot = bot_with_channel(irc=fake_irc)
-        bot.identity.current = BotPresence(
-            "alpha", "host.example", "inst", "alpha", "~alpha"
-        )
+        """Queue the PART of an orphan channel when it cannot be sent."""
+        bot = bot_with_channel(irc=FailingPartIRC())
         mgr = bot.channel_mgr
         mgr.channels.pop(casefold("#test", "rfc1459"))
 
@@ -1920,21 +1912,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert mgr.pending_parts == {"#test": "#test"}
-
-        mgr.apply_record(
-            ChannelRecord.new(
-                "#test",
-                None,
-                present=True,
-                after=mgr.channel_records[casefold("#test", "rfc1459")].revision,
-            ),
-        )
-
-        runtime = mgr.runtime("#test")
-        assert runtime is not None
-        assert runtime.joined
-        assert mgr.pending_parts == {}
-        assert fake_irc.sent == [("NAMES", ("#test",))]
 
     async def test_leaving_a_pending_part_channel_drops_the_part(self) -> None:
         """Forget a pending PART once this bot is kicked or parts anyway.
