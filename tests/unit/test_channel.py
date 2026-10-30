@@ -210,11 +210,12 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.caps.chanmodes = ("beI", "k", "l", "imnpst")
         bot.config = replace(
             bot.config,
-            channel_modes="+np-s",
-            enforced_modes=mode_intent("+np-s"),
+            channel_modes="+np-ls",
+            enforced_modes=mode_intent("+np-ls"),
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
 
+        # The modes follow type-C letters too: no l shows no limit.
         runtime.modes = "+ntp"
         bot.channel_mgr.enforce_modes(runtime)
         assert fake_irc.sent == []
@@ -223,7 +224,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             runtime.modes = modes
             bot.channel_mgr.enforce_modes(runtime)
 
-        assert fake_irc.sent == [("MODE", ("#test", "+np-s"))] * 2
+        assert fake_irc.sent == [("MODE", ("#test", "+np-ls"))] * 2
 
     async def test_enforce_modes_waits_while_modes_unknown(self) -> None:
         """Send nothing while modes are unknown; send while changes go untracked."""
@@ -1288,6 +1289,44 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert "#parted" not in mgr.channels
         assert not mgr.channel_records["#parted"].present
 
+    async def test_retry_stops_at_a_failed_write(self) -> None:
+        """End a retry pass at its first failed write; the next retries every key.
+
+        Each write that fails as JetStream stalls holds the write lock until
+        it times out, and admin JOIN and PART writes wait behind it.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot = bot_with_channel(coordinator=coordinator)
+        mgr = bot.channel_mgr
+        mgr.apply_record(ChannelRecord.new("#kept", None, present=True))
+        runtimes = [
+            mgr.channels[casefold(channel, "rfc1459")] for channel in ("#test", "#kept")
+        ]
+        for runtime in runtimes:
+            runtime.join = JoinState.JOINED
+            await see_key(bot, runtime, "seen")
+
+        record_put = coordinator.put_channel
+        attempts: list[str] = []
+
+        async def counted_put(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            attempts.append(record["channel"])
+            return await record_put(record, after=after)
+
+        with patch.object(coordinator, "put_channel", counted_put):
+            await bounded(mgr.retry_pending_keys())
+            assert attempts == ["#test"]
+            coordinator.failing = False
+            await bounded(mgr.retry_pending_keys())
+
+        assert attempts == ["#test", "#test", "#kept"]
+        assert [put["key"] for put in coordinator.channel_puts] == ["seen", "seen"]
+        assert not any(runtime.key_pending for runtime in runtimes)
+
     async def test_quick_key_changes_are_written_in_order(self) -> None:
         """Compare each key change against the record the previous one left."""
         coordinator = FakeCoordinator()
@@ -2136,3 +2175,17 @@ class ChannelStateTests(unittest.TestCase):
 
         assert runtime.set_key(None)
         assert runtime.key is None
+
+    def test_set_limit_takes_only_ascii_digits(self) -> None:
+        """Clear the limit for a value with other digits, which int() misreads.
+
+        int("²") raises, and int("١٢") reads 12.
+        """
+        runtime = ChannelRuntime(ISupportState())
+
+        for value in ("²", "١٢"):
+            with self.subTest(value=value):
+                runtime.set_limit("5")
+                assert runtime.limit == 5
+                runtime.set_limit(value)
+                assert runtime.limit is None
