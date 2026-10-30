@@ -1021,6 +1021,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert fake_irc.modes == [("#test", "+np-s", ())]
 
+    async def test_mode_enforce_unset_limit_added(self) -> None:
+        """Enforce when another user sets a negated type-C mode, as +l with a limit.
+
+        The tracked modes follow type-C letters too: one they missed would
+        make the line look unneeded, and the limit would stay.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.config = replace(
+            bot.config,
+            channel_modes="+nt-l",
+            enforced_modes=mode_intent("+nt-l"),
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.modes = "+nt"
+        runtime.member("alpha").modes.add("o")
+
+        bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "+l", "5"),
+                Prefix("someone", "user", "host"),
+            ),
+        )
+        assert fake_irc.modes == [("#test", "+nt-l", ())]
+
     async def test_mode_key_tracking(self) -> None:
         """Verify channel key is tracked on mode changes."""
         bot, _ = bot_with_irc()
