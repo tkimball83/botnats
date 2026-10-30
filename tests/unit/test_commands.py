@@ -689,22 +689,25 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [("owner", "ghost not found on #test")]
 
-    async def test_admin_op_refuses_unidentified_member(self) -> None:
-        """Refuse OP for a member whose full nick!user@host is not yet known."""
+    async def test_admin_op_member_before_who(self) -> None:
+        """Op a member whose full nick!user@host WHO has not yet reported."""
         bot, fake_irc, _ = bot_with_coordinator()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        runtime.member("Unseen")
+        runtime.member("Listed")
         runtime.member("Partial").prefix = Prefix("Partial", "user")
         bot.authorizer.grant(OWNER.render())
 
-        await bounded(bot.commands.dispatch(OWNER, "OP #test Unseen"))
+        await bounded(bot.commands.dispatch(OWNER, "OP #test Listed"))
         await bounded(bot.commands.dispatch(OWNER, "OP #test Partial"))
 
-        assert fake_irc.modes == []
+        assert fake_irc.modes == [
+            ("#test", "+o", ("Listed",)),
+            ("#test", "+o", ("Partial",)),
+        ]
         assert fake_irc.privmsgs == [
-            ("owner", "Unseen not found on #test"),
-            ("owner", "Partial not found on #test"),
+            ("owner", "Opped Listed on #test"),
+            ("owner", "Opped Partial on #test"),
         ]
 
     async def test_unauthenticated_commands_are_ignored(self) -> None:
