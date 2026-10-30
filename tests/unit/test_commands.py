@@ -377,9 +377,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_list_drops_items_too_long_to_relay(self) -> None:
         """Drop an item too long to relay whole, never sending a bare header."""
         bot, fake_irc = bot_with_irc()
-        # The shorter mask fits the line the bot sends, but not the line the
+        # The shortest mask fits a relayed line alone, but not after the
+        # header; the next fits the line the bot sends, but not the line the
         # server relays with the bot's source in front.
-        for mask in ("*!*@" + "h" * 400, "*!*@" + "h" * 495):
+        for mask in ("*!*@" + "h" * 356, "*!*@" + "h" * 400, "*!*@" + "h" * 495):
             with self.subTest(length=len(mask)):
                 fake_irc.privmsgs.clear()
                 with self.assertLogs("botnats.commands", level="WARNING"):
@@ -447,6 +448,28 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.limit = 10
         await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
         assert fake_irc.privmsgs == [("owner", "#test +ntkl * 10")]
+
+        fake_irc.privmsgs.clear()
+        runtime.key = "secret"
+        runtime.limit = None
+        await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
+        assert fake_irc.privmsgs == [("owner", "#test +ntkl secret *")]
+
+    async def test_getmodes_holds_places_for_untracked_arguments(self) -> None:
+        """Pair each value with its letter past argument modes not tracked."""
+        bot, fake_irc = bot_with_irc()
+        bot.caps.apply("CHANMODES", "beI,fkL,lFH,cdimnprstzCDGKMNOPQRSTVZ")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        bot.authorizer.grant(OWNER.render())
+        # As tracked from UnrealIRCd's RPL_CHANNELMODEIS "+fnkl [5j]:10 secret
+        # 50": the +f flood setting is an argument this bot does not keep.
+        runtime.modes = "+fnkl"
+        runtime.key = "secret"
+        runtime.limit = 50
+
+        await bounded(bot.commands.dispatch(OWNER, "GETMODES #test"))
+
+        assert fake_irc.privmsgs == [("owner", "#test +fnkl * secret 50")]
 
     async def test_admin_getusers(self) -> None:
         """Verify GETUSERS command lists channel members with op prefixes."""

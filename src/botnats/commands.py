@@ -164,12 +164,19 @@ class CommandHandler:
         if runtime is None:
             self.reply(prefix.nick, f"No record for {channel}")
         elif runtime.modes:
-            # "*" holds the place of an unknown value, such as a key IRC hid.
+            # "*" holds the place of an unknown value, such as a key IRC hid
+            # or the argument of a mode this bot does not track.
             limit = str(runtime.limit) if runtime.limit is not None else "*"
             values = {"k": runtime.key or "*", "l": limit}
-            # Mode arguments follow their letters' order, as in a MODE line.
+            # Mode arguments follow their letters' order, as in a MODE line:
+            # one for each letter CHANMODES gives an argument when set.
+            chanmodes = self.bot.caps.chanmodes
             parts = [channel, runtime.modes]
-            parts.extend(values[mode] for mode in runtime.modes if mode in values)
+            parts.extend(
+                values.get(mode, "*")
+                for mode in runtime.modes
+                if mode in chanmodes[1] + chanmodes[2]
+            )
             self.reply(prefix.nick, " ".join(parts))
         else:
             self.reply(
