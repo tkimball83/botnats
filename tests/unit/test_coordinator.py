@@ -68,6 +68,8 @@ BETA_PRESENCE = {
 }
 CREATED_REVISION = 2
 NOT_OWNED = "bot ID alpha does not own its presence key"
+# Bound before any test patches asyncio.sleep.
+REAL_SLEEP = asyncio.sleep
 SUBJECT = "botnats.v1.efnet.channel"
 
 
@@ -182,6 +184,16 @@ def watcher(*entries: object) -> tuple[AsyncMock, AsyncMock]:
     kv.create = AsyncMock(return_value=CREATED_REVISION)
     kv.watchall = AsyncMock(return_value=result)
     return kv, result
+
+
+async def yield_once(delay: float) -> None:
+    """Stand in for asyncio.sleep: skip the wait but yield to the event loop.
+
+    A retry loop that spins without yielding would starve the timeout bounding
+    it, so a regression would hang instead of failing.
+    """
+    del delay
+    await REAL_SLEEP(0)
 
 
 class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -340,8 +352,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_releases_connection(self) -> None:
         """Cancel watches and release owned presence, KV handles, and the connection."""
         coordinator = build_coordinator("alpha")
-        nc = MagicMock(is_closed=False)
-        nc.close = AsyncMock()
+        nc = closing_client(coordinator)
         coordinator.nc = nc
         coordinator.claim.adopt(7)
         for store in coordinator.stores:
@@ -349,7 +360,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             store.kv = MagicMock()
 
         # The presence key is deleted through the open bucket, so releasing
-        # it after the stores reset would delete nothing.
+        # it after the stores reset, or after closing the client runs the
+        # disconnect callback, would delete nothing.
         presence_kv = AsyncMock()
         presence_kv.delete = AsyncMock(return_value=True)
         coordinator.presence_store.kv = presence_kv
@@ -755,10 +767,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(AttemptStore, "open", fail_then_supersede),
-            patch("asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", yield_once),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
-            await coordinator.init_stores()
+            await bounded(coordinator.init_stores())
 
         assert attempts == 1
 
@@ -788,10 +800,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(AttemptStore, "open", fail_and_drop),
-            patch("asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", yield_once),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
-            await coordinator.init_stores()
+            await bounded(coordinator.init_stores())
 
         assert attempts == 1
 
@@ -810,7 +822,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         js = nc.jetstream.return_value
         js.create_key_value = AsyncMock(side_effect=drop)
         with (
-            patch("asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", yield_once),
             self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs,
         ):
             await bounded(coordinator.init_stores())
@@ -838,10 +850,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ClaimStore, "open", open_store),
             patch.object(PresenceStore, "open", open_store),
             patch.object(SessionStore, "open", open_store),
-            patch("asyncio.sleep", AsyncMock()) as sleep,
+            patch("asyncio.sleep", AsyncMock(side_effect=yield_once)) as sleep,
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
-            await coordinator.init_stores()
+            await bounded(coordinator.init_stores())
 
         # Every store opens on the client's JetStream context.
         assert open_attempt.await_args_list == [call(js)] * 12
@@ -867,10 +879,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(ClaimStore, "open", open_store),
                 patch.object(PresenceStore, "open", open_store),
                 patch.object(SessionStore, "open", open_store),
-                patch("asyncio.sleep", AsyncMock()),
+                patch("asyncio.sleep", yield_once),
                 self.assertRaisesRegex(type(error), str(error)),
             ):
-                await coordinator.init_stores()
+                await bounded(coordinator.init_stores())
 
     async def test_malformed_message_is_ignored(self) -> None:
         """Verify malformed wire data never reaches its callback."""
@@ -941,8 +953,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 raise OSError(msg)
 
         async def sleep(delay: float) -> None:
-            del delay
             steps.append("sleep")
+            await yield_once(delay)
 
         async def start_watches() -> None:
             steps.append("watches")
@@ -1012,7 +1024,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(coordinator, "watch_channels", crash_twice),
-            patch("asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", yield_once),
             patch("botnats.nats.coordinator.time") as clock,
             self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
         ):
@@ -1672,7 +1684,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 partial(fail_once, "watch-presence"),
             ),
             patch.object(coordinator, "watch_sessions", hang),
-            patch("asyncio.sleep", AsyncMock()) as sleep,
+            patch("asyncio.sleep", AsyncMock(side_effect=yield_once)) as sleep,
             self.assertLogs("botnats.nats.coordinator", level="DEBUG") as logs,
         ):
             async with asyncio.timeout(5):
@@ -1743,7 +1755,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 "watch_sessions",
                 partial(watch_until_closed, "watch-sessions"),
             ),
-            patch("asyncio.sleep", AsyncMock()) as sleep,
+            patch("asyncio.sleep", AsyncMock(side_effect=yield_once)) as sleep,
             self.assertNoLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             async with asyncio.timeout(5):
@@ -1818,7 +1830,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator, "watch_channels", swallow_cancel),
             patch.object(coordinator, "watch_presence", swallow_cancel),
             patch.object(coordinator, "watch_sessions", swallow_cancel),
-            patch("asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", yield_once),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
             async with asyncio.timeout(5):
@@ -2026,7 +2038,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator, "watch_channels", crash_once),
             patch.object(coordinator, "watch_presence", hang),
             patch.object(coordinator, "watch_sessions", hang),
-            patch("asyncio.sleep", AsyncMock()),
+            patch("asyncio.sleep", yield_once),
             self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
         ):
             async with asyncio.timeout(5):
