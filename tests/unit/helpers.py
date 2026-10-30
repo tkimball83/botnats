@@ -460,7 +460,7 @@ class FakeCoordinator:
         return
 
     async def status(self) -> NATSStatus:
-        """Return a healthy fake NATS cluster status."""
+        """Return a healthy status, or the one collect reports while disconnected."""
         return NATSStatus(
             connection=self.connected,
             jetstream="up" if self.connected else "unknown",

@@ -101,6 +101,26 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
             assert limiter.check("host.example")
             assert not limiter.check("other.example")
 
+    async def test_refusals_do_not_extend_the_window(self) -> None:
+        """Allow a flooding sender again once its allowed events leave the window.
+
+        Counted too, refusals would keep a sender who never pauses limited.
+        """
+        limiter = RateLimiter(limit=2, window=10)
+        now = 100.0
+        with patch(
+            "botnats.commands.asyncio.get_running_loop",
+            return_value=SimpleNamespace(time=lambda: now),
+        ):
+            assert limiter.check("user")
+            assert limiter.check("user")
+            for second in range(101, 110):
+                now = second
+                assert not limiter.check("user")
+
+            now = 110.0
+            assert limiter.check("user")
+
     async def test_window_expiry(self) -> None:
         """Verify rate limit resets after window expires."""
         limiter = RateLimiter(limit=1, window=0.0)
@@ -130,7 +150,7 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for admin ban, op, deop, invite, and status commands."""
+    """Tests for admin commands, their replies, and their failures."""
 
     async def test_admin_ban(self) -> None:
         """Verify BAN command sets a channel mode when bot is opped."""
@@ -171,12 +191,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc, _ = bot_with_coordinator(coordinator)
         bot.authorizer.grant(OWNER.render())
         put_channel = coordinator.put_channel
+        attempted: list[str] = []
 
         async def put_after_quit(
             record: dict[str, Any],
             *,
             after: str | None,
         ) -> ChannelFields:
+            attempted.append(record["channel"])
             bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
             return await put_channel(record, after=after)
 
@@ -184,6 +206,9 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             await bounded(bot.commands.dispatch(OWNER, "JOIN #new"))
 
         await drain_session_writes(bot)
+        # The write was attempted, and failed, after the session ended.
+        assert attempted == ["#new"]
+        assert not bot.authorizer.authorized(OWNER.render())
         assert casefold("#new", "rfc1459") not in bot.channel_mgr.channels
         assert fake_irc.privmsgs == []
 
@@ -385,8 +410,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc = bot_with_irc()
         # The shortest mask fits a relayed line alone, but not after the
         # header; the next fits the line the bot sends, but not the line the
-        # server relays with the bot's source in front.
-        for mask in ("*!*@" + "h" * 356, "*!*@" + "h" * 400, "*!*@" + "h" * 495):
+        # server relays with the bot's source in front. The last is short in
+        # characters, but each "é" encodes to two bytes.
+        for mask in (
+            "*!*@" + "h" * 356,
+            "*!*@" + "h" * 400,
+            "*!*@" + "h" * 495,
+            "*!*@" + "é" * 200,
+        ):
             with self.subTest(length=len(mask)):
                 fake_irc.privmsgs.clear()
                 with self.assertLogs("botnats.commands", level="WARNING"):
@@ -394,6 +425,21 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
                     bot.commands.reply_list("owner", "#test +b", [mask])
 
                 assert fake_irc.privmsgs == [("owner", "#test +b ok")]
+
+    async def test_reply_list_packs_by_encoded_bytes(self) -> None:
+        """Pack multibyte items by their encoded size, not their characters."""
+        bot, fake_irc = bot_with_irc()
+        # Each "é" encodes to two bytes: packed by characters, a line would
+        # hold nearly twice as many items and overflow 512 bytes.
+        items = [f"{number:02d}" + "é" * 20 for number in range(30)]
+
+        bot.commands.reply_list("owner", "#test +b", items)
+
+        listed = [word for _, text in fake_irc.privmsgs for word in text.split()[2:]]
+        assert listed == items
+        for _, text in fake_irc.privmsgs:
+            line = f"PRIVMSG owner :{text}\r\n".encode()
+            assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
 
     async def test_reply_drops_unsendable_line(self) -> None:
         """Log and drop a reply too long to send instead of raising."""
@@ -834,6 +880,25 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ("owner", "bot id=alpha-id nick=alpha peers=0 channels=0"),
         ]
 
+    async def test_cmd_status_with_nats_down(self) -> None:
+        """Report NATS down, with its cluster details unknown, while disconnected."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        coordinator.connected = False
+        bot.authorizer.grant(OWNER.render())
+
+        await bounded(bot.commands.dispatch(OWNER, "STATUS"))
+
+        assert fake_irc.privmsgs == [
+            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=0"),
+            (
+                "owner",
+                (
+                    "nats connection=down routes=? jetstream=unknown leader=? "
+                    "replicas=?/1 lag=?"
+                ),
+            ),
+        ]
+
     async def test_unknown_command(self) -> None:
         """Verify an unrecognized command sends an error to the user."""
         bot, fake_irc, _ = bot_with_coordinator()
@@ -914,6 +979,17 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         assert coordinator.channel_puts == []
+
+    async def test_part_ignores_oversized_mode_command(self) -> None:
+        """Part a channel even when the enforced mode command could not fit it."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.config = replace(bot.config, channel_modes="+" + "n" * 499)
+        bot.authorizer.grant(OWNER.render())
+
+        await bounded(bot.commands.dispatch(OWNER, "PART #test"))
+
+        assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        assert coordinator.channel_puts[-1]["present"] is False
 
     async def test_join_without_enforced_modes(self) -> None:
         """Join under the default config, which enforces no channel modes."""

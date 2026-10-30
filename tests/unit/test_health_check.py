@@ -4,6 +4,7 @@
 """Tests for HTTP health check endpoint."""
 
 import asyncio
+import ipaddress
 import socket
 import unittest
 from unittest.mock import create_autospec, patch
@@ -56,6 +57,18 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
 
         assert health_check.server is None
         assert not server.is_serving()
+
+    async def test_listens_on_every_interface(self) -> None:
+        """Listen on every interface, so probes from other hosts reach it."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        await bounded(health_check.start())
+        self.addAsyncCleanup(bounded, health_check.close())
+        assert health_check.server is not None
+
+        hosts = [sock.getsockname()[0] for sock in health_check.server.sockets]
+
+        assert hosts
+        assert all(ipaddress.ip_address(host).is_unspecified for host in hosts)
 
     async def test_request_timeout_closes_connection(self) -> None:
         """Close a connection that sends no request line within the timeout."""
