@@ -306,7 +306,7 @@ class CommandHandler:
         target = arguments[1]
         runtime = self.opped_channel(channel)
         member = runtime.members.get(self.bot.caps.fold(target))
-        if member is None or member.prefix is None or not member.prefix.complete:
+        if member is None:
             self.reply(
                 prefix.nick,
                 f"{target} not found on {channel}",

@@ -137,6 +137,34 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
 
         assert bot.identity.current is None
 
+    def test_identity_set_reports_only_changes(self) -> None:
+        """Report a change only for a new identity, not a repeated one.
+
+        A change announces presence and joins channels, so a burst of WHO
+        replies about this bot must repeat neither.
+        """
+        bot = make_bot(irc=FakeIRC())
+        prefix = Prefix("alpha", "~alpha", "real.host")
+
+        assert bot.identity.set(prefix)
+        assert not bot.identity.set(prefix)
+        assert bot.identity.set(Prefix("alpha", "~alpha", "new.host"))
+        assert bot.identity.current is not None
+        assert bot.identity.current.host == "new.host"
+
+    def test_identity_reset_forgets_connection(self) -> None:
+        """Forget the identity and registration of a connection that ended."""
+        bot = make_bot(irc=FakeIRC())
+        bot.identity.on_registered()
+        assert bot.identity.set(Prefix("alpha", "~alpha", "real.host"))
+        generation = bot.identity.generation
+
+        bot.identity.reset()
+
+        assert bot.identity.current is None
+        assert bot.identity.generation == generation + 1
+        assert not bot.identity.registered
+
     async def test_identity_discovery_accepts_final_response(self) -> None:
         """Stop querying once a response arrives, even to the final query."""
         # With two attempts the check before the second WHO sees the

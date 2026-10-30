@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for IRC channel, key, JOIN, server URL, and channel revision validation."""
+"""Tests for IRC channel, key, JOIN, server URL, and channel record validation."""
 
 import re
 import unittest
@@ -129,6 +129,32 @@ class ValidatorTests(unittest.TestCase):
 
         valid = f"{'0' * 19}1-{'0' * 32}"
         assert validate_channel_revision(valid) == valid
+
+    def test_parse_channel_record_rejects_malformed_fields(self) -> None:
+        """Reject a channel record whose channel, key, or presence is malformed."""
+        record: dict[str, object] = {
+            "channel": "#safe",
+            "key": None,
+            "present": True,
+            "revision": f"{'0' * 19}1-{'0' * 32}",
+        }
+        assert parse_channel_record(record) == (
+            "#safe",
+            None,
+            True,
+            record["revision"],
+        )
+
+        # A missing key would read as no key, and 1 as True.
+        keyless = {k: v for k, v in record.items() if k != "key"}
+        for value, error, message in (
+            ({**record, "channel": ["#safe"]}, TypeError, "invalid channel"),
+            (keyless, ValueError, "invalid key"),
+            ({**record, "key": 5}, ValueError, "invalid key"),
+            ({**record, "present": 1}, TypeError, "invalid presence flag"),
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(error, message):
+                parse_channel_record(value)
 
     def test_channel_revision_validation(self) -> None:
         """Verify malformed revisions cannot permanently outrank valid updates."""

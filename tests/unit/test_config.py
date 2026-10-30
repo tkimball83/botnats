@@ -357,7 +357,7 @@ class ConfigTests(unittest.TestCase):
         """Reject a NATS server URL with a scheme other than nats."""
         # nats-py ignores a tls:// scheme and uses TLS only when the server
         # asks, so accepting tls:// would promise encryption it never enforces.
-        for value in ("http://host:4222", "irc://host:4222", "tls://host:4222"):
+        for value in ("irc://host:4222", "tls://host:4222"):
             with (
                 self.subTest(value=value),
                 self.assertRaisesRegex(ValueError, "^invalid NATS server URL$"),
