@@ -59,19 +59,26 @@ class AuthFlow:
         # identity that is already gone.
         if claimed and bot.sessions.watched_valid(rendered):
             session = bot.authorizer.grant(rendered)
+            # A held revocation that outranks the grant blocks it. Writing the
+            # grant anyway could replace that revocation: the store disregards
+            # one expiring past its horizon, as from a peer whose clock runs
+            # ahead.
+            if not bot.authorizer.authorized(rendered):
+                bot.commands.reply(prefix.nick, "Authorization failed")
+                return
+
             try:
                 synced = await bot.sessions.sync(session)
             except asyncio.CancelledError:
                 # Shutdown cancels AUTH mid-write, before the check below can
                 # deny it, and its final flush would write the grant still
                 # queued. The cancelled write may already have landed, so
-                # only a revocation supersedes it.
+                # only a revocation supersedes it. Shutdown reports the IRC
+                # disconnect first, so the identity no longer holds: the
+                # revocation escalates over a newer grant like a change's own.
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
-                    bot.sessions.queue(
-                        revoked,
-                        yielding=bot.sessions.watched_valid(rendered),
-                    )
+                    bot.sessions.queue(revoked)
 
                 raise
 
