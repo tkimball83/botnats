@@ -439,8 +439,10 @@ class IRCEventHandler:
         if self.bot.irc.is_self(desired):
             return
 
+        # A NICK still waiting answers any later offline report too; another
+        # copy would only delay the lines queued after it.
         with suppress(ConnectionError):
-            self.bot.irc.send("NICK", desired)
+            self.bot.irc.send("NICK", desired, unless_waiting=True)
 
         self.poll_ison()
 
@@ -488,8 +490,10 @@ class IRCEventHandler:
         """Poll ISON at a fixed interval until the nick watch stops."""
         while True:
             await asyncio.sleep(ISON_POLL_INTERVAL)
+            # Behind a send backlog longer than the interval, a copy still
+            # waiting will answer; another would only delay the lines after it.
             with suppress(ConnectionError):
-                self.bot.irc.send("ISON", self.bot.config.nickname)
+                self.bot.irc.send("ISON", self.bot.config.nickname, unless_waiting=True)
 
     def handle_isupport(self, message: IRCMessage) -> None:
         """Apply advertised and withdrawn RPL_ISUPPORT tokens."""

@@ -242,6 +242,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(config())
         peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
         session = session_value(time.time() + 60)
+        expired = ("gone!user@host", time.time() - 1)
+        # A live update prunes expired mappings; a replayed one leaves them.
+        bot.sessions.watched["expired"] = expired
 
         bot.callbacks.on_presence(peer)
         bot.callbacks.on_session_update("opaque", session, replaying=False)
@@ -257,7 +260,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.watched
         assert not bot.authorizer.authorized(session.prefix)
 
-        bot.callbacks.on_session_update("opaque", session, replaying=False)
+        bot.sessions.watched["expired"] = expired
+        bot.callbacks.on_session_update("opaque", session, replaying=True)
+        assert bot.sessions.watched["expired"] == expired
         bot.callbacks.on_sessions_replayed({"opaque"})
 
         assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}

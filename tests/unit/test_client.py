@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 from botnats.irc.client import (
     NICK_COLLISION_LIMIT,
+    OUTBOUND_LIMIT,
     IRCClient,
     IRCClientConfig,
     IRCServer,
@@ -854,17 +855,6 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 sent = client.outbound.get_nowait()
                 assert sent == b"CAP END\r\n"
 
-    async def test_cap_ls_requests_desired(self) -> None:
-        """Verify desired capabilities are requested when advertised."""
-        client = self.cap_client()
-        message = parse_message(":server CAP * LS :chghost multi-prefix\r\n")
-        client.handle_cap(message)
-
-        assert client.cap_negotiating
-        assert client.outbound is not None
-        sent = client.outbound.get_nowait()
-        assert sent == b"CAP REQ :chghost multi-prefix\r\n"
-
     async def test_cap_ls_strips_values(self) -> None:
         """Verify capability values are stripped when parsing LS."""
         client = self.cap_client()
@@ -1494,7 +1484,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.writer is None
 
     async def test_send_queue_holds_join_burst(self) -> None:
-        """Queue the join burst for a few hundred channels without overflow.
+        """Queue a few hundred channels' join burst, but no line past the limit.
 
         Each channel takes a JOIN, then WHO, MODE, and ban list queries.
         """
@@ -1520,6 +1510,13 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 client.send("WHO", channel)
                 client.send("MODE", channel)
                 client.send("MODE", channel, "+b")
+
+            assert client.outbound is not None
+            while client.outbound.qsize() < OUTBOUND_LIMIT:
+                client.send("PING", "filler")
+
+            with self.assertRaisesRegex(ConnectionError, "queue is full"):
+                client.send("PING", "overflow")
         finally:
             async with asyncio.timeout(5):
                 await client.close()

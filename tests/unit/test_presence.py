@@ -107,6 +107,25 @@ class PresenceTests(unittest.TestCase):
 class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
     """Tests for discovering this bot's own IRC identity."""
 
+    async def test_announce_waits_for_identity(self) -> None:
+        """Write presence only once this bot knows its own IRC identity.
+
+        The heartbeat starts before discovery resolves it; raising then would
+        log a traceback on every heartbeat.
+        """
+        coordinator = FakeCoordinator()
+        bot = make_bot(irc=FakeIRC(), coordinator=coordinator)
+        async with asyncio.timeout(1):
+            await bot.identity.announce()
+
+        assert coordinator.presence_puts == []
+        presence = BotPresence("alpha", "host", "one", "alpha", "user")
+        bot.identity.current = presence
+        async with asyncio.timeout(1):
+            await bot.identity.announce()
+
+        assert coordinator.presence_puts == [asdict(presence)]
+
     async def test_announce_skips_refused_write(self) -> None:
         """Skip a presence write refused during an outage; the next one retries.
 

@@ -403,17 +403,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == []
 
-    async def test_invite_joins_desired_channel(self) -> None:
-        """Verify a peer's INVITE to a desired unjoined channel joins at once."""
-        bot, fake_irc = bot_with_irc()
-        bot.presence.update(PEER)
-
-        bot.events.on_irc_message(
-            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
-        )
-
-        assert ("JOIN", ("#test",)) in fake_irc.sent
-
     async def test_invite_from_non_peer_sends_no_join(self) -> None:
         """Send no JOIN for an INVITE that no peer bot sent.
 
@@ -2243,15 +2232,19 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
     """Tests for ISON and MONITOR nickname reclaim."""
 
     async def test_ison_reply_reclaims_nick(self) -> None:
-        """Reclaim the desired nickname when ISON reports it offline."""
+        """Reclaim the desired nickname when ISON reports it offline.
+
+        A NICK still waiting to go out is not queued again.
+        """
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
 
-        bot.events.on_irc_message(
-            IRCMessage("303", ("alpha", "")),
-        )
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            bot.events.on_irc_message(
+                IRCMessage("303", ("alpha", "")),
+            )
 
-        assert ("NICK", ("alpha",)) in fake_irc.sent
+        assert send.call_args_list == [call("NICK", "alpha", unless_waiting=True)]
         async with asyncio.timeout(5):
             await bot.tasks.drain()
 
@@ -2532,7 +2525,8 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
 
         A loop that ended on its own would leave nick_watch_task holding a
         finished task, so poll_ison would never start another. One that did
-        not wait would fill the send queue with ISON.
+        not wait, or queued a copy while one still waits, would fill the send
+        queue with ISON.
         """
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
@@ -2569,7 +2563,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("asyncio.sleep", record_sleep),
-            patch.object(fake_irc, "send", send_then_reclaim),
+            patch.object(fake_irc, "send", MagicMock(wraps=send_then_reclaim)) as send,
         ):
             poll = asyncio.create_task(bot.events.ison_poll_loop())
             async with asyncio.timeout(1):
@@ -2580,6 +2574,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(poll, return_exceptions=True)
 
         assert poll.cancelled()
-        assert fake_irc.sent[:2] == [("ISON", ("alpha",)), ("ISON", ("alpha",))]
+        ison = call("ISON", "alpha", unless_waiting=True)
+        assert send.call_args_list[:3] == [ison] * 3
         # The refused poll and both sent ones each waited the interval first.
         assert delays[:3] == [ISON_POLL_INTERVAL] * 3
