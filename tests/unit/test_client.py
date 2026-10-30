@@ -633,7 +633,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_registration_nick_rejections_retry(self) -> None:
         """Verify registration retries every nickname rejection numeric."""
         client = irc_client()
-        retry = MagicMock()
+        retry = MagicMock(return_value=None)
         numerics = ("432", "433", "436", "437")
 
         with patch.object(IRCClient, "nick_collision", retry):
@@ -813,7 +813,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         for raw, reply in cases:
             with (
                 self.subTest(reply=reply[:6]),
-                patch.object(client, "send_immediate", AsyncMock()) as send,
+                patch.object(
+                    client, "send_immediate", AsyncMock(return_value=None)
+                ) as send,
             ):
                 assert await dispatch(client, raw, "tok") == "tok"
                 send.assert_awaited_once()
@@ -973,42 +975,25 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_idle_ping_pong(self) -> None:
         """Verify idle timeout sends PING and raises on missing PONG."""
-        ping_seen = asyncio.Event()
+        client = irc_client()
+        writer = mock_writer()
+        reader = asyncio.StreamReader()
+        # Registered first: until then a quiet connection meets the
+        # registration deadline instead.
+        reader.feed_data(b":server 001 alpha :Welcome\r\n")
+        connection = (reader, writer)
 
-        async def server_handler(
-            reader: asyncio.StreamReader,
-            writer: asyncio.StreamWriter,
-        ) -> None:
-            await reader.readline()
-            await reader.readline()
-            await reader.readline()
-            ping = await reader.readline()
-            if ping.startswith(b"PING :"):
-                ping_seen.set()
-            # Never answer the PING; hold the connection until the client leaves.
-            await reader.read()
-            writer.close()
-            await writer.wait_closed()
-
-        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
-        port = server.sockets[0].getsockname()[1]
-
-        client = irc_client(ports=(port,))
-        try:
+        with (
+            patch.object(client, "establish", AsyncMock(return_value=connection)),
+            patch("botnats.irc.client.IDLE_TIMEOUT", 0),
+            patch("botnats.irc.client.PONG_TIMEOUT", 0),
+            self.assertRaisesRegex(ConnectionError, "did not answer"),
+        ):
             async with asyncio.timeout(5):
-                with (
-                    patch("botnats.irc.client.IDLE_TIMEOUT", 0),
-                    patch("botnats.irc.client.PONG_TIMEOUT", 0),
-                    self.assertRaisesRegex(ConnectionError, "did not answer"),
-                ):
-                    await client.run_connection(client.config.servers[0])
+                await client.run_connection(client.config.servers[0])
 
-                await ping_seen.wait()
-        finally:
-            async with asyncio.timeout(5):
-                await client.close()
-                server.close()
-                await server.wait_closed()
+        writer.write.assert_called_once()
+        assert writer.write.call_args.args[0].startswith(b"PING :")
 
     async def test_oversized_server_line_is_skipped(self) -> None:
         """Skip a complete oversized line without dropping the session."""
@@ -1566,7 +1551,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.on_disconnect = failing_callback
         with (
             patch.object(client, "run_connection", failing_connection),
-            patch.object(client, "close", AsyncMock()) as close,
+            patch.object(client, "close", AsyncMock(return_value=None)) as close,
             patch("asyncio.sleep", skip_sleep),
             self.assertLogs("botnats.irc.client", level="WARNING") as logs,
             self.assertRaises(asyncio.CancelledError),

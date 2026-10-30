@@ -295,10 +295,7 @@ class IRCClient:
                 raise ConnectionError(msg) from error
 
             if raw is None:
-                if (
-                    not self.registered_with_server
-                    and loop.time() >= registration_deadline
-                ):
+                if not self.registered_with_server:
                     msg = "IRC server did not complete registration"
                     raise ConnectionError(msg)
 

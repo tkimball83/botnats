@@ -390,7 +390,7 @@ class IRCProtocolTests(unittest.TestCase):
         )
 
     def test_prefix_without_op_mode_fails_closed(self) -> None:
-        """Never count a sub-operator PREFIX rank as channel operator."""
+        """Count no PREFIX rank as channel operator without "@" or "o"."""
         caps = ISupportState()
 
         caps.parse_prefix("(v)+")
@@ -398,6 +398,5 @@ class IRCProtocolTests(unittest.TestCase):
         assert not caps.is_opped({"v"})
 
         caps.parse_prefix("(qv)~+")
-        assert caps.op_mode == "q"
-        assert caps.is_opped({"q"})
-        assert not caps.is_opped({"v"})
+        assert caps.op_mode == "o"
+        assert not caps.is_opped({"q", "v"})

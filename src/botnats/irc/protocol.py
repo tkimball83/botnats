@@ -178,14 +178,9 @@ class ISupportState:
 
         self.member_prefixes = dict(zip(symbols, modes, strict=True))
         self.membership_modes = modes
-        # Without "@" fall back through the conventional operator tiers; a
-        # PREFIX advertising only sub-operator modes (e.g. "(v)+") must not
-        # count its highest rank as opped.
-        fallback = next(
-            (mode for mode in (DEFAULT_OP_MODE, "a", "q") if mode in modes),
-            DEFAULT_OP_MODE,
-        )
-        self.op_mode = self.member_prefixes.get("@", fallback)
+        # Without "@" the default "o" stays the operator mode: a PREFIX that
+        # lacks it too, such as "(qv)~+", counts no rank as opped.
+        self.op_mode = self.member_prefixes.get("@", DEFAULT_OP_MODE)
 
     def reset(self) -> None:
         """Reset capabilities learned from the previous server connection."""
