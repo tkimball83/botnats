@@ -118,18 +118,19 @@ class TotpAuthorizerTests(unittest.TestCase):
         """
         auth = authorizer("alpha")
         prefix = "owner!user@example.test"
-        session = auth.grant(prefix, now=10)
-        auth.revoke(prefix)
+        now = time.time()
+        session = auth.grant(prefix, now=now)
+        revoked = auth.revoke(prefix)
 
-        auth.drop_session(prefix)
+        assert auth.drop_session(prefix) == revoked
         auth.keep(session)
 
         assert [record.revoked for record in auth.records.values()] == [True]
-        assert not auth.authorized(prefix, now=21)
+        assert not auth.authorized(prefix, now=now + 11)
         # The stale grant is still kept where no revocation is held.
         fresh = authorizer("beta")
         fresh.keep(session)
-        assert fresh.authorized(prefix, now=21)
+        assert fresh.authorized(prefix, now=now + 11)
 
     def test_durable_revocation_blocks_stale_session(self) -> None:
         """Keep a watched revocation authoritative over its original session."""

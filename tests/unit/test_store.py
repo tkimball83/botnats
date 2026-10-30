@@ -465,7 +465,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert key != attempts.key("host.example", 1)
         assert key != attempts.key("other.example", 0)
         assert len(key) == SHA256_HEX_LENGTH
-        assert attempts.ttl >= ATTEMPT_WINDOW
+        # Attempts are kept for two hours, an hour past their window.
+        assert attempts.ttl == 7200
 
     async def test_missing_store_fails_closed(self) -> None:
         """Verify authentication is denied until the bucket is open."""
@@ -511,11 +512,12 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_attempts_count_for_one_hour(self) -> None:
-        """Refuse attempts over the limit until the earlier ones are an hour old."""
+        """Refuse a fourth attempt until the first three are an hour old."""
         attempts = AttemptStore("efnet", 3, SECRET)
         attempts.kv = cast("KeyValue", FakeKV())
         start = 1_000_000.0
-        for _ in range(ATTEMPT_LIMIT):
+        # Every bot shares these slots, so a changed limit must fail here.
+        for _ in range(3):
             assert await bounded(attempts.allow("host.example", now=start))
 
         assert not await bounded(attempts.allow("host.example", now=start + 3599.5))

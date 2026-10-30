@@ -29,6 +29,7 @@ from botnats.nats.coordinator import (
     NATSConfig,
 )
 from botnats.nats.envelope import Envelope
+from botnats.nats.status import unknown
 from botnats.nats.store import (
     SESSION_EXPIRY_GRACE,
     SESSION_TTL,
@@ -350,7 +351,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.deliver_help(message)
 
     async def test_close_releases_connection(self) -> None:
-        """Cancel watches and release owned presence, KV handles, and the connection."""
+        """Cancel watches, then release presence, KV handles, and the connection."""
         coordinator = build_coordinator("alpha")
         nc = closing_client(coordinator)
         coordinator.nc = nc
@@ -359,20 +360,29 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             store.js = MagicMock()
             store.kv = MagicMock()
 
-        # The presence key is deleted through the open bucket, so releasing
-        # it after the stores reset, or after closing the client runs the
-        # disconnect callback, would delete nothing.
-        presence_kv = AsyncMock()
-        presence_kv.delete = AsyncMock(return_value=True)
-        coordinator.presence_store.kv = presence_kv
         watch = asyncio.create_task(hang())
         coordinator.watch_tasks.append(watch)
+        watch_done_at_delete: list[bool] = []
+
+        async def delete(*arguments: object, **options: object) -> bool:
+            del arguments, options
+            watch_done_at_delete.append(watch.done())
+            return True
+
+        # The presence key is deleted through the open bucket, so releasing
+        # it after the stores reset, or after closing the client runs the
+        # disconnect callback, would delete nothing. A presence watch still
+        # running would see the deletion and recreate the key.
+        presence_kv = AsyncMock()
+        presence_kv.delete = AsyncMock(side_effect=delete)
+        coordinator.presence_store.kv = presence_kv
 
         async with asyncio.timeout(5):
             await coordinator.close()
             await coordinator.close()
 
         assert watch.cancelled()
+        assert watch_done_at_delete == [True]
         assert coordinator.nc is None
         assert not coordinator.claim.owned
         assert coordinator.claim.revision is None
@@ -482,6 +492,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         # nats-py's default of 60 attempts closes the client for good after
         # about two minutes of outage, and the restart's connect gives up too.
         assert connect.await_args.kwargs.get("max_reconnect_attempts") == -1
+        assert connect.await_args.kwargs.get("reconnect_time_wait") == RECONNECT_WAIT
         assert coordinator.nc is nc
         assert steps == ["subscribe", "stores", "watches"]
 
@@ -938,6 +949,26 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.channels_store.ttl == 0
         assert coordinator.presence_store.ttl == config.presence_ttl
         assert coordinator.sessions.ttl == SESSION_TTL
+
+    async def test_status_reads_claim_bucket_and_monitor_port(self) -> None:
+        """Collect status over the client, the claim bucket, and the monitor port."""
+        coordinator = build_coordinator("alpha")
+        coordinator.config = replace(coordinator.config, monitor_port=9222)
+        coordinator.nc = MagicMock()
+        for store in coordinator.stores:
+            store.kv = MagicMock()
+
+        snapshot = unknown(coordinator.claims.replicas, connected=True)
+        collect = AsyncMock(return_value=snapshot)
+        with patch("botnats.nats.coordinator.collect", collect):
+            assert await coordinator.status() is snapshot
+
+        collect.assert_awaited_once_with(
+            coordinator.nc,
+            coordinator.claims.kv,
+            coordinator.claims.replicas,
+            9222,
+        )
 
     async def test_reconnect_retries_stores(self) -> None:
         """Verify reconnect restores all stores before starting watches."""

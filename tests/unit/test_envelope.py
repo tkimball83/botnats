@@ -118,13 +118,6 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not bound"):
             Envelope("beta", COORDINATION_KEY).decode(SUBJECT, encoded)
 
-    def test_encode_rejects_large_payload(self) -> None:
-        """Verify encoding a payload that exceeds the size limit raises."""
-        envelope = Envelope("alpha", COORDINATION_KEY)
-
-        with self.assertRaisesRegex(ValueError, "size limit"):
-            envelope.encode(SUBJECT, {"big": "x" * 262_144})
-
     def test_envelope_security(self) -> None:
         """Verify envelope signing, replay rejection, and malformed envelopes."""
         key = COORDINATION_KEY

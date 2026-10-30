@@ -118,7 +118,7 @@ class Envelope:
             self.bot_id,
             timestamp,
         )
-        encoded = json.dumps(
+        return json.dumps(
             {
                 "nonce": nonce,
                 "payload": signed_payload,
@@ -129,11 +129,6 @@ class Envelope:
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-        if len(encoded) > MAX_ENVELOPE_BYTES:
-            msg = "NATS envelope exceeds the size limit"
-            raise ValueError(msg)
-
-        return encoded
 
     def mac(self, value: bytes) -> str:
         """Return the hexadecimal HMAC for canonical envelope bytes."""

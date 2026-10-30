@@ -5,23 +5,59 @@
 
 import asyncio
 import unittest
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
 
 from botnats.nats.claim import PresenceClaim, PresenceState
 from botnats.nats.store import PresenceStore, StoreUnavailableError
-from tests.unit.helpers import COORDINATION_KEY, bounded
+from tests.unit.helpers import COORDINATION_KEY, FakeKV, bounded
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
+    from nats.js.kv import KeyValue
 
 INSTANCE_ID = "instance"
 NOT_OWNED = "bot ID alpha does not own its presence key"
 PRESENCE = {"bot_id": "alpha", "instance_id": INSTANCE_ID}
+# A complete record, which the store can sign.
+IDENTITY = {
+    "bot_id": "alpha",
+    "host": "host",
+    "instance_id": INSTANCE_ID,
+    "nick": "alpha",
+    "user": "user",
+}
 
 
 def build_claim() -> PresenceClaim:
     """Build an unclaimed presence claim over an unopened store."""
     store = PresenceStore("efnet", 1, 15.0, COORDINATION_KEY)
     return PresenceClaim(store, "alpha", INSTANCE_ID)
+
+
+def open_claim() -> tuple[PresenceClaim, FakeKV]:
+    """Build an unclaimed presence claim over an empty in-memory bucket."""
+    claim = build_claim()
+    kv = FakeKV()
+    claim.store.kv = cast("KeyValue", kv)
+    return claim, kv
+
+
+async def overlap(claim: PresenceClaim, *writes: Awaitable[None]) -> list[bool]:
+    """Run presence writes at once; return the claim's ownership at each turn."""
+    owned: list[bool] = []
+    async with asyncio.timeout(5):
+        running = asyncio.gather(*writes)
+        while not running.done():
+            owned.append(claim.owned)
+            await asyncio.sleep(0)
+
+        await running
+
+    return owned
 
 
 class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
@@ -359,3 +395,35 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
         assert claim.owned
         assert claim.revision == 2
+
+    async def test_overlapping_writes_keep_ownership(self) -> None:
+        """Keep the key while an identity change overlaps a heartbeat.
+
+        Both writes would update from the same revision: the loser would drop
+        the key until a reclaim, taking readiness with it.
+        """
+        claim, kv = open_claim()
+        await bounded(claim.put(IDENTITY))
+        renamed = {**IDENTITY, "nick": "renamed"}
+
+        owned = await overlap(claim, claim.put(IDENTITY), claim.put(renamed))
+
+        assert owned
+        assert all(owned)
+        assert claim.revision == kv.entries["alpha"][0]
+
+    async def test_reclaim_overlapping_heartbeat_owns_stored_revision(self) -> None:
+        """Own the stored revision when a reclaim and a heartbeat claim at once.
+
+        The losing claim would overwrite the winner's record after ownership
+        changed and discard its revision, so the next heartbeat would lose the
+        key.
+        """
+        for transition in (PresenceClaim.reclaim, PresenceClaim.deleted):
+            with self.subTest(transition=transition.__name__):
+                claim, kv = open_claim()
+
+                await overlap(claim, transition(claim), claim.put(IDENTITY))
+
+                assert claim.owned
+                assert claim.revision == kv.entries["alpha"][0]
