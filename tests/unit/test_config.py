@@ -65,7 +65,7 @@ class ConfigTests(unittest.TestCase):
             jetstream_replicas=3,
             maintenance_interval=2,
             nats_monitor_port=9222,
-            nats_servers=("nats://nats.internal:4222", "tls://nats2.internal:4223"),
+            nats_servers=("nats://nats.internal:4222", "nats://nats2.internal:4223"),
             nats_token=NATS_CREDENTIAL,
             network="libera",
             nickname="botnick",
@@ -354,8 +354,10 @@ class ConfigTests(unittest.TestCase):
                 replica_count({"jetstream_replicas": bad})
 
     def test_nats_urls_reject_other_schemes(self) -> None:
-        """Reject a NATS server URL with a scheme other than nats or tls."""
-        for value in ("http://host:4222", "irc://host:4222"):
+        """Reject a NATS server URL with a scheme other than nats."""
+        # nats-py ignores a tls:// scheme and uses TLS only when the server
+        # asks, so accepting tls:// would promise encryption it never enforces.
+        for value in ("http://host:4222", "irc://host:4222", "tls://host:4222"):
             with (
                 self.subTest(value=value),
                 self.assertRaisesRegex(ValueError, "^invalid NATS server URL$"),

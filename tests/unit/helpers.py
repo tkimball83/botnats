@@ -75,7 +75,7 @@ CONFIG = b"""{
   "nats": {
     "jetstream_replicas": 3,
     "monitor_port": 9222,
-    "servers": ["nats://nats.internal:4222", "tls://nats2.internal:4223"]
+    "servers": ["nats://nats.internal:4222", "nats://nats2.internal:4223"]
   }
 }
 """
