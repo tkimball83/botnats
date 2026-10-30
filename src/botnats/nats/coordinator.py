@@ -642,8 +642,8 @@ class Coordinator:
         try:
             presence = BotPresence.from_dict(data)
         except ValueError:
-            # A starting process claims its key before it knows its IRC
-            # identity: a duplicate to detect, not yet a peer to record.
+            # A claim carries no IRC identity until a heartbeat writes one: a
+            # duplicate to detect, not yet a peer to record.
             return
 
         self.callbacks.on_presence(presence)
