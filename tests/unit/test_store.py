@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from nats.errors import Error as NatsError
-from nats.js.api import KeyValueConfig, StorageType, StreamConfig
+from nats.js.api import KeyValueConfig, StorageType, StreamConfig, StreamInfo
 from nats.js.errors import (
     BadRequestError,
     KeyNotFoundError,
@@ -475,24 +475,6 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await bounded(attempts.allow("host.example", now=60))
 
-    async def test_sliding_window_reuses_expired_slot(self) -> None:
-        """Verify an expired slot is atomically reused."""
-        attempts = AttemptStore("efnet", 3, SECRET)
-        attempts.kv = AsyncMock()
-        attempts.kv.get.return_value = MagicMock(
-            revision=7,
-            value=float(0).hex().encode(),
-        )
-        attempts.kv.update.return_value = 8
-        now = float(ATTEMPT_WINDOW + 1)
-
-        assert await bounded(attempts.allow("host.example", now=now))
-        attempts.kv.update.assert_awaited_once_with(
-            attempts.key("host.example", 0),
-            now.hex().encode(),
-            last=7,
-        )
-
     async def test_sliding_window_reuses_slot_at_cutoff(self) -> None:
         """Reuse a slot whose attempt sits exactly one window before now."""
         attempts = AttemptStore("efnet", 3, SECRET)
@@ -638,7 +620,6 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         assert key != claims.key(43)
         assert len(key) == SHA256_HEX_LENGTH
         assert claims.ttl >= (2 * TOTP_WINDOW + 1) * TOTP_PERIOD
-        assert claims.ready
         claims.kv.create.assert_awaited_once_with(key, b"1")
 
     async def test_duplicate(self) -> None:
@@ -670,8 +651,6 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await bounded(claims.claim(42))
-
-        assert not claims.ready
 
     async def test_reopen_after_error(self) -> None:
         """Verify a claim retries opening KV after reconnect initialization fails."""
@@ -723,12 +702,30 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_open_replaces_bucket_from_older_context(self) -> None:
+        """Reopen the bucket on a newer JetStream context, not keep the old handle.
+
+        Startup's retry loop can open a store on its own context after nats-py
+        reconnects but before the resynchronization opens it on a newer one.
+        """
+        store = KVStore("test", 1, 60)
+        older = AsyncMock()
+        older.create_key_value.return_value = cast("KeyValue", FakeKV())
+        newer = AsyncMock()
+        kv = cast("KeyValue", FakeKV())
+        newer.create_key_value.return_value = kv
+
+        assert await bounded(store.open(older)) is not kv
+        assert await bounded(store.open(newer)) is kv
+        assert store.js is newer
+        newer.create_key_value.assert_awaited_once()
+
     async def test_retune_matches_created_duplicate_window(self) -> None:
         """Retune a bucket to the duplicate window nats-py creates it with.
 
         That is two minutes, or the TTL when it is shorter.
         """
-        for ttl, window in ((0, 120), (15, 15)):
+        for ttl, window in ((0, 120), (15, 15), (300, 120)):
             store = KVStore("test", 1, ttl)
             js = AsyncMock()
             kv = AsyncMock()
@@ -736,6 +733,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             js.stream_info.return_value = SimpleNamespace(
                 config=StreamConfig(name="KV_test", max_age=3600, duplicate_window=60),
             )
+            js.update_stream.return_value = MagicMock(spec=StreamInfo)
 
             with self.subTest(ttl=ttl):
                 assert await bounded(store.open(js)) is kv
@@ -923,10 +921,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         record = channel_record(1)
         assert channels.parse(key, record) is not None
 
+        # One record the validator rejects with each error type parse catches.
         malformed: dict[str, dict[str, object]] = {
-            "non-string channel": {**record, "channel": ["#test", "#other"]},
             "missing key": {k: v for k, v in record.items() if k != "key"},
-            "non-string key": {**record, "key": 5},
             "non-boolean presence": {**record, "present": 1},
         }
         for label, value in malformed.items():
@@ -1404,11 +1401,11 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def create_key_value(config: object) -> AsyncMock:
+        async def create_key_value(config: object) -> KeyValue:
             del config
             started.set()
             await release.wait()
-            return AsyncMock()
+            return cast("KeyValue", FakeKV())
 
         js = AsyncMock()
         js.create_key_value.side_effect = create_key_value

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 from nats.aio.msg import Msg
+from nats.aio.subscription import Subscription
 from nats.errors import ConnectionClosedError
 from nats.errors import Error as NatsError
 from nats.js.errors import KeyWrongLastSequenceError
@@ -207,7 +208,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         payload = {"channel": "#test", "presence": BETA_PRESENCE}
 
         with patch.object(Coordinator, "ready", PropertyMock(return_value=True)):
-            await coordinator.request_help("op", payload)
+            await bounded(coordinator.request_help("op", payload))
 
         coordinator.nc.publish.assert_awaited_once()
         assert coordinator.nc.publish.await_args.kwargs == {}
@@ -226,9 +227,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.nc.publish.side_effect = NatsError("connection closed")
 
         with patch.object(Coordinator, "ready", PropertyMock(return_value=True)):
-            await coordinator.request_help(
-                "op",
-                {"channel": "#test", "presence": BETA_PRESENCE},
+            await bounded(
+                coordinator.request_help(
+                    "op",
+                    {"channel": "#test", "presence": BETA_PRESENCE},
+                )
             )
 
         coordinator.nc.publish.assert_awaited_once()
@@ -252,7 +255,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(Coordinator, "ready", PropertyMock(return_value=True)),
             patch.object(coordinator.callbacks, "on_help", callback),
         ):
-            await coordinator.deliver_help(message)
+            await bounded(coordinator.deliver_help(message))
 
         callback.assert_called_once_with("unban", "#test", BotPresence(**BETA_PRESENCE))
 
@@ -260,8 +263,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Subscribe once to the namespace, so every help kind is delivered."""
         coordinator = build_coordinator("alpha")
         nc = AsyncMock()
+        nc.subscribe.return_value = MagicMock(spec=Subscription)
 
-        await coordinator.subscribe_help(nc)
+        await bounded(coordinator.subscribe_help(nc))
 
         nc.subscribe.assert_awaited_once_with(
             f"{coordinator.ns}.*",
@@ -286,7 +290,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(Coordinator, "ready", PropertyMock(return_value=True)),
             patch.object(coordinator.callbacks, "on_help", callback),
         ):
-            await coordinator.deliver_help(message)
+            await bounded(coordinator.deliver_help(message))
 
         callback.assert_not_called()
 
@@ -348,7 +352,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.callbacks, "on_help", fail),
             self.assertRaisesRegex(ValueError, "callback failed"),
         ):
-            await coordinator.deliver_help(message)
+            await bounded(coordinator.deliver_help(message))
 
     async def test_close_releases_connection(self) -> None:
         """Cancel watches, then release presence, KV handles, and the connection."""
@@ -459,7 +463,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(side_effect=lambda: steps.append("watches")),
             ),
         ):
-            await coordinator.on_closed()
+            await bounded(coordinator.on_closed())
             restart = coordinator.resync_task
             assert restart is not None
             assert coordinator.nc is None
@@ -503,7 +507,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """
         coordinator = build_coordinator("alpha")
         coordinator.config = replace(coordinator.config, presence_ttl=2.0)
-        connect = AsyncMock(return_value=MagicMock(subscribe=AsyncMock()))
+        connect = AsyncMock(
+            return_value=MagicMock(
+                subscribe=AsyncMock(return_value=MagicMock(spec=Subscription))
+            )
+        )
 
         with (
             patch("nats.connect", connect),
@@ -524,7 +532,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_closed=True)
         nc = MagicMock(is_connected=True)
-        nc.subscribe = AsyncMock()
+        nc.subscribe = AsyncMock(return_value=MagicMock(spec=Subscription))
         connect = AsyncMock(return_value=nc)
         opening = asyncio.Event()
 
@@ -559,8 +567,16 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         start connects again itself and the restart queues on its lock.
         """
         coordinator = build_coordinator("alpha")
-        first = MagicMock(is_closed=False, is_connected=True, subscribe=AsyncMock())
-        second = MagicMock(is_closed=False, is_connected=True, subscribe=AsyncMock())
+        first = MagicMock(
+            is_closed=False,
+            is_connected=True,
+            subscribe=AsyncMock(return_value=MagicMock(spec=Subscription)),
+        )
+        second = MagicMock(
+            is_closed=False,
+            is_connected=True,
+            subscribe=AsyncMock(return_value=MagicMock(spec=Subscription)),
+        )
         connect = AsyncMock(side_effect=[first, second])
         opening = asyncio.Event()
         replaced = asyncio.Event()
@@ -652,8 +668,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.attempts, "allow", allow),
             patch.object(coordinator.claims, "claim", claim),
         ):
-            assert not await coordinator.request_auth("host.example")
-            assert not await coordinator.request_claim(1)
+            assert not await bounded(coordinator.request_auth("host.example"))
+            assert not await bounded(coordinator.request_claim(1))
 
         allow.assert_not_awaited()
         claim.assert_not_awaited()
@@ -669,10 +685,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.attempts, "allow", allow),
             patch.object(coordinator.claims, "claim", claim),
         ):
-            assert await coordinator.request_auth("host.example")
-            assert not await coordinator.request_auth("host.example")
-            assert await coordinator.request_claim(1)
-            assert not await coordinator.request_claim(1)
+            assert await bounded(coordinator.request_auth("host.example"))
+            assert not await bounded(coordinator.request_auth("host.example"))
+            assert await bounded(coordinator.request_claim(1))
+            assert not await bounded(coordinator.request_claim(1))
 
         assert allow.await_args_list == [call("host.example")] * 2
         assert claim.await_args_list == [call(1)] * 2
@@ -714,9 +730,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("botnats.nats.coordinator", level="WARNING") as logs,
         ):
             clock.monotonic.return_value = 10.0
-            await coordinator.on_error(OSError("connection reset"))
-            await coordinator.on_error(crash)
-            await coordinator.on_error(OSError("connection reset"))
+            await bounded(coordinator.on_error(OSError("connection reset")))
+            await bounded(coordinator.on_error(crash))
+            await bounded(coordinator.on_error(OSError("connection reset")))
 
         assert [(log.levelname, log.getMessage()) for log in logs.records] == [
             ("WARNING", "NATS error: connection reset"),
@@ -745,45 +761,63 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.ready
         coordinator.claim.transition(PresenceState.DUPLICATE, None)
 
-        await coordinator.request_help(
-            "op",
-            {"channel": "#test", "presence": {**BETA_PRESENCE, "bot_id": "alpha"}},
+        await bounded(
+            coordinator.request_help(
+                "op",
+                {"channel": "#test", "presence": {**BETA_PRESENCE, "bot_id": "alpha"}},
+            )
         )
         nc.publish.assert_not_awaited()
 
         with patch.object(coordinator.callbacks, "on_help", callback):
-            await coordinator.deliver_help(message)
+            await bounded(coordinator.deliver_help(message))
 
         callback.assert_not_called()
 
     async def test_init_stores_generation_guard(self) -> None:
-        """Verify a newer init_stores call cancels the previous retry loop."""
+        """Stop a retry loop once a newer init_stores call opens the stores."""
         coordinator = build_coordinator("alpha")
         nc = MagicMock(is_connected=True)
-        nc.jetstream.return_value = MagicMock()
+        superseded = MagicMock()
+        current = MagicMock()
+        nc.jetstream.side_effect = [superseded, current]
         coordinator.nc = nc
         attempts = 0
 
-        async def fail_then_supersede(*arguments: object) -> None:
-            del arguments
+        async def fail_once(config: object) -> KeyValue:
+            del config
             nonlocal attempts
             attempts += 1
             if attempts > 1:
                 # Escapes the retry loop, which only absorbs transient errors.
                 self.fail("superseded initialization retried")
 
-            coordinator.store_generation += 1
             msg = "unavailable"
             raise OSError(msg)
 
+        superseded.create_key_value = AsyncMock(side_effect=fail_once)
+        current.create_key_value = AsyncMock(return_value=cast("KeyValue", FakeKV()))
+        retrying = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def sleep(delay: float) -> None:
+            del delay
+            retrying.set()
+            await resume.wait()
+
         with (
-            patch.object(AttemptStore, "open", fail_then_supersede),
-            patch("asyncio.sleep", yield_once),
+            patch("asyncio.sleep", sleep),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
+            first = asyncio.create_task(coordinator.init_stores())
+            await bounded(retrying.wait())
             await bounded(coordinator.init_stores())
+            resume.set()
+            await bounded(first)
 
         assert attempts == 1
+        assert current.create_key_value.await_count == len(coordinator.stores)
+        assert all(store.ready for store in coordinator.stores)
 
     async def test_init_stores_stops_when_client_drops(self) -> None:
         """Stop retrying JetStream initialization once Core NATS drops.
@@ -824,11 +858,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         nc = MagicMock(is_connected=True)
         coordinator.nc = nc
 
-        async def drop(*arguments: object) -> MagicMock:
+        async def drop(*arguments: object) -> KeyValue:
             del arguments
             nc.is_connected = False
             await coordinator.on_disconnected()
-            return MagicMock()
+            return cast("KeyValue", FakeKV())
 
         js = nc.jetstream.return_value
         js.create_key_value = AsyncMock(side_effect=drop)
@@ -852,8 +886,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.nc = MagicMock(is_connected=True)
         js = coordinator.nc.jetstream.return_value
         failures = [OSError("unavailable")] * 11
-        open_attempt = AsyncMock(side_effect=[*failures, None])
-        open_store = AsyncMock()
+        open_attempt = AsyncMock(side_effect=[*failures, cast("KeyValue", FakeKV())])
+        open_store = AsyncMock(return_value=cast("KeyValue", FakeKV()))
 
         with (
             patch.object(AttemptStore, "open", open_attempt),
@@ -877,12 +911,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha")
         coordinator.nc = MagicMock(is_connected=True)
         coordinator.nc.jetstream.return_value = MagicMock()
-        open_store = AsyncMock()
+        open_store = AsyncMock(return_value=cast("KeyValue", FakeKV()))
 
         # A bare RuntimeError is a bug too, unlike StoreUnavailableError.
         for error in (ValueError("bad config"), RuntimeError("bug")):
             # A retry would succeed, so only surfacing the error raises.
-            open_attempt = AsyncMock(side_effect=[error, None])
+            open_attempt = AsyncMock(side_effect=[error, cast("KeyValue", FakeKV())])
             with (
                 self.subTest(error=error),
                 patch.object(AttemptStore, "open", open_attempt),
@@ -906,7 +940,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.callbacks, "on_help", callback),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
-            await coordinator.deliver_help(message)
+            await bounded(coordinator.deliver_help(message))
 
         callback.assert_not_called()
 
@@ -961,7 +995,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         snapshot = unknown(coordinator.claims.replicas, connected=True)
         collect = AsyncMock(return_value=snapshot)
         with patch("botnats.nats.coordinator.collect", collect):
-            assert await coordinator.status() is snapshot
+            assert await bounded(coordinator.status()) is snapshot
 
         collect.assert_awaited_once_with(
             coordinator.nc,
@@ -976,12 +1010,14 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.nc = MagicMock()
         steps: list[str] = []
 
-        async def open_store(*arguments: object) -> None:
+        async def open_store(*arguments: object) -> KeyValue:
             del arguments
             steps.append("open")
             if steps.count("open") == 1:
                 msg = "unavailable"
                 raise OSError(msg)
+
+            return cast("KeyValue", FakeKV())
 
         async def sleep(delay: float) -> None:
             steps.append("sleep")
@@ -1000,7 +1036,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch("asyncio.sleep", sleep),
             self.assertLogs("botnats.nats.coordinator", level="WARNING"),
         ):
-            await coordinator.on_reconnected()
+            await bounded(coordinator.on_reconnected())
             # Resynchronization runs as a background task so a JetStream
             # outage cannot park the nats-py reconnected callback.
             task = coordinator.resync_task
@@ -1456,12 +1492,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(coordinator.callbacks, "on_help", callback):
-            await coordinator.deliver_help(message)
+            await bounded(coordinator.deliver_help(message))
             callback.assert_not_called()
 
             # The same request is accepted once the replay completes.
             coordinator.synced_watches.update(coordinator.watches())
-            await coordinator.deliver_help(message)
+            await bounded(coordinator.deliver_help(message))
 
         callback.assert_called_once_with("op", "#test", BotPresence(**BETA_PRESENCE))
 
