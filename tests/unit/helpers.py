@@ -383,7 +383,6 @@ class FakeCoordinator:
         for store in (self.attempts, self.channels, self.claims, self.sessions):
             store.kv = cast("KeyValue", FakeKV())
 
-        self.bot_id = "alpha-id"
         self.channel_after: list[str | None] = []
         self.channel_puts: list[dict[str, Any]] = []
         self.claim_requests: list[int] = []
@@ -396,7 +395,7 @@ class FakeCoordinator:
     def require_writable(self) -> None:
         """Mirror the real write gate: this process must own its bot ID."""
         if self.duplicate or not self.connected:
-            msg = f"bot ID {self.bot_id} does not own its presence key"
+            msg = "bot ID alpha-id does not own its presence key"
             raise StoreUnavailableError(msg)
 
     async def close(self) -> None:
