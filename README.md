@@ -88,10 +88,14 @@ Example `bot.json`:
 | `irc.verify_tls`                            | Applies only to `ircs://` connections; `true` by default                  |
 | `nats.jetstream_replicas`                   | Use `3` only when three JetStream storage peers are present; 1 by default |
 | `nats.monitor_port`                         | Connected-server monitoring port used by `STATUS`; 8222 by default        |
-| `nats.servers`                              | `nats://` or `tls://` endpoints, tried in any order; required             |
+| `nats.servers`                              | `nats://` endpoints only, tried in any order; required                    |
 
 Plain IRC exposes commands and responses, so use a trusted network when IRCS is
 unavailable. JetStream requires file storage; persist each peer's directory.
+
+The NATS client uses TLS only when the server requires it, and nothing stops an
+on-path attacker from stripping that request and reading the token, so run NATS
+on a private network.
 
 Give the NATS token only to bot processes. NATS attaches no permissions to a
 token and refuses one alongside configured users, so every token holder has the

@@ -25,7 +25,7 @@ MODE_STRING_RE = re.compile(r"(?:[+-][A-Za-z]+)+")
 MAX_NICKNAME_LENGTH = 9
 MIN_COORDINATION_KEY_BYTES = 32
 MIN_TOTP_SECRET_BYTES = 20
-NATS_SCHEMES = frozenset({"nats", "tls"})
+NATS_SCHEMES = frozenset({"nats"})
 NICKNAME_RE = re.compile(r"[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]*")
 
 
