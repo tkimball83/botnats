@@ -4,6 +4,7 @@
 """Tests for the presence claim's ownership transitions."""
 
 import asyncio
+import json
 import unittest
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, patch
@@ -12,6 +13,7 @@ from nats.errors import Error as NatsError
 
 from botnats.nats.claim import PresenceClaim, PresenceState
 from botnats.nats.store import PresenceStore, StoreUnavailableError
+from botnats.presence import BotPresence
 from tests.unit.helpers import COORDINATION_KEY, FakeKV, bounded
 
 if TYPE_CHECKING:
@@ -70,7 +72,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
             claim.require()
 
-        claim.state = PresenceState.OWNED
+        claim.adopt(1)
         claim.require()
 
     async def test_heartbeat_reclaims_after_duplicate(self) -> None:
@@ -284,6 +286,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 "create",
                 AsyncMock(return_value=reclaimed_revision),
             ),
+            self.assertNoLogs("botnats.nats.claim", level="ERROR"),
         ):
             await bounded(claim.put(PRESENCE))
 
@@ -427,3 +430,25 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
                 assert claim.owned
                 assert claim.revision == kv.entries["alpha"][0]
+
+    async def test_reclaim_writes_no_irc_identity(self) -> None:
+        """Reclaim without the IRC identity a heartbeat wrote, which peers skip.
+
+        IRC may have dropped since that heartbeat: writing the identity again
+        would have peers record, for a full TTL, a bot that is not on IRC.
+        """
+        for transition in (PresenceClaim.reclaim, PresenceClaim.deleted):
+            with self.subTest(transition=transition.__name__):
+                claim, kv = open_claim()
+                await bounded(claim.put(IDENTITY))
+                # The key expired or was deleted, and NATS dropped meanwhile.
+                del kv.entries["alpha"]
+                claim.reset()
+
+                await bounded(transition(claim))
+
+                assert claim.owned
+                record = json.loads(kv.entries["alpha"][1])
+                assert claim.store.valid("alpha", record)
+                with self.assertRaisesRegex(ValueError, "invalid identity"):
+                    BotPresence.from_dict(record)

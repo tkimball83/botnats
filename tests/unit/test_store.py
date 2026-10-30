@@ -802,6 +802,22 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert "alpha" in kv.entries
 
+    async def test_presence_delete_keeps_garbled_record(self) -> None:
+        """Leave a garbled value that replaced the owned revision, without failing.
+
+        A failure here would abort shutdown before the client closes.
+        """
+        presence = PresenceStore("efnet", 1, 15.0, SECRET)
+        kv = DeletableKV()
+        presence.kv = cast("KeyValue", kv)
+        owned = json.dumps(signed_presence("inst")).encode()
+        revision = await kv.create("alpha", owned)
+        await kv.update("alpha", b"not json", last=revision)
+
+        await bounded(presence.delete("Alpha", revision, "inst"))
+
+        assert kv.entries["alpha"][1] == b"not json"
+
     async def test_presence_update_uses_owned_revision(self) -> None:
         """Refresh presence under its owned revision and report a lost race."""
         presence = PresenceStore("efnet", 1, 15, SECRET)
@@ -1087,6 +1103,23 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
 
         sessions.kv.update.assert_awaited_once()
+
+    async def test_session_put_keeps_identical_record(self) -> None:
+        """Return an identical stored record without writing it again.
+
+        Every bot that sees a QUIT writes the same signed revocation; each
+        rewrite would cost an update and a watch delivery on every bot.
+        """
+        sessions = SessionStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        sessions.kv = cast("KeyValue", kv)
+        key = sessions.key("owner!user@host")
+        revocation = session_record(time.time() + 40, 1, revoked=True)
+        kv.store(key, json.dumps(revocation).encode())
+        stored = kv.entries[key]
+
+        assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
+        assert kv.entries[key] == stored
 
     async def test_session_put_yields_to_concurrent_writer(self) -> None:
         """Return and keep a newer session that lands between our read and write."""

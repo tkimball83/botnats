@@ -41,14 +41,16 @@ class PresenceClaim:
         self.generation = 0
         self.instance_id = instance_id
         self.key = store.key(bot_id)
-        self.last: dict[str, Any] = {
+        self.lock = asyncio.Lock()
+        # A reclaim may run after IRC drops, so it claims the key without an
+        # IRC identity, which peers do not record; only put() writes one.
+        self.placeholder: dict[str, Any] = {
             "bot_id": bot_id,
             "host": "",
             "instance_id": instance_id,
             "nick": "",
             "user": "",
         }
-        self.lock = asyncio.Lock()
         self.revision: int | None = None
         self.state = PresenceState.UNCLAIMED
         self.store = store
@@ -89,7 +91,6 @@ class PresenceClaim:
     async def put(self, presence: dict[str, Any]) -> None:
         """Write or refresh presence, reclaiming the key when not owned."""
         async with self.lock:
-            self.last = presence
             generation = self.generation
             if self.revision is not None:
                 revision = await self.store.update(self.bot_id, presence, self.revision)
@@ -102,13 +103,13 @@ class PresenceClaim:
 
                 self.transition(PresenceState.UNCLAIMED, None)
 
-            await self.claim()
+            await self.claim(presence)
 
     async def reclaim(self) -> None:
         """Reclaim the key after a watch replay, while unowned."""
         async with self.lock:
             if not self.owned:
-                await self.claim()
+                await self.claim(self.placeholder)
 
     async def deleted(self) -> None:
         """Handle this bot's key being deleted, then try to reclaim it."""
@@ -116,7 +117,7 @@ class PresenceClaim:
             if self.owned:
                 self.transition(PresenceState.UNCLAIMED, None)
 
-            await self.claim()
+            await self.claim(self.placeholder)
 
     def observe(self, instance_id: str, revision: int) -> None:
         """Apply a validly signed record on this bot's key.
@@ -139,7 +140,7 @@ class PresenceClaim:
 
             self.reset()
 
-    async def claim(self) -> None:
+    async def claim(self, presence: dict[str, Any]) -> None:
         """Create the key, or reclaim it from a stale or forged occupant.
 
         A validly signed record from another instance is a duplicate to yield
@@ -148,11 +149,11 @@ class PresenceClaim:
         is stale and discarded.
         """
         generation = self.generation
-        revision = await self.store.create(self.bot_id, self.last)
+        revision = await self.store.create(self.bot_id, presence)
         if revision is None:
             revision = await self.store.reclaim(
                 self.bot_id,
-                self.last,
+                presence,
                 self.instance_id,
             )
 
