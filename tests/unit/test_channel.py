@@ -1869,10 +1869,13 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         def refuse(delay: float) -> None:
             """Send a JOIN and refuse it; it is due again after delay, not sooner."""
             bot.channel_mgr.safe_join(runtime)
+            refused_at = asyncio.get_running_loop().time()
             runtime.refuse_join()
-            runtime.join_retry_at -= delay - 5
+            assert runtime.join_retry_at >= refused_at + delay
+            # A margin no stall outlasts; the bound above pins a shorter delay.
+            runtime.join_retry_at -= delay - 3600
             assert not runtime.join_due()
-            runtime.join_retry_at -= 5
+            runtime.join_retry_at -= 3600
             assert runtime.join_due()
 
         refuse(JOIN_RETRY_DELAY)

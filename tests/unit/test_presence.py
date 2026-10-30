@@ -7,10 +7,10 @@ import asyncio
 import unittest
 from dataclasses import asdict
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from botnats.irc.protocol import Prefix
-from botnats.presence import BotPresence, PresenceRegistry
+from botnats.presence import IDENTITY_RETRY_DELAY, BotPresence, PresenceRegistry
 from tests.unit.helpers import FakeCoordinator, FakeIRC, make_bot
 
 if TYPE_CHECKING:
@@ -203,11 +203,16 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
             with (
                 self.subTest(attempts=attempts),
                 patch("botnats.presence.IDENTITY_RETRY_ATTEMPTS", attempts),
-                patch("asyncio.sleep", receive_identity),
+                patch(
+                    "asyncio.sleep", AsyncMock(side_effect=receive_identity)
+                ) as sleep,
             ):
                 async with asyncio.timeout(1):
                     await bot.identity.discover(bot.identity.generation)
 
+                # Long enough for a WHO paced behind the registration lines
+                # to be answered.
+                sleep.assert_awaited_once_with(IDENTITY_RETRY_DELAY)
                 assert fake_irc.sent == [("WHO", ("alpha_",))]
                 assert fake_irc.reconnects == 0
 
@@ -228,11 +233,12 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
             with (
                 self.subTest(attempts=attempts),
                 patch("botnats.presence.IDENTITY_RETRY_ATTEMPTS", attempts),
-                patch("asyncio.sleep", reset_identity),
+                patch("asyncio.sleep", AsyncMock(side_effect=reset_identity)) as sleep,
             ):
                 async with asyncio.timeout(1):
                     await bot.identity.discover(generation)
 
+                sleep.assert_awaited_once_with(IDENTITY_RETRY_DELAY)
                 assert bot.identity.generation == generation + 1
                 assert fake_irc.sent == [("WHO", ("alpha_",))]
                 assert fake_irc.reconnects == 0
