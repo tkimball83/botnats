@@ -17,6 +17,7 @@ from botnats.channel import (
     JoinState,
 )
 from botnats.config import mode_intent
+from botnats.events import ISON_POLL_INTERVAL
 from botnats.irc.protocol import (
     IRCMessage,
     ISupportState,
@@ -198,7 +199,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert watched == (8, False)
 
     async def test_non_commands_are_not_queued(self) -> None:
-        """Skip channel chatter, CTCP, and anonymous senders before queueing."""
+        """Skip channel chatter, CTCP, and anonymous senders before queueing.
+
+        They spend none of the sender's command budget, so an admin who chats
+        can still run commands.
+        """
         bot = make_bot(irc=FakeIRC())
         prefix = Prefix("owner", "user", "host.example")
 
@@ -212,6 +217,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.tasks
         assert not bot.sessions.watched_identities
+        assert not bot.commands.command_limiter.buckets
 
     async def test_commands_from_undecodable_prefixes_are_refused(self) -> None:
         """Run no command from a prefix whose undecodable bytes became U+FFFD.
@@ -2345,6 +2351,25 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(5):
             await bot.tasks.drain()
 
+    async def test_welcome_after_reconnect_discovers_identity(self) -> None:
+        """Ask WHO again on a later connection's welcome.
+
+        A disconnect bumps the identity generation, and discovery for an older
+        generation stops before WHO: no channel would be joined again.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.events.on_irc_disconnect()
+
+        bot.events.on_irc_message(
+            IRCMessage("001", ("alpha", "Welcome")),
+        )
+        # Let identity discovery send its first WHO.
+        await asyncio.sleep(0)
+
+        assert fake_irc.sent == [("WHO", ("alpha",))]
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
+
     async def test_isupport_monitor_switches_nick_watch(self) -> None:
         """Watch the nick with MONITOR while advertised, and with ISON after."""
         bot, fake_irc = bot_with_irc()
@@ -2461,16 +2486,23 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         assert bot.events.nick_watch_task is None
 
     async def test_ison_poll_loop_polls_until_cancelled(self) -> None:
-        """Keep polling ISON, past a refused send and once the nick is ours.
+        """Poll ISON every interval, past a refused send and once the nick is ours.
 
         A loop that ended on its own would leave nick_watch_task holding a
-        finished task, so poll_ison would never start another.
+        finished task, so poll_ison would never start another. One that did
+        not wait would fill the send queue with ISON.
         """
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "fallback"
         record = fake_irc.send
         refused = False
         polled_twice = asyncio.Event()
+        delays: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def record_sleep(delay: float) -> None:
+            delays.append(delay)
+            await real_sleep(0)
 
         def send_then_reclaim(
             command: str,
@@ -2494,7 +2526,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             return queued
 
         with (
-            patch("botnats.events.ISON_POLL_INTERVAL", 0),
+            patch("asyncio.sleep", record_sleep),
             patch.object(fake_irc, "send", send_then_reclaim),
         ):
             poll = asyncio.create_task(bot.events.ison_poll_loop())
@@ -2507,3 +2539,5 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
 
         assert poll.cancelled()
         assert fake_irc.sent[:2] == [("ISON", ("alpha",)), ("ISON", ("alpha",))]
+        # The refused poll and both sent ones each waited the interval first.
+        assert delays[:3] == [ISON_POLL_INTERVAL] * 3
