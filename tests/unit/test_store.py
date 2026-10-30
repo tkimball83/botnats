@@ -23,7 +23,6 @@ from nats.js.errors import (
 )
 from nats.js.kv import KV_DEL, KV_PURGE
 
-from botnats.auth import TOTP_PERIOD, TOTP_WINDOW
 from botnats.nats.store import (
     ATTEMPT_LIMIT,
     ATTEMPT_WINDOW,
@@ -347,6 +346,11 @@ class PresenceValidTests(unittest.TestCase):
                 with self.subTest(offset=offset):
                     assert store.valid("alpha", record) is fresh_at
 
+        # Heartbeats carry whole seconds, so a peer even a fraction of a second
+        # ahead stamps the next one.
+        ahead = sign({**fresh, "timestamp": int(now) + 1})
+        assert store.valid("alpha", ahead, now=now)
+
         surrogate = {
             "bot_id": "alpha",
             "host": "\ud800",
@@ -619,7 +623,10 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         assert key != ClaimStore("efnet", 3, OTHER_SECRET).key(42)
         assert key != claims.key(43)
         assert len(key) == SHA256_HEX_LENGTH
-        assert claims.ttl >= (2 * TOTP_WINDOW + 1) * TOTP_PERIOD
+        # Claims are kept for five minutes, well past the 90 seconds a code is
+        # accepted, so a code claimed on a bot whose clock runs ahead cannot be
+        # replayed on one that lags.
+        assert claims.ttl == 300
         claims.kv.create.assert_awaited_once_with(key, b"1")
 
     async def test_duplicate(self) -> None:
@@ -1118,6 +1125,23 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
         assert kv.entries[key] == stored
 
+    async def test_session_put_writes_expired_revocation(self) -> None:
+        """Store, over the grant it revokes, a revocation that expired while queued.
+
+        AUTH keeps a record the store refuses queued until the clock catches
+        up, which never happens for an expired one.
+        """
+        sessions = SessionStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        sessions.kv = cast("KeyValue", kv)
+        key = sessions.key("owner!user@host")
+        expired = time.time() - 10
+        kv.store(key, json.dumps(session_record(expired, 1)).encode())
+        revocation = session_record(expired, 2, revoked=True)
+
+        assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
+        assert json.loads(kv.entries[key][1]) == revocation
+
     async def test_session_put_yields_to_concurrent_writer(self) -> None:
         """Return and keep a newer session that lands between our read and write."""
         sessions = SessionStore("efnet", 1, SECRET)
@@ -1183,13 +1207,15 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         other_network = {k: v for k, v in valid.items() if k != "signature"}
         other_network["signature"] = session_signature(SECRET, "undernet", valid)
         assert parse_session_record(SECRET, "undernet", other_network) is not None
-        # Each record differs from the valid revocation in one field alone, and
-        # every changed value is well-formed, so only the signature rejects it.
+        # Each record differs from the valid revocation in one field alone.
+        # Unless noted, the changed value is well-formed, so only the signature
+        # rejects it.
         invalid: dict[str, dict[str, object]] = {
             "prefix changed": {**valid, "prefix": "other!user@host"},
             "issuer changed": {**valid, "issuer": "beta"},
             "expiry extended": {**valid, "expires_at": expiry + 10},
             "version raised": {**valid, "version": 2},
+            # Missing, so the bool type check rejects it before the signature.
             "revoked flag removed": {k: v for k, v in valid.items() if k != "revoked"},
             "revoked flag changed": {**valid, "revoked": False},
             "signed for another network": other_network,

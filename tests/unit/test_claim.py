@@ -23,9 +23,8 @@ if TYPE_CHECKING:
 
 INSTANCE_ID = "instance"
 NOT_OWNED = "bot ID alpha does not own its presence key"
-PRESENCE = {"bot_id": "alpha", "instance_id": INSTANCE_ID}
 # A complete record, which the store can sign.
-IDENTITY = {
+PRESENCE = {
     "bot_id": "alpha",
     "host": "host",
     "instance_id": INSTANCE_ID,
@@ -407,10 +406,10 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         the key until a reclaim, taking readiness with it.
         """
         claim, kv = open_claim()
-        await bounded(claim.put(IDENTITY))
-        renamed = {**IDENTITY, "nick": "renamed"}
+        await bounded(claim.put(PRESENCE))
+        renamed = {**PRESENCE, "nick": "renamed"}
 
-        owned = await overlap(claim, claim.put(IDENTITY), claim.put(renamed))
+        owned = await overlap(claim, claim.put(PRESENCE), claim.put(renamed))
 
         assert owned
         assert all(owned)
@@ -427,7 +426,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(transition=transition.__name__):
                 claim, kv = open_claim()
 
-                await overlap(claim, transition(claim), claim.put(IDENTITY))
+                await overlap(claim, transition(claim), claim.put(PRESENCE))
 
                 assert claim.owned
                 assert claim.revision == kv.entries["alpha"][0]
@@ -441,7 +440,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         for transition in (PresenceClaim.reclaim, PresenceClaim.deleted):
             with self.subTest(transition=transition.__name__):
                 claim, kv = open_claim()
-                await bounded(claim.put(IDENTITY))
+                await bounded(claim.put(PRESENCE))
                 # The key expired or was deleted, and NATS dropped meanwhile.
                 del kv.entries["alpha"]
                 claim.reset()
