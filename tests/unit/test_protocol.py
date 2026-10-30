@@ -136,6 +136,15 @@ class IRCProtocolTests(unittest.TestCase):
             ):
                 format_message(command, params, trailing)
 
+    def test_format_length_limit(self) -> None:
+        """Accept a line of 512 bytes, its CRLF included, and refuse one byte more."""
+        # "PRIVMSG #chan :" and the CRLF take 17 bytes.
+        longest = format_message("PRIVMSG", ("#chan",), "x" * 495)
+        assert len(longest) == MAX_IRC_MESSAGE_BYTES
+
+        with self.assertRaisesRegex(ValueError, "exceeds 512 bytes"):
+            format_message("PRIVMSG", ("#chan",), "x" * 496)
+
     def test_mode_parser(self) -> None:
         """Verify mode string parsing yields correct add/remove tuples."""
         changes = list(
