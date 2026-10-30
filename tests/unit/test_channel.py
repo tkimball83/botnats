@@ -1434,33 +1434,57 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """Return a complete QUIT prefix over the member prefix stored for it.
 
         A stored prefix can be stale, as after a host change this bot never
-        saw: it completes only a prefix lacking a user or host.
+        saw: it completes only a prefix lacking a user or host. Every channel
+        drops the member.
         """
         bot = bot_with_channel()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+        mgr = bot.channel_mgr
+        mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for runtime in mgr.channels.values():
+            runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+
         prefix = Prefix("owner", "user", "host.example")
 
-        assert bot.channel_mgr.forget_member(prefix) == prefix
+        assert mgr.forget_member(prefix) == prefix
+        assert [runtime.members for runtime in mgr.channels.values()] == [{}, {}]
 
     async def test_nick_prefix_outranks_stored_member_prefix(self) -> None:
-        """Return a complete NICK prefix over the member prefix stored for it."""
+        """Return a complete NICK prefix over the member prefix stored for it.
+
+        Every channel renames the member.
+        """
         bot = bot_with_channel()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+        mgr = bot.channel_mgr
+        mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for runtime in mgr.channels.values():
+            runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+
         prefix = Prefix("owner", "user", "host.example")
 
-        assert bot.channel_mgr.rename_member(prefix, "newowner") == prefix
+        assert mgr.rename_member(prefix, "newowner") == prefix
+        assert [list(runtime.members) for runtime in mgr.channels.values()] == [
+            ["newowner"],
+            ["newowner"],
+        ]
 
     async def test_chghost_prefix_outranks_stored_member_prefix(self) -> None:
-        """Return a complete CHGHOST prefix over the member prefix stored for it."""
+        """Return a complete CHGHOST prefix over the member prefix stored for it.
+
+        Every channel moves the member to the new host.
+        """
         bot = bot_with_channel()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+        mgr = bot.channel_mgr
+        mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for runtime in mgr.channels.values():
+            runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+
         prefix = Prefix("owner", "user", "host.example")
         new_prefix = Prefix("owner", "newuser", "new.host")
 
-        assert bot.channel_mgr.change_member_host(prefix, new_prefix) == prefix
+        assert mgr.change_member_host(prefix, new_prefix) == prefix
+        assert [
+            runtime.members["owner"].prefix for runtime in mgr.channels.values()
+        ] == [new_prefix, new_prefix]
 
     async def test_disconnected_bot_does_not_help(self) -> None:
         """Swallow a lost connection in every help action; report no help given."""
@@ -1774,9 +1798,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_join_waits_for_identity(self) -> None:
         """Join nothing between 001 and the WHO reply naming this bot.
 
-        A JOIN refused before then could ask no peer for help.
+        A JOIN refused before then could ask no peer for help. The reply then
+        joins every desired channel, not one per tick.
         """
         bot, fake_irc, _ = bot_with_coordinator()
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
         bot.identity.on_registered()  # 001
 
         await tick(bot)
@@ -1790,7 +1816,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         await settle(bot)
 
-        assert fake_irc.sent == [("JOIN", ("#test",))]
+        assert fake_irc.sent == [("JOIN", ("#test",)), ("JOIN", ("#other",))]
 
     async def test_refusals_back_off_until_joined(self) -> None:
         """Double a refused JOIN's retry delay per refusal, up to the reply timeout.
