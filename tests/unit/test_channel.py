@@ -815,9 +815,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with mgr.write_lock:
-            # MODE +k k queues behind a key write still in flight...
+            # MODE +k k's write starts, and queues behind one still in flight...
             bot.events.process_key(runtime, "k")
             assert runtime.key_pending
+            await asyncio.sleep(0)
             # ...while another bot's PART #test arrives.
             mgr.apply_record(tombstone)
 

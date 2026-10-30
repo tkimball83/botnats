@@ -374,12 +374,14 @@ class IRCClient:
             msg = "IRC is not connected"
             raise ConnectionError(msg)
 
-        # Peer help and the op-gain MODE query ask for this. Under flood
-        # pacing a queued copy costs seconds, and IRC state cannot show a
-        # command still queued. A help copy skipped before a line that
-        # reverses it heals: the peer asks again until it sees the result.
-        # A skipped query is safe: the waiting copy goes out after the op
-        # gain already seen, so its 324 still shows the operator's view.
+        # Peer help, the op-gain MODE query, and the nick watch ask for
+        # this. Under flood pacing a queued copy costs seconds, and IRC
+        # state cannot show a command still queued. A help copy skipped
+        # before a line that reverses it heals: the peer asks again until
+        # it sees the result. A skipped query is safe: the waiting copy
+        # goes out after the op gain already seen, so its 324 still shows
+        # the operator's view. A skipped ISON or NICK heals too: the nick
+        # watch polls again until the nick is ours.
         if unless_waiting and self.queued_lines[encoded]:
             return False
 
@@ -527,7 +529,7 @@ def pong_reply(line: bytes) -> bytes:
     first, mirroring parse_message, so a leading prefix's space-colon is not
     mistaken for the trailing-parameter marker.
     The token is kept verbatim, so the reply never exceeds the wire length of
-    the PING that parse_message already accepted.
+    the PING that parse_message already accepted, plus a CR for a bare LF.
     """
     rest = line.rstrip(b"\r\n")
     if rest.startswith(b"@"):

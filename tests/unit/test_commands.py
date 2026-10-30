@@ -7,6 +7,7 @@ import asyncio
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, call, patch
 
@@ -86,14 +87,19 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_window(self) -> None:
         """Verify the command limiter counts commands for 10 seconds, then forgets."""
         limiter = make_bot().commands.command_limiter
-        now = asyncio.get_running_loop().time()
+        now = 100.0
         # A full budget spent exactly one window ago no longer counts.
         limiter.buckets["host.example"] = deque([now - 10] * 8)
         # One spent a second inside the window still does.
         limiter.buckets["other.example"] = deque([now - 9] * 8)
 
-        assert limiter.check("host.example")
-        assert not limiter.check("other.example")
+        # Judged at exactly now, however long the test takes.
+        with patch(
+            "botnats.commands.asyncio.get_running_loop",
+            return_value=SimpleNamespace(time=lambda: now),
+        ):
+            assert limiter.check("host.example")
+            assert not limiter.check("other.example")
 
     async def test_window_expiry(self) -> None:
         """Verify rate limit resets after window expires."""
