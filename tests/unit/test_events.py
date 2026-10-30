@@ -451,6 +451,22 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == []
 
+    async def test_invite_for_another_nick_sends_no_join(self) -> None:
+        """Send no JOIN for a peer's INVITE addressed to another nick."""
+        bot, fake_irc = bot_with_irc()
+        bot.presence.update(PEER)
+
+        bot.events.on_irc_message(
+            IRCMessage("INVITE", ("gamma", "#test"), PEER.to_prefix()),
+        )
+        assert fake_irc.sent == []
+
+        # The same INVITE addressed to this bot joins.
+        bot.events.on_irc_message(
+            IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
+        )
+        assert fake_irc.sent == [("JOIN", ("#test",))]
+
     async def test_isupport_parsing(self) -> None:
         """Verify ISUPPORT tokens update server capabilities and channel lookups."""
         bot, _ = bot_with_irc()
