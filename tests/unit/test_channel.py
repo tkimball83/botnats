@@ -174,10 +174,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [("MODE", ("#test", "+n-l"))]
         assert "configured mode requires an argument" in logs.output[0]
 
-    async def test_enforce_modes_skips_quietly(self) -> None:
-        """Send nothing without configured modes; skip a lost connection quietly."""
+    async def test_enforce_modes_skips_quietly_and_refused_is_due(self) -> None:
+        """Send nothing without configured modes; keep NAMES due, quietly, on a refusal.
+
+        The next tick resends NAMES, whose end reply enforces again.
+        """
         bot, fake_irc = bot_with_irc()
-        bot.channel_mgr.channels[casefold("#test", "rfc1459")].modes = ""
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.modes = ""
         configured = bot.config
         bot.config = replace(
             configured,
@@ -189,32 +193,15 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send,
             self.assertNoLogs("botnats.channel", level="WARNING"),
         ):
-            bot.channel_mgr.enforce_modes(
-                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-            )
+            bot.channel_mgr.enforce_modes(runtime)
             assert send.call_args_list == []
 
             bot.config = configured
+            # A full send queue refuses commands as a dropped connection does.
             fake_irc.connected = False
-            bot.channel_mgr.enforce_modes(
-                bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-            )
+            bot.channel_mgr.enforce_modes(runtime)
 
         send.assert_called_once_with("MODE", "#test", "+npst")
-
-    async def test_enforce_modes_refused_is_due_again(self) -> None:
-        """Keep NAMES due when the send queue refuses enforcement.
-
-        The next tick resends NAMES, whose end reply enforces again.
-        """
-        bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.modes = ""
-        # A full send queue refuses commands as a dropped connection does.
-        fake_irc.connected = False
-
-        bot.channel_mgr.enforce_modes(runtime)
-
         assert runtime.names_due
 
     async def test_enforce_modes_sends_only_modes_not_in_place(self) -> None:
@@ -404,6 +391,27 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.failing = False
         mgr.retry_pending_parts()
         assert fake_irc.sent == []
+
+    async def test_casemapping_change_keeps_pending_part(self) -> None:
+        """Keep a PART the send queue refused pending, rekeyed, and send it later."""
+        fake_irc = FailingPartIRC()
+        bot = make_bot(irc=fake_irc)
+        mgr = bot.channel_mgr
+        joined = ChannelRecord.new("#Gone[", None, present=True)
+        mgr.apply_record(joined)
+        mgr.channels[casefold("#Gone[", "rfc1459")].join = JoinState.JOINED
+        mgr.apply_record(
+            ChannelRecord.new("#Gone[", None, present=False, after=joined.revision),
+        )
+        assert mgr.pending_parts == {"#gone{": "#Gone["}
+
+        mgr.set_casemapping("ascii")
+
+        assert mgr.pending_parts == {"#gone[": "#Gone["}
+        fake_irc.failing = False
+        mgr.retry_pending_parts()
+        assert fake_irc.sent == [("PART", ("#Gone[",))]
+        assert mgr.pending_parts == {}
 
     async def test_multi_channel_join_part_isolation(self) -> None:
         """Verify keyed channels join and part without changing their peers."""
@@ -1484,7 +1492,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_help_needs_active_peer_presence(self) -> None:
-        """Help no peer whose presence expired or was never announced."""
+        """Help no peer whose presence expired, was never announced, or changed.
+
+        A late request naming a peer's old nick would otherwise help whoever
+        holds that nick now.
+        """
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
@@ -1493,6 +1505,15 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.limit = 2
         # beta's heartbeat has lapsed; gamma has not announced itself.
         bot.presence.update(INVITEE, now=time.monotonic() - bot.presence.ttl - 1)
+
+        await request_help(bot)
+        assert fake_irc.sent == []
+
+        # Both peers now run as new instances under other nicks.
+        for peer in (INVITEE, OP_REQUESTER):
+            bot.presence.update(
+                replace(peer, instance_id="three", nick=f"{peer.nick}_"),
+            )
 
         await request_help(bot)
         assert fake_irc.sent == []
