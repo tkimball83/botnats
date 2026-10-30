@@ -369,10 +369,12 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 await server.wait_closed()
 
     def test_nickname_collision(self) -> None:
-        """Verify collision nicknames are alphabetic."""
+        """Verify collision nicknames are random letters."""
         candidates = [next_nickname(9) for _ in range(20)]
 
         assert all(candidate.isalpha() for candidate in candidates)
+        with patch("secrets.choice", side_effect=list("bravo")):
+            assert next_nickname(5) == "bravo"
 
     async def test_run_forever_rotates_servers_with_backoff(self) -> None:
         """Rotate failover servers on failure with growing, capped backoff."""

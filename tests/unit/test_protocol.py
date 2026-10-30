@@ -50,6 +50,9 @@ class IRCProtocolTests(unittest.TestCase):
         assert mask_matches("bot[one]!*@2001:db8::*", prefix, "rfc1459")
         assert mask_matches("*!~user@*", prefix, "rfc1459")
         assert not mask_matches("*!other@*", prefix, "rfc1459")
+        # The nick folds by the server casemapping: only rfc1459 pairs [] with {}.
+        assert mask_matches("bot{one}!*@*", prefix, "rfc1459")
+        assert not mask_matches("bot{one}!*@*", prefix, "ascii")
 
     def test_ban_mask_many_wildcards(self) -> None:
         """Fail a mask of many wildcards within a line budget, without backtracking.
@@ -144,6 +147,13 @@ class IRCProtocolTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "exceeds 512 bytes"):
             format_message("PRIVMSG", ("#chan",), "x" * 496)
+
+        # The limit counts encoded bytes, and each "é" takes two.
+        longest = format_message("PRIVMSG", ("#chan",), "x" + "é" * 247)
+        assert len(longest) == MAX_IRC_MESSAGE_BYTES
+
+        with self.assertRaisesRegex(ValueError, "exceeds 512 bytes"):
+            format_message("PRIVMSG", ("#chan",), "é" * 248)
 
     def test_mode_parser(self) -> None:
         """Verify mode string parsing yields correct add/remove tuples."""
@@ -287,6 +297,11 @@ class IRCProtocolTests(unittest.TestCase):
             Prefix("owner", "user", "strasse.example"),
             "rfc1459",
         )
+        # The nick folds by the server casemapping, user and host as ASCII.
+        assert Prefix("a[", "u", "h").matches(Prefix("A{", "u", "h"), "rfc1459")
+        assert not Prefix("a[", "u", "h").matches(Prefix("A{", "u", "h"), "ascii")
+        assert not Prefix("n", "u[", "h").matches(Prefix("n", "u{", "h"), "rfc1459")
+        assert not Prefix("n", "u", "h[").matches(Prefix("n", "u", "h{"), "rfc1459")
         # An incomplete prefix identifies no one, not even itself.
         for incomplete in (
             Prefix("owner"),
@@ -305,6 +320,15 @@ class IRCProtocolTests(unittest.TestCase):
         caps.apply("CHANMODES", "beIq,kf,lj,imnstC,X")
 
         assert caps.chanmodes == ("beIq", "kf", "lj", "imnstC")
+
+    def test_isupport_chanmodes_too_few_groups_ignored(self) -> None:
+        """Keep the advertised CHANMODES when a later value has too few groups."""
+        caps = ISupportState()
+        caps.apply("CHANMODES", "b,k,l,imn")
+
+        caps.apply("CHANMODES", "b,k,l")
+
+        assert caps.chanmodes == ("b", "k", "l", "imn")
 
     def test_isupport_empty_prefix_clears_membership_modes(self) -> None:
         """Track no membership prefixes when PREFIX advertises none."""
