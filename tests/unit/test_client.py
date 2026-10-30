@@ -4,6 +4,7 @@
 """Tests for the IRC client's connection, dispatch, and sending."""
 
 import asyncio
+import errno
 import socket
 import ssl
 import unittest
@@ -491,6 +492,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert clock.timeline == [*lines[:5], 2.0, lines[5], 2.0, lines[6]]
         assert client.queue_delay == 0.0
+        # A written line leaves no zero count behind.
+        assert not client.queued_lines
 
     async def test_send_loop_charges_long_lines_more(self) -> None:
         """Charge a long line the larger of ircu's and UnrealIRCd's costs."""
@@ -1247,6 +1250,33 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert len(pings) == 2
         assert dispatched == ["001", "002"]
 
+    async def test_socket_timeout_ends_session_without_ping(self) -> None:
+        """End the session with a socket's ETIMEDOUT, not a PING as if idle."""
+        client = irc_client()
+        writer = mock_writer()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b":server 001 alpha :Welcome\r\n")
+        error = TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+
+        def lose_connection(message: IRCMessage) -> None:
+            # Once registered, the kernel gives up on the peer, and
+            # connection_lost stores its error on the reader.
+            if message.command == "001":
+                reader.set_exception(error)
+
+        client.on_message = lose_connection
+        connection = (reader, writer)
+
+        with (
+            patch.object(client, "establish", AsyncMock(return_value=connection)),
+            self.assertRaises(TimeoutError) as raised,
+        ):
+            async with asyncio.timeout(5):
+                await client.run_connection(client.config.servers[0])
+
+        assert raised.exception is error
+        writer.write.assert_not_called()
+
     async def test_reconnect_restarts_registration(self) -> None:
         """Negotiate and register afresh on the session after a registered one.
 
@@ -1362,6 +1392,35 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
             assert await reader.read() == b""
             await client.close()
+
+    async def test_send_immediate_propagates_socket_timeout(self) -> None:
+        """Raise a socket's ETIMEDOUT from drain as itself, not as a write timeout."""
+        client = irc_client()
+        writer = mock_writer()
+        error = TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+        writer.drain.side_effect = error
+
+        with self.assertRaises(TimeoutError) as raised:
+            async with asyncio.timeout(5):
+                await client.send_immediate(b"PING :token\r\n", writer)
+
+        assert raised.exception is error
+
+    async def test_send_immediate_refuses_closing_socket(self) -> None:
+        """Refuse a line once the socket is closing, and write nothing.
+
+        A closing TLS transport drops writes without raising until its
+        connection_lost arrives.
+        """
+        client = irc_client()
+        writer = mock_writer()
+        writer.is_closing.return_value = True
+
+        with self.assertRaisesRegex(ConnectionError, "not connected"):
+            async with asyncio.timeout(5):
+                await client.send_immediate(b"PING :token\r\n", writer)
+
+        writer.write.assert_not_called()
 
     async def test_send_immediate_skips_waiting_on_another_drain(self) -> None:
         """Write a PONG at once while the sender still waits for its write to drain."""

@@ -289,19 +289,22 @@ class IRCClient:
                 deadline = min(deadline, registration_deadline)
 
             try:
-                async with asyncio.timeout_at(deadline):
-                    raw = await reader.readline()
-            except TimeoutError as error:
+                raw = await read_line(reader, deadline)
+            except ValueError as error:
+                msg = "IRC server sent an oversized line"
+                raise ConnectionError(msg) from error
+
+            if raw is None:
                 if (
                     not self.registered_with_server
                     and loop.time() >= registration_deadline
                 ):
                     msg = "IRC server did not complete registration"
-                    raise ConnectionError(msg) from error
+                    raise ConnectionError(msg)
 
                 if ping_token is not None:
                     msg = "IRC server did not answer client PING"
-                    raise ConnectionError(msg) from error
+                    raise ConnectionError(msg)
 
                 ping_token = secrets.token_hex(16)
                 pong_deadline = loop.time() + PONG_TIMEOUT
@@ -310,9 +313,6 @@ class IRCClient:
                     writer,
                 )
                 continue
-            except ValueError as error:
-                msg = "IRC server sent an oversized line"
-                raise ConnectionError(msg) from error
 
             if not check_line(raw):
                 continue
@@ -413,9 +413,13 @@ class IRCClient:
         self.charged_until = max(self.charged_until, now) + send_cost(encoded)
         writer.write(encoded)
         try:
-            async with asyncio.timeout(WRITE_TIMEOUT):
+            async with asyncio.timeout(WRITE_TIMEOUT) as timeout:
                 await writer.drain()
         except TimeoutError as error:
+            # A socket's ETIMEDOUT is no write deadline; it reaches the caller.
+            if not timeout.expired():
+                raise
+
             # Abort: a close would wait on the very bytes that did not drain.
             writer.transport.abort()
             msg = "IRC write timed out"
@@ -501,6 +505,22 @@ def check_line(raw: bytes) -> bool:
         return False
 
     return True
+
+
+async def read_line(reader: asyncio.StreamReader, deadline: float) -> bytes | None:
+    """Read one line, or return None once the loop time reaches the deadline.
+
+    A socket's ETIMEDOUT is a TimeoutError too: it is raised as itself, not
+    taken for the deadline.
+    """
+    try:
+        async with asyncio.timeout_at(deadline) as timeout:
+            return await reader.readline()
+    except TimeoutError:
+        if timeout.expired():
+            return None
+
+        raise
 
 
 def pong_reply(line: bytes) -> bytes:
