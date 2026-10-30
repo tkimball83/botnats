@@ -68,7 +68,10 @@ class AuthFlow:
                 # only a revocation supersedes it.
                 revoked = bot.authorizer.revoke(rendered)
                 if revoked is not None:
-                    bot.sessions.queue(revoked)
+                    bot.sessions.queue(
+                        revoked,
+                        yielding=bot.sessions.watched_valid(rendered),
+                    )
 
                 raise
 
@@ -83,7 +86,12 @@ class AuthFlow:
                 if revoked is not None:
                     # Queued before waiting on the lock: shutdown may cancel
                     # the wait, and its final flush writes only what is queued.
-                    bot.sessions.queue(revoked)
+                    # It yields to a newer grant only while the identity
+                    # holds; once gone, it escalates like the change's own.
+                    bot.sessions.queue(
+                        revoked,
+                        yielding=bot.sessions.watched_valid(rendered),
+                    )
                     await bot.sessions.retry()
 
                 bot.commands.reply(prefix.nick, "Authorization failed")
@@ -146,9 +154,10 @@ class SessionSync:
         self.coordinator = coordinator
         self.lock = asyncio.Lock()
         self.pending: dict[str, Session] = {}
-        # Identity -> held record queued to write back over a rollback, not a
-        # new mutation: a newer grant supersedes it unrevoked.
-        self.restoring: dict[str, Session] = {}
+        # Identity -> queued record that is not a new mutation, so a newer
+        # grant supersedes it unrevoked: a held record written back over a
+        # rollback, or AUTH's revocation of its own grant.
+        self.yielding: dict[str, Session] = {}
         # KV key -> (prefix, expiry) for each unexpired watched session.
         self.watched: dict[str, tuple[str, float]] = {}
         # ASCII-folded identity -> (commands in flight, invalidated since the
@@ -183,11 +192,16 @@ class SessionSync:
         return watched is not None and not watched[1]
 
     def invalidate(self, identity: str) -> None:
-        """Mark an identity that quit or changed as invalid for pending commands."""
-        key = casefold(identity, "ascii")
-        if key in self.watched_identities:
-            count, _ = self.watched_identities[key]
-            self.watched_identities[key] = (count, True)
+        """Mark an identity that quit or changed as invalid for pending commands.
+
+        A command may spell the identity another way the casemapping folds
+        together; every casemapping folds an ASCII-folded key alike.
+        """
+        fold = self.authorizer.identity_fold
+        self.watched_identities = {
+            key: (count, invalidated or fold(key) == fold(identity))
+            for key, (count, invalidated) in self.watched_identities.items()
+        }
 
     def invalidate_all(self) -> None:
         """Invalidate every pending command's identity after IRC disconnects.
@@ -245,7 +259,7 @@ class SessionSync:
         """Queue a held record to write back unless its identity has a mutation."""
         identity = casefold(held.prefix, "ascii")
         if identity not in self.pending:
-            self.pending[identity] = self.restoring[identity] = held
+            self.pending[identity] = self.yielding[identity] = held
             self.tasks.spawn(self.retry(), "session-sync")
 
     def prune(self, now: float | None = None) -> None:
@@ -254,17 +268,21 @@ class SessionSync:
         for key in [k for k, mapped in self.watched.items() if mapped[1] <= current]:
             del self.watched[key]
 
-    def queue(self, session: Session) -> str:
+    def queue(self, session: Session, *, yielding: bool = False) -> str:
         """Queue a mutation unless an unwritten one for its identity outranks it.
 
         AUTH grants before it waits for the lock, so a revocation queued
         meanwhile by a QUIT must not be replaced by the older grant. The
         identity is the session's own prefix, which the store keys it by.
+        A yielding revocation only cancels this bot's own grant: a newer
+        grant it meets, as when the user authenticates on a peer, stands.
         """
         key = casefold(session.prefix, "ascii")
         queued = self.pending.get(key)
         if queued is None or session.order > queued.order:
             self.pending[key] = session
+            if yielding:
+                self.yielding[key] = session
 
         return key
 
@@ -298,9 +316,21 @@ class SessionSync:
                     return
 
     def revoke(self, prefix: Prefix) -> None:
-        """Revoke a session locally now and write the revocation in background."""
+        """Revoke a session locally now and write the revocation in background.
+
+        The identity is gone, so whatever is queued for it escalates over a
+        newer grant, even when its record is already revoked. Like its
+        session, a queued record may spell the identity another way the
+        casemapping folds together.
+        """
         identity = prefix.render()
         self.invalidate(identity)
+        fold = self.authorizer.identity_fold
+        self.yielding = {
+            key: held
+            for key, held in self.yielding.items()
+            if fold(held.prefix) != fold(identity)
+        }
         revoked = self.authorizer.revoke(identity)
         if revoked is not None:
             self.queue(revoked)
@@ -356,7 +386,7 @@ class SessionSync:
             session.revoked
             and winner is not None
             and not winner.revoked
-            and self.restoring.get(identity) is not session
+            and self.yielding.get(identity) is not session
         ):
             replacement = self.authorizer.create(
                 winner.prefix,
@@ -372,7 +402,7 @@ class SessionSync:
             return True
 
         del self.pending[identity]
-        self.restoring.pop(identity, None)
+        self.yielding.pop(identity, None)
         return True
 
 
