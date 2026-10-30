@@ -83,6 +83,7 @@ class KVStore:
         async with self.lock:
             if js is not None and js is not self.js:
                 self.js = js
+                # Startup's retry can open it on an older context mid-reconnect.
                 self.kv = None
 
             if self.kv is not None:
