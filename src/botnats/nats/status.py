@@ -143,6 +143,7 @@ async def route_count(host: str | None, port: int) -> int | None:
             )
             await writer.drain()
             response = await read_response(reader)
+
         if len(response) > MAX_RESPONSE_BYTES:
             return None
 

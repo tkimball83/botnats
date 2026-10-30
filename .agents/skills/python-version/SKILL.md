@@ -5,7 +5,8 @@ description: Bump the Python version across all project files.
 
 # python-version
 
-Update every Python pin; `{{ patch }}` is the newest patch release of `{{ version }}`.
+Update every Python pin; `{{ patch }}` is `N` in the newest `python:{{ version }}.N-alpine` tag on
+Docker Hub.
 
 | File              | Pattern                                        |
 | ----------------- | ---------------------------------------------- |

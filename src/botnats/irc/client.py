@@ -195,6 +195,7 @@ class IRCClient:
         )
         async with asyncio.timeout(self.config.connect_timeout):
             reader, writer = await connect
+
         self.writer = writer
         # The server charges each connection afresh.
         self.charged_until = 0.0
