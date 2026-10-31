@@ -203,9 +203,6 @@ class Coordinator:
         await self.cancel_resync()
         await self.cancel_watches()
         await self.claim.release()
-        for store in self.stores:
-            store.reset()
-
         if nc is not None:
             await nc.close()
 

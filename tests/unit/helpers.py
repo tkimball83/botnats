@@ -418,14 +418,16 @@ class FakeCoordinator:
         """Record a presence write, refused while disconnected.
 
         Disconnected, the real presence store has no open bucket and raises. A
-        duplicate is not refused: the real claim yields to the live instance's
-        signed record and returns, and the next heartbeat tries again.
+        duplicate writes nothing but is not refused: the real claim yields to
+        the live instance's signed record and returns, and the next heartbeat
+        tries again.
         """
         if not self.connected:
             msg = "JetStream is unavailable"
             raise StoreUnavailableError(msg)
 
-        self.presence_puts.append(presence)
+        if not self.duplicate:
+            self.presence_puts.append(presence)
 
     async def put_session(self, session: dict[str, Any]) -> Session:
         """Record a session write and store it as SessionStore would."""
