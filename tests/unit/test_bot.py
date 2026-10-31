@@ -323,6 +323,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         async def run_forever() -> None:
             await coordinator_started.wait()
+            # Ended as SIGTERM ends it: IRCClient.run_forever never returns.
+            raise asyncio.CancelledError
 
         with (
             patch.object(coordinator, "start", blocked_start),
@@ -331,8 +333,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 bot.health_check, "start", AsyncMock(return_value=None)
             ) as health_start,
             patch.object(bot.health_check, "close", AsyncMock(return_value=None)),
+            self.assertRaises(asyncio.CancelledError),
         ):
-            # run() returns only once run_forever has run beside the blocked start.
+            # run() ends only once run_forever has run beside the blocked start.
             async with asyncio.timeout(5):
                 await bot.run()
 
@@ -446,7 +449,8 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             # every loop take one step, so a stalled heartbeat fails here.
             for _ in range(100):
                 if stalled.is_set() and len(coordinator.presence_puts) >= 3:
-                    return
+                    # Ended as SIGTERM ends it: IRCClient.run_forever never returns.
+                    raise asyncio.CancelledError
 
                 await REAL_SLEEP(0)
 
@@ -457,6 +461,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot.health_check, "start", AsyncMock(return_value=None)),
             patch.object(fake_irc, "run_forever", run_until_heartbeats),
             patch("asyncio.sleep", yield_once),
+            self.assertRaises(asyncio.CancelledError),
         ):
             async with asyncio.timeout(5):
                 await bot.run()
