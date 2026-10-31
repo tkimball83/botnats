@@ -100,9 +100,10 @@ async def stale_presence(instance_id: str) -> tuple[PresenceStore, DeletableKV]:
     store = PresenceStore("efnet", 1, 15.0, SECRET)
     kv = DeletableKV()
     store.kv = cast("KeyValue", kv)
-    revision = await kv.create("alpha", json.dumps(signed_presence("inst")).encode())
+    owned = json.dumps(signed_presence("inst")).encode()
+    revision = await bounded(kv.create("alpha", owned))
     newer = json.dumps(signed_presence(instance_id)).encode()
-    await kv.update("alpha", newer, last=revision)
+    await bounded(kv.update("alpha", newer, last=revision))
     return store, kv
 
 
@@ -139,7 +140,8 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         store = PresenceStore("efnet", 1, 15.0, SECRET)
         kv = FakeKV()
         store.kv = cast("KeyValue", kv)
-        stored = await kv.create("alpha", json.dumps(signed_presence("inst")).encode())
+        owned = json.dumps(signed_presence("inst")).encode()
+        stored = await bounded(kv.create("alpha", owned))
         heartbeat = {
             "bot_id": "Alpha",
             "host": "new.host",
@@ -816,8 +818,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         kv = DeletableKV()
         presence.kv = cast("KeyValue", kv)
         owned = json.dumps(signed_presence("inst")).encode()
-        revision = await kv.create("alpha", owned)
-        await kv.update("alpha", b"not json", last=revision)
+        revision = await bounded(kv.create("alpha", owned))
+        await bounded(kv.update("alpha", b"not json", last=revision))
 
         await bounded(presence.delete("Alpha", revision, "inst"))
 
@@ -1403,6 +1405,12 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert session_key != SessionStore("efnet", 1, OTHER_SECRET).key(
             "owner!user@host",
         )
+
+    async def test_channel_and_session_retention(self) -> None:
+        """Keep channel records for good and sessions for the hour they last."""
+        # Channel records never expire, so a restarting bot replays every one.
+        assert ChannelStore("efnet", 1, SECRET).ttl == 0
+        assert SessionStore("efnet", 1, SECRET).ttl == 3600
 
     async def test_session_parse_rejects_unencodable_identity(self) -> None:
         """Reject, without raising, a record with an unencodable prefix or issuer."""

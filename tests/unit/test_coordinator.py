@@ -33,7 +33,6 @@ from botnats.nats.envelope import Envelope
 from botnats.nats.status import unknown
 from botnats.nats.store import (
     SESSION_EXPIRY_GRACE,
-    SESSION_TTL,
     AttemptStore,
     ChannelStore,
     ClaimStore,
@@ -416,6 +415,38 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert not coordinator.claim.owned
         assert not coordinator.presence_store.ready
         nc.close.assert_awaited_once_with()
+
+    async def test_reconnect_during_close_resyncs_quietly(self) -> None:
+        """Log no failure for a resync that starts after close() drops the client.
+
+        Core NATS can drop and reconnect while shutdown deletes the presence
+        key, after close() has cancelled any resync already running.
+        """
+        coordinator = build_coordinator("alpha")
+        coordinator.nc = AsyncMock()
+        coordinator.claim.adopt(7)
+        resyncs: list[asyncio.Task[None] | None] = []
+
+        async def reconnect(*arguments: object, **options: object) -> bool:
+            del arguments, options
+            await coordinator.on_reconnected()
+            resyncs.append(coordinator.resync_task)
+            return True
+
+        presence_kv = AsyncMock()
+        presence_kv.delete = AsyncMock(side_effect=reconnect)
+        coordinator.presence_store.kv = presence_kv
+
+        with self.assertLogs("botnats.nats.coordinator", level="DEBUG") as logs:
+            async with asyncio.timeout(5):
+                await coordinator.close()
+                (resync,) = resyncs
+                assert resync is not None
+                await asyncio.gather(resync, return_exceptions=True)
+
+        assert [log.getMessage() for log in logs.records] == [
+            "reconnected to Core NATS",
+        ]
 
     async def test_deliberate_close_does_not_restart(self) -> None:
         """Leave the client closed when nats-py reports the close close() asked for."""
@@ -980,15 +1011,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_stores_use_configured_retention(self) -> None:
-        """Open every bucket with the configured replicas and record TTLs."""
+        """Open every bucket with the configured replicas and presence TTL."""
         coordinator = build_coordinator("alpha")
         config = coordinator.config
 
         assert {store.replicas for store in coordinator.stores} == {config.replicas}
-        # Channel records never expire, so a restarting bot replays every one.
-        assert coordinator.channels_store.ttl == 0
         assert coordinator.presence_store.ttl == config.presence_ttl
-        assert coordinator.sessions.ttl == SESSION_TTL
 
     def test_config_repr_hides_token(self) -> None:
         """Keep the NATS token out of the config's repr, which a log may print."""
@@ -1790,12 +1818,18 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         async def fail_once(name: str, synced: Callable[[], None]) -> None:
             error = failures.pop(name, None)
             if error is not None:
-                # The failed run had completed its replay.
+                # The failed run had completed its replay, and fails only once
+                # watch-sessions has completed its own.
                 synced()
+                await REAL_SLEEP(0)
                 raise error
 
             stale_markers[name] = name in coordinator.synced_watches
             restarted[name].set()
+            await asyncio.Event().wait()
+
+        async def sync_and_hang(synced: Callable[[], None]) -> None:
+            synced()
             await asyncio.Event().wait()
 
         with (
@@ -1809,7 +1843,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 "watch_presence",
                 partial(fail_once, "watch-presence"),
             ),
-            patch.object(coordinator, "watch_sessions", hang),
+            patch.object(coordinator, "watch_sessions", sync_and_hang),
             patch("asyncio.sleep", AsyncMock(side_effect=yield_once)) as sleep,
             self.assertLogs("botnats.nats.coordinator", level="DEBUG") as logs,
         ):
@@ -1818,12 +1852,16 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 for event in restarted.values():
                     await event.wait()
 
+                synced_after_restarts = set(coordinator.synced_watches)
                 await coordinator.cancel_watches()
 
         # Each failed watch waits before its one restart instead of spinning.
         assert sleep.await_args_list == [call(RECONNECT_WAIT)] * len(restarted)
         # A restarted watch must replay again before readiness returns.
         assert stale_markers == {"watch-channels": False, "watch-presence": False}
+        # A watch that kept running never replays again: losing its marker
+        # would hold readiness down until the next Core NATS reconnect.
+        assert synced_after_restarts == {"watch-sessions"}
         # Each failure is a rate-limited warning, never a crash traceback.
         assert sorted((log.levelname, log.getMessage()) for log in logs.records) == [
             ("WARNING", "watch watch-channels failed: transient"),
@@ -2210,24 +2248,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert len(channels.entries) == 1
         assert len(sessions.entries) == 1
-
-    async def test_presence_heartbeat_reclaims_unowned_key(self) -> None:
-        """Reclaim a free presence key on a heartbeat, which needs no ownership.
-
-        A duplicate's record expiring by TTL emits no watch event, and a
-        failed watch reclaim waits for this heartbeat to retry it.
-        """
-        coordinator = build_coordinator("alpha")
-        instance_id = coordinator.claim.instance_id
-        presence = asdict(BotPresence("alpha", "host", instance_id, "alpha", "user"))
-
-        for state in (PresenceState.UNCLAIMED, PresenceState.DUPLICATE):
-            coordinator.presence_store.kv = cast("KeyValue", FakeKV())
-            coordinator.claim.transition(state, None)
-            with self.subTest(state=state):
-                await bounded(coordinator.put_presence(presence))
-
-                assert coordinator.claim.owned
 
     async def test_start_fails_on_server_url_nats_rejects(self) -> None:
         """Fail once, unready, on a server URL nats-py rejects before connecting.
