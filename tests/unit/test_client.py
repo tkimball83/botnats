@@ -118,6 +118,10 @@ def mock_writer() -> MagicMock:
     """Create a mock StreamWriter that reports as connected."""
     writer = create_autospec(asyncio.StreamWriter, instance=True)
     writer.is_closing.return_value = False
+    writer.write.return_value = None
+    writer.drain.return_value = None
+    writer.wait_closed.return_value = None
+    writer.transport.abort.return_value = None
     return writer
 
 

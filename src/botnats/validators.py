@@ -23,8 +23,10 @@ SAFE_CHANNEL_RE = re.compile(r"![A-Z0-9]{5}.")
 type ChannelFields = tuple[str, str | None, bool, str]
 
 
-def _has_space_or_nul(value: str) -> bool:
-    return any(c.isspace() or c == "\x00" for c in value)
+def _has_space_nul_or_undecoded(value: str) -> bool:
+    # U+FFFD stands for bytes that did not decode as UTF-8: sent back, they
+    # would name a different channel or key.
+    return any(c.isspace() or c in "\x00\ufffd" for c in value)
 
 
 def validate_channel(value: str) -> str:
@@ -37,7 +39,7 @@ def validate_channel(value: str) -> str:
         msg = "channel name is empty"
         raise ValueError(msg)
 
-    if "," in value or "\x07" in value or _has_space_or_nul(value):
+    if "," in value or "\x07" in value or _has_space_nul_or_undecoded(value):
         msg = "channel contains unsupported characters"
         raise ValueError(msg)
 
@@ -50,7 +52,7 @@ def validate_key(value: str) -> str:
         msg = "channel key must not be empty"
         raise ValueError(msg)
 
-    if value.startswith(":") or "," in value or _has_space_or_nul(value):
+    if value.startswith(":") or "," in value or _has_space_nul_or_undecoded(value):
         msg = "channel key contains unsupported characters"
         raise ValueError(msg)
 
