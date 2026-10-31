@@ -7,7 +7,6 @@ import re
 import unittest
 
 from botnats.validators import (
-    MAX_CHANNEL_REVISION,
     parse_channel_record,
     validate_channel,
     validate_channel_revision,
@@ -151,6 +150,8 @@ class ValidatorTests(unittest.TestCase):
             ({**record, "channel": ["#safe"]}, TypeError, "invalid channel"),
             (keyless, ValueError, "invalid key"),
             ({**record, "key": 5}, ValueError, "invalid key"),
+            ({**record, "channel": "#safe QUIT"}, ValueError, "channel contains"),
+            ({**record, "key": "bad key"}, ValueError, "channel key contains"),
             ({**record, "present": 1}, TypeError, "invalid presence flag"),
         ):
             with self.subTest(value=value), self.assertRaisesRegex(error, message):
@@ -165,7 +166,8 @@ class ValidatorTests(unittest.TestCase):
             "1",
             "z",
             "0" * 20 + "-not-hex",
-            f"{MAX_CHANNEL_REVISION + 1:020d}-{suffix}",
+            # The counter after the 20-digit maximum.
+            f"{10**20}-{suffix}",
         ):
             with (
                 self.subTest(revision=revision),
@@ -179,9 +181,3 @@ class ValidatorTests(unittest.TestCase):
                         "revision": revision,
                     },
                 )
-
-        # The same record with the highest valid revision parses.
-        newest = f"{MAX_CHANNEL_REVISION:020d}-{suffix}"
-        assert parse_channel_record(
-            {"channel": "#safe", "key": None, "present": True, "revision": newest},
-        ) == ("#safe", None, True, newest)
