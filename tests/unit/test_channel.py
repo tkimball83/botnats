@@ -17,6 +17,7 @@ from botnats.channel import (
     JOIN_REPLY_TIMEOUT,
     JOIN_RETRY_DELAY,
     PEER_HELP_DELAY,
+    PEER_REQUEST_COOLDOWN,
     ChannelRecord,
     ChannelRuntime,
     JoinState,
@@ -316,39 +317,42 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_casemapping_change_preserves_colliding_records(self) -> None:
         """Keep records that collide temporarily under one server casemapping.
 
-        The newer record arrives first, so only revision order, not arrival,
-        keeps it when the records collide again.
+        Whichever arrives first, only revision order keeps the newer record
+        when the records collide again.
         """
-        bot = make_bot()
         first = ChannelRecord.new("#room[", "first", present=True)
         second = ChannelRecord.new(
             "#room{", "second", present=True, after=first.revision
         )
+        for arrival in ((second, first), (first, second)):
+            with self.subTest(arrival=[record.key for record in arrival]):
+                mgr = make_bot().channel_mgr
+                for record in arrival:
+                    mgr.apply_record(record)
 
-        bot.channel_mgr.apply_record(second)
-        bot.channel_mgr.apply_record(first)
-        assert len(bot.channel_mgr.channel_records) == 1
+                assert len(mgr.channel_records) == 1
 
-        bot.channel_mgr.set_casemapping("ascii")
-        assert len(bot.channel_mgr.channel_records) == 2
-        assert {record.key for record in bot.channel_mgr.channel_records.values()} == {
-            "first",
-            "second",
-        }
-        # The channel split off gets a fresh runtime, which joins with its key.
-        assert {runtime.key for runtime in bot.channel_mgr.channels.values()} == {
-            "first",
-            "second",
-        }
+                mgr.set_casemapping("ascii")
+                assert len(mgr.channel_records) == 2
+                assert {record.key for record in mgr.channel_records.values()} == {
+                    "first",
+                    "second",
+                }
+                # The channel split off gets a fresh runtime, which joins with
+                # its key.
+                assert {runtime.key for runtime in mgr.channels.values()} == {
+                    "first",
+                    "second",
+                }
 
-        bot.channel_mgr.set_casemapping("rfc1459")
-        assert list(bot.channel_mgr.channel_records.values()) == [second]
-        assert [runtime.key for runtime in bot.channel_mgr.channels.values()] == [
-            "second",
-        ]
+                mgr.set_casemapping("rfc1459")
+                assert list(mgr.channel_records.values()) == [second]
+                assert [runtime.key for runtime in mgr.channels.values()] == [
+                    "second",
+                ]
 
-        bot.channel_mgr.set_casemapping("ascii")
-        assert len(bot.channel_mgr.channel_records) == 2
+                mgr.set_casemapping("ascii")
+                assert len(mgr.channel_records) == 2
 
     async def test_casemapping_change_parts_tombstoned_channel(self) -> None:
         """Queue a PART when a joined channel now folds onto a tombstone."""
@@ -1383,6 +1387,44 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert [put["key"] for put in coordinator.channel_puts] == ["seen", "seen"]
         assert not any(runtime.key_pending for runtime in runtimes)
 
+    async def test_keys_seen_together_queue_one_retry(self) -> None:
+        """Queue one key retry for keys seen while it waits; it writes them all.
+
+        A retry per key, as a burst of RPL_CHANNELMODEIS replies shows them,
+        would each repeat the same failing write under the write lock.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot = bot_with_channel(coordinator=coordinator)
+        mgr = bot.channel_mgr
+        channels = ("#test", "#a", "#b")
+        for channel in channels[1:]:
+            mgr.apply_record(ChannelRecord.new(channel, None, present=True))
+
+        runtimes = [mgr.channels[casefold(channel, "rfc1459")] for channel in channels]
+        record_put = coordinator.put_channel
+        attempts: list[str] = []
+
+        async def counted_put(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            attempts.append(record["channel"])
+            return await record_put(record, after=after)
+
+        with patch.object(coordinator, "put_channel", counted_put):
+            for runtime in runtimes:
+                runtime.join = JoinState.JOINED
+                bot.events.process_key(runtime, "seen")
+
+            await settle(bot)
+            assert attempts == ["#test"]
+            coordinator.failing = False
+            await bounded(mgr.retry_pending_keys())
+
+        assert attempts == ["#test", "#test", "#a", "#b"]
+        assert not any(runtime.key_pending for runtime in runtimes)
+
     async def test_quick_key_changes_are_written_in_order(self) -> None:
         """Compare each key change against the record the previous one left."""
         coordinator = FakeCoordinator()
@@ -2028,6 +2070,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "bot.host", "one", "alpha", "~alpha"
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        # The real cooldown, which a stall between requests could outlast.
+        assert PEER_REQUEST_COOLDOWN == 0.5
         # Long enough that no stall between requests can outlast it; each
         # kind last asked a full cooldown ago, however long the clock has run.
         cooldown = 3600.0
