@@ -36,6 +36,9 @@ from tests.unit.helpers import (
 if TYPE_CHECKING:
     from botnats.nats.store import Session
 
+# Bound before any test patches asyncio.sleep.
+REAL_SLEEP = asyncio.sleep
+
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
     """Tests for bot wiring, readiness, startup, shutdown, and NATS callbacks."""
@@ -178,8 +181,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         # TimeoutError is an OSError: bound the close outside assertRaises.
         async with asyncio.timeout(5):
             with (
-                patch.object(bot.irc, "close") as irc_close,
-                patch.object(bot.health_check, "close") as health_close,
+                patch.object(
+                    bot.irc, "close", AsyncMock(return_value=None)
+                ) as irc_close,
+                patch.object(
+                    bot.health_check, "close", AsyncMock(return_value=None)
+                ) as health_close,
                 self.assertRaises(OSError),
             ):
                 await bot.close()
@@ -226,7 +233,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(coordinator, "put_session", hang),
-            patch.object(coordinator, "close", AsyncMock()) as coordinator_close,
+            patch.object(
+                coordinator, "close", AsyncMock(return_value=None)
+            ) as coordinator_close,
             patch("botnats.bot.SHUTDOWN_SYNC_TIMEOUT", 0),
         ):
             async with asyncio.timeout(1):
@@ -322,8 +331,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(coordinator, "start", blocked_start),
             patch.object(fake_irc, "run_forever", run_forever),
-            patch.object(bot.health_check, "start", AsyncMock()) as health_start,
-            patch.object(bot.health_check, "close", AsyncMock()),
+            patch.object(
+                bot.health_check, "start", AsyncMock(return_value=None)
+            ) as health_start,
+            patch.object(bot.health_check, "close", AsyncMock(return_value=None)),
         ):
             # run() returns only once run_forever has run beside the blocked start.
             async with asyncio.timeout(5):
@@ -346,8 +357,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(fake_irc, "run_forever", cancelled),
-            patch.object(bot.health_check, "start", AsyncMock()),
-            patch.object(bot.health_check, "close", AsyncMock()) as health_close,
+            patch.object(bot.health_check, "start", AsyncMock(return_value=None)),
+            patch.object(
+                bot.health_check, "close", AsyncMock(return_value=None)
+            ) as health_close,
             self.assertRaises(asyncio.CancelledError),
         ):
             async with asyncio.timeout(5):
@@ -381,7 +394,6 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(config())
         calls = 0
         delays: list[float] = []
-        real_sleep = asyncio.sleep
 
         async def counting_tick() -> None:
             nonlocal calls
@@ -391,7 +403,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError(msg)
 
             # Yield, so the timeout can end a loop that stops sleeping.
-            await real_sleep(0)
+            await REAL_SLEEP(0)
 
         async def immediate(delay: float) -> None:
             delays.append(delay)
@@ -401,7 +413,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
                 msg = "stop"
                 raise asyncio.CancelledError(msg)
 
-            await real_sleep(0)
+            await REAL_SLEEP(0)
 
         with (
             patch("asyncio.sleep", immediate),
@@ -424,7 +436,6 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.identity.registered = True
         stalled = asyncio.Event()
-        real_sleep = asyncio.sleep
 
         async def stall() -> None:
             stalled.set()
@@ -432,7 +443,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
 
         async def yield_once(delay: float) -> None:
             del delay
-            await real_sleep(0)
+            await REAL_SLEEP(0)
 
         async def run_until_heartbeats() -> None:
             # Bounded by event-loop turns, not wall-clock time: each turn lets
@@ -441,13 +452,13 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
                 if stalled.is_set() and len(coordinator.presence_puts) >= 3:
                     return
 
-                await real_sleep(0)
+                await REAL_SLEEP(0)
 
             self.fail("presence heartbeat stalled behind the maintenance tick")
 
         with (
             patch.object(bot.channel_mgr, "retry_pending_keys", stall),
-            patch.object(bot.health_check, "start", AsyncMock()),
+            patch.object(bot.health_check, "start", AsyncMock(return_value=None)),
             patch.object(fake_irc, "run_forever", run_until_heartbeats),
             patch("asyncio.sleep", yield_once),
         ):

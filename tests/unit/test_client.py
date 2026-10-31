@@ -381,7 +381,6 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(6667, 6668))
         delays: list[float] = []
         ports: list[int] = []
-        real_sleep = asyncio.sleep
 
         async def failing_connection(server: IRCServer) -> None:
             ports.append(server.port)
@@ -394,7 +393,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def record_sleep(delay: float) -> None:
             delays.append(delay)
-            await real_sleep(0)
+            await REAL_SLEEP(0)
 
         with (
             patch.object(client, "run_connection", failing_connection),
@@ -416,7 +415,6 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(6667, 6668))
         delays: list[float] = []
         ports: list[int] = []
-        real_sleep = asyncio.sleep
 
         async def connection(server: IRCServer) -> None:
             ports.append(server.port)
@@ -431,7 +429,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def record_sleep(delay: float) -> None:
             delays.append(delay)
-            await real_sleep(0)
+            await REAL_SLEEP(0)
 
         with (
             patch.object(client, "run_connection", connection),
@@ -451,7 +449,6 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client = irc_client(ports=(6667, 6668))
         delays: list[float] = []
         ports: list[int] = []
-        real_sleep = asyncio.sleep
 
         async def connection(server: IRCServer) -> None:
             ports.append(server.port)
@@ -464,7 +461,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def record_sleep(delay: float) -> None:
             delays.append(delay)
-            await real_sleep(0)
+            await REAL_SLEEP(0)
 
         with (
             patch.object(client, "run_connection", connection),
@@ -1529,7 +1526,6 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Log a failing disconnect callback and still close and reconnect."""
         client = irc_client()
         ports: list[int] = []
-        real_sleep = asyncio.sleep
 
         def failing_callback() -> None:
             msg = "callback bug"
@@ -1545,7 +1541,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def skip_sleep(delay: float) -> None:
             del delay
-            await real_sleep(0)
+            await REAL_SLEEP(0)
 
         client.on_disconnect = failing_callback
         with (
