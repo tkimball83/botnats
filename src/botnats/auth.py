@@ -249,16 +249,18 @@ class SessionSync:
 
         A held unexpired revocation is written back, as over a rollback: bots
         that start later would otherwise accept the revoked grant if re-put.
+        A key whose mapping expired held a record that is already gone: the
+        identity's record, if any, is newer, as a grant this bot has yet to
+        write, and stays.
         """
         mapped = self.watched.pop(key, None)
-        if mapped is not None:
+        if mapped is not None and mapped[1] > time.time():
             held = self.authorizer.drop_session(mapped[0])
             if held is not None:
                 self.restore(held)
 
     def replayed(self, keys: set[str]) -> None:
         """Forget the keys a completed watch replay held no valid record for."""
-        self.prune()
         for key in self.watched.keys() - keys:
             self.forget(key)
 
@@ -269,10 +271,9 @@ class SessionSync:
             self.pending[identity] = self.yielding[identity] = held
             self.tasks.spawn(self.retry(), "session-sync")
 
-    def prune(self, now: float | None = None) -> None:
+    def prune(self, now: float) -> None:
         """Discard expired key mappings, which receive no TTL delete event."""
-        current = time.time() if now is None else now
-        for key in [k for k, mapped in self.watched.items() if mapped[1] <= current]:
+        for key in [k for k, mapped in self.watched.items() if mapped[1] <= now]:
             del self.watched[key]
 
     def queue(self, session: Session, *, yielding: bool = False) -> str:

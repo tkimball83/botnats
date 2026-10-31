@@ -133,6 +133,22 @@ class TotpAuthorizerTests(unittest.TestCase):
         fresh.keep(session)
         assert fresh.authorized(prefix, now=now + 11)
 
+    def test_dropped_key_returns_only_live_revocation(self) -> None:
+        """Return a held revocation to write back only while it is unexpired.
+
+        The grant an expired revocation revoked expired with it, so writing
+        the revocation back would protect nothing.
+        """
+        auth = authorizer()
+        now = time.time()
+        live = auth.create("live!user@host", now + 60, "beta", 1, revoked=True)
+        expired = auth.create("expired!user@host", now - 1, "beta", 1, revoked=True)
+        auth.keep(live)
+        auth.keep(expired)
+
+        assert auth.drop_session(live.prefix) == live
+        assert auth.drop_session(expired.prefix) is None
+
     def test_durable_revocation_blocks_stale_session(self) -> None:
         """Keep a watched revocation authoritative over its original session."""
         source = authorizer("alpha")
@@ -958,6 +974,39 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
         assert [put["revoked"] for put in coordinator.session_puts] == [False]
 
+    async def test_auth_survives_replayed_expired_record(self) -> None:
+        """Authorize when a restarted watch replays an expired record mid-AUTH.
+
+        Its key mapping expired unpruned. Forgetting the key would drop the
+        grant just written, and AUTH would report failure with nothing left
+        to revoke, while the grant stays live in KV and on peers.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        key = coordinator.sessions.key(prefix.render())
+        now = time.time()
+        old = bot.authorizer.create(prefix.render(), now - 1, "beta", 1, revoked=True)
+        bot.sessions.watched[key] = (old.prefix, old.expires_at)
+        # Writes an outage left queued: this identity's, which the grant
+        # replaces in place, then another identity's.
+        bot.sessions.queue(old)
+        other = bot.authorizer.create("other!u@h", now + 60, "beta", 1, revoked=True)
+        bot.sessions.queue(other)
+        put_session = coordinator.put_session
+
+        async def replay_during_later_write(record: dict[str, Any]) -> Session:
+            if record["prefix"] == other.prefix:
+                bot.sessions.observe(key, old, replaying=True)
+
+            return await put_session(record)
+
+        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        with patch.object(coordinator, "put_session", replay_during_later_write):
+            await send_command(bot, prefix, f"AUTH {code}")
+
+        assert fake_irc.privmsgs == [("owner", "Authorized")]
+        assert bot.authorizer.authorized(prefix.render())
+
     async def test_auth_revokes_grant_past_store_horizon(self) -> None:
         """Revoke and refuse a grant the store rejects after the clock steps back.
 
@@ -1374,6 +1423,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(1):
                 assert await bot.sessions.sync(grant)
 
+        # The newer grant stays revoked locally until the escalation lands.
+        assert not bot.authorizer.authorized("x!u@h")
         replacement = bot.sessions.pending[casefold("x!u@h", "ascii")]
         assert replacement.revoked
         assert replacement.version == newer.version + 1
@@ -1929,6 +1980,30 @@ class SessionSyncWatchTests(unittest.TestCase):
 
         assert sessions.watched == {}
         assert auth.authorized(prefix)
+
+    def test_expired_key_keeps_newer_grant(self) -> None:
+        """Keep a newer local grant when an expired key is replayed or deleted.
+
+        A record stays in KV up to an hour past its expiry, so a restarted
+        watch replays it, and replay skips pruning; forgetting the key would
+        drop the grant this bot has yet to write.
+        """
+        prefix = "owner!user@host"
+        for trigger in ("replayed", "deleted"):
+            with self.subTest(trigger=trigger):
+                auth = authorizer()
+                sessions = SessionSync(auth, FakeCoordinator(), Tasks())
+                expired = time.time() - 1
+                sessions.watched["expired-key"] = (prefix, expired)
+                auth.grant(prefix)
+                if trigger == "replayed":
+                    record = auth.create(prefix, expired, "beta", 1, revoked=True)
+                    sessions.observe("expired-key", record, replaying=True)
+                else:
+                    sessions.forget("expired-key")
+
+                assert sessions.watched == {}
+                assert auth.authorized(prefix)
 
     def test_session_identity_cache_does_not_prune_during_replay(self) -> None:
         """Avoid rescanning the growing cache for every replayed session."""
