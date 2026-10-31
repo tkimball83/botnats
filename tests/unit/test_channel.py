@@ -124,7 +124,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 bot.channel_mgr.channels[casefold("#test", "rfc1459")]
             )
 
-        send.assert_called_once_with("MODE", "#test", "+npst")
+        send.assert_called_once_with("MODE", "#test", "+npst", unless_waiting=True)
         assert logs.output == [
             "WARNING:botnats.channel:cannot enforce modes on #test: bad mode command",
         ]
@@ -202,7 +202,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             fake_irc.connected = False
             bot.channel_mgr.enforce_modes(runtime)
 
-        send.assert_called_once_with("MODE", "#test", "+npst")
+        send.assert_called_once_with("MODE", "#test", "+npst", unless_waiting=True)
         assert runtime.names_due
 
     async def test_enforce_modes_sends_only_modes_not_in_place(self) -> None:
@@ -249,6 +249,23 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.enforce_modes(runtime)
 
         assert fake_irc.sent == [("MODE", ("#test", "+npst"))]
+
+    async def test_enforce_modes_skips_a_copy_still_waiting(self) -> None:
+        """Skip the configured modes' line while a copy still waits to go out.
+
+        Behind a send backlog, each change an operator makes would queue
+        another copy; the waiting one goes out after them and sets the modes.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.modes = ""
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            bot.channel_mgr.enforce_modes(runtime)
+
+        assert send.call_args_list == [
+            call("MODE", "#test", "+npst", unless_waiting=True),
+        ]
 
     async def test_casemapping_change(self) -> None:
         """Verify casemapping change migrates channel and auth state."""
@@ -412,10 +429,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         Under rfc1459 the server has merged #room[ with #room{, still joined
         or left while the send queue was full: it ignores #room['s JOIN, so
-        no echo would ever mark it joined.
+        no echo would ever mark it joined. Merged with one this bot is not
+        in, as when the server refused both JOINs, it stays joining.
         """
-        for left in (False, True):
-            with self.subTest(left=left):
+        for joined, left in ((True, False), (True, True), (False, False)):
+            with self.subTest(joined=joined, left=left):
                 fake_irc = FailingPartIRC()
                 bot = make_bot(irc=fake_irc)
                 bot.identity.current = BotPresence(
@@ -425,7 +443,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 mgr.set_casemapping("ascii")
                 record = ChannelRecord.new("#room{", None, present=True)
                 mgr.apply_record(record)
-                mgr.channels[casefold("#room{", "ascii")].join = JoinState.JOINED
+                if joined:
+                    mgr.channels[casefold("#room{", "ascii")].join = JoinState.JOINED
+
                 if left:
                     record = ChannelRecord.new(
                         "#room{", None, present=False, after=record.revision
@@ -444,12 +464,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 mgr.set_casemapping("rfc1459")
 
                 assert mgr.runtime("#room{") is runtime
-                assert runtime.joined
-                assert fake_irc.sent == [
-                    ("JOIN", ("#room{",)),
-                    ("JOIN", ("#room[",)),
-                    ("NAMES", ("#room[",)),
-                ]
+                joins = [("JOIN", ("#room{",)), ("JOIN", ("#room[",))]
+                if joined:
+                    assert runtime.joined
+                    assert fake_irc.sent == [*joins, ("NAMES", ("#room[",))]
+                else:
+                    assert runtime.join is JoinState.JOINING
+                    assert fake_irc.sent == joins
+
                 assert mgr.pending_parts == {}
 
     async def test_casemapping_change_keeps_pending_part(self) -> None:
@@ -873,19 +895,54 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             after=mgr.channel_records[folded].revision,
         )
 
-        async with mgr.write_lock:
+        await bounded(mgr.write_lock.acquire())
+        try:
             # MODE +k k's write starts, and queues behind one still in flight...
             bot.events.process_key(runtime, "k")
             assert runtime.key_pending
             await asyncio.sleep(0)
             # ...while another bot's PART #test arrives.
             mgr.apply_record(tombstone)
+        finally:
+            mgr.write_lock.release()
 
         await settle(bot)
 
         assert coordinator.channel_puts == []
         assert folded not in mgr.channels
         assert mgr.channel_records[folded] == tombstone
+
+    async def test_queued_key_write_covers_a_channel_joined_meanwhile(self) -> None:
+        """Write a key seen on a channel joined while the write waited its turn.
+
+        That key queues no write of its own: the one waiting covers it.
+        """
+        coordinator = FakeCoordinator()
+        bot, _, _ = bot_with_coordinator(coordinator)
+        mgr = bot.channel_mgr
+        runtime = mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+
+        await bounded(mgr.write_lock.acquire())
+        try:
+            # MODE +k k's write starts, and queues behind one still in flight...
+            bot.events.process_key(runtime, "k")
+            await asyncio.sleep(0)
+            # ...while this bot joins #new and sees its key.
+            mgr.apply_record(ChannelRecord.new("#new", None, present=True))
+            new = mgr.channels[casefold("#new", "rfc1459")]
+            new.join = JoinState.JOINED
+            bot.events.process_key(new, "n")
+        finally:
+            mgr.write_lock.release()
+
+        await settle(bot)
+
+        assert [(put["channel"], put["key"]) for put in coordinator.channel_puts] == [
+            ("#test", "k"),
+            ("#new", "n"),
+        ]
+        assert not new.key_pending
 
     async def test_failed_key_write_does_not_override_a_newer_key(self) -> None:
         """Drop a failed key write once another bot has recorded a newer key."""
