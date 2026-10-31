@@ -422,8 +422,7 @@ class IRCEventHandler:
 
         targets = message.params[-1].split(",")
         folded = self.bot.caps.fold(self.bot.config.nickname)
-        for target in targets:
-            nick = target.partition("!")[0]
+        for nick in targets:
             if self.bot.caps.fold(nick) == folded:
                 self.try_nick_reclaim()
                 return
@@ -534,11 +533,10 @@ class IRCEventHandler:
         if is_self:
             runtime.reset()
             runtime.join = JoinState.JOINED
-            runtime.member(message.prefix.nick).prefix = message.prefix
             self.set_identity(message.prefix)
             LOGGER.info("joined %s", channel)
-        else:
-            runtime.member(message.prefix.nick).prefix = message.prefix
+
+        runtime.member(message.prefix.nick).prefix = message.prefix
 
     def handle_kick(self, message: IRCMessage) -> None:
         """Handle a KICK by removing the target or requesting an unban for self."""

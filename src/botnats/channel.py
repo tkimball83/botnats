@@ -61,6 +61,9 @@ class ChannelManager:
         # at a time, so each compares against the record the previous write
         # left.
         self.write_lock = asyncio.Lock()
+        # A key retry waiting for the write lock: at its turn it writes every
+        # key pending then, so a key seen meanwhile needs no retry of its own.
+        self.key_retry_queued = False
         # Revisions of this bot's writes in flight: the KV watch can deliver
         # one before the store's reply reaches the writer.
         self.writing: set[str] = set()
@@ -178,7 +181,9 @@ class ChannelManager:
         turn: no record applied in between may replace it.
         """
         runtime.key_pending = True
-        self.bot.tasks.spawn(self.retry_pending_keys(), "record-channel-key")
+        if not self.key_retry_queued:
+            self.key_retry_queued = True
+            self.bot.tasks.spawn(self.retry_pending_keys(), "record-channel-key")
 
     def refuse_key(self, runtime: ChannelRuntime) -> None:
         """Take the stored key once the server refuses the one this bot tried.
@@ -541,6 +546,9 @@ class ChannelManager:
     async def retry_pending_keys(self) -> None:
         """Write each pending key as this bot sees it on IRC now."""
         async with self.write_lock:
+            # From its turn on, it can miss a key seen later, which queues a
+            # retry of its own.
+            self.key_retry_queued = False
             for runtime in tuple(self.channels.values()):
                 # Checked at its turn: IRC can hide a key during earlier writes.
                 if runtime.key_pending and not await self.write_key(runtime):

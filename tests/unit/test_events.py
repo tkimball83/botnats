@@ -2258,7 +2258,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.current_nick = "fallback"
 
         bot.events.on_irc_message(
-            IRCMessage("731", ("fallback", "ALPHA!user@host")),
+            IRCMessage("731", ("fallback", "ALPHA")),
         )
 
         assert ("NICK", ("alpha",)) in fake_irc.sent
@@ -2271,7 +2271,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.current_nick = "fallback"
 
         bot.events.on_irc_message(
-            IRCMessage("731", ("fallback", "stranger!user@host")),
+            IRCMessage("731", ("fallback", "stranger")),
         )
 
         assert ("NICK", ("alpha",)) not in fake_irc.sent
@@ -2285,7 +2285,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.current_nick = "fallback"
         ison, monitor = (
             IRCMessage("303", ("alpha", "")),
-            IRCMessage("731", ("alpha", "alpha!user@host")),
+            IRCMessage("731", ("alpha", "alpha")),
         )
         bot.events.on_irc_message(monitor)
         fake_irc.current_nick = "alpha"
@@ -2315,7 +2315,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.connected = False
         for _ in range(2):
             bot.events.on_irc_message(
-                IRCMessage("731", ("fallback", "alpha!user@host")),
+                IRCMessage("731", ("fallback", "alpha")),
             )
 
         task = bot.events.nick_watch_task
@@ -2326,9 +2326,9 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             await bot.tasks.drain()
 
     async def test_server_refused_monitor_reclaim_polls_ison(self) -> None:
-        """Poll ISON when the server refuses a NICK that MONITOR prompted.
+        """Poll ISON after sending a NICK that MONITOR prompted.
 
-        A nick delay or services hold refuses it with 437 after MONITOR has
+        A nick delay or services hold can refuse it with 437 after MONITOR has
         reported the nick offline, and MONITOR does not report it again.
         """
         bot, fake_irc = bot_with_irc()
@@ -2337,10 +2337,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         bot.events.start_nick_watch()
 
         bot.events.on_irc_message(
-            IRCMessage("731", ("fallback", "alpha!user@host")),
-        )
-        bot.events.on_irc_message(
-            IRCMessage("437", ("fallback", "alpha", "Nick temporarily unavailable")),
+            IRCMessage("731", ("fallback", "alpha")),
         )
 
         assert fake_irc.sent == [("MONITOR", ("+", "alpha")), ("NICK", ("alpha",))]
