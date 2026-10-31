@@ -320,6 +320,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         key = coordinator.sessions.key(prefix.render())
         await bounded(coordinator.sessions.put(asdict(peer)))
         bot.sessions.observe(key, peer, replaying=False)
+        # An unrelated user's QUIT leaves the revocation yielding.
+        other = Prefix("other", "user", "other.example")
+        bot.events.on_irc_message(IRCMessage("QUIT", (), other))
         coordinator.failing = False
         # An escalation would wait for the second retry.
         await bounded(bot.sessions.retry())
@@ -1396,6 +1399,11 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
 
         kv = cast("FakeKV", coordinator.sessions.kv)
         kv.store(key, json.dumps(asdict(grant)).encode())
+        # Another identity's queued revocation must not hold back the write-back.
+        bot.authorizer.grant("other!user@host.example")
+        queued = bot.authorizer.revoke("other!user@host.example")
+        assert queued is not None
+        bot.sessions.queue(queued)
 
         bot.sessions.observe(key, grant, replaying=False)
         await drain_session_writes(bot)
@@ -1821,6 +1829,24 @@ class SessionSyncWatchTests(unittest.TestCase):
                 bot.sessions.unwatch_identity(identity)
 
                 assert not bot.sessions.watched_identities
+
+    def test_invalidate_marks_only_the_changed_identity(self) -> None:
+        """Invalidate the identity that changed, and keep it invalid after others.
+
+        Another user's QUIT must neither fail every AUTH in flight nor let one
+        that already quit grant a session to the departed identity.
+        """
+        sessions = SessionSync(authorizer(), FakeCoordinator(), Tasks())
+        sessions.watch_identity("a!u@h")
+        sessions.watch_identity("b!u@h")
+
+        sessions.invalidate("a!u@h")
+        assert not sessions.watched_valid("a!u@h")
+        assert sessions.watched_valid("b!u@h")
+
+        sessions.invalidate("c!u@h")
+        assert not sessions.watched_valid("a!u@h")
+        assert sessions.watched_valid("b!u@h")
 
     def test_session_identity_cache_prunes_during_updates(self) -> None:
         """Prune expired key mappings during normal watch traffic."""
