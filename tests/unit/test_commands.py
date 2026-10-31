@@ -1037,3 +1037,22 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         payload = coordinator.channel_puts[-1]
         assert payload["channel"] == "#new"
         assert payload["key"] == "hunter2"
+
+    async def test_join_key_replaces_tracked_key(self) -> None:
+        """Store a JOIN's key in place of the key a tracked channel holds.
+
+        A key changed while every bot was outside locks them all out; only
+        the admin's key lets them back in.
+        """
+        folded = casefold("#test", "rfc1459")
+        for tracked in ("old-key", None):
+            with self.subTest(tracked=tracked):
+                bot, fake_irc, coordinator = bot_with_coordinator()
+                bot.channel_mgr.channels[folded].key = tracked
+                bot.authorizer.grant(OWNER.render())
+
+                await bounded(bot.commands.dispatch(OWNER, "JOIN #test new-key"))
+
+                assert fake_irc.privmsgs == [("owner", "Joining #test")]
+                assert coordinator.channel_puts[-1]["key"] == "new-key"
+                assert bot.channel_mgr.channel_records[folded].key == "new-key"
