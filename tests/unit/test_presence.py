@@ -194,6 +194,7 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
         """Forget the identity and registration of a connection that ended."""
         bot = make_bot(irc=FakeIRC())
         bot.identity.on_registered()
+        assert bot.identity.registered
         assert bot.identity.set(Prefix("alpha", "~alpha", "real.host"))
         generation = bot.identity.generation
 

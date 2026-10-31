@@ -399,8 +399,8 @@ class FakeCoordinator:
             raise StoreUnavailableError(msg)
 
     async def close(self) -> None:
-        """No-op close."""
-        return
+        """Disconnect, as the real close leaves this bot unready and unwritable."""
+        self.connected = False
 
     async def put_channel(
         self,

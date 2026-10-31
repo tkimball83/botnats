@@ -206,12 +206,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         # JetStream recovers, but no maintenance tick retries before shutdown.
         coordinator.failing = False
 
-        async def disconnect() -> None:
-            coordinator.connected = False
-
-        with patch.object(coordinator, "close", disconnect):
-            async with asyncio.timeout(5):
-                await bot.close()
+        async with asyncio.timeout(5):
+            await bot.close()
 
         puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
         assert puts == [(prefix.render(), True)]
@@ -484,6 +480,22 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
             await bot.maintenance_tick()
 
         assert [kind for kind, _ in coordinator.help_requests] == ["op"]
+
+    async def test_joins_desired_channels_and_retries_parts(self) -> None:
+        """Join a desired channel and resend a PART that IRC refused earlier."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+        )
+        fake_irc.connected = False
+        bot.channel_mgr.part("#old")
+        fake_irc.connected = True
+
+        async with asyncio.timeout(1):
+            await bot.maintenance_tick()
+
+        assert ("JOIN", ("#test",)) in fake_irc.sent
+        assert ("PART", ("#old",)) in fake_irc.sent
 
     async def test_prunes_expired_sessions_while_disconnected(self) -> None:
         """Remove expired auth sessions even while IRC is disconnected."""
