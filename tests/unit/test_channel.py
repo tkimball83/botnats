@@ -267,10 +267,20 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.authorizer.authorized("nick[!~user@host.example")
         assert not bot.authorizer.authorized("nick{!~user@host.example")
 
-        # A casemapping this bot cannot fold by keeps the current one.
-        bot.channel_mgr.set_casemapping("rfc7613")
+    async def test_unknown_casemapping_folds_as_ascii(self) -> None:
+        """Fold as ASCII, the least, by a casemapping this bot does not know.
+
+        InspIRCd's codepage module advertises its codepage name, under which
+        Admin[ and Admin{ are two users: rfc1459 would give them one session.
+        """
+        bot = make_bot()
+
+        bot.channel_mgr.set_casemapping("iso-8859-1")
 
         assert bot.caps.casemapping == "ascii"
+        bot.authorizer.grant("Admin[!~admin@shell.example")
+        assert bot.authorizer.authorized("admin[!~admin@shell.example")
+        assert not bot.authorizer.authorized("Admin{!~admin@shell.example")
 
     async def test_casemapping_change_keeps_joined_runtime(self) -> None:
         """Keep a joined channel's live state; the server sends no second JOIN."""
@@ -392,6 +402,51 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.failing = False
         mgr.retry_pending_parts()
         assert fake_irc.sent == []
+
+    async def test_casemapping_change_marks_merged_channel_joined(self) -> None:
+        """Mark joined a joining channel the server merges with one this bot is in.
+
+        Under rfc1459 the server has merged #room[ with #room{, still joined
+        or left while the send queue was full: it ignores #room['s JOIN, so
+        no echo would ever mark it joined.
+        """
+        for left in (False, True):
+            with self.subTest(left=left):
+                fake_irc = FailingPartIRC()
+                bot = make_bot(irc=fake_irc)
+                bot.identity.current = BotPresence(
+                    "alpha", "alpha.host", "inst", "alpha", "~alpha"
+                )
+                mgr = bot.channel_mgr
+                mgr.set_casemapping("ascii")
+                record = ChannelRecord.new("#room{", None, present=True)
+                mgr.apply_record(record)
+                mgr.channels[casefold("#room{", "ascii")].join = JoinState.JOINED
+                if left:
+                    record = ChannelRecord.new(
+                        "#room{", None, present=False, after=record.revision
+                    )
+                    mgr.apply_record(record)
+                    assert mgr.pending_parts == {"#room{": "#room{"}
+
+                mgr.apply_record(
+                    ChannelRecord.new(
+                        "#room[", None, present=True, after=record.revision
+                    ),
+                )
+                runtime = mgr.channels[casefold("#room[", "ascii")]
+                assert runtime.join is JoinState.JOINING
+
+                mgr.set_casemapping("rfc1459")
+
+                assert mgr.runtime("#room{") is runtime
+                assert runtime.joined
+                assert fake_irc.sent == [
+                    ("JOIN", ("#room{",)),
+                    ("JOIN", ("#room[",)),
+                    ("NAMES", ("#room[",)),
+                ]
+                assert mgr.pending_parts == {}
 
     async def test_casemapping_change_keeps_pending_part(self) -> None:
         """Keep a PART the send queue refused pending, rekeyed, and send it later."""
@@ -2203,3 +2258,12 @@ class ChannelStateTests(unittest.TestCase):
                 assert runtime.limit == 5
                 runtime.set_limit(value)
                 assert runtime.limit is None
+
+    def test_update_mode_removing_last_mode_clears_string(self) -> None:
+        """Track a channel with no modes left as "", not "+"."""
+        runtime = ChannelRuntime(ISupportState())
+        runtime.modes = "+n"
+
+        runtime.update_mode("n", adding=False)
+
+        assert runtime.modes == ""

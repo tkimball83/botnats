@@ -101,10 +101,8 @@ class ChannelManager:
                 runtime.key = record.key
 
             if unparted:
-                # Wanted again before its PART went out, so never left: the
-                # server would ignore a JOIN, and NAMES relearns its state.
-                runtime.join = JoinState.JOINED
-                self.refresh_names(runtime)
+                # Wanted again before its PART went out, so never left.
+                self.keep_joined(runtime)
             elif self.bot.identity.current is not None and runtime.join_due():
                 self.safe_join(runtime)
 
@@ -559,6 +557,14 @@ class ChannelManager:
         """Drop a pending PART for a channel this bot has left anyway."""
         self.pending_parts.pop(self.bot.caps.fold(channel), None)
 
+    def keep_joined(self, runtime: ChannelRuntime) -> None:
+        """Mark joined a desired channel this bot never left.
+
+        The server would ignore a JOIN, and NAMES relearns its state.
+        """
+        runtime.join = JoinState.JOINED
+        self.refresh_names(runtime)
+
     def refresh_names(self, runtime: ChannelRuntime) -> None:
         """Send NAMES to relearn a channel, or keep it due for the next tick."""
         try:
@@ -605,7 +611,10 @@ class ChannelManager:
         channel keeps its live runtime: the server sends no JOIN for a channel
         this bot is already in, so a fresh runtime would never become joined.
         """
-        if casemapping not in CASEMAPPINGS or casemapping == self.bot.caps.casemapping:
+        # Fold an unknown casemapping least, so no nicks the server keeps
+        # apart share a session.
+        casemapping = casemapping if casemapping in CASEMAPPINGS else "ascii"
+        if casemapping == self.bot.caps.casemapping:
             return
 
         self.bot.caps.casemapping = casemapping
@@ -638,12 +647,17 @@ class ChannelManager:
             self.channels[folded] = runtime
 
         joined = [runtime.channel for runtime in previous.values() if runtime.joined]
-        # Leave any joined channel that no longer folds onto a desired one.
-        self.pending_parts = {
-            self.bot.caps.fold(channel): channel
-            for channel in (*self.pending_parts.values(), *joined)
-            if self.bot.caps.fold(channel) not in self.channels
-        }
+        member_of = (*self.pending_parts.values(), *joined)
+        self.pending_parts = {}
+        for channel in member_of:
+            folded = self.bot.caps.fold(channel)
+            runtime = self.channels.get(folded)
+            if runtime is None:
+                # Leave a joined channel that no longer folds onto a desired one.
+                self.pending_parts[folded] = channel
+            elif not runtime.joined:
+                # The server merges a channel this bot is in with a desired one.
+                self.keep_joined(runtime)
 
 
 def revision_number(revision: str) -> int:
