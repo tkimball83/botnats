@@ -352,6 +352,9 @@ class PresenceValidTests(unittest.TestCase):
         # ahead stamps the next one.
         ahead = sign({**fresh, "timestamp": int(now) + 1})
         assert store.valid("alpha", ahead, now=now)
+        # A peer's clock may run at most 30 seconds ahead.
+        too_far_ahead = sign({**fresh, "timestamp": int(now) + 31})
+        assert not store.valid("alpha", too_far_ahead, now=now)
 
         surrogate = {
             "bot_id": "alpha",
@@ -434,8 +437,10 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         """Verify a full attempt window denies another authentication attempt."""
         attempts = AttemptStore("efnet", 3, SECRET)
         attempts.kv = AsyncMock()
-        attempts.kv.get.side_effect = KeyNotFoundError()
-        attempts.kv.create.side_effect = KeyWrongLastSequenceError()
+        # Finite, because AsyncMock calls never suspend for bounded() to
+        # interrupt: an unbounded loop fails once the races run out.
+        attempts.kv.get.side_effect = [KeyNotFoundError()] * ATTEMPT_LIMIT
+        attempts.kv.create.side_effect = [KeyWrongLastSequenceError()] * ATTEMPT_LIMIT
 
         assert not await bounded(attempts.allow("host.example", now=60))
         assert attempts.kv.create.await_count == ATTEMPT_LIMIT

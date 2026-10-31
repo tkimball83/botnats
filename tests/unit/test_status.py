@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
 from nats.errors import Error as NatsError
-from nats.js.api import ClusterInfo, PeerInfo
+from nats.js.api import ClusterInfo, PeerInfo, StreamInfo
 
 from botnats.nats.status import (
     MAX_RESPONSE_BYTES,
@@ -88,6 +88,28 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
 
         assert status.render() == (
             "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=3/3 lag=0"
+        )
+
+    async def test_collect_one_replica_cluster(self) -> None:
+        """Report a clustered one-replica stream, which lists no peers, as up."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        # NATS names a one-replica stream's leader but sends no replica list,
+        # which nats-py leaves as None.
+        kv.status.return_value = SimpleNamespace(
+            stream_info=StreamInfo.from_response(
+                {"config": {"num_replicas": 1}, "cluster": {"leader": "nats-1"}},
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 1, 8222))
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=1/1 lag=0"
         )
 
     async def test_collect_leaderless_cluster(self) -> None:

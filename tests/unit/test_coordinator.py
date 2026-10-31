@@ -373,9 +373,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         # The presence key is deleted through the open bucket, so releasing
-        # it after the stores reset, or after closing the client runs the
-        # disconnect callback, would delete nothing. A presence watch still
-        # running would see the deletion and recreate the key.
+        # it after closing the client, whose disconnect callback resets the
+        # stores, would delete nothing. A presence watch still running would
+        # see the deletion and recreate the key.
         presence_kv = AsyncMock()
         presence_kv.delete = AsyncMock(side_effect=delete)
         coordinator.presence_store.kv = presence_kv
@@ -514,7 +514,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         # nats-py's default of 60 attempts closes the client for good after
         # about two minutes of outage, and the restart's connect gives up too.
         assert connect.await_args.kwargs.get("max_reconnect_attempts") == -1
-        assert connect.await_args.kwargs.get("reconnect_time_wait") == RECONNECT_WAIT
+        assert connect.await_args.kwargs.get("reconnect_time_wait") == 1
         assert coordinator.nc is nc
         assert steps == ["subscribe", "stores", "watches"]
 
@@ -2087,20 +2087,38 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 await coordinator.cancel_watches()
 
     async def test_watch_stops_watcher_on_error(self) -> None:
-        """Verify a crashed watch coroutine stops its KV watcher subscription.
+        """Verify a watch whose callback crashes stops its KV watcher subscription.
 
         nats-py would otherwise subscribe it again on every reconnect.
         """
         coordinator = build_coordinator("alpha")
+        record = ChannelRecord.new("#test", None, present=True)
+        signed = coordinator.channels_store.sign(astuple(record))
+        channel = SimpleNamespace(
+            key=coordinator.channels_store.key("#test"),
+            operation=None,
+            value=json.dumps(signed).encode(),
+        )
+        # A peer's key deleted, which the presence and session watches report.
+        deleted = SimpleNamespace(key="beta", operation=KV_DEL, value=None)
+        deliveries = {
+            "watch-channels": ("on_channel", channel),
+            "watch-presence": ("on_presence_delete", deleted),
+            "watch-sessions": ("on_session_delete", deleted),
+        }
+        crash = MagicMock(side_effect=RuntimeError("callback crashed"))
         for name, watch in coordinator.watches().items():
-            with self.subTest(watch=name):
-                kv, subscription = watcher(OSError("disconnected"))
+            callback, entry = deliveries[name]
+            with (
+                self.subTest(watch=name),
+                patch.object(coordinator.callbacks, callback, crash),
+            ):
+                kv, subscription = watcher(entry)
                 # Whichever store the watch opens hands it this watcher.
                 for store in coordinator.stores:
                     store.kv = kv
 
-                # By message: the bound's TimeoutError is an OSError too.
-                with self.assertRaisesRegex(OSError, "disconnected"):
+                with self.assertRaisesRegex(RuntimeError, "callback crashed"):
                     await bounded(watch(MagicMock()))
 
                 subscription.stop.assert_awaited_once()
