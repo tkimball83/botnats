@@ -1435,6 +1435,26 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert mgr.runtime("#new") is None
         assert mgr.channel_records[casefold("#new", "rfc1459")] == winner
 
+    async def test_write_record_refuses_counter_past_maximum(self) -> None:
+        """Refuse a write after the last revision counter, storing nothing."""
+        bot, _, coordinator = bot_with_coordinator()
+        mgr = bot.channel_mgr
+        last = replace(
+            ChannelRecord.new("#test", None, present=True),
+            revision=f"{MAX_CHANNEL_REVISION:020d}-{'0' * 32}",
+        )
+        await bounded(coordinator.channels.put(asdict(last), after=None))
+        mgr.apply_record(last)
+        kv = cast("FakeKV", coordinator.channels.kv)
+        stored = dict(kv.entries)
+
+        with self.assertRaisesRegex(ValueError, "invalid revision"):
+            await bounded(mgr.write_record("#test", "key", present=True))
+
+        assert kv.entries == stored
+        assert mgr.channel_records[casefold("#test", "rfc1459")] == last
+        assert not mgr.writing
+
     async def test_write_applies_authoritative_winner(self) -> None:
         """Converge local channel state when a newer durable mutation wins."""
         coordinator = FakeCoordinator()
@@ -2142,16 +2162,6 @@ class ChannelStateTests(unittest.TestCase):
         assert revision_number(tombstone.revision) > revision_number(update.revision)
         assert tombstone.revision > update.revision
         assert ChannelRecord(*parse_channel_record(asdict(tombstone))) == tombstone
-
-    def test_channel_record_rejects_counter_past_maximum(self) -> None:
-        """Refuse to build a record past the last revision counter."""
-        with self.assertRaisesRegex(ValueError, "counter is exhausted"):
-            ChannelRecord.new(
-                "#test",
-                None,
-                present=True,
-                after=f"{MAX_CHANNEL_REVISION:020d}-{'0' * 32}",
-            )
 
     def test_member_reuses_entry(self) -> None:
         """Verify repeated member lookups reuse the tracked object."""

@@ -881,7 +881,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_cmd_status_with_nats_down(self) -> None:
-        """Report NATS down, with its cluster details unknown, while disconnected."""
+        """Answer STATUS while the coordinator is not ready.
+
+        The NATS line renders whatever status the coordinator reports.
+        """
         bot, fake_irc, coordinator = bot_with_coordinator()
         coordinator.connected = False
         bot.authorizer.grant(OWNER.render())

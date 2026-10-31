@@ -9,9 +9,11 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
+from nats.errors import Error as NatsError
+
 from botnats.irc.protocol import Prefix
 from botnats.presence import IDENTITY_RETRY_DELAY, BotPresence, PresenceRegistry
-from tests.unit.helpers import FakeCoordinator, FakeIRC, make_bot
+from tests.unit.helpers import FakeCoordinator, FakeIRC, bounded, make_bot
 
 if TYPE_CHECKING:
     from botnats.bot import Bot
@@ -144,6 +146,23 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
             await bot.identity.announce()
 
         assert coordinator.presence_puts == [asdict(presence)]
+
+    async def test_announce_skips_failed_publish(self) -> None:
+        """Skip a presence write NATS fails; the next heartbeat retries.
+
+        Raised, the failure would log a traceback on every heartbeat.
+        """
+        coordinator = FakeCoordinator()
+        bot = make_bot(irc=FakeIRC(), coordinator=coordinator)
+        bot.identity.current = BotPresence("alpha", "host", "one", "alpha", "user")
+        failed = AsyncMock(side_effect=NatsError("nats: connection closed"))
+        with (
+            patch.object(coordinator, "put_presence", failed),
+            self.assertNoLogs("botnats", level="ERROR"),
+        ):
+            await bounded(bot.identity.announce())
+
+        failed.assert_awaited_once()
 
     def test_identity_ignores_incomplete_prefix(self) -> None:
         """Record no identity from a prefix lacking its user or host.

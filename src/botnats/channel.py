@@ -21,7 +21,7 @@ from botnats.irc.protocol import (
     mode_requires_argument,
 )
 from botnats.nats.store import PUBLISH_ERRORS
-from botnats.validators import MAX_CHANNEL_REVISION, validate_join
+from botnats.validators import validate_join
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -680,10 +680,6 @@ class ChannelRecord:
     ) -> ChannelRecord:
         """Create a record whose revision follows after, if any."""
         number = revision_number(after) + 1 if after is not None else 1
-        if number > MAX_CHANNEL_REVISION:
-            msg = "channel revision counter is exhausted"
-            raise ValueError(msg)
-
         return cls(
             channel=channel,
             key=key,
