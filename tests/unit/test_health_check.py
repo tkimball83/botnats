@@ -9,7 +9,7 @@ import socket
 import unittest
 from unittest.mock import create_autospec, patch
 
-from botnats.health_check import HealthCheck
+from botnats.health_check import RESPONSE_NOT_FOUND, HealthCheck
 from tests.unit.helpers import bounded
 
 
@@ -101,6 +101,19 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
             await health_check.handle(reader, writer)
 
         writer.write.assert_not_called()
+        writer.close.assert_called_once_with()
+
+    async def test_empty_request_line_is_not_found(self) -> None:
+        """Answer a TCP probe that connects and closes without a request."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+
+        async with asyncio.timeout(5):
+            await health_check.handle(reader, writer)
+
+        writer.write.assert_called_once_with(RESPONSE_NOT_FOUND)
         writer.close.assert_called_once_with()
 
     async def test_liveness_ignores_dependencies(self) -> None:

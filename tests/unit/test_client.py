@@ -919,6 +919,15 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         )
         assert client.outbound.empty()
 
+    async def test_cap_new_without_desired_sends_nothing(self) -> None:
+        """Spend no send credit on a NEW that offers no desired capability."""
+        client = self.cap_client(negotiating=False)
+
+        client.handle_cap(parse_message(":server CAP * NEW :sasl\r\n"))
+
+        assert client.outbound is not None
+        assert client.outbound.empty()
+
     async def test_cap_new_with_full_queue_keeps_session(self) -> None:
         """Drop a CAP NEW request that finds the send queue full, not the session."""
         client = self.cap_client(negotiating=False)
