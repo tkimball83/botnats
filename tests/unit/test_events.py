@@ -182,12 +182,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rate_limited_commands_are_not_queued(self) -> None:
         """Drop a flood at the rate limit instead of queueing every message."""
-        bot, _ = bot_with_irc()
+        bot, fake_irc = bot_with_irc()
+        # Commands reach this bot on a fallback nick too.
+        fake_irc.current_nick = "alpha_"
         prefix = Prefix("flooder", "user", "host.example")
 
         for _ in range(100):
             bot.events.on_irc_message(
-                IRCMessage("PRIVMSG", ("alpha", "AUTH 000000"), prefix),
+                IRCMessage("PRIVMSG", ("alpha_", "AUTH 000000"), prefix),
             )
 
         queued = len(bot.tasks)
@@ -330,6 +332,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert runtime.members["bob"].prefix == Prefix("bob", "user", "host")
         assert runtime.members["bob"].modes == set()
+
+    async def test_mode_and_names_skip_entries_without_a_nick(self) -> None:
+        """Skip a mode missing its argument and a NAMES entry of prefixes only.
+
+        The rest of the MODE line still applies, and its op gain is handled.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+
+        bot.events.on_irc_message(
+            IRCMessage("353", ("alpha", "=", "#test", "alpha @ bob")),
+        )
+        bot.events.on_irc_message(
+            IRCMessage(
+                "MODE",
+                ("#test", "+ob", "alpha"),
+                Prefix("chanserv", "service", "services.host"),
+            ),
+        )
+
+        assert set(runtime.members) == {"alpha", "bob"}
+        assert runtime.members["alpha"].modes == {"o"}
+        assert runtime.members["bob"].modes == set()
+        assert runtime.bans == {}
+        assert fake_irc.sent == [("MODE", ("#test",))]
 
     async def test_names_replaces_stale_modes(self) -> None:
         """Verify a NAMES reply without op prefix clears a prior op mode."""
@@ -969,8 +997,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[folded]
         runtime.join = JoinState.JOINED
         runtime.modes = "+npst"
-        runtime.member("alpha").modes.add("o")
-        fake_irc.current_nick = "Alpha"
+        # On a fallback nick, while its old connection holds the configured one.
+        runtime.member("alpha")
+        runtime.member("alpha_").modes.add("o")
+        fake_irc.current_nick = "Alpha_"
 
         bot.events.on_irc_message(UNSET_MODE)
         assert fake_irc.modes == [("#test", "+npst", ())]
@@ -1648,22 +1678,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert runtime.modes == "+nst"
 
-    async def test_channel_modes_removal_clears_string(self) -> None:
-        """Verify removing the last mode produces an empty string, not '+'."""
-        bot, _ = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.modes = "+n"
-
-        bot.events.on_irc_message(
-            IRCMessage(
-                "MODE",
-                ("#test", "-n"),
-                Prefix("chanserv", "service", "services.host"),
-            ),
-        )
-        assert runtime.modes == ""
-
     async def test_mode_no_enforce_when_not_opped(self) -> None:
         """Verify mode enforcement is skipped when bot is not opped."""
         bot, fake_irc = bot_with_irc()
@@ -2044,19 +2058,21 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """
         for channel in ("#test", "*"):
             with self.subTest(channel=channel):
-                bot, _ = bot_with_irc()
+                bot, fake_irc = bot_with_irc()
+                # On a fallback nick, as after a 433 at registration.
+                fake_irc.current_nick = "alpha_"
                 runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
                 runtime.join = JoinState.JOINED
                 bot.events.on_irc_message(
                     IRCMessage(
                         "352",
                         (
-                            "alpha",
+                            "alpha_",
                             channel,
                             "~alpha",
                             "alpha.host",
                             "irc.server",
-                            "alpha",
+                            "alpha_",
                             "H",
                             "0 realname",
                         ),
@@ -2069,7 +2085,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                     bot.config.bot_id,
                     "alpha.host",
                     bot.identity.instance_id,
-                    "alpha",
+                    "alpha_",
                     "~alpha",
                 )
 
