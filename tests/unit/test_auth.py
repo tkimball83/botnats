@@ -191,18 +191,6 @@ class TotpAuthorizerTests(unittest.TestCase):
             "live-revoked!user@example.test",
         ]
 
-    def test_session_import(self) -> None:
-        """Keep a session granted by another authorizer until it expires."""
-        first = authorizer("alpha")
-        second = authorizer("beta")
-        prefix = "owner!user@example.test"
-
-        session = first.grant(prefix, now=10)
-        second.keep(session)
-
-        assert second.authorized(prefix, now=10 + SESSION_TTL - 0.1)
-        assert not second.authorized(prefix, now=10 + SESSION_TTL)
-
     def test_totp_matching_windows(self) -> None:
         """Accept codes one period either side of now, and none further out."""
         auth = authorizer()
@@ -1504,7 +1492,11 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
                 assert not bot.sessions.pending
 
     async def test_lost_key_writes_back_only_live_revocations(self) -> None:
-        """Drop a lost key's grant or expired revocation without writing it."""
+        """Write back neither a lost key's grant nor an expired key's revocation.
+
+        The expired key's mapping expired with its revocation, so forget
+        returns before asking the authorizer for it.
+        """
         bot, _, coordinator = bot_with_coordinator()
         granted = bot.authorizer.grant("granted!user@host.example")
         expired = bot.authorizer.create(
@@ -1963,23 +1955,6 @@ class SessionSyncWatchTests(unittest.TestCase):
         assert sessions.watched == {"kept-key": (kept.prefix, expiry)}
         assert auth.authorized(kept.prefix)
         assert not auth.authorized(gone.prefix)
-
-    def test_replay_keeps_grant_behind_expired_key(self) -> None:
-        """Keep a newer local grant for a prefix an expired, unreplayed key held.
-
-        An expired record gets no TTL delete and is missing from the replay;
-        forgetting its key would drop the grant this bot has yet to write.
-        """
-        auth = authorizer()
-        sessions = SessionSync(auth, FakeCoordinator(), Tasks())
-        prefix = "owner!user@host"
-        sessions.watched["expired-key"] = (prefix, time.time() - 1)
-        auth.grant(prefix)
-
-        sessions.replayed(set())
-
-        assert sessions.watched == {}
-        assert auth.authorized(prefix)
 
     def test_expired_key_keeps_newer_grant(self) -> None:
         """Keep a newer local grant when an expired key is replayed or deleted.

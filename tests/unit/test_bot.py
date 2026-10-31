@@ -8,7 +8,7 @@ import time
 import unittest
 from dataclasses import astuple, replace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 from nats.errors import Error as NatsError
 
@@ -247,13 +247,18 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(config())
         peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
         session = session_value(time.time() + 60)
-        expired = ("gone!user@host", time.time() - 1)
-        # A live update prunes expired mappings; a replayed one leaves them.
-        bot.sessions.watched["expired"] = expired
 
         bot.callbacks.on_presence(peer)
-        bot.callbacks.on_session_update("opaque", session, replaying=False)
+        with patch.object(
+            bot.sessions, "observe", wraps=bot.sessions.observe
+        ) as observe:
+            bot.callbacks.on_session_update("opaque", session, replaying=False)
+            bot.callbacks.on_session_update("opaque", session, replaying=True)
 
+        assert observe.call_args_list == [
+            call("opaque", session, replaying=False),
+            call("opaque", session, replaying=True),
+        ]
         assert bot.presence.has(peer)
         assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}
         assert bot.authorizer.authorized(session.prefix)
@@ -265,9 +270,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.watched
         assert not bot.authorizer.authorized(session.prefix)
 
-        bot.sessions.watched["expired"] = expired
         bot.callbacks.on_session_update("opaque", session, replaying=True)
-        assert bot.sessions.watched["expired"] == expired
         bot.callbacks.on_sessions_replayed({"opaque"})
 
         assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}

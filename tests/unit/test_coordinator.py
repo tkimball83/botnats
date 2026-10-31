@@ -12,7 +12,14 @@ from dataclasses import asdict, astuple, replace
 from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+    PropertyMock,
+    call,
+    create_autospec,
+    patch,
+)
 
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
@@ -21,6 +28,7 @@ from nats.errors import Error as NatsError
 from nats.js.errors import KeyWrongLastSequenceError
 from nats.js.kv import KV_DEL
 
+from botnats.bot import NATSCallbackHandler
 from botnats.channel import ChannelRecord
 from botnats.nats.claim import PresenceState
 from botnats.nats.coordinator import (
@@ -39,6 +47,7 @@ from botnats.nats.store import (
     PresenceStore,
     SessionStore,
     StoreUnavailableError,
+    parse_session_record,
     presence_signature,
 )
 from botnats.presence import BotPresence
@@ -46,7 +55,6 @@ from tests.unit.helpers import (
     COORDINATION_KEY,
     NATS_CREDENTIAL,
     FakeKV,
-    bot_with_coordinator,
     bounded,
     hang,
     session_record,
@@ -57,8 +65,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from nats.js.kv import KeyValue
-
-    from botnats.bot import NATSCallbackHandler
 
 BETA_PRESENCE = {
     "bot_id": "beta",
@@ -75,21 +81,9 @@ SUBJECT = "botnats.v1.efnet.channel"
 
 
 def build_coordinator(bot_id: str, network: str = "efnet") -> Coordinator:
-    """Build a coordinator whose callbacks accept and ignore every event."""
-    callbacks = cast(
-        "NATSCallbackHandler",
-        SimpleNamespace(
-            on_channel=MagicMock(),
-            on_help=noop_help,
-            on_presence=noop_presence,
-            on_presence_delete=noop_presence_delete,
-            on_session_delete=MagicMock(),
-            on_session_update=MagicMock(),
-            on_sessions_replayed=MagicMock(),
-        ),
-    )
+    """Build a coordinator whose callbacks check each call's shape and ignore it."""
     return Coordinator(
-        callbacks=callbacks,
+        callbacks=create_autospec(NATSCallbackHandler, instance=True),
         config=NATSConfig(
             instance_id=uuid.uuid4().hex,
             monitor_port=8222,
@@ -101,21 +95,6 @@ def build_coordinator(bot_id: str, network: str = "efnet") -> Coordinator:
         ),
         envelope=Envelope(bot_id, COORDINATION_KEY),
     )
-
-
-def noop_help(kind: str, channel: str, presence: BotPresence) -> None:
-    """Accept and ignore any help request."""
-    del kind, channel, presence
-
-
-def noop_presence(presence: BotPresence) -> None:
-    """Accept and ignore a presence update."""
-    del presence
-
-
-def noop_presence_delete(bot_id: str) -> None:
-    """Accept and ignore a presence deletion."""
-    del bot_id
 
 
 def connect_owned(coordinator: Coordinator) -> AsyncMock:
@@ -1668,45 +1647,35 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         replayed.assert_called_once_with({key})
 
     async def test_session_watch_applies_revocation_beyond_horizon(self) -> None:
-        """Revoke a held grant with a signed revocation beyond the horizon.
+        """Report a signed revocation beyond the horizon, but no later grant there.
 
         A peer whose clock runs ahead by more than the grace revokes its own
         grant, which outranks this bot's; skipped, the revocation would leave
-        this bot's grant authorized until it expires. It applies during the
-        replay and after it, and the peer's later grant beyond the horizon
-        does not undo it.
+        this bot's grant authorized until it expires. It is reported during
+        the replay and after it, and the peer's later grant beyond the horizon
+        is not, so it cannot undo the revocation.
         """
-        prefix = "owner!user@host"
+        coordinator = build_coordinator("alpha")
+        key = coordinator.sessions.key("owner!user@host")
+        horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
+        revoked = session_record(horizon + 60, 1, revoked=True)
+        revocation, grant = (
+            SimpleNamespace(key=key, operation=None, value=json.dumps(record).encode())
+            for record in (revoked, session_record(horizon + 120))
+        )
+        session = parse_session_record(COORDINATION_KEY, "efnet", revoked)
         for replaying in (True, False):
-            with self.subTest(replaying=replaying):
-                bot, _, _ = bot_with_coordinator()
-                coordinator = build_coordinator("alpha")
-                coordinator.callbacks = bot.callbacks
-                key = coordinator.sessions.key(prefix)
-                bot.authorizer.keep(
-                    bot.authorizer.create(prefix, time.time() + 60, "alpha"),
-                )
-                horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
-                revocation, grant = (
-                    SimpleNamespace(
-                        key=key,
-                        operation=None,
-                        value=json.dumps(record).encode(),
-                    )
-                    for record in (
-                        session_record(horizon + 60, 1, revoked=True),
-                        session_record(horizon + 120),
-                    )
-                )
-                entries = (revocation, None) if replaying else (None, revocation)
-                kv, _ = watcher(*entries, grant)
-                coordinator.sessions.kv = kv
-
+            entries = (revocation, None) if replaying else (None, revocation)
+            kv, _ = watcher(*entries, grant)
+            coordinator.sessions.kv = kv
+            update = MagicMock()
+            with (
+                self.subTest(replaying=replaying),
+                patch.object(coordinator.callbacks, "on_session_update", update),
+            ):
                 await bounded(coordinator.watch_sessions(MagicMock()))
 
-                assert not bot.authorizer.authorized(prefix)
-                assert key in bot.sessions.watched
-                assert not bot.sessions.pending
+                update.assert_called_once_with(key, session, replaying=replaying)
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""
