@@ -92,6 +92,13 @@ class CommandHandler:
         present: bool,
     ) -> None:
         """Publish a channel record update and apply it locally."""
+        channellen = self.bot.caps.channellen
+        # Past the limit a server refuses the JOIN, or truncates the name to
+        # another channel. Servers count the bytes this bot sends as UTF-8.
+        if present and channellen is not None and len(channel.encode()) > channellen:
+            msg = f"channel name exceeds the server limit of {channellen} bytes"
+            raise ValueError(msg)
+
         if present and self.bot.config.channel_modes:
             # Validation only: reject the join before the durable write when
             # the enforced MODE line cannot fit this channel name in 512 bytes.

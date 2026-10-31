@@ -35,6 +35,7 @@ def advertised_caps() -> ISupportState:
     """Return capabilities a server advertised, each unlike its default."""
     caps = ISupportState(casemapping="ascii")
     caps.apply("CHANMODES", "b,k,l,imn")
+    caps.apply("CHANNELLEN", "50")
     caps.apply("MONITOR", "")
     caps.apply("PREFIX", "(yov)@%+")
     return caps
@@ -330,6 +331,26 @@ class IRCProtocolTests(unittest.TestCase):
 
         assert caps.chanmodes == ("b", "k", "l", "imn")
 
+    def test_isupport_channellen_records_limit(self) -> None:
+        """Record the longest channel name the server advertises."""
+        caps = ISupportState()
+
+        caps.apply("CHANNELLEN", "50")
+
+        assert caps.channellen == 50
+
+    def test_isupport_empty_or_malformed_channellen_gives_no_limit(self) -> None:
+        """Track no channel name limit for an empty or malformed CHANNELLEN."""
+        # Superscript and fullwidth digits pass str.isdigit but are not ASCII.
+        for value in ("", "0", "-50", "+50", "50x", "\u00b2", "\uff15\uff10"):
+            with self.subTest(value=value):
+                caps = ISupportState()
+                caps.apply("CHANNELLEN", "50")
+
+                caps.apply("CHANNELLEN", value)
+
+                assert caps.channellen is None
+
     def test_isupport_empty_prefix_clears_membership_modes(self) -> None:
         """Track no membership prefixes when PREFIX advertises none."""
         for value in ("", "()"):
@@ -370,6 +391,7 @@ class IRCProtocolTests(unittest.TestCase):
         advertised = advertised_caps()
         for name, expected in (
             ("CHANMODES", replace(advertised, chanmodes=default.chanmodes)),
+            ("CHANNELLEN", replace(advertised, channellen=default.channellen)),
             ("MONITOR", replace(advertised, monitor=default.monitor)),
             (
                 "PREFIX",
