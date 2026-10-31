@@ -154,6 +154,7 @@ class ChannelManager:
                 "MODE",
                 runtime.channel,
                 self.bot.config.channel_modes,
+                unless_waiting=True,
             )
         except ConnectionError:
             # The next tick resends NAMES, whose end reply enforces again.
