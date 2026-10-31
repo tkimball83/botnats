@@ -7,7 +7,7 @@ import asyncio
 import io
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 from urllib.parse import urlparse
 
 from nats.errors import Error as NatsError
@@ -20,6 +20,16 @@ from botnats.nats.status import (
     stream_info,
 )
 from tests.unit.helpers import bounded, hang
+
+
+def mock_writer() -> MagicMock:
+    """Create a mock StreamWriter whose methods return None, as the real ones do."""
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.write.return_value = None
+    writer.drain.return_value = None
+    writer.close.return_value = None
+    writer.wait_closed.return_value = None
+    return writer
 
 
 class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
@@ -219,7 +229,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                     b'{"num_routes":2}',
                     b"",
                 ]
-                writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+                writer = mock_writer()
                 connect = AsyncMock(return_value=(reader, writer))
 
                 with patch("asyncio.open_connection", connect):
@@ -234,7 +244,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_route_count_unknown_when_unanswered(self) -> None:
         """Give up on a monitoring port that accepts but never answers."""
-        writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+        writer = mock_writer()
 
         with (
             patch(
@@ -256,7 +266,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             b'{"num_routes":2}',
             b"",
         ]
-        writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+        writer = mock_writer()
 
         with patch(
             "asyncio.open_connection",
@@ -274,7 +284,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         )
         reader = AsyncMock()
         reader.read.side_effect = response.read
-        writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+        writer = mock_writer()
 
         with patch(
             "asyncio.open_connection",
@@ -307,7 +317,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         """Treat a monitoring payload too deep to parse as an unknown count."""
         reader = AsyncMock()
         reader.read.side_effect = [b"HTTP/1.0 200 OK\r\n\r\n", b"[[]]", b""]
-        writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+        writer = mock_writer()
 
         # The parser overflows only past the native stack, a depth that varies
         # by platform, so raise its RecursionError directly.
@@ -337,7 +347,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(body=body):
                 reader = AsyncMock()
                 reader.read.side_effect = [b"HTTP/1.0 200 OK\r\n\r\n", body, b""]
-                writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+                writer = mock_writer()
 
                 with patch(
                     "asyncio.open_connection",

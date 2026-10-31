@@ -7,10 +7,20 @@ import asyncio
 import ipaddress
 import socket
 import unittest
-from unittest.mock import create_autospec, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 from botnats.health_check import RESPONSE_NOT_FOUND, HealthCheck
 from tests.unit.helpers import bounded
+
+
+def mock_writer() -> MagicMock:
+    """Create a mock StreamWriter whose methods return None, as the real ones do."""
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.write.return_value = None
+    writer.drain.return_value = None
+    writer.close.return_value = None
+    writer.wait_closed.return_value = None
+    return writer
 
 
 class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
@@ -73,7 +83,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_timeout_closes_connection(self) -> None:
         """Close a connection that sends no request line within the timeout."""
         health_check = HealthCheck(ready=lambda: True, port=0)
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        writer = mock_writer()
         real_timeout = asyncio.timeout
         delays: list[float | None] = []
 
@@ -92,7 +102,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     async def test_overlong_request_line_closes_connection(self) -> None:
         """Close a connection whose request line overflows the reader limit."""
         health_check = HealthCheck(ready=lambda: True, port=0)
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        writer = mock_writer()
         reader = asyncio.StreamReader(limit=64)
         reader.feed_data(b"GET /" + b"x" * 128 + b" HTTP/1.0\r\n\r\n")
         reader.feed_eof()
@@ -106,7 +116,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_request_line_is_not_found(self) -> None:
         """Answer a TCP probe that connects and closes without a request."""
         health_check = HealthCheck(ready=lambda: True, port=0)
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        writer = mock_writer()
         reader = asyncio.StreamReader()
         reader.feed_eof()
 
