@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from collections.abc import Collection
 
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+")
-MAX_CHANNEL_REVISION = (1 << 63) - 1
 CHANNEL_REVISION_RE = re.compile(r"[0-9]{20}-[0-9a-f]{32}")
 # A safe channel's full name starts with its 5-character channel ID (RFC 2811
 # 3.2 and 5.2.1). The server answers a JOIN by short name under the full name,
@@ -68,11 +67,7 @@ def validate_join(channel: str, key: str | None) -> tuple[str, str | None]:
 
 def validate_channel_revision(value: object) -> str:
     """Verify a durable channel revision and return it."""
-    if (
-        not isinstance(value, str)
-        or CHANNEL_REVISION_RE.fullmatch(value) is None
-        or int(value.partition("-")[0]) > MAX_CHANNEL_REVISION
-    ):
+    if not isinstance(value, str) or CHANNEL_REVISION_RE.fullmatch(value) is None:
         msg = "channel record has an invalid revision"
         raise ValueError(msg)
 

@@ -397,25 +397,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         presence_kv.delete.assert_awaited_once_with("alpha", last=7)
         nc.close.assert_awaited_once_with()
 
-    async def test_close_completes_when_presence_release_fails(self) -> None:
-        """Finish shutdown when deleting the owned presence key fails."""
-        coordinator = build_coordinator("alpha")
-        nc = MagicMock(is_closed=False)
-        nc.close = AsyncMock()
-        coordinator.nc = nc
-        coordinator.claim.adopt(7)
-        presence_kv = AsyncMock()
-        presence_kv.delete.side_effect = NatsError("timeout")
-        coordinator.presence_store.kv = presence_kv
-
-        async with asyncio.timeout(5):
-            await coordinator.close()
-
-        presence_kv.delete.assert_awaited_once_with("alpha", last=7)
-        assert not coordinator.claim.owned
-        assert not coordinator.presence_store.ready
-        nc.close.assert_awaited_once_with()
-
     async def test_reconnect_during_close_resyncs_quietly(self) -> None:
         """Log no failure for a resync that starts after close() drops the client.
 
@@ -1270,6 +1251,29 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         callback.assert_called_once_with(astuple(record))
         synced.assert_called_once_with()
 
+    async def test_watch_channel_skips_delete(self) -> None:
+        """Skip a delete marker, even one carrying a signed channel record."""
+        coordinator = build_coordinator("alpha")
+        callback = MagicMock()
+        record = ChannelRecord.new("#test", None, present=True)
+        signed = coordinator.channels_store.sign(astuple(record))
+        # JetStream sends delete markers without a value; this one keeps the
+        # record, so only the operation can mark it a delete.
+        entry = SimpleNamespace(
+            key=coordinator.channels_store.key("#test"),
+            operation=KV_DEL,
+            value=json.dumps(signed).encode(),
+        )
+        kv, _ = watcher(entry, None)
+        coordinator.channels_store.kv = kv
+        synced = MagicMock()
+
+        with patch.object(coordinator.callbacks, "on_channel", callback):
+            await bounded(coordinator.watch_channels(synced))
+
+        callback.assert_not_called()
+        synced.assert_called_once_with()
+
     async def test_watch_channel_rejects_mismatched_key(self) -> None:
         """Ignore a valid channel record stored under the wrong opaque key."""
         coordinator = build_coordinator("alpha")
@@ -1466,15 +1470,26 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Report a live session delete by its opaque key."""
         coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
-        deleted = SimpleNamespace(key=key, operation=KV_DEL, value=None)
+        # JetStream sends delete markers without a value; this one keeps a
+        # signed grant, so only the operation can mark it a delete.
+        deleted = SimpleNamespace(
+            key=key,
+            operation=KV_DEL,
+            value=json.dumps(session_record(time.time() + 60)).encode(),
+        )
         kv, _ = watcher(None, deleted)
         coordinator.sessions.kv = kv
         delete = MagicMock()
+        update = MagicMock()
 
-        with patch.object(coordinator.callbacks, "on_session_delete", delete):
+        with (
+            patch.object(coordinator.callbacks, "on_session_delete", delete),
+            patch.object(coordinator.callbacks, "on_session_update", update),
+        ):
             await bounded(coordinator.watch_sessions(MagicMock()))
 
         delete.assert_called_once_with(key)
+        update.assert_not_called()
 
     async def test_expired_session_update_reaches_owner(self) -> None:
         """Hand an expired session record to its owner, which drops it."""

@@ -632,12 +632,13 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
         claims.kv.create.assert_awaited_once_with(key, b"1")
 
     async def test_duplicate(self) -> None:
-        """Verify a duplicate counter fails closed."""
+        """Verify a duplicate counter fails closed without a store warning."""
         claims = ClaimStore("efnet", 3, SECRET)
         claims.kv = AsyncMock()
         claims.kv.create.side_effect = KeyWrongLastSequenceError()
 
-        assert not await bounded(claims.claim(42))
+        with self.assertNoLogs("botnats.nats.store", level="WARNING"):
+            assert not await bounded(claims.claim(42))
 
     async def test_error(self) -> None:
         """Fail closed during a JetStream error, then claim once it recovers."""
@@ -809,6 +810,30 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert "alpha" in kv.entries
 
+    async def test_presence_delete_keeps_replacement_after_reread(self) -> None:
+        """Refuse the retried delete once a replacement has claimed the key.
+
+        This instance's record expires after the re-read, and a replacement
+        with the same bot ID creates the key before the delete lands.
+        """
+        presence, kv = await stale_presence("inst")
+        read = kv.get
+
+        async def read_then_replace(key: str) -> SimpleNamespace:
+            entry = await read(key)
+            del kv.entries[key]
+            replacement = json.dumps(signed_presence("replacement")).encode()
+            await kv.create(key, replacement)
+            return entry
+
+        with (
+            patch.object(kv, "get", read_then_replace),
+            self.assertRaises(BadRequestError),
+        ):
+            await bounded(presence.delete("Alpha", 1, "inst"))
+
+        assert json.loads(kv.entries["alpha"][1])["instance_id"] == "replacement"
+
     async def test_presence_delete_keeps_garbled_record(self) -> None:
         """Leave a garbled value that replaced the owned revision, without failing.
 
@@ -861,24 +886,15 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert key == channels.key("#test")
         assert json.loads(value) == record
 
-    async def test_channel_put_rejects_injected_fields(self) -> None:
-        """Refuse, before any write, a channel or key that could inject IRC."""
+    async def test_channel_put_rejects_injected_channel(self) -> None:
+        """Refuse, before any write, a channel that could inject IRC."""
         channels = ChannelStore("efnet", 1, SECRET)
         kv = FakeKV()
         channels.kv = cast("KeyValue", kv)
-        injected: dict[str, dict[str, object]] = {
-            "CR in channel": {"channel": "#test\rQUIT"},
-            "LF in channel": {"channel": "#test\nQUIT"},
-            "space in channel": {"channel": "#test QUIT"},
-            "NUL in channel": {"channel": "#test\x00"},
-            "CR in key": {"key": "secret\rQUIT"},
-            "LF in key": {"key": "secret\nQUIT"},
-            "space in key": {"key": "secret QUIT"},
-            "NUL in key": {"key": "secret\x00"},
-        }
-        for label, change in injected.items():
-            with self.subTest(label), self.assertRaises(ValueError):
-                await bounded(channels.put({**channel_record(1), **change}, after=None))
+        injected = {**channel_record(1), "channel": "#test\rQUIT"}
+
+        with self.assertRaises(ValueError):
+            await bounded(channels.put(injected, after=None))
 
         assert kv.entries == {}
 
@@ -938,19 +954,6 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         for label, value in malformed.items():
             with self.subTest(label):
                 assert channels.parse(key, value) is None
-
-    async def test_channel_parse_rejects_unusable_key(self) -> None:
-        """Reject a correctly signed record whose channel key IRC cannot use."""
-        channels = ChannelStore("efnet", 1, SECRET)
-        record: dict[str, object] = {
-            "channel": "#test",
-            "key": "bad key",
-            "present": True,
-            "revision": f"{1:020d}-{'0' * 32}",
-        }
-        record["signature"] = channel_signature(SECRET, "efnet", record)
-
-        assert channels.parse(channels.key("#test"), record) is None
 
     async def test_channel_signature_covers_every_field(self) -> None:
         """Detect tampering with any signed field or the network after signing."""

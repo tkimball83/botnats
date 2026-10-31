@@ -346,7 +346,8 @@ class Coordinator:
 
         A lost race or transient failure concerns only this key; letting it
         propagate would restart the whole watch and drop readiness for a full
-        replay. The next presence heartbeat retries the reclaim.
+        replay. The next presence heartbeat, once this bot knows its IRC
+        identity, retries the reclaim.
         """
         try:
             await transition()

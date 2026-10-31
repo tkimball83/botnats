@@ -25,7 +25,7 @@ from botnats.channel import (
 from botnats.config import mode_intent
 from botnats.irc.protocol import IRCMessage, ISupportState, Prefix, casefold
 from botnats.presence import BotPresence
-from botnats.validators import MAX_CHANNEL_REVISION, parse_channel_record
+from botnats.validators import parse_channel_record
 from tests.unit.helpers import (
     OWNER,
     FailingPartIRC,
@@ -1496,7 +1496,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         mgr = bot.channel_mgr
         last = replace(
             ChannelRecord.new("#test", None, present=True),
-            revision=f"{MAX_CHANNEL_REVISION:020d}-{'0' * 32}",
+            revision=f"{'9' * 20}-{'0' * 32}",
         )
         await bounded(coordinator.channels.put(asdict(last), after=None))
         mgr.apply_record(last)
