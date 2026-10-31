@@ -169,7 +169,9 @@ async def cluster_restart() -> None:
     """Restart every NATS node; durable state must survive."""
     await test_restart.mark()
     await compose("kill", *NATS_NODES)
-    await compose(*UP)
+    # Only the NATS nodes: compose would also start a bot that died during the
+    # outage, hiding the crash from the readiness wait below.
+    await compose(*UP, *NATS_NODES)
     await publish_nats_addresses()
     # Check durable state before waiting on bot readiness so the TTL'd claim
     # is read well inside its TTL; the bots' own recovery is verified after.

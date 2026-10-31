@@ -92,6 +92,8 @@ Example `bot.json`:
 
 Plain IRC exposes commands and responses, so use a trusted network when IRCS is
 unavailable. JetStream requires file storage; persist each peer's directory.
+The replica count is fixed once the buckets exist: a later change leaves bots
+unready until the `KV_botnats_v1_<network>_*` streams are edited to match.
 
 The NATS client uses TLS only when the server requires it, and nothing stops an
 on-path attacker from stripping that request and reading the token, so run NATS
