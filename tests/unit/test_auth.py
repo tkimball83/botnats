@@ -38,6 +38,7 @@ from tests.unit.helpers import (
     make_bot,
     send_command,
     session_value,
+    settle,
 )
 
 
@@ -1253,7 +1254,11 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.pending
 
     async def test_revocation_retries_authoritative_active_winner(self) -> None:
-        """Revoke a newer active session returned by the durable store."""
+        """Revoke a newer active session returned by the durable store.
+
+        The QUIT's drain spawns the retry that writes the escalation, so peers
+        stop honoring the grant without waiting for a maintenance tick.
+        """
         bot, _, coordinator = bot_with_coordinator()
         prefix = Prefix("owner", "user", "host.example")
         active = bot.authorizer.grant(prefix.render())
@@ -1275,12 +1280,9 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(side_effect=put_session),
         ):
             bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-            await drain_session_writes(bot)
-            assert not bot.authorizer.authorized(prefix.render())
-            assert bot.sessions.pending
-            async with asyncio.timeout(1):
-                await bot.sessions.retry()
+            await settle(bot)
 
+        assert not bot.authorizer.authorized(prefix.render())
         # The retry revokes the winner itself, not the original session.
         escalated = bot.authorizer.create(
             winner.prefix,
@@ -1787,8 +1789,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         """Write the escalation a queued revocation meets at shutdown.
 
         A peer granted the identity again, unseen by this bot, so the queued
-        revocation loses to that grant. Its escalation would wait for the
-        next retry, which shutdown never makes.
+        revocation loses to that grant. Its escalation would otherwise be left
+        to a background retry, which shutdown cancels.
         """
         bot, _, coordinator = bot_with_coordinator()
         prefix = "owner!user@host.example"
@@ -1847,6 +1849,17 @@ class SessionSyncWatchTests(unittest.TestCase):
         sessions.invalidate("c!u@h")
         assert not sessions.watched_valid("a!u@h")
         assert sessions.watched_valid("b!u@h")
+
+    def test_unwatched_identity_is_not_valid(self) -> None:
+        """Fail closed for an identity no command watches, as after its release."""
+        sessions = SessionSync(authorizer(), FakeCoordinator(), Tasks())
+        assert not sessions.watched_valid("a!u@h")
+
+        sessions.watch_identity("a!u@h")
+        assert sessions.watched_valid("a!u@h")
+
+        sessions.unwatch_identity("a!u@h")
+        assert not sessions.watched_valid("a!u@h")
 
     def test_session_identity_cache_prunes_during_updates(self) -> None:
         """Prune expired key mappings during normal watch traffic."""

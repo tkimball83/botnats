@@ -310,10 +310,10 @@ class SessionSync:
     async def flush(self) -> None:
         """Write everything queued at shutdown, escalations included.
 
-        A drain leaves an escalated revocation for the next retry, which
-        shutdown never makes, so drain again until the queue is empty or a
-        pass changes nothing, as when JetStream fails or the store refuses
-        the rest.
+        A drain leaves an escalated revocation to a background retry, which
+        shutdown cancels instead of awaiting, so drain again until the queue
+        is empty or a pass changes nothing, as when JetStream fails or the
+        store refuses the rest.
         """
         async with self.lock:
             while self.pending:
@@ -402,10 +402,12 @@ class SessionSync:
                 winner.version + 1,
                 revoked=True,
             )
-            # The write succeeded; the replacement waits for the next
-            # retry so later identities are not held behind it.
+            # The write succeeded; a retry writes the replacement once this
+            # drain releases the lock, so later identities are not held
+            # behind it.
             self.authorizer.keep(replacement)
             self.pending[identity] = replacement
+            self.tasks.spawn(self.retry(), "session-sync")
             return True
 
         del self.pending[identity]
