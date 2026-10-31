@@ -105,6 +105,8 @@ class ISupportState:
 
     casemapping: str = DEFAULT_CASEMAPPING
     chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES
+    # The longest channel name a client may join, or None for no known limit.
+    channellen: int | None = None
     member_prefixes: dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_MEMBER_PREFIXES),
     )
@@ -123,6 +125,10 @@ class ISupportState:
         match name:
             case "CHANMODES":
                 self.parse_chanmodes(value)
+            case "CHANNELLEN":
+                # An empty value means no limit, and a malformed one leaves none known.
+                limit = int(value) if value.isascii() and value.isdigit() else 0
+                self.channellen = limit or None
             case "MONITOR":
                 # The value is only a target limit, and this bot monitors one.
                 self.monitor = True
@@ -135,6 +141,8 @@ class ISupportState:
         match name:
             case "CHANMODES":
                 self.chanmodes = default.chanmodes
+            case "CHANNELLEN":
+                self.channellen = default.channellen
             case "MONITOR":
                 self.monitor = default.monitor
             case "PREFIX":

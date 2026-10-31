@@ -994,6 +994,60 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "Parting #test")]
         assert coordinator.channel_puts[-1]["present"] is False
 
+    async def test_join_accepts_name_at_server_channellen(self) -> None:
+        """Store a JOIN of a channel name exactly as long as the server allows."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.caps.apply("CHANNELLEN", "50")
+        bot.authorizer.grant(OWNER.render())
+        channel = "#" + "a" * 49
+
+        await bounded(bot.commands.dispatch(OWNER, f"JOIN {channel}"))
+
+        assert fake_irc.privmsgs == [("owner", f"Joining {channel}")]
+        assert coordinator.channel_puts[-1]["channel"] == channel
+
+    async def test_join_refuses_name_over_server_channellen(self) -> None:
+        """Refuse, before storing it, a JOIN of a name the server would not take.
+
+        A server that truncates it would put this bot in another channel.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.caps.apply("CHANNELLEN", "50")
+        bot.authorizer.grant(OWNER.render())
+        # 50 characters, but 51 bytes in UTF-8.
+        channel = "#" + "a" * 48 + "é"
+
+        await bounded(bot.commands.dispatch(OWNER, f"JOIN {channel}"))
+
+        assert fake_irc.privmsgs == [
+            ("owner", "channel name exceeds the server limit of 50 bytes"),
+        ]
+        assert coordinator.channel_puts == []
+
+    async def test_part_ignores_server_channellen(self) -> None:
+        """Part a channel whose stored name is longer than the server allows."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.caps.apply("CHANNELLEN", "4")
+        bot.authorizer.grant(OWNER.render())
+
+        await bounded(bot.commands.dispatch(OWNER, "PART #test"))
+
+        assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        assert coordinator.channel_puts[-1]["channel"] == "#test"
+        assert coordinator.channel_puts[-1]["present"] is False
+
+    async def test_join_without_channellen_takes_long_name(self) -> None:
+        """Store a long JOIN when the server advertises no CHANNELLEN."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        # Longer than the 200 that RFC 1459 allowed.
+        channel = "#" + "a" * 300
+
+        await bounded(bot.commands.dispatch(OWNER, f"JOIN {channel}"))
+
+        assert fake_irc.privmsgs == [("owner", f"Joining {channel}")]
+        assert coordinator.channel_puts[-1]["channel"] == channel
+
     async def test_join_without_enforced_modes(self) -> None:
         """Join under the default config, which enforces no channel modes."""
         bot, fake_irc, coordinator = bot_with_coordinator()
