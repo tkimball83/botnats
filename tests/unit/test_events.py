@@ -400,7 +400,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.modes == [("#test", "+b", ("*!*@owner",))]
 
     async def test_end_of_names(self) -> None:
-        """Query members, modes, and bans after NAMES; ask peers for op."""
+        """Query members, modes, and bans after NAMES; ask peers for op if needed."""
         bot, fake_irc, coordinator = bot_with_coordinator()
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
@@ -413,10 +413,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha")
         runtime.member("beta").prefix = peer.to_prefix()
         runtime.member("beta").modes.add("o")
+        end_of_names = IRCMessage("366", ("alpha", "#test", "End of /NAMES list"))
 
-        bot.events.on_irc_message(
-            IRCMessage("366", ("alpha", "#test", "End of /NAMES list")),
-        )
+        bot.events.on_irc_message(end_of_names)
         await settle(bot)
 
         assert fake_irc.sent == [
@@ -424,6 +423,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             ("MODE", ("#test",)),
             ("MODE", ("#test", "+b")),
         ]
+        assert [kind for kind, _ in coordinator.help_requests] == ["op"]
+
+        # Opped, it asks for nothing, even past the request cooldown.
+        runtime.member("alpha").modes.add("o")
+        runtime.cooldowns.clear()
+        bot.events.on_irc_message(end_of_names)
+        await settle(bot)
+
         assert [kind for kind, _ in coordinator.help_requests] == ["op"]
 
     async def test_end_of_names_queries_resent_after_refusal(self) -> None:
@@ -519,11 +526,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime.members["carol"].modes == set()
 
     async def test_quit_with_host_only_prefix_revokes_via_member(self) -> None:
-        """Revoke the member's full identity on a QUIT lacking the user part."""
+        """Revoke the member's full identity on a QUIT lacking the user part.
+
+        A desired channel the member is not in, searched first, is skipped.
+        """
         bot, _, coordinator = bot_with_coordinator()
         owner = Prefix("owner", "user", "static.example")
         bot.authorizer.grant(owner.render())
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        runtime = bot.channel_mgr.channels[casefold("#other", "rfc1459")]
         runtime.member("owner").prefix = owner
 
         bot.events.on_irc_message(
@@ -2038,9 +2049,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_self_join_clears_state(self) -> None:
         """Reset channel state on a self-join and learn this bot's identity.
 
-        The JOIN echo's prefix replaces an outdated identity.
+        The JOIN echo's prefix replaces an outdated identity, and the joins
+        that identity change prompts skip the channel just joined.
         """
-        bot, _, _ = bot_with_coordinator()
+        bot, fake_irc, _ = bot_with_coordinator()
         bot.identity.current = BotPresence(
             bot.config.bot_id,
             "old.host",
@@ -2069,6 +2081,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             "alpha",
             "~alpha",
         )
+        assert fake_irc.sent == []
 
     async def test_self_join_orphaned(self) -> None:
         """Verify self-join to undesired channel triggers immediate part."""
