@@ -2139,6 +2139,24 @@ class SessionSyncWatchTests(unittest.TestCase):
         assert not sessions.watched_valid("a!u@h")
         assert sessions.watched_valid("b!u@h")
 
+    def test_invalidate_nick_marks_every_identity_of_the_nick(self) -> None:
+        """Invalidate each identity sent from a nick, folded by the casemapping.
+
+        An identity of another nick, even one whose user is that nick, stays.
+        """
+        bot, _ = bot_with_irc()
+        identities = ("Owner[!user@host", "owner{!other@elsewhere", "other!owner[@host")
+        for identity in identities:
+            bot.sessions.watch_identity(identity)
+
+        bot.sessions.invalidate_nick("OWNER{")
+
+        assert [bot.sessions.watched_valid(identity) for identity in identities] == [
+            False,
+            False,
+            True,
+        ]
+
     def test_unwatched_identity_is_not_valid(self) -> None:
         """Fail closed for an identity no command watches, as after its release."""
         sessions = SessionSync(authorizer(), FakeCoordinator(), Tasks())

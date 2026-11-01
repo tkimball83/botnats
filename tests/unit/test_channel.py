@@ -1888,8 +1888,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_peer_help_needs_presence_when_sent(self) -> None:
         """Bind an invite or op to the peer's presence, checked when its turn comes.
 
-        Flood pacing can hold the line for minutes: the peer may leave
-        meanwhile, and another user take its nick.
+        Flood pacing can hold the line for minutes, while the peer leaves the
+        mesh.
         """
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
@@ -1913,6 +1913,35 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             bot.presence.remove(peer.bot_id)
 
         assert [check() for check in checks] == [False, False]
+
+    async def test_peer_op_needs_the_member_when_sent(self) -> None:
+        """Drop a queued peer op once another user holds the peer's nick.
+
+        A netsplit, or the peer's IRC link dropping, leaves its presence
+        standing while another user takes the nick and joins.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha").modes.add("o")
+        runtime.member("gamma").prefix = OP_REQUESTER.to_prefix()
+        bot.presence.update(OP_REQUESTER)
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            bot.channel_mgr.op_peer("#test", OP_REQUESTER)
+
+        check = send.call_args.kwargs["check"]
+        assert check()
+
+        bot.events.on_irc_message(
+            IRCMessage("QUIT", ("*.net *.split",), OP_REQUESTER.to_prefix()),
+        )
+        bot.events.on_irc_message(
+            IRCMessage("JOIN", ("#test",), Prefix("gamma", "mallory", "evil.example")),
+        )
+
+        assert bot.presence.has(OP_REQUESTER)
+        assert not check()
 
     async def test_make_room_raises_limit_for_left_out_bots(self) -> None:
         """Raise a full channel's limit by the number of bots not in it."""

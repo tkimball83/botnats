@@ -690,13 +690,14 @@ class IRCEventHandler:
         """Revoke the session of an identity that left or changed.
 
         A prefix that member state could not complete, as for a member known
-        only from NAMES, names only the nick, so every live session held for
-        the nick is revoked, failing closed: one nick belongs to one user at
-        a time.
+        only from NAMES, names only the nick, so every identity holding the
+        nick is invalidated for pending commands and its live session revoked,
+        failing closed: one nick belongs to one user at a time.
         """
         if prefix.complete:
             self.bot.sessions.revoke(prefix)
         else:
+            self.bot.sessions.invalidate_nick(prefix.nick)
             for held in self.bot.authorizer.live_prefixes(prefix.nick):
                 self.bot.sessions.revoke(Prefix.parse(held))
 

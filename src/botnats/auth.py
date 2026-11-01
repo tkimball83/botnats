@@ -213,6 +213,19 @@ class SessionSync:
             for key, (count, invalidated) in self.watched_identities.items()
         }
 
+    def invalidate_nick(self, nick: str) -> None:
+        """Invalidate the identity of every pending command sent from a nick.
+
+        For a departure member state could not complete, which names only the
+        nick. A command may spell the nick another way the casemapping folds
+        together.
+        """
+        fold = self.authorizer.identity_fold
+        self.watched_identities = {
+            key: (count, invalidated or fold(key.partition("!")[0]) == fold(nick))
+            for key, (count, invalidated) in self.watched_identities.items()
+        }
+
     def invalidate_all(self) -> None:
         """Invalidate every pending command's identity after IRC disconnects.
 
