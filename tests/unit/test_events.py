@@ -321,6 +321,26 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         # Only the JOIN spent budget.
         assert len(bot.commands.command_limiter.buckets["real.host"]) == 1
 
+    async def test_commands_need_no_channel_while_only_tombstones_remain(
+        self,
+    ) -> None:
+        """Hear any sender once every channel is parted, so the next JOIN can come.
+
+        A part tombstone is a record, not a desired channel.
+        """
+        fake_irc = FakeIRC()
+        bot = bot_with_channel(irc=fake_irc, coordinator=FakeCoordinator())
+        current = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
+        bot.channel_mgr.apply_record(
+            ChannelRecord.new("#test", None, present=False, after=current.revision),
+        )
+        bot.authorizer.grant(OWNER.render())
+
+        bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", "XYZZY"), OWNER))
+        await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Unknown command")]
+
     async def test_commands_need_known_channels_to_pass_ungated(self) -> None:
         """Refuse an unseen sender, though no channel is desired, until ready.
 
@@ -2327,6 +2347,27 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.authorizer.authorized(OWNER.render())
         assert bot.authorizer.authorized(other.render())
+        assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
+            (OWNER.render(), True),
+        ]
+
+    async def test_kick_of_untracked_member_revokes_its_nick(self) -> None:
+        """Revoke the live sessions held for a kicked nick no channel tracks.
+
+        A channel wanted again before its PART went out stays joined with no
+        members until NAMES answers, so the bare nick is all this bot knows.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        bot.authorizer.grant(OWNER.render())
+
+        bot.events.on_irc_message(
+            IRCMessage("KICK", ("#test", "owner"), Prefix("op", "~op", "op.host")),
+        )
+        await drain_session_writes(bot)
+
+        assert not bot.authorizer.authorized(OWNER.render())
         assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
             (OWNER.render(), True),
         ]
