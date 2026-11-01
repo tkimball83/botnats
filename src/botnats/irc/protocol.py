@@ -339,7 +339,7 @@ def iter_mode_changes(
     # arguments paired with their modes.
     if sum(consumes) == len(arguments) + 1:
         for position, (adding, mode) in enumerate(changes):
-            if mode == "k" and not adding and consumes[position]:
+            if mode == "k" and not adding:
                 consumes[position] = False
                 break
 

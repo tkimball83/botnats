@@ -338,7 +338,6 @@ class ChannelManager:
                 member is not None
                 and not full_prefix.complete
                 and member.prefix is not None
-                and member.prefix.complete
             ):
                 full_prefix = member.prefix
 
@@ -361,7 +360,7 @@ class ChannelManager:
             member.nick = new_nick
             member_prefix = member.prefix
             if member_prefix is not None:
-                if not old_prefix.complete and member_prefix.complete:
+                if not old_prefix.complete:
                     old_prefix = member_prefix
 
                 member.prefix = Prefix(new_nick, member_prefix.user, member_prefix.host)
@@ -383,11 +382,7 @@ class ChannelManager:
             if member is None:
                 continue
 
-            if (
-                not old_prefix.complete
-                and member.prefix is not None
-                and member.prefix.complete
-            ):
+            if not old_prefix.complete and member.prefix is not None:
                 old_prefix = member.prefix
 
             member.prefix = new_prefix

@@ -81,10 +81,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert "*!*@banned.host" in runtime.bans.values()
 
     async def test_ban_matching_bot_requests_unban(self) -> None:
-        """Track every new ban, and ask peers to lift only one matching this bot."""
+        """Track every new ban, and ask peers to lift only one matching this bot.
+
+        A nick mask matches under the server's casemapping: rfc1459 folds
+        the [ of alpha[1 to {.
+        """
         bot, _, coordinator = bot_with_coordinator()
         bot.identity.current = BotPresence(
-            "alpha", "alpha.host", "inst", "alpha", "~alpha"
+            "alpha", "alpha.host", "inst", "alpha[1", "~alpha"
         )
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         bot.presence.update(peer)
@@ -105,6 +109,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await ban("*!*@alpha.host")
         assert set(runtime.bans.values()) == {"*!*@other.host", "*!*@alpha.host"}
         assert [kind for kind, _ in coordinator.help_requests] == ["unban"]
+
+        # Past the request cooldown, a nick mask asks again.
+        runtime.cooldowns.clear()
+        await ban("Alpha{*!*@*")
+        assert [kind for kind, _ in coordinator.help_requests] == ["unban", "unban"]
 
     async def test_unban_mode_forgets_tracked_ban(self) -> None:
         """Forget a tracked ban when MODE -b lifts it, ignoring case."""

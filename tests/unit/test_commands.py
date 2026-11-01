@@ -187,10 +187,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_failure_without_message_gets_generic_reply(self) -> None:
-        """Reply "Command failed" when the error a command raised has no text.
-
-        A write cut off by a timeout raises a bare TimeoutError.
-        """
+        """Reply "Command failed" when the error a command raised has no text."""
         bot, fake_irc, coordinator = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
 
@@ -912,6 +909,55 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
                     join_test_channel(bot, Prefix("Target", "other", "other.host"))
 
                     assert not check()
+
+    async def test_target_lines_tell_names_only_members_apart(self) -> None:
+        """Bind each line to its target member, even one alike in every field.
+
+        Known only from NAMES, the target and the user who takes its nick
+        share nick, modes, and a missing prefix: only the member itself tells
+        them apart.
+        """
+        for text, status in (
+            ("OP #test Target", ""),
+            ("KICK #test Target", ""),
+            ("DEOP #test Target", "@"),
+        ):
+            with self.subTest(text=text):
+                bot, fake_irc, _ = bot_with_coordinator()
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.join = JoinState.JOINED
+                runtime.member("alpha").modes.add("o")
+                bot.authorizer.grant(OWNER.render())
+                bot.events.on_irc_message(
+                    IRCMessage(
+                        "353",
+                        ("alpha", "=", "#test", f"{status}Target {status}Other"),
+                    ),
+                )
+
+                with patch.object(
+                    fake_irc, "send", MagicMock(wraps=fake_irc.send)
+                ) as send:
+                    await send_command(bot, OWNER, text)
+
+                checks = [
+                    entry.kwargs.get("check")
+                    for entry in send.call_args_list
+                    if entry.args[0] != "PRIVMSG"
+                ]
+                assert len(checks) == 1
+                check = checks[0]
+                assert check is not None
+                assert check()
+
+                bot.events.on_irc_message(
+                    IRCMessage("QUIT", ("Quit",), Prefix("Target", "user", "host")),
+                )
+                bot.events.on_irc_message(
+                    IRCMessage("NICK", ("Target",), Prefix("Other", "other", "host")),
+                )
+
+                assert not check()
 
     async def test_admin_op(self) -> None:
         """Verify OP command grants operator mode directly."""
