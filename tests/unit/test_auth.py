@@ -983,47 +983,56 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         A SIGTERM ends the IRC loop, which reports the disconnect, then closes
         the bot. The identity no longer holds, so the revocation of the grant
         whose write shutdown cut short fails closed over a grant the user may
-        have made on a peer meanwhile.
+        have made on a peer meanwhile, even one the watch already delivered.
         """
-        bot, _, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
-        put_session = coordinator.put_session
-        writing = asyncio.Event()
 
-        async def hang_after_first_put(record: Session) -> Session:
-            stored = await put_session(record)
-            if not writing.is_set():
-                writing.set()
-                await asyncio.Event().wait()
+        async def escalates(*, observed: bool) -> None:
+            bot, _, coordinator = bot_with_coordinator()
+            prefix = Prefix("owner", "user", "host.example")
+            put_session = coordinator.put_session
+            writing = asyncio.Event()
 
-            return stored
+            async def hang_after_first_put(record: Session) -> Session:
+                stored = await put_session(record)
+                if not writing.is_set():
+                    writing.set()
+                    await asyncio.Event().wait()
 
-        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
-        peer = Session(
-            time.time() + SESSION_TTL + 30,
-            "beta",
-            prefix.render(),
-            revoked=False,
-            version=0,
-        )
-        join_test_channel(bot, prefix)
-        with patch.object(coordinator, "put_session", hang_after_first_put):
-            bot.events.on_irc_message(
-                IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
+                return stored
+
+            valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+            peer = Session(
+                time.time() + SESSION_TTL + 30,
+                "beta",
+                prefix.render(),
+                revoked=False,
+                version=0,
             )
-            async with asyncio.timeout(1):
-                await writing.wait()
-                await coordinator.sessions.put(peer)
-                bot.events.on_irc_disconnect()
-                await bot.close()
+            key = coordinator.sessions.key(prefix.render())
+            join_test_channel(bot, prefix)
+            with patch.object(coordinator, "put_session", hang_after_first_put):
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
+                )
+                async with asyncio.timeout(1):
+                    await writing.wait()
+                    await coordinator.sessions.put(peer)
+                    if observed:
+                        bot.sessions.observe(key, peer)
 
-        key = coordinator.sessions.key(prefix.render())
-        kv = cast("FakeKV", coordinator.sessions.kv)
-        stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
-        assert stored is not None
-        assert (stored.expires_at, stored.revoked) == (peer.expires_at, True)
-        assert not bot.authorizer.authorized(prefix.render())
-        assert not bot.sessions.pending
+                    bot.events.on_irc_disconnect()
+                    await bot.close()
+
+            kv = cast("FakeKV", coordinator.sessions.kv)
+            stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
+            assert stored is not None
+            assert (stored.expires_at, stored.revoked) == (peer.expires_at, True)
+            assert not bot.authorizer.authorized(prefix.render())
+            assert not bot.sessions.pending
+
+        for observed in (False, True):
+            with self.subTest(observed=observed):
+                await escalates(observed=observed)
 
     async def test_auth_cancelled_after_identity_change_escalates(self) -> None:
         """Escalate AUTH's cancelled revocation once its identity is gone.

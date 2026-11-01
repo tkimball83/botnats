@@ -42,9 +42,9 @@ HELP_KINDS = ("invite", "limit", "op", "unban")
 START_TIMEOUT = 30.0
 
 
-def ignore(*arguments: object, **keywords: object) -> None:
+def ignore(*arguments: object) -> None:
     """Accept and ignore a coordinator callback."""
-    del arguments, keywords
+    del arguments
 
 
 def build_coordinator(
