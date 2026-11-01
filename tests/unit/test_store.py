@@ -1249,6 +1249,16 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert sessions.verify(sessions.key("other!user@host"), future) is None
         assert sessions.verify(key, unsigned) is None
 
+    async def test_session_stands_within_horizon_unless_revoked(self) -> None:
+        """Let a grant stand only within the horizon, and a revocation past it."""
+        sessions = SessionStore("efnet", 1, SECRET)
+        horizon = time.time() + SESSION_TTL + SESSION_EXPIRY_GRACE
+
+        assert sessions.stands(parsed_session(session_record(horizon - 60)))
+        assert not sessions.stands(parsed_session(session_record(horizon + 60)))
+        revoked = session_record(horizon + 60, 1, revoked=True)
+        assert sessions.stands(parsed_session(revoked))
+
     async def test_session_signature_covers_every_field(self) -> None:
         """Refuse a record whose signed fields changed or whose signature is bad."""
         sessions = SessionStore("efnet", 1, SECRET)

@@ -498,8 +498,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("nats.connect", connect),
-            patch.object(coordinator, "init_stores", AsyncMock()),
-            patch.object(coordinator, "start_watches", AsyncMock()),
+            patch.object(coordinator, "init_stores", AsyncMock(return_value=None)),
+            patch.object(coordinator, "start_watches", AsyncMock(return_value=None)),
         ):
             await bounded(coordinator.start())
 
@@ -572,7 +572,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("nats.connect", connect),
             patch.object(coordinator, "init_stores", open_stores),
-            patch.object(coordinator, "start_watches", AsyncMock()) as start_watches,
+            patch.object(
+                coordinator, "start_watches", AsyncMock(return_value=None)
+            ) as start_watches,
         ):
             initial = asyncio.create_task(coordinator.start())
             async with asyncio.timeout(5):
@@ -945,14 +947,17 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert "suppressed 1 similar warning(s)" in logs.output[-1]
 
     async def test_network_namespaces(self) -> None:
-        """Verify separate network groups share no subjects or KV buckets."""
+        """Verify stores and network groups share no KV buckets or subjects.
+
+        Two stores sharing a bucket would retune its TTL to each in turn.
+        """
         first = build_coordinator("alpha", "efnet")
         second = build_coordinator("alpha", "undernet")
 
         assert first.ns != second.ns
-        assert {store.bucket for store in first.stores}.isdisjoint(
-            store.bucket for store in second.stores
-        )
+        buckets = [store.bucket for store in first.stores]
+        assert len(set(buckets)) == len(buckets)
+        assert set(buckets).isdisjoint(store.bucket for store in second.stores)
 
     async def test_stores_use_configured_retention(self) -> None:
         """Open every bucket with the configured replicas and presence TTL."""

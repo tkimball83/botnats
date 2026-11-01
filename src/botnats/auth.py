@@ -236,13 +236,36 @@ class SessionSync:
         now = time.time()
         if session.expires_at > now:
             self.watched[key] = (session.prefix, session.expires_at)
-            held = self.authorizer.keep(session)
+            held = self.keep(session)
             # A record of an IRC-equivalent identity lives under another key.
             identity = casefold(session.prefix, "ascii")
             if held is not None and casefold(held.prefix, "ascii") == identity:
                 self.restore(held)
         else:
             self.forget(key)
+
+    def keep(self, session: Session) -> Session | None:
+        """Keep a record locally, as TotpAuthorizer.keep, unless an escalation waits.
+
+        A grant is held back while a revocation queued for its identity
+        escalates: that identity is gone, and once written the escalation
+        revokes whatever grant the key holds. The identity is the record's
+        prefix ASCII-folded, as the queue keys it: an IRC-equivalent spelling
+        has its own key, which the escalation never meets. A held-back grant
+        returns None, as its identity's queued mutation leaves nothing to
+        write back.
+        """
+        identity = casefold(session.prefix, "ascii")
+        queued = self.pending.get(identity)
+        if (
+            not session.revoked
+            and queued is not None
+            and queued.revoked
+            and self.yielding.get(identity) is not queued
+        ):
+            return None
+
+        return self.authorizer.keep(session)
 
     def forget(self, key: str) -> None:
         """Drop the local session a deleted, unauthentic, or expired KV key held.
@@ -383,7 +406,7 @@ class SessionSync:
         # The store returns a validated record; an expired one is no winner.
         winner = stored if stored.expires_at > time.time() else None
         if winner is not None:
-            self.authorizer.keep(winner)
+            self.keep(winner)
 
         # revoke() queues without the lock, so a newer mutation for
         # this identity may have replaced this entry during the write; it is
