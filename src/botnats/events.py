@@ -279,13 +279,7 @@ class IRCEventHandler:
         new_prefix = Prefix(nick, new_user, new_host)
         folded = self.bot.caps.fold(nick)
         old_prefix = self.bot.channel_mgr.change_member_host(message.prefix, new_prefix)
-        if old_prefix.complete:
-            self.bot.sessions.revoke(old_prefix)
-        else:
-            LOGGER.debug(
-                "CHGHOST for %s carried no complete identity; nothing to revoke",
-                nick,
-            )
+        self.revoke_identity(old_prefix)
 
         identity = self.bot.identity.current
         if identity is not None and folded == self.bot.caps.fold(identity.nick):
@@ -638,8 +632,7 @@ class IRCEventHandler:
         old_folded = self.bot.caps.fold(old_nick)
         old_prefix = self.bot.channel_mgr.rename_member(message.prefix, new_nick)
         # A new nick is a new identity: it must authenticate again.
-        if old_prefix.complete:
-            self.bot.sessions.revoke(old_prefix)
+        self.revoke_identity(old_prefix)
 
         identity = self.bot.identity.current
         if identity is not None and old_folded == self.bot.caps.fold(identity.nick):
@@ -682,9 +675,7 @@ class IRCEventHandler:
         IRC reports a QUIT, NICK, or CHGHOST only to clients sharing a
         channel with the user, so an identity this bot no longer sees must
         authenticate again. A KICK names only the nick: the member's own
-        prefix completes it. A member known only from NAMES has none, so
-        every live session held for the nick is revoked, failing closed: one
-        nick belongs to one user at a time.
+        prefix completes it.
         """
         member = runtime.remove(prefix.nick)
         if self.bot.channel_mgr.sees(prefix.nick):
@@ -693,6 +684,16 @@ class IRCEventHandler:
         if not prefix.complete and member is not None and member.prefix is not None:
             prefix = member.prefix
 
+        self.revoke_identity(prefix)
+
+    def revoke_identity(self, prefix: Prefix) -> None:
+        """Revoke the session of an identity that left or changed.
+
+        A prefix that member state could not complete, as for a member known
+        only from NAMES, names only the nick, so every live session held for
+        the nick is revoked, failing closed: one nick belongs to one user at
+        a time.
+        """
         if prefix.complete:
             self.bot.sessions.revoke(prefix)
         else:
@@ -704,9 +705,7 @@ class IRCEventHandler:
         if message.prefix is None:
             return
 
-        prefix = self.bot.channel_mgr.forget_member(message.prefix)
-        if prefix.complete:
-            self.bot.sessions.revoke(prefix)
+        self.revoke_identity(self.bot.channel_mgr.forget_member(message.prefix))
 
     def on_irc_disconnect(self) -> None:
         """Clear connection-scoped state when the IRC connection drops."""
