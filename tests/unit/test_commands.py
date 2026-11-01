@@ -186,6 +186,27 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ("owner", "NATS disconnected: channel #test"),
         ]
 
+    async def test_failure_without_message_gets_generic_reply(self) -> None:
+        """Reply "Command failed" when the error a command raised has no text.
+
+        A write cut off by a timeout raises a bare TimeoutError.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+
+        async def put_timed_out(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            del record, after
+            raise TimeoutError
+
+        with patch.object(coordinator, "put_channel", put_timed_out):
+            await send_command(bot, OWNER, "JOIN #new")
+
+        assert fake_irc.privmsgs == [("owner", "Command failed")]
+
     async def test_failure_reply_needs_live_session(self) -> None:
         """Send no write error once the admin quit while the write was in flight.
 
@@ -739,7 +760,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert commands == [
             call("MODE", "#test", "+b", "*!*@bad.host"),
             call("MODE", "#test", "-b", "*!*@bad.host"),
-            call("MODE", "#test", "+o", "Target"),
+            call("MODE", "#test", "+o", "Target", check=ANY),
             call("INVITE", "guest", "#test"),
         ]
 
@@ -823,14 +844,74 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         kicks = [c for c in send.call_args_list if c.args[0] == "KICK"]
         assert kicks == [
-            call("KICK", "#test", "Target", trailing=None),
-            call("KICK", "#test", "Target", trailing="go away"),
+            call("KICK", "#test", "Target", trailing=None, check=ANY),
+            call("KICK", "#test", "Target", trailing="go away", check=ANY),
         ]
         assert fake_irc.privmsgs == [
             ("owner", "ghost not found on #test"),
             ("owner", "Kicked Target from #test"),
             ("owner", "Kicked Target from #test"),
         ]
+
+    async def test_target_lines_need_the_same_member_when_sent(self) -> None:
+        """Bind each OP, KICK, and DEOP line to its target, checked again when sent.
+
+        Flood pacing can hold a line for minutes: the target may quit or
+        rename meanwhile, and another user take its nick and join.
+        """
+        target = Prefix("Target", "user", "real.host")
+        departures = {
+            "quit": IRCMessage("QUIT", ("Quit",), target),
+            "rename": IRCMessage("NICK", ("Moved",), target),
+        }
+        for text, flags in (
+            ("OP #test Target", "H"),
+            ("KICK #test Target", "H"),
+            ("DEOP #test Target", "H@"),
+        ):
+            for label, departure in departures.items():
+                with self.subTest(text=text, departure=label):
+                    bot, fake_irc, _ = bot_with_coordinator()
+                    runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                    runtime.join = JoinState.JOINED
+                    runtime.member("alpha").modes.add("o")
+                    bot.authorizer.grant(OWNER.render())
+                    who = IRCMessage(
+                        "352",
+                        (
+                            "alpha",
+                            "#test",
+                            "user",
+                            "real.host",
+                            "srv",
+                            "Target",
+                            flags,
+                            "0 r",
+                        ),
+                    )
+                    bot.events.on_irc_message(who)
+
+                    with patch.object(
+                        fake_irc, "send", MagicMock(wraps=fake_irc.send)
+                    ) as send:
+                        await send_command(bot, OWNER, text)
+
+                    checks = [
+                        entry.kwargs.get("check")
+                        for entry in send.call_args_list
+                        if entry.args[0] != "PRIVMSG"
+                    ]
+                    assert len(checks) == 1
+                    check = checks[0]
+                    assert check is not None
+                    # WHO reports the same user again: the line still goes out.
+                    bot.events.on_irc_message(who)
+                    assert check()
+
+                    bot.events.on_irc_message(departure)
+                    join_test_channel(bot, Prefix("Target", "other", "other.host"))
+
+                    assert not check()
 
     async def test_admin_op(self) -> None:
         """Verify OP command grants operator mode directly."""

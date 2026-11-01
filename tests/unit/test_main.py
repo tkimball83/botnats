@@ -30,8 +30,8 @@ class MainTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["botnats", "--config", str(config_path)]),
             patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": log_level}),
-            patch("logging.basicConfig"),
-            patch("asyncio.run") as run_loop,
+            patch("logging.basicConfig", return_value=None),
+            patch("asyncio.run", return_value=None) as run_loop,
             patch("botnats.__main__.run") as run_bot,
             redirect_stderr(stderr),
             self.assertRaises(SystemExit) as raised,
@@ -89,8 +89,8 @@ class MainTests(unittest.TestCase):
                 patch.object(sys, "argv", ["botnats", "--config", str(path)]),
                 # A shell or env file may leave whitespace around the level.
                 patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": " debug\n"}),
-                patch("logging.basicConfig") as basic_config,
-                patch("asyncio.run") as run_loop,
+                patch("logging.basicConfig", return_value=None) as basic_config,
+                patch("asyncio.run", return_value=None) as run_loop,
                 patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
             ):
                 main()
@@ -113,8 +113,8 @@ class MainTests(unittest.TestCase):
             with (
                 patch.object(sys, "argv", ["botnats"]),
                 patch.dict(os.environ, environment),
-                patch("logging.basicConfig"),
-                patch("asyncio.run"),
+                patch("logging.basicConfig", return_value=None),
+                patch("asyncio.run", return_value=None),
                 patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
             ):
                 main()
@@ -130,8 +130,8 @@ class MainTests(unittest.TestCase):
             with (
                 patch.object(sys, "argv", ["botnats", "--config", str(path)]),
                 patch.dict(os.environ, SECRETS),
-                patch("logging.basicConfig") as basic_config,
-                patch("asyncio.run"),
+                patch("logging.basicConfig", return_value=None) as basic_config,
+                patch("asyncio.run", return_value=None),
                 patch("botnats.__main__.run", new_callable=MagicMock),
             ):
                 # patch.dict restores the variable if the shell set it.
@@ -151,7 +151,7 @@ class MainTests(unittest.TestCase):
                     self.subTest(interrupt=interrupt.__name__),
                     patch.object(sys, "argv", ["botnats", "--config", str(path)]),
                     patch.dict(os.environ, {**SECRETS, "BOTNATS_LOG_LEVEL": "INFO"}),
-                    patch("logging.basicConfig"),
+                    patch("logging.basicConfig", return_value=None),
                     patch("asyncio.run", side_effect=interrupt) as run_loop,
                     patch("botnats.__main__.run", new_callable=MagicMock) as run_bot,
                 ):
@@ -178,7 +178,9 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         with (
             patch("botnats.__main__.Bot") as bot_class,
-            patch.object(loop, "add_signal_handler") as add_signal_handler,
+            patch.object(
+                loop, "add_signal_handler", return_value=None
+            ) as add_signal_handler,
         ):
             bot_class.return_value.run = serve
             task = asyncio.create_task(run(config()))
