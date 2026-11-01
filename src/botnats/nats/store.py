@@ -536,16 +536,9 @@ class SessionStore(KVStore):
         return _sign_fields(self.secret, "botnats-session-v1", folded)
 
     def parse(self, key: str, record: dict[str, Any]) -> Session | None:
-        """Validate a signed session record held under a KV key.
-
-        As in the watch, only a grant must expire within this bot's horizon:
-        a revocation past it, as from a peer whose clock runs ahead, only
-        denies, so it stands.
-        """
+        """Validate a signed session record held under a KV key, if it stands."""
         session = self.verify(key, record)
-        if session is None or (
-            not session.revoked and not self.within_horizon(session)
-        ):
+        if session is None or not self.stands(session):
             return None
 
         return session
@@ -585,6 +578,14 @@ class SessionStore(KVStore):
         record = asdict(session)
         record["signature"] = session_signature(self.secret, self.network, record)
         return record
+
+    def stands(self, session: Session) -> bool:
+        """Return whether a verified record applies to local authorization.
+
+        Only a grant must expire within this bot's horizon: a revocation past
+        it, as from a peer whose clock runs ahead, only denies, so it stands.
+        """
+        return session.revoked or self.within_horizon(session)
 
     def within_horizon(self, session: Session) -> bool:
         """Return whether a session expires no later than one TTL plus grace away."""

@@ -382,6 +382,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         key = coordinator.sessions.key(prefix.render())
         await bounded(coordinator.sessions.put(peer))
         bot.sessions.observe(key, peer)
+        # AUTH's own revocation yields, so it holds back no newer grant.
+        assert bot.authorizer.authorized(prefix.render())
         # An unrelated user's QUIT leaves the revocation yielding.
         other = Prefix("other", "user", "other.example")
         bot.events.on_irc_message(IRCMessage("QUIT", (), other))
@@ -443,13 +445,13 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
                 assert not bot.authorizer.authorized(prefix.render())
                 assert not bot.sessions.pending
 
-    async def test_auth_revocation_after_identity_change_escalates(self) -> None:
-        """Escalate AUTH's revocation when the identity changed during its write.
+    async def test_identity_change_during_auth_write_escalates(self) -> None:
+        """Escalate a QUIT's revocation that arrives during AUTH's write.
 
         The QUIT revokes the grant being written, but the write returns a
-        peer's newer grant, which AUTH then revokes in place of the QUIT's
-        revocation. A still newer grant must not stand either. Under
-        rfc1459 the QUIT may name foo{ as foo[.
+        peer's newer grant, which stays revoked locally while the QUIT's
+        revocation escalates over it. A still newer grant must not stand
+        either. Under rfc1459 the QUIT may name foo{ as foo[.
         """
 
         async def escalates(prefix: Prefix, quitting: Prefix) -> None:
@@ -474,7 +476,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
             with patch.object(coordinator, "put_session", land_peer_grant_first):
                 await send_command(bot, prefix, f"AUTH {valid_code}")
-                await drain_session_writes(bot)
+                # The QUIT's retry spawns the one that writes its escalation.
+                await settle(bot)
 
             key = coordinator.sessions.key(prefix.render())
             kv = cast("FakeKV", coordinator.sessions.kv)
@@ -1529,6 +1532,107 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         replacement = bot.sessions.pending[casefold("x!u@h", "ascii")]
         assert replacement.revoked
         assert replacement.version == newer.version + 1
+
+    async def test_queued_escalation_holds_back_watched_grant(self) -> None:
+        """Leave a watched newer grant unapplied while a QUIT's revocation waits.
+
+        The identity is gone, so its queued revocation escalates over the
+        grant once written; applied meanwhile, the grant would authorize the
+        departed identity until then.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        assert await bounded(bot.sessions.sync(bot.authorizer.grant(prefix.render())))
+        coordinator.duplicate = True
+        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+        await drain_session_writes(bot)
+        assert bot.sessions.pending
+        peer = Session(
+            time.time() + SESSION_TTL + 30,
+            "beta",
+            prefix.render(),
+            revoked=False,
+            version=0,
+        )
+        await bounded(coordinator.sessions.put(peer))
+
+        bot.sessions.observe(coordinator.sessions.key(prefix.render()), peer)
+
+        assert not bot.authorizer.authorized(prefix.render())
+        coordinator.duplicate = False
+        # The escalation waits for the second retry.
+        await bounded(bot.sessions.retry())
+        await bounded(bot.sessions.retry())
+
+        assert not bot.authorizer.authorized(prefix.render())
+        last = coordinator.session_puts[-1]
+        assert (last.expires_at, last.issuer, last.revoked) == (
+            peer.expires_at,
+            peer.issuer,
+            True,
+        )
+        assert not bot.sessions.pending
+
+    async def test_queued_escalation_applies_equivalent_spelling_grant(self) -> None:
+        """Apply a watched grant for an IRC-equivalent spelling of a revoked one.
+
+        foo{ and foo[ fold together under rfc1459 but have their own durable
+        keys. foo{'s queued revocation escalates only over foo{'s key, so it
+        never meets the grant of a user who renamed to foo[ and authenticated
+        again on a peer; held back, that grant would never apply.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        assert await bounded(bot.sessions.sync(bot.authorizer.grant("foo{!u@h")))
+        coordinator.duplicate = True
+        bot.sessions.revoke(Prefix("foo{", "u", "h"))
+        await drain_session_writes(bot)
+        assert bot.sessions.pending
+        peer = Session(
+            time.time() + SESSION_TTL + 30, "beta", "foo[!u@h", revoked=False, version=0
+        )
+
+        bot.sessions.observe(coordinator.sessions.key(peer.prefix), peer)
+
+        assert bot.authorizer.authorized("foo[!u@h")
+
+    async def test_quit_during_write_holds_back_stored_grant(self) -> None:
+        """Leave a newer grant the store returns unapplied after a mid-write QUIT.
+
+        The QUIT's revocation replaced the grant being written and escalates
+        over the store's grant once written.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        grant = bot.authorizer.grant(prefix.render())
+        peer = Session(
+            time.time() + SESSION_TTL + 30,
+            "beta",
+            prefix.render(),
+            revoked=False,
+            version=0,
+        )
+        put_session = coordinator.put_session
+
+        async def quit_mid_write(record: Session) -> Session:
+            if not record.revoked:
+                await coordinator.sessions.put(peer)
+                bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+
+            return await put_session(record)
+
+        with patch.object(coordinator, "put_session", quit_mid_write):
+            assert not await bounded(bot.sessions.sync(grant))
+            assert not bot.authorizer.authorized(prefix.render())
+            await settle(bot)
+
+        assert not bot.authorizer.authorized(prefix.render())
+        last = coordinator.session_puts[-1]
+        assert (last.expires_at, last.issuer, last.revoked) == (
+            peer.expires_at,
+            peer.issuer,
+            True,
+        )
+        assert not bot.sessions.pending
 
     async def test_rolled_back_grant_rewrites_held_revocation(self) -> None:
         """Write a held revocation again when its key rolls back to the grant.

@@ -688,7 +688,7 @@ class Coordinator:
                 if replayed is not None:
                     replayed.add(entry.key)
 
-                if not session.revoked and not self.sessions.within_horizon(session):
+                if not self.sessions.stands(session):
                     continue
 
                 self.callbacks.on_session_update(entry.key, session)
