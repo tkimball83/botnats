@@ -599,6 +599,47 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
                 assert not bot.authorizer.authorized(prefix.render())
                 assert not bot.sessions.pending
 
+    async def test_nick_only_kick_escalates_auth_failure_revocation(self) -> None:
+        """Escalate AUTH's queued revocation once a KICK naming only the nick ends it.
+
+        The owner is seen with its prefix in #test but only from NAMES in
+        #other, so the KICK from #other, the last channel it shares with this
+        bot, names only the nick. The cached record is already revoked, so
+        the KICK revokes no live session; a peer's newer grant must not stand.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot, _, _ = bot_with_coordinator(coordinator)
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        other = bot.channel_mgr.runtime("#other")
+        assert other is not None
+        other.member("owner")
+        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        await send_command(bot, OWNER, f"AUTH {code}")
+        kicker = Prefix("op", "~op", "op.host")
+        for channel in ("#test", "#other"):
+            bot.events.on_irc_message(IRCMessage("KICK", (channel, "Owner"), kicker))
+
+        peer = Session(
+            time.time() + SESSION_TTL + 30,
+            "beta",
+            OWNER.render(),
+            revoked=False,
+            version=0,
+        )
+        await bounded(coordinator.sessions.put(peer))
+        coordinator.failing = False
+        # The escalation waits for the second retry.
+        await bounded(bot.sessions.retry())
+        await bounded(bot.sessions.retry())
+
+        key = coordinator.sessions.key(OWNER.render())
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
+        assert stored is not None
+        assert (stored.expires_at, stored.revoked) == (peer.expires_at, True)
+        assert not bot.authorizer.authorized(OWNER.render())
+        assert not bot.sessions.pending
+
     async def test_identity_change_during_auth_write_escalates(self) -> None:
         """Escalate a QUIT's revocation that arrives during AUTH's write.
 
@@ -1035,12 +1076,15 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
                 await escalates(observed=observed)
 
     async def test_auth_cancelled_after_identity_change_escalates(self) -> None:
-        """Escalate AUTH's cancelled revocation once its identity is gone.
+        """Escalate a QUIT's revocation when shutdown cancels AUTH's write.
 
-        The QUIT revokes the grant being written, then the watch delivers a
-        peer's newer grant, which AUTH revokes when shutdown cancels it. A
-        still newer grant must not stand either. Under rfc1459 the QUIT may
-        name foo{ as foo[.
+        The QUIT revokes the grant being written and queues its revocation,
+        whose write waits for the lock AUTH's write holds, so the queued
+        escalation holds back a peer's newer grant the watch delivers. The
+        held record is already revoked, so AUTH revokes nothing more when
+        shutdown cancels it, and ends cancelled. The final flush writes the
+        QUIT's revocation, which escalates over a still newer grant. Under
+        rfc1459 the QUIT may name foo{ as foo[.
         """
 
         async def escalates(prefix: Prefix, quitting: Prefix) -> None:
@@ -1067,6 +1111,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
                 bot.events.on_irc_message(
                     IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
                 )
+                auth = next(t for t in bot.tasks if t.get_name() == "admin-command")
                 async with asyncio.timeout(1):
                     await writing.wait()
                     bot.events.on_irc_message(IRCMessage("QUIT", (), quitting))
@@ -1074,6 +1119,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
                     bot.sessions.observe(key, peer)
                     await coordinator.sessions.put(newest)
                     await bot.close()
+
+            with self.assertRaises(asyncio.CancelledError):
+                await bounded(auth)
 
             kv = cast("FakeKV", coordinator.sessions.kv)
             stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
@@ -2255,6 +2303,34 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
                 stored = json.loads(kv.entries[key][1])
                 assert coordinator.sessions.parse(key, stored) == revocation
                 assert not bot.sessions.pending
+
+    async def test_lost_key_rewrites_revocation_outlasting_earlier_grant(self) -> None:
+        """Write back a revocation lost after an earlier grant its key held expires.
+
+        The user authenticated again before the first grant expired, then
+        quit. The key's mapping must carry the revocation's expiry: pruned
+        with the first grant's, a later delete would write nothing back, and
+        bots started after it would accept the revoked grant if re-put.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = "owner!user@host.example"
+        key = coordinator.sessions.key(prefix)
+        now = time.time()
+        first = Session(now + 100, "beta", prefix, revoked=False, version=0)
+        second = Session(now + 3000, "beta", prefix, revoked=False, version=0)
+        revocation = Session(now + 3000, "beta", prefix, revoked=True, version=1)
+        for record in (first, second, revocation):
+            bot.sessions.observe(key, record)
+
+        with patch("botnats.auth.time") as clock:
+            clock.time.return_value = now + 200
+            bot.sessions.prune()
+            bot.sessions.forget(key)
+
+        await drain_session_writes(bot)
+
+        assert coordinator.session_puts == [revocation]
+        assert not bot.sessions.pending
 
     async def test_lost_key_writes_back_only_live_revocations(self) -> None:
         """Write back neither a lost key's grant nor an expired key's revocation.
