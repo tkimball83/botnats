@@ -698,21 +698,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         # Keyed as "#te[st" under ascii until the restored rfc1459 rekeys it.
         assert mgr.runtime("#te[st") is not None
 
-    async def test_refused_monitor_subscription_polls_ison(self) -> None:
-        """Poll ISON instead when the send queue refuses MONITOR +."""
-        bot, fake_irc = bot_with_irc()
-        fake_irc.current_nick = "fallback"
-        fake_irc.connected = False
-        bot.caps.monitor = True
-
-        bot.events.start_nick_watch()
-
-        task = bot.events.nick_watch_task
-        assert task is not None
-        assert task.get_name() == "nick-ison-poll"
-        async with asyncio.timeout(5):
-            await bot.tasks.drain()
-
     async def test_isupport_without_trailing(self) -> None:
         """Verify the final ISUPPORT token is kept when trailing text is omitted."""
         bot, _ = bot_with_irc()
@@ -2622,8 +2607,12 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.presence_puts == []
 
     async def test_set_identity_dedup(self) -> None:
-        """Sweep pending joins when the identity changes, not when it repeats."""
-        bot, fake_irc, _ = bot_with_coordinator()
+        """Join and publish presence when the identity changes, not when it repeats.
+
+        Each change sweeps pending joins and writes one presence record; a
+        repeated identity does neither.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         prefix = Prefix("alpha", "~alpha", "real.host")
         join = ("JOIN", ("#test",))
@@ -2636,31 +2625,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         # retries it.
         runtime.reset()
         bot.events.set_identity(prefix)
+        await settle(bot)
         assert fake_irc.sent == [join]
-
-        bot.events.set_identity(Prefix("alpha", "~alpha", "new.host"))
-        assert bot.identity.current is not None
-        assert bot.identity.current.host == "new.host"
-        assert fake_irc.sent == [join, join]
-        await settle(bot)
-
-    async def test_set_identity_dedups_presence_publish(self) -> None:
-        """Verify redundant identity updates do not re-publish presence."""
-        coordinator = FakeCoordinator()
-        bot = bot_with_channel(coordinator=coordinator)
-        prefix = Prefix("alpha", "~alpha", "real.host")
-
-        bot.events.set_identity(prefix)
-        bot.events.set_identity(prefix)
-        await settle(bot)
-
         assert len(coordinator.presence_puts) == 1
 
         bot.events.set_identity(Prefix("alpha", "~alpha", "new.host"))
         await settle(bot)
-
         assert bot.identity.current is not None
         assert bot.identity.current.host == "new.host"
+        assert fake_irc.sent == [join, join]
         assert len(coordinator.presence_puts) == 2
 
     async def test_disconnect_clears_runtime(self) -> None:
@@ -2776,6 +2749,21 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert ("NICK", ("alpha",)) not in fake_irc.sent
+
+    async def test_refused_monitor_subscription_polls_ison(self) -> None:
+        """Poll ISON instead when the send queue refuses MONITOR +."""
+        bot, fake_irc = bot_with_irc()
+        fake_irc.current_nick = "fallback"
+        fake_irc.connected = False
+        bot.caps.monitor = True
+
+        bot.events.start_nick_watch()
+
+        task = bot.events.nick_watch_task
+        assert task is not None
+        assert task.get_name() == "nick-ison-poll"
+        async with asyncio.timeout(5):
+            await bot.tasks.drain()
 
     async def test_offline_reports_ignored_once_nick_reclaimed(self) -> None:
         """Ignore an ISON or MONITOR offline report once the nick is reclaimed.
