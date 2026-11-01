@@ -93,7 +93,7 @@ class PresenceRegistry:
 
 
 class SelfIdentity:
-    """Own this bot's resolved IRC identity and its registration state."""
+    """Own this bot's resolved IRC identity."""
 
     def __init__(
         self,
@@ -111,7 +111,6 @@ class SelfIdentity:
         self.generation = 0
         self.instance_id = instance_id
         self.irc = irc
-        self.registered = False
 
     async def announce(self) -> None:
         """Write this bot's presence; the next heartbeat retries a failure."""
@@ -139,16 +138,10 @@ class SelfIdentity:
             LOGGER.warning("IRC identity discovery failed; reconnecting")
             self.irc.reconnect()
 
-    def on_registered(self) -> None:
-        """Start a new registration; disconnecting already forgot any old identity."""
-        self.registered = True
-        LOGGER.info("registered on IRC as %s", self.irc.current_nick)
-
     def reset(self) -> None:
         """Forget the identity of a connection that ended or restarted."""
         self.current = None
         self.generation += 1
-        self.registered = False
 
     def set(self, prefix: Prefix) -> bool:
         """Record a resolved identity; return whether it changed."""

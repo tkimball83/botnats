@@ -1292,13 +1292,15 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         The first session advertises a desired capability, spends the whole
         nickname collision budget, and registers under the fallback nick;
-        none of it may carry into the next session.
+        none of it may carry into the next session, which stays unregistered
+        until its own 001.
         """
         collision = b":server 433 * alpha :Nickname is already in use\r\n"
         greetings = (
             b":server CAP * LS :multi-prefix\r\n"
             + collision * NICK_COLLISION_LIMIT
             + b":server CAP * ACK :multi-prefix\r\n:server 001 bravo :Welcome\r\n",
+            b":server NOTICE * :*** Looking up your hostname\r\n"
             # An ACK of a NEW capability ahead of this session's LS reply
             # must not end negotiation as though that LS were done.
             b":server CAP * NEW :chghost\r\n"
@@ -1326,7 +1328,10 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
+        registered: list[bool] = []
+
         def join_on_welcome(message: IRCMessage) -> None:
+            registered.append(client.registered_with_server)
             if message.command == "001":
                 client.send("JOIN", "#sync")
 
@@ -1365,6 +1370,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             b"NICK bravo\r\n",
             b"JOIN #sync\r\n",
         ]
+        # The handler sees the first 001, the next session's NOTICE, and its 001.
+        assert registered == [True, False, True]
 
     async def test_nick_collision_limit_disconnects(self) -> None:
         """Retry up to the collision limit, then raise on the next collision."""

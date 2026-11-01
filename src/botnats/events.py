@@ -647,7 +647,7 @@ class IRCEventHandler:
         if self.bot.irc.is_self(new_nick):
             if self.bot.irc.is_self(self.bot.config.nickname):
                 self.finish_nick_watch()
-            elif self.bot.identity.registered:
+            elif self.bot.irc.registered_with_server:
                 self.start_nick_watch()
 
     def handle_part(self, message: IRCMessage) -> None:
@@ -718,9 +718,8 @@ class IRCEventHandler:
         self.bot.identity.reset()
 
     def handle_welcome(self, message: IRCMessage) -> None:
-        """Notify the bot that IRC registration is complete."""
+        """Discover this bot's identity and watch its nick once registered."""
         LOGGER.debug("received welcome: %s", " ".join(message.params))
-        self.bot.identity.on_registered()
         self.bot.tasks.spawn(
             self.bot.identity.discover(self.bot.identity.generation),
             "identity-discovery",

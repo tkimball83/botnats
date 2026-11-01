@@ -191,10 +191,8 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
         assert bot.identity.current.host == "new.host"
 
     def test_identity_reset_forgets_connection(self) -> None:
-        """Forget the identity and registration of a connection that ended."""
+        """Forget the identity of a connection that ended."""
         bot = make_bot(irc=FakeIRC())
-        bot.identity.on_registered()
-        assert bot.identity.registered
         assert bot.identity.set(Prefix("alpha", "~alpha", "real.host"))
         generation = bot.identity.generation
 
@@ -202,7 +200,6 @@ class SelfIdentityTests(unittest.IsolatedAsyncioTestCase):
 
         assert bot.identity.current is None
         assert bot.identity.generation == generation + 1
-        assert not bot.identity.registered
 
     async def test_identity_discovery_accepts_final_response(self) -> None:
         """Stop querying once a response arrives, even to the final query."""

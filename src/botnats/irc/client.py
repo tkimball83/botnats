@@ -491,6 +491,8 @@ class IRCClient:
             self.registered_with_server = True
             if message.params:
                 self.current_nick = message.params[0]
+
+            LOGGER.info("registered on IRC as %s", self.current_nick)
         elif (
             message.command == "NICK"
             and message.prefix is not None

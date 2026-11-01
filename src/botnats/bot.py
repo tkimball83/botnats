@@ -145,7 +145,9 @@ class Bot:
     def ready(self) -> bool:
         """Return whether IRC and all coordination dependencies are ready."""
         return (
-            self.identity.registered and self.irc.connected and self.coordinator.ready
+            self.irc.registered_with_server
+            and self.irc.connected
+            and self.coordinator.ready
         )
 
     async def run(self) -> None:

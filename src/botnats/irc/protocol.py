@@ -82,6 +82,9 @@ class IRCProtocol(IRCSender, Protocol):
 
     # About how long the lines queued now take to go out.
     queue_delay: float
+    # Whether the latest connection has registered (001); only while
+    # connected does it describe the current one.
+    registered_with_server: bool
 
     async def close(self) -> None:
         """Close the connection."""

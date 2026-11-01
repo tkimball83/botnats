@@ -584,7 +584,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        bot.identity.registered = True
+        fake_irc.registered_with_server = True
         mgr = bot.channel_mgr
         old = mgr.channels[casefold("#test", "rfc1459")]
         old.join = JoinState.JOINED
@@ -654,7 +654,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        bot.identity.registered = True
+        fake_irc.registered_with_server = True
         mgr, folded = bot.channel_mgr, casefold("#test", "rfc1459")
         mgr.channels[folded].join = JoinState.JOINED
         tombstone = ChannelRecord.new(
@@ -714,7 +714,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """Keep a failed part queued, retrying it each maintenance tick until sent."""
         fake_irc = FailingPartIRC()
         bot = bot_with_channel(irc=fake_irc)
-        bot.identity.registered = True
+        fake_irc.registered_with_server = True
         bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
 
         current = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
@@ -2064,7 +2064,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         """
         bot, fake_irc, _ = bot_with_coordinator()
         bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
-        bot.identity.on_registered()  # 001
+        fake_irc.registered_with_server = True  # 001
 
         await tick(bot)
         assert fake_irc.sent == []
