@@ -48,9 +48,8 @@ class Bot:
         self.caps = ISupportState()
         self.authorizer = TotpAuthorizer(
             config.totp_secret,
-            coordination_secret=config.coordination_secret,
             identity_fold=self.caps.fold_identity,
-            scope=(config.bot_id, config.network),
+            issuer=config.bot_id,
         )
         instance_id = uuid.uuid4().hex
         self.presence = PresenceRegistry(config.presence_ttl)

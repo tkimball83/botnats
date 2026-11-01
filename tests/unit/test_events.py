@@ -131,7 +131,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         new_prefix = Prefix("owner", new_user, new_host)
         assert not bot.authorizer.authorized(new_prefix.render())
         assert len(coordinator.session_puts) == 1
-        assert coordinator.session_puts[0]["revoked"] is True
+        assert coordinator.session_puts[0].revoked is True
 
     async def test_chghost_without_identity_skips_revocation(self) -> None:
         """Log and skip revocation when no complete old identity exists."""
@@ -490,8 +490,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert casefold("owner", "rfc1459") not in runtime.members
         assert not bot.authorizer.authorized(owner.render())
         assert len(coordinator.session_puts) == 1
-        assert coordinator.session_puts[0]["prefix"] == owner.render()
-        assert coordinator.session_puts[0]["revoked"] is True
+        assert coordinator.session_puts[0].prefix == owner.render()
+        assert coordinator.session_puts[0].revoked is True
 
     async def test_quit_before_who_revokes_the_quit_identity(self) -> None:
         """Revoke the QUIT's own identity for a member WHO has not filled yet."""
@@ -507,8 +507,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert casefold("owner", "rfc1459") not in runtime.members
         assert not bot.authorizer.authorized(owner.render())
         assert len(coordinator.session_puts) == 1
-        assert coordinator.session_puts[0]["prefix"] == owner.render()
-        assert coordinator.session_puts[0]["revoked"] is True
+        assert coordinator.session_puts[0].prefix == owner.render()
+        assert coordinator.session_puts[0].revoked is True
 
     async def test_invite_ignores_joined_channel(self) -> None:
         """Verify a peer's INVITE to an already-joined channel is ignored."""
@@ -1408,7 +1408,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
                 assert not bot.authorizer.authorized(owner.render())
                 assert [
-                    (put["prefix"], put["revoked"]) for put in coordinator.session_puts
+                    (put.prefix, put.revoked) for put in coordinator.session_puts
                 ] == [(owner.render(), True)]
 
     async def test_mode_key_unusable(self) -> None:
@@ -1905,7 +1905,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.authorizer.authorized(old_prefix.render())
         assert not bot.authorizer.authorized(new_prefix.render())
-        assert [put["revoked"] for put in coordinator.session_puts] == [True]
+        assert [put.revoked for put in coordinator.session_puts] == [True]
 
     async def test_other_kick_preserves_state(self) -> None:
         """Verify kick of another user preserves channel state."""
@@ -2186,9 +2186,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await drain_session_writes(bot)
 
         assert not bot.authorizer.authorized(OWNER.render())
-        assert [
-            (put["prefix"], put["revoked"]) for put in coordinator.session_puts
-        ] == [
+        assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
             (OWNER.render(), True),
         ]
 
@@ -2210,9 +2208,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.authorizer.authorized(OWNER.render())
         assert bot.authorizer.authorized(kicker.render())
-        assert [
-            (put["prefix"], put["revoked"]) for put in coordinator.session_puts
-        ] == [
+        assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
             (OWNER.render(), True),
         ]
 

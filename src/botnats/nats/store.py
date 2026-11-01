@@ -9,7 +9,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from nats.errors import Error as NatsError
@@ -549,16 +549,15 @@ class SessionStore(KVStore):
 
         return session
 
-    async def put(self, data: dict[str, Any]) -> Session:
-        """Store a session or revocation and return the authoritative session.
+    async def put(self, session: Session) -> Session:
+        """Sign and store a session or revocation; return the authoritative one.
 
         Only the future horizon is bounded: an already-expired record must
         stay writable so a near-expiry revocation is not rejected under
         clock skew, and consumers treat expired records as deletions.
         """
-        session = parse_session_record(self.secret, self.network, data)
-        if session is None or not self.within_horizon(session):
-            msg = "session record is invalid"
+        if not self.within_horizon(session):
+            msg = "session record expires past this bot's horizon"
             raise ValueError(msg)
 
         key = self.key(session.prefix)
@@ -570,7 +569,13 @@ class SessionStore(KVStore):
 
             return stored
 
-        return await self.put_newer(key, data, session, standing)
+        return await self.put_newer(key, self.sign(session), session, standing)
+
+    def sign(self, session: Session) -> dict[str, Any]:
+        """Return the canonical, signed record of a session."""
+        record = asdict(session)
+        record["signature"] = session_signature(self.secret, self.network, record)
+        return record
 
     def within_horizon(self, session: Session) -> bool:
         """Return whether a session expires no later than one TTL plus grace away."""
@@ -586,7 +591,6 @@ class Session:
     prefix: str
     revoked: bool
     version: int
-    signature: str
 
     @property
     def order(self) -> tuple[float, int, bool]:
@@ -645,7 +649,6 @@ def parse_session_record(
         prefix=prefix,
         revoked=revoked,
         version=version,
-        signature=signature,
     )
 
 

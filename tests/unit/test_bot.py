@@ -7,7 +7,7 @@ import asyncio
 import time
 import unittest
 from dataclasses import astuple, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, call, patch
 
 from nats.errors import Error as NatsError
@@ -98,9 +98,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         # The secrets differ, so a swap of the two cannot pass.
         assert bot.authorizer.secret == AUTH_KEY
-        assert bot.authorizer.coordination_key == COORDINATION_KEY
         assert bot.authorizer.issuer == "alpha-id"
-        assert bot.authorizer.network == "libera"
         # Only the nick folds under the server casemapping: rfc1459 folding
         # of user@host would merge nick!~user@host and nick!^user@host.
         assert bot.authorizer.identity_fold == bot.caps.fold_identity
@@ -209,7 +207,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(5):
             await bot.close()
 
-        puts = [(put["prefix"], put["revoked"]) for put in coordinator.session_puts]
+        puts = [(put.prefix, put.revoked) for put in coordinator.session_puts]
         assert puts == [(prefix.render(), True)]
         assert not bot.sessions.pending
 
@@ -221,7 +219,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
         writing = asyncio.Event()
 
-        async def hang(record: dict[str, Any]) -> Session:
+        async def hang(record: Session) -> Session:
             del record
             writing.set()
             never: asyncio.Future[Session] = asyncio.get_running_loop().create_future()

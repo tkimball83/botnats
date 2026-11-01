@@ -2230,7 +2230,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.channels_store.kv = cast("KeyValue", channels)
         coordinator.sessions.kv = cast("KeyValue", sessions)
         channel = asdict(ChannelRecord.new("#test", None, present=True))
-        session = session_record(time.time() + 60)
+        session = session_value(time.time() + 60)
 
         for state in (PresenceState.UNCLAIMED, PresenceState.DUPLICATE):
             coordinator.claim.state = state
