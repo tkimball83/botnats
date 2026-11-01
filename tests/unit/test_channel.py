@@ -17,7 +17,6 @@ from botnats.channel import (
     JOIN_REPLY_TIMEOUT,
     JOIN_RETRY_DELAY,
     PEER_HELP_DELAY,
-    PEER_REQUEST_COOLDOWN,
     ChannelRecord,
     ChannelRuntime,
     JoinState,
@@ -2111,8 +2110,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "bot.host", "one", "alpha", "~alpha"
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        # The real cooldown, which a stall between requests could outlast.
-        assert PEER_REQUEST_COOLDOWN == 0.5
         # Long enough that no stall between requests can outlast it; each
         # kind last asked a full cooldown ago, however long the clock has run.
         cooldown = 3600.0

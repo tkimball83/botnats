@@ -1933,7 +1933,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Run an admin's OP while a stranger's AUTH waits on JetStream.
 
         The stranger's commands still run one at a time in arrival order, and
-        each sender's last command drops its lock.
+        each sender's last command drops its lock and identity watch.
         """
         bot, fake_irc, coordinator = bot_with_coordinator()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
@@ -1984,10 +1984,21 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert checks == ["evil.example"] * 3
         assert bot.events.command_locks == {}
+        assert not bot.sessions.watched_identities
 
     async def test_self_join_clears_state(self) -> None:
-        """Reset channel state on a self-join and learn this bot's identity."""
+        """Reset channel state on a self-join and learn this bot's identity.
+
+        The JOIN echo's prefix replaces an outdated identity.
+        """
         bot, _, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            bot.config.bot_id,
+            "old.host",
+            bot.identity.instance_id,
+            "alpha",
+            "~alpha",
+        )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.add_ban("*!*@old.ban")
@@ -2190,6 +2201,27 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             (OWNER.render(), True),
         ]
 
+    async def test_part_prefix_outranks_stored_member_prefix(self) -> None:
+        """Revoke a complete PART prefix over the member prefix stored for it.
+
+        A stored prefix can be stale, as after a host change this bot never
+        saw: it completes only a KICK's bare nick.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
+        bot.authorizer.grant(OWNER.render())
+
+        bot.events.on_irc_message(IRCMessage("PART", ("#test",), OWNER))
+        await drain_session_writes(bot)
+
+        assert casefold("owner", "rfc1459") not in runtime.members
+        assert not bot.authorizer.authorized(OWNER.render())
+        assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
+            (OWNER.render(), True),
+        ]
+
     async def test_kick_from_last_shared_channel_revokes(self) -> None:
         """Revoke the kicked member's session, by the identity WHO recorded."""
         bot, _, coordinator = bot_with_coordinator()
@@ -2275,12 +2307,16 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_who_reply_updates_member(self) -> None:
-        """Update another member's prefix and modes, not this bot's identity."""
+        """Update another member's prefix and modes, not this bot's identity.
+
+        The reply's prefix replaces an outdated one.
+        """
         bot, _, coordinator = bot_with_coordinator()
         identity = BotPresence("alpha", "alpha.host", "inst", "alpha", "~alpha")
         bot.identity.current = identity
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
+        runtime.member("someone").prefix = Prefix("someone", "user", "old.host")
 
         bot.events.on_irc_message(
             IRCMessage(
@@ -2355,7 +2391,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         The channel and the session identity fold differently under ascii and
         rfc1459, so both are found again only if disconnect rekeys them onto
         the default casemapping it restores. Every joined channel is reset,
-        so the next connection joins each again.
+        so the next connection joins each again. A pending command's identity
+        is invalidated: this bot can no longer see its QUIT or NICK.
         """
         bot = bot_with_channel()
         other = bot.channel_mgr.runtime("#test")
@@ -2369,6 +2406,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         identity = "owner[!user@host.example"
         bot.authorizer.grant(identity)
+        bot.sessions.watch_identity(identity)
         runtime = bot.channel_mgr.runtime(channel)
         assert runtime is not None
         bot.caps.parse_chanmodes("b,k,l,imn")
@@ -2404,6 +2442,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not other.members
         assert bot.channel_mgr.pending_parts == {}
         assert bot.authorizer.authorized(identity)
+        assert bot.sessions.watched_identities == {identity: (1, True)}
 
 
 class NickWatchTests(unittest.IsolatedAsyncioTestCase):
