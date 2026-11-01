@@ -5,10 +5,15 @@
 
 import asyncio
 import logging
+import sys
 import threading
 import unittest
+from typing import TYPE_CHECKING
 
 from botnats import Tasks, error_label, log_task_failure
+
+if TYPE_CHECKING:
+    from _typeshed import TraceFunction
 
 
 async def block() -> None:
@@ -121,13 +126,27 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
 
         loop = asyncio.get_running_loop()
         drained: asyncio.Future[list[bool]] = loop.create_future()
+        abandoned = threading.Event()
+
+        def stop_if_abandoned(*_: object) -> TraceFunction:
+            if abandoned.is_set():
+                # Raising from a trace function also ends the tracing, and
+                # the thread drops a SystemExit silently.
+                raise SystemExit
+
+            return stop_if_abandoned
 
         def run() -> None:
+            sys.settrace(stop_if_abandoned)
             tracked = asyncio.run(drain_finished())
             loop.call_soon_threadsafe(drained.set_result, tracked)
 
         # A drain that never yields blocks its event loop, timeouts included,
-        # so it runs on its own loop in a thread this wait can abandon.
+        # so it runs on its own loop in a thread this wait can abandon. The
+        # thread then stops at its next traced line instead of spinning.
         threading.Thread(target=run, daemon=True).start()
-        async with asyncio.timeout(5):
-            assert await drained == [True]
+        try:
+            async with asyncio.timeout(5):
+                assert await drained == [True]
+        finally:
+            abandoned.set()

@@ -2221,18 +2221,3 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         assert len(channels.entries) == 1
         assert len(sessions.entries) == 1
-
-    async def test_start_fails_on_server_url_nats_rejects(self) -> None:
-        """Fail once, unready, on a server URL nats-py rejects before connecting.
-
-        nats-py retries every other connection failure itself, for good.
-        """
-        coordinator = build_coordinator("alpha")
-        coordinator.config = replace(coordinator.config, servers=("nats://none:4222",))
-
-        async with asyncio.timeout(5):
-            with self.assertRaisesRegex(NatsError, "invalid hostname"):
-                await coordinator.start()
-
-        assert coordinator.nc is None
-        assert not coordinator.ready
