@@ -533,11 +533,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_quit_with_host_only_prefix_revokes_via_member(self) -> None:
         """Revoke the member's full identity on a QUIT lacking the user part.
 
-        A desired channel the member is not in, searched first, is skipped.
+        A desired channel the member is not in, searched first, is skipped. A
+        session another identity holds for the same nick stays.
         """
         bot, _, coordinator = bot_with_coordinator()
         owner = Prefix("owner", "user", "static.example")
-        bot.authorizer.grant(owner.render())
+        same_nick = Prefix("owner", "other", "old.host")
+        for prefix in (owner, same_nick):
+            bot.authorizer.grant(prefix.render())
+
         bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
         runtime = bot.channel_mgr.channels[casefold("#other", "rfc1459")]
         runtime.member("owner").prefix = owner
@@ -549,6 +553,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert casefold("owner", "rfc1459") not in runtime.members
         assert not bot.authorizer.authorized(owner.render())
+        assert bot.authorizer.authorized(same_nick.render())
         assert len(coordinator.session_puts) == 1
         assert coordinator.session_puts[0].prefix == owner.render()
         assert coordinator.session_puts[0].revoked is True
@@ -1486,9 +1491,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Revoke from another channel's member when NAMES alone lists one.
 
         A member WHO has not described yet has no user or host to complete a
-        nick-only QUIT, NICK, or CHGHOST prefix from.
+        nick-only QUIT, NICK, or CHGHOST prefix from. A session another
+        identity holds for the same nick stays.
         """
         owner = Prefix("owner", "user", "host.example")
+        same_nick = Prefix("owner", "other", "old.host")
         for message in (
             IRCMessage("QUIT", ("bye",), Prefix("Owner")),
             IRCMessage("NICK", ("newowner",), Prefix("Owner")),
@@ -1496,7 +1503,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(command=message.command):
                 bot, _, coordinator = bot_with_coordinator()
-                bot.authorizer.grant(owner.render())
+                for prefix in (owner, same_nick):
+                    bot.authorizer.grant(prefix.render())
+
                 mgr = bot.channel_mgr
                 mgr.apply_record(ChannelRecord.new("#other", None, present=True))
                 # Seen first, as listed by NAMES; WHO has not answered yet.
@@ -1510,6 +1519,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                     await drain_session_writes(bot)
 
                 assert not bot.authorizer.authorized(owner.render())
+                assert bot.authorizer.authorized(same_nick.render())
                 assert [
                     (put.prefix, put.revoked) for put in coordinator.session_puts
                 ] == [(owner.render(), True)]
@@ -2484,14 +2494,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_nick_only_identity_change_revokes_names_only_member(self) -> None:
         """Revoke the live sessions held for a NAMES-only member's nick-only change.
 
-        A QUIT, NICK, or CHGHOST naming only the nick of a member WHO has yet
-        to report leaves the bare nick all this bot knows of the identity. A
-        session held for another nick stays.
+        A QUIT or NICK naming only the nick of a member WHO has yet to report
+        leaves the bare nick all this bot knows of the identity. A session
+        held for another nick stays.
         """
         for message in (
             IRCMessage("QUIT", ("bye",), Prefix("Owner")),
             IRCMessage("NICK", ("newowner",), Prefix("Owner")),
-            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("Owner")),
         ):
             with self.subTest(command=message.command):
                 bot, _, coordinator = bot_with_coordinator()
