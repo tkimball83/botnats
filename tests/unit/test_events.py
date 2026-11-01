@@ -10,6 +10,7 @@ from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, call, patch
 
+from botnats.auth import TOTP_PERIOD, totp
 from botnats.channel import (
     JOIN_REPLY_TIMEOUT,
     JOIN_RETRY_DELAY,
@@ -2329,6 +2330,51 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
             (OWNER.render(), True),
         ]
+
+    async def test_nick_only_kick_from_last_shared_channel_fails_pending_auth(
+        self,
+    ) -> None:
+        """Refuse a pending AUTH once a bare-nick KICK leaves its sender seen nowhere.
+
+        WHO showed the sender in #test, while #other knows it only from NAMES.
+        Kicked from both while its AUTH waits on JetStream, it holds no session
+        yet, so only its nick can invalidate the AUTH.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for runtime in bot.channel_mgr.channels.values():
+            runtime.join = JoinState.JOINED
+
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("owner").prefix = OWNER
+        bot.events.on_irc_message(IRCMessage("353", ("alpha", "=", "#other", "owner")))
+        claiming = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_claim(counter: int) -> bool:
+            del counter
+            claiming.set()
+            await release.wait()
+            return True
+
+        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        kicker = Prefix("op", "~op", "op.host")
+        with patch.object(coordinator, "request_claim", slow_claim):
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", f"AUTH {code}"), OWNER),
+            )
+            await bounded(claiming.wait())
+            for channel in ("#test", "#other"):
+                bot.events.on_irc_message(
+                    IRCMessage("KICK", (channel, "Owner", "reason"), kicker),
+                )
+
+            release.set()
+            await settle(bot)
+
+        assert not bot.authorizer.authorized(OWNER.render())
+        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert coordinator.session_puts == []
 
     async def test_nick_only_identity_change_revokes_names_only_member(self) -> None:
         """Revoke the live sessions held for a NAMES-only member's nick-only change.

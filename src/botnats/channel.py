@@ -445,7 +445,13 @@ class ChannelManager:
             LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
     def op_peer(self, channel: str, presence: BotPresence) -> None:
-        """Grant operator status to a peer bot, rechecked at send as an invite is."""
+        """Grant operator status to a peer bot that is a member of the channel.
+
+        The MODE goes out only if the peer is still eligible when its turn in
+        the send queue comes. Its presence alone may outlast its membership:
+        a netsplit or a dropped IRC link leaves it standing while another
+        user takes the nick and joins.
+        """
         if self.help_eligible(channel, presence) is None:
             return
 
@@ -456,7 +462,7 @@ class ChannelManager:
                 f"+{self.bot.caps.op_mode}",
                 presence.nick,
                 unless_waiting=True,
-                check=partial(self.bot.presence.has, presence),
+                check=lambda: self.help_eligible(channel, presence) is not None,
             )
         except ConnectionError:
             return
