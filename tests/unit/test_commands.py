@@ -32,6 +32,9 @@ from tests.unit.helpers import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from botnats.bot import Bot
     from botnats.nats.status import NATSStatus
     from botnats.validators import ChannelFields
 
@@ -891,12 +894,27 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         """Bind each OP, KICK, and DEOP line to its target, checked again when sent.
 
         Flood pacing can hold a line for minutes: the target may quit or
-        rename meanwhile, and another user take its nick and join.
+        rename meanwhile, and another user take its nick and join, or an
+        admin PART on any bot drop the channel.
         """
         target = Prefix("Target", "user", "real.host")
-        departures = {
-            "quit": IRCMessage("QUIT", ("Quit",), target),
-            "rename": IRCMessage("NICK", ("Moved",), target),
+
+        def part(bot: Bot) -> None:
+            """Part #test, as an admin PART on any bot reaches this one's watch."""
+            mgr = bot.channel_mgr
+            current = mgr.channel_records[casefold("#test", "rfc1459")]
+            mgr.apply_record(
+                ChannelRecord.new("#test", None, present=False, after=current.revision)
+            )
+
+        departures: dict[str, Callable[[Bot], None]] = {
+            "quit": lambda bot: bot.events.on_irc_message(
+                IRCMessage("QUIT", ("Quit",), target)
+            ),
+            "rename": lambda bot: bot.events.on_irc_message(
+                IRCMessage("NICK", ("Moved",), target)
+            ),
+            "part": part,
         }
         for text, flags in (
             ("OP #test Target", "H"),
@@ -942,7 +960,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
                     bot.events.on_irc_message(who)
                     assert check()
 
-                    bot.events.on_irc_message(departure)
+                    departure(bot)
                     join_test_channel(bot, Prefix("Target", "other", "other.host"))
 
                     assert not check()

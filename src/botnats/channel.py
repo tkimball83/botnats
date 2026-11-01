@@ -347,7 +347,9 @@ class ChannelManager:
         """Rekey a user's membership after NICK; return their full old prefix.
 
         A nick-only NICK prefix is completed from member state before the
-        members are renamed, since that would otherwise lose the only copy.
+        members are renamed, since that would otherwise lose the only copy. A
+        complete one renames the members with its own user and host: a stored
+        prefix can be stale, as after a host change this bot never saw.
         """
         old_folded = self.bot.caps.fold(prefix.nick)
         new_folded = self.bot.caps.fold(new_nick)
@@ -359,11 +361,12 @@ class ChannelManager:
 
             member.nick = new_nick
             member_prefix = member.prefix
-            if member_prefix is not None:
-                if not old_prefix.complete:
-                    old_prefix = member_prefix
+            if member_prefix is not None and not old_prefix.complete:
+                old_prefix = member_prefix
 
-                member.prefix = Prefix(new_nick, member_prefix.user, member_prefix.host)
+            source = prefix if prefix.complete else member_prefix
+            if source is not None:
+                member.prefix = Prefix(new_nick, source.user, source.host)
 
             runtime.members[new_folded] = member
 
