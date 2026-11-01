@@ -23,7 +23,7 @@ from tests.integration.test_failover import (
     nats_urls,
 )
 from tests.integration.test_mesh import poll_until
-from tests.integration.test_restart import session_record
+from tests.integration.test_restart import session_value
 
 if TYPE_CHECKING:
     from botnats.bot import NATSCallbackHandler
@@ -165,18 +165,13 @@ class CoordinatorIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_write_keeps_highest_order(self) -> None:
         """Keep the newest session or revocation when bots write concurrently."""
         expires_at = time.time() + 120
-        active = session_record(self.network, expires_at)
-        stale = session_record(self.network, expires_at - 60)
-        revocation = session_record(
-            self.network,
-            expires_at,
-            revoked=True,
-            version=1,
-        )
+        active = session_value(expires_at)
+        stale = session_value(expires_at - 60)
+        revocation = session_value(expires_at, revoked=True, version=1)
 
-        assert asdict(await self.alpha.put_session(active)) == active
-        assert asdict(await self.beta.put_session(stale)) == active
-        assert asdict(await self.beta.put_session(revocation)) == revocation
+        assert await self.alpha.put_session(active) == active
+        assert await self.beta.put_session(stale) == active
+        assert await self.beta.put_session(revocation) == revocation
 
     async def test_duplicate_bot_id_stays_unready(self) -> None:
         """Keep a second process with a live bot's ID unready; the owner stays ready."""

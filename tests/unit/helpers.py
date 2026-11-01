@@ -408,7 +408,7 @@ class FakeCoordinator:
         self.duplicate = False
         self.help_requests: list[tuple[str, dict[str, object]]] = []
         self.presence_puts: list[dict[str, Any]] = []
-        self.session_puts: list[dict[str, Any]] = []
+        self.session_puts: list[Session] = []
 
     def require_writable(self) -> None:
         """Mirror the real write gate: this process must own its bot ID."""
@@ -447,7 +447,7 @@ class FakeCoordinator:
         if not self.duplicate:
             self.presence_puts.append(presence)
 
-    async def put_session(self, session: dict[str, Any]) -> Session:
+    async def put_session(self, session: Session) -> Session:
         """Record a session write and store it as SessionStore would."""
         self.require_writable()
         self.session_puts.append(session)
@@ -514,10 +514,10 @@ class FailingWriteCoordinator(FakeCoordinator):
 
         return await super().put_channel(record, after=after)
 
-    async def put_session(self, session: dict[str, Any]) -> Session:
+    async def put_session(self, session: Session) -> Session:
         """Raise NatsError while failing, to simulate a NATS disconnect."""
         if self.failing:
-            msg = f"NATS disconnected: session {session['prefix']}"
+            msg = f"NATS disconnected: session {session.prefix}"
             raise NatsError(msg)
 
         return await super().put_session(session)

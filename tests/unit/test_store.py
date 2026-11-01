@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 OTHER_SECRET = b"a-different-coordination-secret!"
 SHA256_HEX_LENGTH = 64
-SESSION_INVALID = "session record is invalid"
+SESSION_PAST_HORIZON = "session record expires past this bot's horizon"
 
 
 def signed_presence(instance_id: str) -> dict[str, object]:
@@ -1087,12 +1087,13 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         expires_at = time.time() + 40
         revocation = session_record(expires_at, 1, revoked=True)
         active = session_record(expires_at, 1, revoked=False)
+        winner = parsed_session(revocation)
         sessions.kv.get.return_value = SimpleNamespace(
             revision=7,
             value=json.dumps(revocation).encode(),
         )
 
-        assert await bounded(sessions.put(active)) == parsed_session(revocation)
+        assert await bounded(sessions.put(parsed_session(active))) == winner
         sessions.kv.update.assert_not_awaited()
 
         sessions.kv.get.return_value = SimpleNamespace(
@@ -1101,7 +1102,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         sessions.kv.update.return_value = 9
 
-        assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
+        assert await bounded(sessions.put(winner)) == winner
 
         sessions.kv.update.assert_awaited_once()
 
@@ -1118,8 +1119,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         revocation = session_record(time.time() + 40, 1, revoked=True)
         kv.store(key, json.dumps(revocation).encode())
         stored = kv.entries[key]
+        session = parsed_session(revocation)
 
-        assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
+        assert await bounded(sessions.put(session)) == session
         assert kv.entries[key] == stored
 
     async def test_session_put_writes_expired_revocation(self) -> None:
@@ -1135,9 +1137,33 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         expired = time.time() - 10
         kv.store(key, json.dumps(session_record(expired, 1)).encode())
         revocation = session_record(expired, 2, revoked=True)
+        session = parsed_session(revocation)
 
-        assert await bounded(sessions.put(revocation)) == parsed_session(revocation)
+        assert await bounded(sessions.put(session)) == session
         assert json.loads(kv.entries[key][1]) == revocation
+
+    async def test_session_put_stores_signed_record(self) -> None:
+        """Store a session as the signed record that parse and verify accept.
+
+        session_record signs the fields itself, so the stored bytes match
+        records written before put took a Session.
+        """
+        sessions = SessionStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        sessions.kv = cast("KeyValue", kv)
+        key = sessions.key("owner!user@host")
+        expires_at = time.time() + 40
+        revocation = Session(
+            expires_at, "alpha", "owner!user@host", revoked=True, version=1
+        )
+
+        assert await bounded(sessions.put(revocation)) == revocation
+
+        stored = kv.entries[key][1]
+        signed = session_record(expires_at, 1, revoked=True)
+        assert stored == json.dumps(signed).encode()
+        assert sessions.verify(key, json.loads(stored)) == revocation
+        assert sessions.parse(key, json.loads(stored)) == revocation
 
     async def test_session_put_yields_to_concurrent_writer(self) -> None:
         """Return and keep a newer session that lands between our read and write."""
@@ -1154,7 +1180,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         sessions.kv.update.side_effect = [KeyWrongLastSequenceError()]
 
-        stored = await bounded(sessions.put(session_record(expires_at, 1)))
+        stored = await bounded(
+            sessions.put(parsed_session(session_record(expires_at, 1)))
+        )
 
         assert stored == parsed_session(concurrent)
         sessions.kv.update.assert_awaited_once()
@@ -1174,12 +1202,13 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         with patch("botnats.nats.store.time") as clock:
             clock.time.return_value = now
             assert sessions.parse(key, future) is None
-            with self.assertRaisesRegex(ValueError, SESSION_INVALID):
-                await bounded(sessions.put(future))
+            with self.assertRaisesRegex(ValueError, SESSION_PAST_HORIZON):
+                await bounded(sessions.put(parsed_session(future)))
 
             assert kv.entries == {}
-            assert sessions.parse(key, edge) == parsed_session(edge)
-            assert await bounded(sessions.put(edge)) == parsed_session(edge)
+            session = parsed_session(edge)
+            assert sessions.parse(key, edge) == session
+            assert await bounded(sessions.put(session)) == session
 
         assert list(kv.entries) == [key]
 
@@ -1198,8 +1227,6 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_signature_covers_every_field(self) -> None:
         """Refuse a record whose signed fields changed or whose signature is bad."""
         sessions = SessionStore("efnet", 1, SECRET)
-        kv = FakeKV()
-        sessions.kv = cast("KeyValue", kv)
         expiry = time.time() + 30
         valid = session_record(expiry, 1, revoked=True)
         other_network = {k: v for k, v in valid.items() if k != "signature"}
@@ -1231,13 +1258,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(label):
                 assert parse_session_record(SECRET, "efnet", record) is None
                 assert sessions.parse(key, record) is None
-                with self.assertRaisesRegex(ValueError, SESSION_INVALID):
-                    await bounded(sessions.put(record))
 
-        assert kv.entries == {}
         key = sessions.key("owner!user@host")
         assert sessions.parse(key, valid) == parsed_session(valid)
-        assert await bounded(sessions.put(valid)) == parsed_session(valid)
 
     async def test_session_parse_rejects_malformed_signed_fields(self) -> None:
         """Reject a correctly signed record whose fields have the wrong shape."""
@@ -1315,10 +1338,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         sessions.kv.update.return_value = 2
 
-        valid_session = session_record(time.time() + 40, 0, revoked=False)
-        assert await bounded(sessions.put(valid_session)) == parsed_session(
-            valid_session
-        )
+        valid_session = parsed_session(session_record(time.time() + 40, 0))
+        assert await bounded(sessions.put(valid_session)) == valid_session
         sessions.kv.update.assert_awaited_once()
 
     async def test_oversized_json_integer_is_replaced(self) -> None:
@@ -1343,10 +1364,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         sessions.kv.get.return_value = oversized
         sessions.kv.update.return_value = 2
 
-        valid_session = session_record(time.time() + 40)
-        assert await bounded(sessions.put(valid_session)) == parsed_session(
-            valid_session
-        )
+        valid_session = parsed_session(session_record(time.time() + 40))
+        assert await bounded(sessions.put(valid_session)) == valid_session
         sessions.kv.update.assert_awaited_once()
 
     async def test_decode_record_rejects_non_objects_and_deep_nesting(self) -> None:

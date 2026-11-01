@@ -76,7 +76,7 @@ class PresenceWriter(Protocol):
 class SessionWriter(Protocol):
     """Writes durable session mutations."""
 
-    async def put_session(self, session: dict[str, Any]) -> Session:
+    async def put_session(self, session: Session) -> Session:
         """Store an auth session and return the authoritative session."""
         ...
 
@@ -319,7 +319,7 @@ class Coordinator:
         """Store or refresh bot presence in JetStream KV."""
         await self.claim.put(presence)
 
-    async def put_session(self, session: dict[str, Any]) -> Session:
+    async def put_session(self, session: Session) -> Session:
         """Store an auth session and return the authoritative session."""
         self.claim.require()
         return await self.sessions.put(session)

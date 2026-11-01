@@ -13,8 +13,8 @@ from botnats.nats.store import (
     SESSION_TTL,
     ChannelStore,
     ClaimStore,
+    Session,
     SessionStore,
-    session_signature,
 )
 from tests.integration.test_failover import (
     JETSTREAM_REPLICAS,
@@ -33,23 +33,14 @@ COUNTER = 987_654_321
 SESSION_IDENTITY = "restart!user@host.example"
 
 
-def session_record(
-    network: str,
+def session_value(
     expires_at: float,
     *,
     revoked: bool = False,
     version: int = 0,
-) -> dict[str, object]:
-    """Build a session record for SESSION_IDENTITY signed for one network."""
-    record: dict[str, object] = {
-        "expires_at": expires_at,
-        "issuer": "integration",
-        "prefix": SESSION_IDENTITY,
-        "revoked": revoked,
-        "version": version,
-    }
-    record["signature"] = session_signature(coordination_key(), network, record)
-    return record
+) -> Session:
+    """Build a session for SESSION_IDENTITY."""
+    return Session(expires_at, "integration", SESSION_IDENTITY, revoked, version)
 
 
 def stores() -> tuple[ClaimStore, ChannelStore, SessionStore]:
@@ -75,7 +66,7 @@ async def mark() -> None:
         assert stored_key == CHANNEL_KEY
         await sessions.open(nc.jetstream())
         expires_at = time.time() + SESSION_TTL / 2
-        session = await sessions.put(session_record("restart-test", expires_at))
+        session = await sessions.put(session_value(expires_at))
         assert session.prefix == SESSION_IDENTITY
     finally:
         await nc.drain()

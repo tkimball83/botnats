@@ -1,21 +1,16 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""TOTP authentication, signed sessions, and their mesh-wide synchronization."""
+"""TOTP authentication, sessions, and their mesh-wide synchronization."""
 
 import asyncio
 import hmac
 import time
-from dataclasses import asdict
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from botnats.irc.protocol import casefold
-from botnats.nats.store import (
-    PUBLISH_ERRORS,
-    SESSION_TTL,
-    Session,
-    session_signature,
-)
+from botnats.nats.store import PUBLISH_ERRORS, SESSION_TTL, Session
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -373,7 +368,7 @@ class SessionSync:
         writes.
         """
         try:
-            stored = await self.coordinator.put_session(asdict(session))
+            stored = await self.coordinator.put_session(session)
         except PUBLISH_ERRORS:
             return False
         except ValueError:
@@ -396,13 +391,7 @@ class SessionSync:
             and not winner.revoked
             and self.yielding.get(identity) is not session
         ):
-            replacement = self.authorizer.create(
-                winner.prefix,
-                winner.expires_at,
-                winner.issuer,
-                winner.version + 1,
-                revoked=True,
-            )
+            replacement = replace(winner, revoked=True, version=winner.version + 1)
             # The write succeeded; a retry writes the replacement once this
             # drain releases the lock, so later identities are not held
             # behind it.
@@ -423,13 +412,11 @@ class TotpAuthorizer:
         self,
         secret: bytes,
         *,
-        coordination_secret: bytes,
         identity_fold: Callable[[str], str],
-        scope: tuple[str, str],
+        issuer: str,
     ) -> None:
-        self.coordination_key = coordination_secret
         self.identity_fold = identity_fold
-        self.issuer, self.network = scope
+        self.issuer = issuer
         self.secret = secret
         # Each identity's highest-ranked session or revocation, except that a
         # grant replaces a held live session whatever its rank.
@@ -448,32 +435,6 @@ class TotpAuthorizer:
             return False
 
         return not record.revoked
-
-    def create(
-        self,
-        prefix: str,
-        expires_at: float,
-        issuer: str,
-        version: int = 0,
-        *,
-        revoked: bool = False,
-    ) -> Session:
-        """Create a signed session value."""
-        record: dict[str, object] = {
-            "expires_at": expires_at,
-            "issuer": issuer,
-            "prefix": prefix,
-            "revoked": revoked,
-            "version": version,
-        }
-        return Session(
-            expires_at=expires_at,
-            issuer=issuer,
-            prefix=prefix,
-            revoked=revoked,
-            version=version,
-            signature=session_signature(self.coordination_key, self.network, record),
-        )
 
     def drop_session(self, prefix: str) -> Session | None:
         """Remove a cached session whose durable record was deleted.
@@ -500,8 +461,13 @@ class TotpAuthorizer:
     ) -> Session:
         """Create an authenticated session for the given IRC prefix."""
         current = time.time() if now is None else now
-        expires_at = current + SESSION_TTL
-        session = self.create(prefix, expires_at, self.issuer)
+        session = Session(
+            expires_at=current + SESSION_TTL,
+            issuer=self.issuer,
+            prefix=prefix,
+            revoked=False,
+            version=0,
+        )
         key = self.identity_fold(prefix)
         existing = self.records.get(key)
         # Only a revocation that outranks the new session blocks it. A held
@@ -555,19 +521,13 @@ class TotpAuthorizer:
             self.keep(record)
 
     def revoke(self, prefix: str) -> Session | None:
-        """Replace the prefix's session with a signed revocation; return it."""
+        """Replace the prefix's session with a revocation; return it."""
         key = self.identity_fold(prefix)
         record = self.records.get(key)
         if record is None or record.revoked:
             return None
 
-        revoked = self.create(
-            record.prefix,
-            record.expires_at,
-            record.issuer,
-            record.version + 1,
-            revoked=True,
-        )
+        revoked = replace(record, revoked=True, version=record.version + 1)
         self.records[key] = revoked
         return revoked
 
