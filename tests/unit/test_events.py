@@ -2584,14 +2584,12 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.cooldowns["op"] = 1.0
         bot.channel_mgr.pending_parts[bot.caps.fold("#gone")] = "#gone"
         bot.identity.current = BotPresence("alpha", "host", "one", "alpha", "user")
-        bot.identity.registered = True
         generation = bot.identity.generation
 
         bot.events.on_irc_disconnect()
 
         assert bot.identity.current is None
         assert bot.identity.generation == generation + 1
-        assert not bot.identity.registered
         assert bot.caps == ISupportState()
         assert bot.channel_mgr.runtime(channel) is runtime
         assert not runtime.joined
@@ -2749,7 +2747,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             await bot.tasks.drain()
 
     async def test_welcome_skips_watch_when_nick_matches(self) -> None:
-        """Register and start identity discovery; the desired nick needs no watch."""
+        """Start identity discovery; the desired nick needs no watch."""
         bot, fake_irc = bot_with_irc()
 
         bot.events.on_irc_message(
@@ -2758,7 +2756,6 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         # Let identity discovery send its first WHO.
         await asyncio.sleep(0)
 
-        assert bot.identity.registered
         assert bot.events.nick_watch_task is None
         assert fake_irc.sent == [("WHO", ("alpha",))]
         async with asyncio.timeout(5):
@@ -2832,7 +2829,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         """Start a nick watch when the bot's nick changes away from desired."""
         bot, fake_irc = bot_with_irc()
         fake_irc.current_nick = "forced"
-        bot.identity.registered = True
+        fake_irc.registered_with_server = True
 
         bot.events.on_irc_message(
             IRCMessage("NICK", ("forced",), Prefix("alpha", "~alpha", "host")),
@@ -2847,7 +2844,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.current_nick = "fallback"
         identity = BotPresence("alpha", "host", "inst", "fallback", "~alpha")
         bot.identity.current = identity
-        bot.identity.registered = True
+        fake_irc.registered_with_server = True
 
         bot.events.on_irc_message(
             IRCMessage(

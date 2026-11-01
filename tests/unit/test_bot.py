@@ -370,7 +370,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot = make_bot(irc=fake_irc, coordinator=coordinator)
 
         assert not bot.ready()
-        bot.identity.registered = True
+        fake_irc.registered_with_server = True
         assert bot.ready()
         fake_irc.connected = False
         assert not bot.ready()
@@ -427,7 +427,6 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        bot.identity.registered = True
         stalled = asyncio.Event()
 
         async def stall() -> None:
@@ -466,7 +465,6 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        bot.identity.registered = True
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]

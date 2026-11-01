@@ -246,7 +246,8 @@ class FakeIRC:
 
     It delivers every command at once, so unlike IRCClient its outbound queue
     never fills. It does not parse server lines either: tests set current_nick
-    where IRCClient would track it from 001 and NICK.
+    and registered_with_server where IRCClient would track them from 001 and
+    NICK.
     """
 
     def __init__(self) -> None:
@@ -260,6 +261,7 @@ class FakeIRC:
         # Its queue delivers at once; a test sets a backlog for IRCClient's.
         self.queue_delay = 0.0
         self.reconnects = 0
+        self.registered_with_server = False
         self.sent: list[tuple[str, tuple[str, ...]]] = []
 
     async def close(self) -> None:

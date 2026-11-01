@@ -277,7 +277,6 @@ class IRCClient:
 
     async def run_connection(self, server: IRCServer) -> None:
         """Read and dispatch messages from a single server session."""
-        self.registered_with_server = False
         reader, writer = await self.establish(server)
         loop = asyncio.get_running_loop()
         ping_token: str | None = None
@@ -343,6 +342,10 @@ class IRCClient:
                     error_label(error),
                 )
             finally:
+                # Cleared first: a plain-TCP EOF leaves the socket open until
+                # close(), and the session must not count as registered then.
+                registered = self.registered_with_server
+                self.registered_with_server = False
                 try:
                     self.on_disconnect()
                 except Exception:
@@ -351,7 +354,7 @@ class IRCClient:
                 await self.close()
 
             duration = loop.time() - session_start
-            if self.registered_with_server and duration >= STABLE_SESSION_SECONDS:
+            if registered and duration >= STABLE_SESSION_SECONDS:
                 backoff = 0
             else:
                 index += 1
@@ -491,6 +494,8 @@ class IRCClient:
             self.registered_with_server = True
             if message.params:
                 self.current_nick = message.params[0]
+
+            LOGGER.info("registered on IRC as %s", self.current_nick)
         elif (
             message.command == "NICK"
             and message.prefix is not None
