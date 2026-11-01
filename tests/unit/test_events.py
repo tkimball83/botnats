@@ -2051,6 +2051,84 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert casefold("bob", "rfc1459") not in runtime.members
         assert runtime.joined
 
+    async def test_part_of_last_shared_channel_revokes(self) -> None:
+        """Revoke a session when its holder parts the last channel this bot shares.
+
+        This bot would see none of its later QUIT or NICK changes.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for runtime in bot.channel_mgr.channels.values():
+            runtime.join = JoinState.JOINED
+            runtime.member("owner").prefix = OWNER
+
+        bot.authorizer.grant(OWNER.render())
+
+        bot.events.on_irc_message(IRCMessage("PART", ("#test",), OWNER))
+        await drain_session_writes(bot)
+
+        # Still seen in #other.
+        assert bot.authorizer.authorized(OWNER.render())
+        assert coordinator.session_puts == []
+
+        bot.events.on_irc_message(IRCMessage("PART", ("#other",), OWNER))
+        await drain_session_writes(bot)
+
+        assert not bot.authorizer.authorized(OWNER.render())
+        assert [
+            (put["prefix"], put["revoked"]) for put in coordinator.session_puts
+        ] == [
+            (OWNER.render(), True),
+        ]
+
+    async def test_kick_from_last_shared_channel_revokes(self) -> None:
+        """Revoke the kicked member's session, by the identity WHO recorded."""
+        bot, _, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("owner").prefix = OWNER
+        kicker = Prefix("op", "~op", "op.host")
+        runtime.member("op").prefix = kicker
+        for prefix in (OWNER, kicker):
+            bot.authorizer.grant(prefix.render())
+
+        bot.events.on_irc_message(
+            IRCMessage("KICK", ("#test", "Owner", "reason"), kicker),
+        )
+        await drain_session_writes(bot)
+
+        assert not bot.authorizer.authorized(OWNER.render())
+        assert bot.authorizer.authorized(kicker.render())
+        assert [
+            (put["prefix"], put["revoked"]) for put in coordinator.session_puts
+        ] == [
+            (OWNER.render(), True),
+        ]
+
+    async def test_bot_leaving_revokes_no_one(self) -> None:
+        """Keep sessions when this bot itself parts or is kicked.
+
+        Its peers still see the members it left behind.
+        """
+        for message in (
+            IRCMessage("PART", ("#test",), Prefix("alpha", "~alpha", "host")),
+            IRCMessage("KICK", ("#test", "alpha"), Prefix("op", "~op", "op.host")),
+        ):
+            with self.subTest(command=message.command):
+                bot, _, coordinator = bot_with_coordinator()
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.join = JoinState.JOINED
+                runtime.member("alpha")
+                runtime.member("owner").prefix = OWNER
+                bot.authorizer.grant(OWNER.render())
+
+                bot.events.on_irc_message(message)
+                await settle(bot)
+
+                assert not runtime.joined
+                assert bot.authorizer.authorized(OWNER.render())
+                assert coordinator.session_puts == []
+
     async def test_who_reply_about_self_sets_identity(self) -> None:
         """Learn this bot's own user and host from a WHO reply naming any channel.
 

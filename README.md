@@ -18,7 +18,8 @@ stores shared durable state and atomic authentication controls.
   directly on the receiving bot.
 - Each bot ID atomically claims a case-insensitive presence key; duplicates remain unready.
 - Authorization binds the visible nick, user, and host. Any identity change,
-  NICK included, requires new authentication.
+  NICK included, requires new authentication. Leaving the last channel shared
+  with a bot, by PART or KICK, ends the session as QUIT does.
 
 ### State
 

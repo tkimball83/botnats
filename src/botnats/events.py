@@ -559,7 +559,7 @@ class IRCEventHandler:
                 "kick-unban-request",
             )
         else:
-            runtime.remove(target)
+            self.member_left(runtime, Prefix(target))
 
     def handle_mode(self, message: IRCMessage) -> None:
         """Apply channel MODE changes and trigger enforcement or op requests."""
@@ -665,7 +665,25 @@ class IRCEventHandler:
         if is_self:
             runtime.reset()
         else:
-            runtime.remove(message.prefix.nick)
+            self.member_left(runtime, message.prefix)
+
+    def member_left(self, runtime: ChannelRuntime, prefix: Prefix) -> None:
+        """Remove a member who left a channel; revoke its session once seen in none.
+
+        IRC reports a QUIT, NICK, or CHGHOST only to clients sharing a
+        channel with the user, so an identity this bot no longer sees must
+        authenticate again. A KICK names only the nick: the member's own
+        prefix completes it.
+        """
+        member = runtime.remove(prefix.nick)
+        if self.bot.channel_mgr.sees(prefix.nick):
+            return
+
+        if not prefix.complete and member is not None and member.prefix is not None:
+            prefix = member.prefix
+
+        if prefix.complete:
+            self.bot.sessions.revoke(prefix)
 
     def handle_quit(self, message: IRCMessage) -> None:
         """Remove a user and revoke its session on QUIT."""
