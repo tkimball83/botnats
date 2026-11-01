@@ -434,6 +434,41 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(nick=prefix.nick):
                 await escalates(prefix, quitting)
 
+    async def test_auth_keeps_peer_grant_that_lands_first(self) -> None:
+        """Authorize when a peer's newer grant for the identity lands first.
+
+        The user authenticated on a peer too, so the store returns the peer's
+        grant in place of this one. It authorizes the same identity; revoking
+        it would end a valid session on every bot.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        peer = bot.authorizer.create(
+            prefix.render(),
+            time.time() + SESSION_TTL + 10,
+            "beta",
+        )
+        landing = [peer]
+        put_session = coordinator.put_session
+
+        async def land_peer_grant_first(record: dict[str, Any]) -> Session:
+            if landing:
+                await coordinator.sessions.put(asdict(landing.pop()))
+
+            return await put_session(record)
+
+        valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        with patch.object(coordinator, "put_session", land_peer_grant_first):
+            await send_command(bot, prefix, f"AUTH {valid_code}")
+            await drain_session_writes(bot)
+
+        key = coordinator.sessions.key(prefix.render())
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        assert coordinator.sessions.parse(key, json.loads(kv.entries[key][1])) == peer
+        assert bot.authorizer.authorized(prefix.render())
+        assert fake_irc.privmsgs == [("owner", "Authorized")]
+        assert not bot.sessions.pending
+
     async def test_auth_failure_revokes_grant_over_equivalent_session(self) -> None:
         """Revoke the failed grant itself, not an equivalent prefix's session.
 
@@ -1421,37 +1456,68 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         """Write a held revocation again when its key rolls back to the grant.
 
         A NATS writer without the coordination secret can re-put the earlier
-        signed grant; a bot started later would replay only that grant.
+        signed grant; a bot started later would replay only that grant. This
+        bot may see the rollback only in a reconnect's replay.
         """
-        bot, _, coordinator = bot_with_coordinator()
         # Mixed case and "[", as the write-back compares identities ASCII-folded.
         prefix = "Owner[!user@host.example"
-        grant = bot.authorizer.grant(prefix)
-        async with asyncio.timeout(1):
-            assert await bot.sessions.sync(grant)
-            revocation = bot.authorizer.revoke(prefix)
-            assert revocation is not None
-            assert await bot.sessions.sync(revocation)
+        for replaying in (False, True):
+            with self.subTest(replaying=replaying):
+                bot, _, coordinator = bot_with_coordinator()
+                grant = bot.authorizer.grant(prefix)
+                assert await bounded(bot.sessions.sync(grant))
+                revocation = bot.authorizer.revoke(prefix)
+                assert revocation is not None
+                assert await bounded(bot.sessions.sync(revocation))
 
+                key = coordinator.sessions.key(prefix)
+                # The watch echoing this bot's own write is no rollback.
+                bot.sessions.observe(key, revocation, replaying=False)
+                assert not bot.tasks
+
+                kv = cast("FakeKV", coordinator.sessions.kv)
+                kv.store(key, json.dumps(asdict(grant)).encode())
+                # Another identity's queued revocation must not hold back the
+                # write-back.
+                bot.authorizer.grant("other!user@host.example")
+                queued = bot.authorizer.revoke("other!user@host.example")
+                assert queued is not None
+                bot.sessions.queue(queued)
+
+                bot.sessions.observe(key, grant, replaying=replaying)
+                await drain_session_writes(bot)
+
+                stored = json.loads(kv.entries[key][1])
+                assert coordinator.sessions.parse(key, stored) == revocation
+                assert not bot.authorizer.authorized(prefix)
+                assert not bot.sessions.pending
+
+    async def test_rolled_back_revocation_rewrites_held_grant(self) -> None:
+        """Write a held grant again when its key rolls back to the revocation.
+
+        The user authenticated again after the revocation; a bot started
+        later would replay only the revocation and refuse the live session.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = "owner!user@host.example"
+        grant = bot.authorizer.grant(prefix)
+        assert await bounded(bot.sessions.sync(grant))
+        revocation = bot.authorizer.revoke(prefix)
+        assert revocation is not None
+        assert await bounded(bot.sessions.sync(revocation))
+        later = bot.authorizer.create(prefix, revocation.expires_at + 30, "beta")
+        await bounded(coordinator.sessions.put(asdict(later)))
         key = coordinator.sessions.key(prefix)
-        # The watch echoing this bot's own write is no rollback.
-        bot.sessions.observe(key, revocation, replaying=False)
-        assert not bot.tasks
+        bot.sessions.observe(key, later, replaying=False)
 
         kv = cast("FakeKV", coordinator.sessions.kv)
-        kv.store(key, json.dumps(asdict(grant)).encode())
-        # Another identity's queued revocation must not hold back the write-back.
-        bot.authorizer.grant("other!user@host.example")
-        queued = bot.authorizer.revoke("other!user@host.example")
-        assert queued is not None
-        bot.sessions.queue(queued)
-
-        bot.sessions.observe(key, grant, replaying=False)
+        kv.store(key, json.dumps(asdict(revocation)).encode())
+        bot.sessions.observe(key, revocation, replaying=False)
         await drain_session_writes(bot)
 
         stored = json.loads(kv.entries[key][1])
-        assert coordinator.sessions.parse(key, stored) == revocation
-        assert not bot.authorizer.authorized(prefix)
+        assert coordinator.sessions.parse(key, stored) == later
+        assert bot.authorizer.authorized(prefix)
         assert not bot.sessions.pending
 
     async def test_lost_key_rewrites_held_revocation(self) -> None:
