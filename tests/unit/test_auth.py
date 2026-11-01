@@ -420,6 +420,64 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.pending
         assert not bot.sessions.yielding
 
+    async def test_auth_failure_spares_peer_grant_watched_mid_write(self) -> None:
+        """Revoke only AUTH's own grant while its identity holds.
+
+        The user authenticates on a peer while this bot's write fails, and
+        the watch delivers the peer's newer grant first. Revoking it would end
+        a valid session on every bot. Once IRC disconnects, the identity is
+        gone and the revocation escalates over it.
+        """
+
+        async def failed_write(*, disconnects: bool) -> None:
+            bot, fake_irc, coordinator = bot_with_coordinator()
+            prefix = Prefix("owner", "user", "host.example")
+            peer = Session(
+                time.time() + SESSION_TTL + 30,
+                "beta",
+                prefix.render(),
+                revoked=False,
+                version=0,
+            )
+            key = coordinator.sessions.key(prefix.render())
+            landing = [peer]
+            put_session = coordinator.put_session
+
+            async def peer_lands_then_fail(record: Session) -> Session:
+                if not landing:
+                    return await put_session(record)
+
+                await coordinator.sessions.put(landing.pop())
+                bot.sessions.observe(key, peer)
+                if disconnects:
+                    bot.events.on_irc_disconnect()
+
+                msg = "publish timed out"
+                raise NatsError(msg)
+
+            code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+            with patch.object(coordinator, "put_session", peer_lands_then_fail):
+                await send_command(bot, prefix, f"AUTH {code}")
+                # An escalation would wait for the second retry.
+                await bounded(bot.sessions.retry())
+                await bounded(bot.sessions.retry())
+
+            kv = cast("FakeKV", coordinator.sessions.kv)
+            stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
+            assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+            assert not bot.sessions.pending
+            if disconnects:
+                assert stored is not None
+                assert (stored.expires_at, stored.revoked) == (peer.expires_at, True)
+                assert not bot.authorizer.authorized(prefix.render())
+            else:
+                assert stored == peer
+                assert bot.authorizer.authorized(prefix.render())
+
+        for disconnects in (False, True):
+            with self.subTest(disconnects=disconnects):
+                await failed_write(disconnects=disconnects)
+
     async def test_identity_change_escalates_auth_failure_revocation(self) -> None:
         """Escalate AUTH's queued revocation once its identity is gone.
 
@@ -773,12 +831,17 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
             )
+            auth = next(t for t in bot.tasks if t.get_name() == "admin-command")
             async with asyncio.timeout(1):
                 await writing.wait()
                 # A SIGTERM ends the IRC loop, which reports the disconnect,
                 # then closes the bot.
                 bot.events.on_irc_disconnect()
                 await bot.close()
+
+        # AUTH ends cancelled, as shutdown expects of the tasks it cancels.
+        with self.assertRaises(asyncio.CancelledError):
+            await bounded(auth)
 
         key = coordinator.sessions.key(prefix.render())
         kv = cast("FakeKV", coordinator.sessions.kv)
