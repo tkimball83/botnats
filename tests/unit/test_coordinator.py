@@ -90,7 +90,7 @@ def build_coordinator(bot_id: str, network: str = "efnet") -> Coordinator:
             monitor_port=8222,
             network=network,
             presence_ttl=20.0,
-            replicas=3,
+            replicas=2,
             servers=("nats://localhost:4222",),
             token=NATS_CREDENTIAL,
         ),
