@@ -1004,6 +1004,22 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         )
         assert client.outbound.empty()
 
+    async def test_cap_ack_records_multi_prefix(self) -> None:
+        """Record multi-prefix once an ACK includes it, in negotiation or after."""
+        for negotiating, acked, expected in (
+            (True, "chghost", False),
+            (True, "chghost multi-prefix", True),
+            # The request a CAP NEW prompts is acknowledged after registration.
+            (False, "multi-prefix", True),
+        ):
+            with self.subTest(negotiating=negotiating, acked=acked):
+                client = self.cap_client(negotiating=negotiating)
+                client.cap_ls_done = True
+
+                client.handle_cap(parse_message(f":server CAP alpha ACK :{acked}\r\n"))
+
+                assert client.caps.multi_prefix is expected
+
     async def test_cap_new_without_desired_sends_nothing(self) -> None:
         """Spend no send credit on a NEW that offers no desired capability."""
         client = self.cap_client(negotiating=False)

@@ -806,9 +806,19 @@ class IRCEventHandler:
         *,
         adding: bool,
     ) -> None:
-        """Grant or revoke a member's operator status."""
+        """Grant or revoke a member's operator status.
+
+        Without multi-prefix, NAMES and WHO show only a member's highest rank,
+        so a removal that leaves none tracked asks NAMES again for any lower.
+        """
         member = runtime.member(nick)
         if adding:
             member.modes.add(mode)
         else:
             member.modes.discard(mode)
+            if (
+                not member.modes
+                and not self.bot.caps.multi_prefix
+                and mode != self.bot.caps.operator_modes[-1]
+            ):
+                runtime.names_due = True

@@ -748,6 +748,44 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert not bot.caps.is_opped(runtime.members["target"].modes)
 
+    async def test_rank_loss_without_multi_prefix_resends_names(self) -> None:
+        """Ask NAMES again when a lost rank may have hidden a lower one.
+
+        Without multi-prefix, NAMES shows a +ao member only as &, so a -a
+        that leaves no rank tracked leaves the +o unknown until the next
+        tick's NAMES. The op mode, the lowest rank tracked, hides none.
+        """
+        services = Prefix("ChanServ", "service", "services.host")
+        for multi_prefix, names, mode, due in (
+            (False, "&alpha", "a", True),
+            (True, "&alpha", "a", False),
+            (False, "@alpha", "o", False),
+        ):
+            with self.subTest(multi_prefix=multi_prefix, mode=mode):
+                bot, fake_irc = bot_with_irc()
+                bot.identity.current = BotPresence(
+                    "alpha", "host.example", "inst", "alpha", "~alpha"
+                )
+                bot.caps.multi_prefix = multi_prefix
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.join = JoinState.JOINED
+                bot.events.on_irc_message(
+                    IRCMessage("005", ("alpha", "PREFIX=(qaohv)~&@%+", "supported")),
+                )
+                bot.events.on_irc_message(
+                    IRCMessage("353", ("alpha", "=", "#test", names)),
+                )
+
+                bot.events.on_irc_message(
+                    IRCMessage("MODE", ("#test", f"-{mode}", "alpha"), services),
+                )
+                assert runtime.names_due is due
+
+                bot.channel_mgr.join_desired()
+                await settle(bot)
+
+                assert fake_irc.sent == ([("NAMES", ("#test",))] if due else [])
+
     async def test_unhandled_join_error_logged_once(self) -> None:
         """Log an unhandled refusal of a pending JOIN once, until joined again."""
         bot, _ = bot_with_irc()
@@ -2629,6 +2667,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert runtime is not None
         bot.caps.parse_chanmodes("b,k,l,imn")
         bot.caps.parse_prefix("(yov)@%+")
+        bot.caps.multi_prefix = True
         runtime.join = JoinState.JOINED
         runtime.add_ban("*!*@old.ban")
         runtime.member("alpha").modes.add("o")

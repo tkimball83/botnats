@@ -229,6 +229,10 @@ class IRCClient:
 
         subcommand = message.params[1].upper()
         caps = {cap.partition("=")[0] for cap in message.params[-1].split()}
+        # Counted outside negotiation too: a NEW's request is acknowledged after it.
+        if subcommand == "ACK" and "multi-prefix" in caps:
+            self.caps.multi_prefix = True
+
         if subcommand == "LS":
             if not self.cap_negotiating:
                 return
