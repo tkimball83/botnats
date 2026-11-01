@@ -18,6 +18,7 @@ from botnats.presence import BotPresence
 from tests.unit.helpers import (
     OWNER,
     FailingWriteCoordinator,
+    FakeCoordinator,
     FakeIRC,
     bot_with_coordinator,
     bot_with_irc,
@@ -139,7 +140,8 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limiting_ignores_nick_change(self) -> None:
         """Verify the command limiter keys on host so nick cycling cannot bypass it."""
         fake_irc = FakeIRC()
-        bot = make_bot(irc=fake_irc)
+        # Ready, with no channel desired, so every sender is heard.
+        bot = make_bot(irc=fake_irc, coordinator=FakeCoordinator())
 
         for index in range(20):
             prefix = Prefix(f"nick{index}", "user", "host.example")
@@ -616,7 +618,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_getchans(self) -> None:
         """List tracked channels, marking opped ones @ and those not joined -."""
-        bot, fake_irc = bot_with_irc()
+        bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
         bot.channel_mgr.channels.clear()
 

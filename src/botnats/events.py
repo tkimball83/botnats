@@ -320,11 +320,13 @@ class IRCEventHandler:
             or len(message.params) < 2
             or not self.bot.irc.is_self(message.params[0])
             or message.params[-1].startswith("\x01")
-            # Once a channel is desired, only a sender this bot sees in one:
-            # it would miss anyone else's QUIT or NICK. With none, anyone may
-            # send the first JOIN.
+            # Only a sender this bot sees in one of its channels: it would
+            # miss anyone else's QUIT or NICK. While no channel is desired,
+            # anyone may send the first JOIN, once readiness shows the channel
+            # watch has replayed: until then, the mesh may have channels this
+            # bot has yet to learn.
             or (
-                self.bot.channel_mgr.channels
+                (self.bot.channel_mgr.channels or not self.bot.coordinator.ready)
                 and not self.bot.channel_mgr.sees_prefix(prefix)
             )
             or not self.bot.commands.allow(prefix)

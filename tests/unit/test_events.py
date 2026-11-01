@@ -208,7 +208,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         They spend none of the sender's command budget, so an admin who chats
         can still run commands.
         """
-        bot = make_bot(irc=FakeIRC())
+        # Ready, with no channel desired, so no sender is refused as unseen.
+        bot = make_bot(irc=FakeIRC(), coordinator=FakeCoordinator())
         prefix = Prefix("owner", "user", "host.example")
 
         for message in (
@@ -295,6 +296,31 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.tasks
         # Only the JOIN spent budget.
         assert len(bot.commands.command_limiter.buckets["real.host"]) == 1
+
+    async def test_commands_need_known_channels_to_pass_ungated(self) -> None:
+        """Refuse an unseen sender, though no channel is desired, until ready.
+
+        Until readiness shows the channel watch replayed, the mesh may have
+        channels this bot has yet to learn.
+        """
+        fake_irc = FakeIRC()
+        coordinator = FakeCoordinator()
+        # Unready, as while the watches replay.
+        coordinator.connected = False
+        bot = make_bot(irc=fake_irc, coordinator=coordinator)
+        bot.authorizer.grant(OWNER.render())
+        command = IRCMessage("PRIVMSG", ("alpha", "XYZZY"), OWNER)
+
+        bot.events.on_irc_message(command)
+
+        assert not bot.tasks
+        assert not bot.commands.command_limiter.buckets
+
+        coordinator.connected = True
+        bot.events.on_irc_message(command)
+        await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Unknown command")]
 
     async def test_commands_from_undecodable_prefixes_are_refused(self) -> None:
         """Run no command from a prefix whose undecodable bytes became U+FFFD.
