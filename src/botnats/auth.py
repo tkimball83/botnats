@@ -348,12 +348,12 @@ class SessionSync:
                     return
 
     def revoke(self, prefix: Prefix) -> None:
-        """Revoke a session locally now and write the revocation in background.
+        """Revoke sessions locally now and write the revocations in background.
 
         The identity is gone, so whatever is queued for it escalates over a
-        newer grant, even when its record is already revoked. Like its
-        session, a queued record may spell the identity another way the
-        casemapping folds together.
+        newer grant, even when its record is already revoked. Its sessions,
+        like its queued records, may spell the identity any way the
+        casemapping folds together; each is revoked under its own key.
         """
         identity = prefix.render()
         self.invalidate(identity)
@@ -363,9 +363,11 @@ class SessionSync:
             for key, held in self.yielding.items()
             if fold(held.prefix) != fold(identity)
         }
-        revoked = self.authorizer.revoke(identity)
-        if revoked is not None:
+        revocations = self.authorizer.revoke_all(identity)
+        for revoked in revocations:
             self.queue(revoked)
+
+        if revocations:
             self.tasks.spawn(self.retry(), "session-sync")
 
     async def drain(self, key: str | None = None) -> bool:
@@ -609,6 +611,24 @@ class TotpAuthorizer:
         identity = casefold(record.prefix, "ascii")
         self.records[key] = self.source_records[identity] = revoked
         return revoked
+
+    def revoke_all(self, prefix: str) -> list[Session]:
+        """Revoke every session the prefix folds with; return the revocations.
+
+        Under the casemapping in force each spelling is the same user, though
+        each has its own durable key: one left live would authorize the
+        departed identity again under a mapping that parts them.
+        """
+        key = self.identity_fold(prefix)
+        revocations = [
+            replace(record, revoked=True, version=record.version + 1)
+            for record in self.source_records.values()
+            if not record.revoked and self.identity_fold(record.prefix) == key
+        ]
+        for revoked in revocations:
+            self.keep(revoked)
+
+        return revocations
 
 
 def limit_identity(prefix: Prefix) -> str:

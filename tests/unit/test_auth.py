@@ -1569,6 +1569,33 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert puts == [("foo{!u@h", False), ("foo{!u@h", True)]
         assert not bot.sessions.pending
 
+    async def test_quit_revokes_every_equivalent_watched_session(self) -> None:
+        """Revoke every watched session the departed identity folds with.
+
+        foo{ and foo[ are one user under rfc1459 but have their own durable
+        keys. Revoking only the session that wins the fold would leave the
+        other live: a mapping that parts them, as after a failover to another
+        server family, would authorize the departed identity again, as would
+        any bot that replays the other key there.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        now = time.time()
+        sessions = [
+            Session(now + 2000, "beta", "foo{!u@h", revoked=False, version=0),
+            Session(now + 1000, "beta", "foo[!u@h", revoked=False, version=0),
+        ]
+        for session in sessions:
+            bot.sessions.observe(coordinator.sessions.key(session.prefix), session)
+
+        bot.events.on_irc_message(IRCMessage("QUIT", (), Prefix("foo[", "u", "h")))
+        await drain_session_writes(bot)
+        bot.channel_mgr.set_casemapping("ascii")
+
+        assert not any(bot.authorizer.authorized(s.prefix) for s in sessions)
+        puts = [(put.prefix, put.revoked) for put in coordinator.session_puts]
+        assert puts == [("foo{!u@h", True), ("foo[!u@h", True)]
+        assert not bot.sessions.pending
+
     async def test_ascii_casemapping_regroups_sessions_the_default_merged(self) -> None:
         """Regroup the sessions the default casemapping merged once ISUPPORT arrives.
 
@@ -1603,10 +1630,11 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
                 bot.channel_mgr.set_casemapping("ascii")
 
                 assert all(bot.authorizer.authorized(s.prefix) for s in sessions)
-                for session in sessions:
-                    prefix = Prefix.parse(session.prefix)
-                    bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-
+                first, second = (Prefix.parse(s.prefix) for s in sessions)
+                bot.events.on_irc_message(IRCMessage("QUIT", (), first))
+                # Distinct under ascii, the other user keeps its session.
+                assert bot.authorizer.authorized(second.render())
+                bot.events.on_irc_message(IRCMessage("QUIT", (), second))
                 await drain_session_writes(bot)
 
                 puts = [(put.prefix, put.revoked) for put in coordinator.session_puts]
