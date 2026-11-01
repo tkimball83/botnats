@@ -474,6 +474,63 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert ports == [6667, 6668, 6668]
         assert delays == [1.5, 1.0]
 
+    async def test_run_forever_clears_registration_as_session_ends(self) -> None:
+        """Clear registration before the disconnect callback; keep its backoff.
+
+        A plain-TCP EOF leaves the socket open until close(), so only the
+        cleared flag stops the ended session from counting as registered.
+        """
+
+        async def server_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            # Read the registration first: closing with unread bytes would
+            # reset the connection instead of ending it with EOF.
+            while line := await reader.readline():
+                if line.startswith(b"USER "):
+                    break
+
+            writer.write(b":server 001 alpha :Welcome\r\n")
+            writer.close()
+            await writer.wait_closed()
+
+        states: list[tuple[bool, bool]] = []
+        delays: list[float] = []
+
+        def record_disconnect() -> None:
+            states.append((client.registered_with_server, client.connected))
+
+        async def stop(delay: float) -> None:
+            delays.append(delay)
+            raise asyncio.CancelledError
+
+        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
+        port = server.sockets[0].getsockname()[1]
+        client = irc_client(ports=(port,))
+        client.on_disconnect = record_disconnect
+        try:
+            with (
+                patch("asyncio.sleep", stop),
+                patch("botnats.irc.client.STABLE_SESSION_SECONDS", 0.0),
+                patch("secrets.randbelow", return_value=0),
+                self.assertLogs("botnats.irc.client", level="WARNING") as logs,
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                async with asyncio.timeout(5):
+                    await client.run_forever()
+        finally:
+            async with asyncio.timeout(5):
+                await client.close()
+                server.close()
+                await server.wait_closed()
+
+        ended = f"IRC connection to 127.0.0.1:{port} ended: IRC connection closed"
+        assert logs.output == [f"WARNING:botnats.irc.client:{ended}"]
+        assert states == [(False, True)]
+        # The registered session took the stable path: the base delay.
+        assert delays == [1.0]
+
     async def test_send_loop_spends_flood_credit_then_waits(self) -> None:
         """Send a burst that fits the flood credit at once, then wait each cost."""
         client, clock = self.paced_client()
@@ -1335,6 +1392,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             if message.command == "001":
                 client.send("JOIN", "#sync")
 
+        async def stop_after_last_session(delay: float) -> None:
+            del delay
+            if len(sessions) == len(greetings):
+                raise asyncio.CancelledError
+
         server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
         client = irc_client(ports=(port,))
@@ -1344,22 +1406,21 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("botnats.irc.client.SEND_CREDIT", 1000.0),
                 patch("botnats.irc.client.next_nickname", return_value="bravo"),
+                patch("asyncio.sleep", stop_after_last_session),
+                self.assertLogs("botnats.irc.client", level="WARNING") as logs,
+                self.assertRaises(asyncio.CancelledError),
             ):
                 async with asyncio.timeout(5):
-                    for _ in greetings:
-                        with self.assertRaisesRegex(
-                            ConnectionError,
-                            "connection closed",
-                        ):
-                            await client.run_connection(client.config.servers[0])
-
-                        await client.close()
+                    await client.run_forever()
         finally:
             async with asyncio.timeout(5):
                 await client.close()
                 server.close()
                 await server.wait_closed()
 
+        # Each session ran until the server closed it.
+        assert len(logs.output) == len(greetings)
+        assert all(line.endswith("IRC connection closed") for line in logs.output)
         assert sessions[1] == [
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
