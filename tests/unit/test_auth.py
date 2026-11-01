@@ -587,6 +587,49 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert puts == [("foo[!u@h", True)]
         assert not bot.sessions.pending
 
+    async def test_rekey_keeps_equivalent_session_a_grant_superseded(self) -> None:
+        """Leave the equivalent sessions a grant superseded out of every rekey.
+
+        foo[], foo{} and foo{] are one user under rfc1459 and strict-rfc1459
+        alike, so foo[]'s grant supersedes the peer's higher sessions for the
+        other two: the one it displaces and the one that one outranks. Kept
+        apart, either would outrank the grant's revocation, after a failed
+        AUTH or a QUIT, once a rekey regroups them, as every IRC disconnect
+        does, and authorize the departed identity again.
+        """
+        for failing in (True, False):
+            coordinator = FailingWriteCoordinator()
+            coordinator.failing = failing
+            bot, _, _ = bot_with_coordinator(coordinator)
+            with self.subTest(failing=failing):
+                for spelling, later in (("foo{}", 30), ("foo{]", 15)):
+                    peer = Session(
+                        time.time() + SESSION_TTL + later,
+                        "beta",
+                        f"{spelling}!u@h",
+                        revoked=False,
+                        version=0,
+                    )
+                    bot.authorizer.keep(peer)
+
+                prefix = Prefix("foo[]", "u", "h")
+                code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+                await send_command(bot, prefix, f"AUTH {code}")
+                if failing:
+                    assert not bot.authorizer.authorized(prefix.render())
+                else:
+                    assert bot.authorizer.authorized(prefix.render())
+                    bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+                    await drain_session_writes(bot)
+                    assert not bot.authorizer.authorized(prefix.render())
+
+                bot.channel_mgr.set_casemapping("strict-rfc1459")
+                assert not bot.authorizer.authorized(prefix.render())
+                bot.events.on_irc_disconnect()
+                assert bot.caps.casemapping == "rfc1459"
+                assert not bot.authorizer.authorized(prefix.render())
+
     async def test_auth_grant_does_not_replace_queued_revocation(self) -> None:
         """Persist a QUIT's revocation queued while AUTH waits for the lock."""
         bot, fake_irc, coordinator = bot_with_coordinator()
@@ -2366,8 +2409,11 @@ class SessionSyncWatchTests(unittest.TestCase):
         assert bot.caps.fold_identity(first) == bot.caps.fold_identity(second)
         assert casefold(first, "ascii") != casefold(second, "ascii")
         now = time.time()
-        bot.authorizer.grant(first, now=now)
-        bot.authorizer.grant(second, now=now + 1)
+        for prefix, expires_at in ((first, now + 60), (second, now + 61)):
+            bot.authorizer.keep(
+                Session(expires_at, "beta", prefix, revoked=False, version=0)
+            )
+
         # Each prefix has its own ASCII-folded KV key; deletes arrive by key.
         expiry = now + 60
         bot.sessions.watched["first-key"] = (first, expiry)

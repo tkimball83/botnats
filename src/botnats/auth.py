@@ -514,6 +514,16 @@ class TotpAuthorizer:
         # live session gives way even to a lower-ranked grant, so revoking
         # the prefix when AUTH fails revokes this grant under its own key.
         if existing is None or not existing.revoked or session.order > existing.order:
+            # AUTH runs under the server's casemapping, so every spelling the
+            # grant folds with is this user's and superseded: kept apart, one
+            # could outrank the grant's revocation once a rekey regroups them.
+            for identity in [
+                i
+                for i, r in self.source_records.items()
+                if self.identity_fold(r.prefix) == key
+            ]:
+                del self.source_records[identity]
+
             self.records[key] = self.source_records[casefold(prefix, "ascii")] = session
 
         return session
