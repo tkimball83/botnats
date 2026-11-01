@@ -124,11 +124,19 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
             now = 110.0
             assert limiter.check("user")
 
-    async def test_window_expiry(self) -> None:
-        """Verify rate limit resets after window expires."""
-        limiter = RateLimiter(limit=1, window=0.0)
-        assert limiter.check("user")
-        assert limiter.check("user")
+    async def test_window_forgets_only_expired_events(self) -> None:
+        """Forget the events that left the window and keep counting the rest."""
+        limiter = RateLimiter(limit=3, window=10)
+        # By 11.5 only the event at 1 has left the window.
+        limiter.buckets["user"] = deque([1.0, 5.0, 9.0])
+        now = 11.5
+        with patch(
+            "botnats.commands.asyncio.get_running_loop",
+            return_value=SimpleNamespace(time=lambda: now),
+        ):
+            assert limiter.check("user")
+            now = 12.0
+            assert not limiter.check("user")
 
     async def test_rate_limiting_ignores_nick_change(self) -> None:
         """Verify the command limiter keys on host so nick cycling cannot bypass it."""

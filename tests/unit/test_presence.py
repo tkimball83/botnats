@@ -49,15 +49,6 @@ class PresenceTests(unittest.TestCase):
         restored = BotPresence.from_dict(asdict(original))
         assert original == restored
 
-    def test_presence_expiry(self) -> None:
-        """Verify presence entries expire after TTL."""
-        registry = PresenceRegistry(ttl=10)
-        presence = BotPresence("vhagar", "host", "instance", "vhagar", "user")
-        registry.update(presence, lifetime=registry.ttl, now=5)
-
-        assert registry.active(now=14.9) == (presence,)
-        assert registry.active(now=15) == ()
-
     def test_presence_expires_with_its_record(self) -> None:
         """Count a heartbeat for the TTL, or only for its record's shorter lifetime.
 
