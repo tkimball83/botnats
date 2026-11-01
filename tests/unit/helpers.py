@@ -508,7 +508,12 @@ class FakeCoordinator:
 
 
 class FailingWriteCoordinator(FakeCoordinator):
-    """Coordinator stub whose channel and session writes fail until it recovers."""
+    """Coordinator stub whose channel and session writes fail until it recovers.
+
+    It models JetStream refusing writes while NATS stays connected: it stays
+    ready, and each write raises NatsError. A disconnect would instead drop
+    readiness, and writes would raise StoreUnavailableError.
+    """
 
     def __init__(self) -> None:
         """Start failing channel and session writes."""
@@ -521,7 +526,7 @@ class FailingWriteCoordinator(FakeCoordinator):
         *,
         after: str | None,
     ) -> ChannelFields:
-        """Raise NatsError while failing, to simulate a NATS disconnect."""
+        """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
             msg = f"NATS disconnected: channel {record['channel']}"
             raise NatsError(msg)
@@ -529,7 +534,7 @@ class FailingWriteCoordinator(FakeCoordinator):
         return await super().put_channel(record, after=after)
 
     async def put_session(self, session: Session) -> Session:
-        """Raise NatsError while failing, to simulate a NATS disconnect."""
+        """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
             msg = f"NATS disconnected: session {session.prefix}"
             raise NatsError(msg)

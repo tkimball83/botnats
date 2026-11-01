@@ -106,7 +106,7 @@ class IRCProtocol(IRCSender, Protocol):
 
 @dataclass(slots=True)
 class ISupportState:
-    """Tracks server capabilities advertised via ISUPPORT tokens."""
+    """Tracks server capabilities advertised via ISUPPORT or acknowledged via CAP."""
 
     casemapping: str = DEFAULT_CASEMAPPING
     chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES
@@ -117,6 +117,9 @@ class ISupportState:
     )
     membership_modes: str = DEFAULT_MEMBERSHIP_MODES
     monitor: bool = False
+    # Whether the server acknowledged multi-prefix: NAMES and WHO then show
+    # every rank a member holds, not only its highest.
+    multi_prefix: bool = False
 
     @property
     def op_mode(self) -> str:
