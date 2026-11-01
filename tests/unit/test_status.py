@@ -313,6 +313,25 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 assert f"\r\nHost: {location}\r\n".encode() in request
                 writer.close.assert_called_once_with()
 
+    async def test_route_count_accepts_http_11(self) -> None:
+        """Accept an HTTP/1.1 server's answer to the HTTP/1.0 request."""
+        reader = AsyncMock()
+        # RFC 9110 lets a server reply with the highest version it supports.
+        reader.read.side_effect = [
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b'{"num_routes":2}',
+            b"",
+        ]
+        writer = mock_writer()
+
+        with patch(
+            "asyncio.open_connection",
+            AsyncMock(return_value=(reader, writer)),
+        ):
+            routes = await bounded(route_count("nats-1", 8222))
+
+        assert routes == 2
+
     async def test_route_count_standalone_server(self) -> None:
         """Report a standalone server's zero routes as a known count."""
         reader = AsyncMock()
