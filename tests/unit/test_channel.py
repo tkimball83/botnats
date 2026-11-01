@@ -1333,12 +1333,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_skips_channels_changed_meanwhile(self) -> None:
         """Skip a key hidden, or a channel parted, while an earlier write ran.
 
-        The keys still pending after them are written all the same.
+        A channel parted and wanted again meanwhile has a new runtime: the old
+        one's key is not written over the record that wants it again. The keys
+        still pending after them are written all the same.
         """
         coordinator = FailingWriteCoordinator()
         bot = bot_with_channel(coordinator=coordinator)
         mgr = bot.channel_mgr
-        channels = ("#test", "#hidden", "#parted", "#kept")
+        channels = ("#test", "#hidden", "#parted", "#rejoined", "#kept")
         for channel in channels[1:]:
             mgr.apply_record(ChannelRecord.new(channel, None, present=True))
 
@@ -1367,14 +1369,20 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
                 retry = asyncio.create_task(mgr.retry_pending_keys())
                 await in_flight.wait()
                 runtimes[1].hide_key()
-                mgr.apply_record(
-                    ChannelRecord.new(
-                        "#parted",
-                        None,
-                        present=False,
-                        after=mgr.channel_records["#parted"].revision,
-                    ),
-                )
+                for channel, present in (
+                    ("#parted", False),
+                    ("#rejoined", False),
+                    ("#rejoined", True),
+                ):
+                    mgr.apply_record(
+                        ChannelRecord.new(
+                            channel,
+                            None,
+                            present=present,
+                            after=mgr.channel_records[channel].revision,
+                        ),
+                    )
+
                 release.set()
                 await retry
 
@@ -2017,6 +2025,21 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ("#test", "+o", ("Beta",)),
             ("#test", "+o", ("Gamma",)),
         ]
+
+    async def test_op_peer_uses_the_advertised_op_mode(self) -> None:
+        """Op a peer with the mode letter the server's PREFIX maps to "@"."""
+        bot, fake_irc = bot_with_irc()
+        bot.events.on_irc_message(
+            IRCMessage("005", ("alpha", "PREFIX=(yov)@%+", "supported")),
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("y")
+        runtime.member("gamma").prefix = OP_REQUESTER.to_prefix()
+        bot.presence.update(OP_REQUESTER)
+
+        bot.channel_mgr.op_peer("#test", OP_REQUESTER)
+
+        assert fake_irc.modes == [("#test", "+y", ("gamma",))]
 
     async def test_op_requires_matching_host(self) -> None:
         """Verify op request is rejected when peer host does not match."""
