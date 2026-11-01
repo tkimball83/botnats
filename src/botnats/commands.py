@@ -7,6 +7,7 @@ import asyncio
 import logging
 from collections import OrderedDict, deque
 from functools import partial
+from itertools import batched
 from typing import TYPE_CHECKING
 
 from botnats import error_label
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
     from botnats.irc.protocol import Prefix
 
 LOGGER = logging.getLogger(__name__)
+# Mode changes per MODE line: RFC 1459 allows three with a parameter, and no
+# server's ISUPPORT MODES allows fewer.
+MAX_LINE_MODES = 3
 # Each list line holds the send queue for seconds, ahead of the bot's own
 # commands: a large channel's members could hold it for minutes, or fill it.
 MAX_LIST_LINES = 10
@@ -305,8 +309,14 @@ class CommandHandler:
             index for index, mode in enumerate(operator_modes) if mode in member.modes
         )
         check = partial(self.target_holds, channel, member.nick, member)
-        for mode in operator_modes[highest:]:
-            self.bot.irc.send("MODE", channel, f"-{mode}", member.nick, check=check)
+        for modes in batched(operator_modes[highest:], MAX_LINE_MODES, strict=False):
+            self.bot.irc.send(
+                "MODE",
+                channel,
+                "-" + "".join(modes),
+                *(member.nick for _ in modes),
+                check=check,
+            )
 
         self.reply(
             prefix,

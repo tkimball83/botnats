@@ -98,7 +98,7 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
 
         # Judged at exactly now, however long the test takes.
         with patch(
-            "botnats.commands.asyncio.get_running_loop",
+            "asyncio.get_running_loop",
             return_value=SimpleNamespace(time=lambda: now),
         ):
             assert limiter.check("host.example")
@@ -112,7 +112,7 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         limiter = RateLimiter(limit=2, window=10)
         now = 100.0
         with patch(
-            "botnats.commands.asyncio.get_running_loop",
+            "asyncio.get_running_loop",
             return_value=SimpleNamespace(time=lambda: now),
         ):
             assert limiter.check("user")
@@ -131,7 +131,7 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         limiter.buckets["user"] = deque([1.0, 5.0, 9.0])
         now = 11.5
         with patch(
-            "botnats.commands.asyncio.get_running_loop",
+            "asyncio.get_running_loop",
             return_value=SimpleNamespace(time=lambda: now),
         ):
             assert limiter.check("user")
@@ -808,9 +808,21 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await send_command(bot, OWNER, "DEOP #test Target")
 
+        assert fake_irc.modes == [("#test", "-qao", ("Target", "Target", "Target"))]
+
+    async def test_admin_deop_sends_at_most_three_modes_per_line(self) -> None:
+        """Verify DEOP splits more than three operator ranks across MODE lines."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.caps.parse_prefix("(Yqaohv)!~&@%+")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("Target").modes.add("Y")
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "DEOP #test Target")
+
         assert fake_irc.modes == [
-            ("#test", "-q", ("Target",)),
-            ("#test", "-a", ("Target",)),
+            ("#test", "-Yqa", ("Target", "Target", "Target")),
             ("#test", "-o", ("Target",)),
         ]
 
