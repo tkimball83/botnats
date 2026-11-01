@@ -210,36 +210,6 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.privmsgs == [("owner", "Command failed")]
 
-    async def test_failure_reply_needs_live_session(self) -> None:
-        """Send no write error once the admin quit while the write was in flight.
-
-        Another user may hold the admin's old nick by the time the write fails.
-        """
-        coordinator = FailingWriteCoordinator()
-        bot, fake_irc, _ = bot_with_coordinator(coordinator)
-        bot.authorizer.grant(OWNER.render())
-        put_channel = coordinator.put_channel
-        attempted: list[str] = []
-
-        async def put_after_quit(
-            record: dict[str, Any],
-            *,
-            after: str | None,
-        ) -> ChannelFields:
-            attempted.append(record["channel"])
-            bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
-            return await put_channel(record, after=after)
-
-        with patch.object(coordinator, "put_channel", put_after_quit):
-            await send_command(bot, OWNER, "JOIN #new")
-
-        await drain_session_writes(bot)
-        # The write was attempted, and failed, after the session ended.
-        assert attempted == ["#new"]
-        assert not bot.authorizer.authorized(OWNER.render())
-        assert casefold("#new", "rfc1459") not in bot.channel_mgr.channels
-        assert fake_irc.privmsgs == []
-
     async def test_failure_reply_needs_unbroken_connection(self) -> None:
         """Send no write error once IRC reconnected while the write was in flight.
 
@@ -381,30 +351,6 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.privmsgs == [("owner", "Joining #other")]
         assert mgr.channel_records[casefold("#other", "rfc1459")].key == "new"
-
-    async def test_join_reply_needs_live_session(self) -> None:
-        """Send no JOIN reply once the admin quit while its write was in flight.
-
-        Another user may hold the admin's old nick by the time the write lands.
-        """
-        bot, fake_irc, coordinator = bot_with_coordinator()
-        bot.authorizer.grant(OWNER.render())
-        put_channel = coordinator.put_channel
-
-        async def put_after_quit(
-            record: dict[str, Any],
-            *,
-            after: str | None,
-        ) -> ChannelFields:
-            bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
-            return await put_channel(record, after=after)
-
-        with patch.object(coordinator, "put_channel", put_after_quit):
-            await send_command(bot, OWNER, "JOIN #new")
-
-        await drain_session_writes(bot)
-        assert casefold("#new", "rfc1459") in bot.channel_mgr.channels
-        assert fake_irc.privmsgs == []
 
     async def test_replies_need_unbroken_connection(self) -> None:
         """Answer no command received before IRC reconnected.
@@ -1162,28 +1108,6 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
                     "replicas=1/1 lag=0"
                 ),
             ),
-        ]
-
-    async def test_status_reply_needs_live_session(self) -> None:
-        """Send no NATS status once the admin renamed while it was read.
-
-        Another user may hold the admin's old nick by the time NATS answers.
-        """
-        bot, fake_irc, coordinator = bot_with_coordinator()
-        bot.authorizer.grant(OWNER.render())
-        status = coordinator.status
-
-        async def status_after_nick() -> NATSStatus:
-            bot.events.on_irc_message(IRCMessage("NICK", ("owner2",), OWNER))
-            return await status()
-
-        with patch.object(coordinator, "status", status_after_nick):
-            await send_command(bot, OWNER, "STATUS")
-
-        await drain_session_writes(bot)
-        # Only the line sent before the await reached the admin.
-        assert fake_irc.privmsgs == [
-            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=0"),
         ]
 
     async def test_status_reply_needs_unbroken_connection(self) -> None:

@@ -470,3 +470,15 @@ class IRCProtocolTests(unittest.TestCase):
         caps.parse_prefix("(qv)~+")
         assert caps.op_mode == "o"
         assert not caps.is_opped({"q", "v"})
+
+    def test_prefix_ranks_above_op_count_as_opped(self) -> None:
+        """Count PREFIX ranks above channel operator as opped, and none below."""
+        caps = ISupportState()
+
+        caps.parse_prefix("(qaohv)~&@%+")
+
+        assert caps.operator_modes == "qao"
+        assert caps.is_opped({"q"})
+        assert caps.is_opped({"a"})
+        assert not caps.is_opped({"h"})
+        assert not caps.is_opped({"v"})

@@ -985,7 +985,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.outbound.empty()
 
     async def test_cap_new_and_del_after_registration(self) -> None:
-        """Verify NEW requests desired capabilities and DEL is ignored."""
+        """Verify NEW requests desired capabilities and a DEL sends nothing."""
         client = self.cap_client(negotiating=False)
         # The LS phase finished before registration, so only the ended
         # negotiation keeps this ACK from sending another CAP END.
