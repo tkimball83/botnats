@@ -73,7 +73,7 @@ class AuthFlow:
                 # only a revocation supersedes it. Shutdown reports the IRC
                 # disconnect first, so the identity no longer holds: the
                 # revocation escalates over a newer grant like a change's own.
-                revoked = bot.authorizer.revoke(rendered)
+                revoked = bot.authorizer.revoke(session)
                 if revoked is not None:
                     bot.sessions.queue(revoked)
 
@@ -88,13 +88,14 @@ class AuthFlow:
             ):
                 # While the identity holds, the revocation cancels only this
                 # grant and yields to a newer one: the user may authenticate
-                # on a peer meanwhile. Once gone, it revokes whatever is held
-                # and escalates like the change's own.
+                # on a peer meanwhile. Once gone, it revokes whatever is held,
+                # or this grant if nothing is, and escalates like the change's
+                # own.
                 holds = bot.sessions.watched_valid(rendered)
                 revoked = (
                     bot.authorizer.withdraw(session)
                     if holds
-                    else bot.authorizer.revoke(rendered)
+                    else bot.authorizer.revoke(session)
                 )
                 if revoked is not None:
                     # Queued before waiting on the lock: shutdown may cancel
@@ -625,14 +626,17 @@ class TotpAuthorizer:
         for record in self.source_records.values():
             self.keep(record)
 
-    def revoke(self, prefix: str) -> Session | None:
-        """Replace the session under the prefix's own key with a revocation.
+    def revoke(self, session: Session) -> Session | None:
+        """Replace the record under a session's own key with a revocation.
 
-        Returns the revocation. An IRC-equivalent identity's session, which
-        may outrank it under the fold, has its own key and stays.
+        Returns the revocation, or None if that record is already revoked.
+        With no record held, as when a delete dropped it during the session's
+        write, the session itself is revoked, which outranks it where it is
+        still queued. An IRC-equivalent identity's session, which may outrank
+        it under the fold, has its own key and stays.
         """
-        record = self.source_records.get(casefold(prefix, "ascii"))
-        if record is None or record.revoked:
+        record = self.source_records.get(casefold(session.prefix, "ascii"), session)
+        if record.revoked:
             return None
 
         revoked = replace(record, revoked=True, version=record.version + 1)
@@ -658,15 +662,18 @@ class TotpAuthorizer:
         return revocations
 
     def withdraw(self, session: Session) -> Session | None:
-        """Revoke a grant only while it is the record under its own key.
+        """Revoke a grant only while it, or no record, is under its own key.
 
         Returns the revocation, as revoke does. A record that replaced the
-        grant stands, as a peer's newer grant for the same identity.
+        grant stands, as a peer's newer grant for the same identity. With none
+        held, as when a delete dropped it during the grant's write, the grant
+        itself is revoked: it failed, and must not land from the queue.
         """
-        if self.source_records.get(casefold(session.prefix, "ascii")) != session:
+        key = casefold(session.prefix, "ascii")
+        if self.source_records.get(key, session) != session:
             return None
 
-        return self.revoke(session.prefix)
+        return self.revoke(session)
 
 
 def limit_identity(prefix: Prefix) -> str:

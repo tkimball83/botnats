@@ -284,10 +284,13 @@ class Coordinator:
         self.resync_task.add_done_callback(self.resync_done)
 
     def resync_done(self, task: asyncio.Task[None]) -> None:
-        """Surface a failed resynchronization or restart instead of losing it."""
-        if self.resync_task is task:
-            self.resync_task = None
+        """Surface a failed resynchronization or restart instead of losing it.
 
+        The slot still holds this task: only the reconnected and closed
+        callbacks fill it, and nats-py runs the disconnect callback, which
+        waits for this task, before either.
+        """
+        self.resync_task = None
         log_task_failure(task, LOGGER, "NATS resynchronization")
 
     async def resync(self) -> None:
