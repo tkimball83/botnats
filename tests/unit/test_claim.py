@@ -175,6 +175,19 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         assert claim.owned
         assert claim.revision == created_revision
 
+    async def test_reclaim_leaves_owned_key(self) -> None:
+        """Write nothing after a watch replay while this process owns its key."""
+        claim = build_claim()
+        claim.adopt(5)
+        create = AsyncMock(return_value=6)
+
+        with patch.object(claim.store, "create", create):
+            await bounded(claim.reclaim())
+
+        create.assert_not_awaited()
+        assert claim.owned
+        assert claim.revision == 5
+
     async def test_reclaim_after_reset_is_discarded(self) -> None:
         """Record nothing from a reclaim that finishes after a disconnect."""
         claim = build_claim()
