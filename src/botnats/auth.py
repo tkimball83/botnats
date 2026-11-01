@@ -86,16 +86,20 @@ class AuthFlow:
                 or not bot.authorizer.authorized(rendered)
                 or not bot.sessions.watched_valid(rendered)
             ):
-                revoked = bot.authorizer.revoke(rendered)
+                # While the identity holds, the revocation cancels only this
+                # grant and yields to a newer one: the user may authenticate
+                # on a peer meanwhile. Once gone, it revokes whatever is held
+                # and escalates like the change's own.
+                holds = bot.sessions.watched_valid(rendered)
+                revoked = (
+                    bot.authorizer.withdraw(session)
+                    if holds
+                    else bot.authorizer.revoke(rendered)
+                )
                 if revoked is not None:
                     # Queued before waiting on the lock: shutdown may cancel
                     # the wait, and its final flush writes only what is queued.
-                    # It yields to a newer grant only while the identity
-                    # holds; once gone, it escalates like the change's own.
-                    bot.sessions.queue(
-                        revoked,
-                        yielding=bot.sessions.watched_valid(rendered),
-                    )
+                    bot.sessions.queue(revoked, yielding=holds)
                     await bot.sessions.retry()
 
                 bot.commands.reply(prefix, "Authorization failed", checked=False)
@@ -652,6 +656,17 @@ class TotpAuthorizer:
             self.keep(revoked)
 
         return revocations
+
+    def withdraw(self, session: Session) -> Session | None:
+        """Revoke a grant only while it is the record under its own key.
+
+        Returns the revocation, as revoke does. A record that replaced the
+        grant stands, as a peer's newer grant for the same identity.
+        """
+        if self.source_records.get(casefold(session.prefix, "ascii")) != session:
+            return None
+
+        return self.revoke(session.prefix)
 
 
 def limit_identity(prefix: Prefix) -> str:
