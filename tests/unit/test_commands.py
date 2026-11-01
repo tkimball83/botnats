@@ -188,8 +188,8 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert casefold("#test", "rfc1459") in bot.channel_mgr.channels
         # Each reply is the write's own error, so each command attempted one.
         assert fake_irc.privmsgs == [
-            ("owner", "NATS disconnected: channel #new"),
-            ("owner", "NATS disconnected: channel #test"),
+            ("owner", "JetStream write failed: channel #new"),
+            ("owner", "JetStream write failed: channel #test"),
         ]
 
     async def test_failure_without_message_gets_generic_reply(self) -> None:

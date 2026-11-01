@@ -528,7 +528,7 @@ class FailingWriteCoordinator(FakeCoordinator):
     ) -> ChannelFields:
         """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
-            msg = f"NATS disconnected: channel {record['channel']}"
+            msg = f"JetStream write failed: channel {record['channel']}"
             raise NatsError(msg)
 
         return await super().put_channel(record, after=after)
@@ -536,7 +536,7 @@ class FailingWriteCoordinator(FakeCoordinator):
     async def put_session(self, session: Session) -> Session:
         """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
-            msg = f"NATS disconnected: session {session.prefix}"
+            msg = f"JetStream write failed: session {session.prefix}"
             raise NatsError(msg)
 
         return await super().put_session(session)

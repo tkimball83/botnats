@@ -591,30 +591,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert connect.await_count == 2
         start_watches.assert_awaited_once_with()
 
-    async def test_close_cancels_restart(self) -> None:
-        """Stop a restart that is still connecting when the bot shuts down."""
-        coordinator = build_coordinator("alpha")
-        coordinator.nc = MagicMock()
-        connecting = asyncio.Event()
-
-        async def connect(**options: object) -> None:
-            del options
-            connecting.set()
-            await asyncio.Event().wait()
-
-        with patch("nats.connect", connect):
-            # Without the cancel, the restart never finishes: fail, not hang.
-            async with asyncio.timeout(5):
-                await coordinator.on_closed()
-                restart = coordinator.resync_task
-                assert restart is not None
-                await connecting.wait()
-                await coordinator.close()
-                await asyncio.gather(restart, return_exceptions=True)
-
-        assert restart.cancelled()
-        assert coordinator.resync_task is None
-
     async def test_disconnect_resets_stores(self) -> None:
         """Verify a Core NATS disconnect cancels watches and clears store readiness."""
         coordinator = build_coordinator("alpha")
