@@ -423,7 +423,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         async def connection(server: IRCServer) -> None:
             ports.append(server.port)
             # Registration alone is not stability: this session is far
-            # shorter than STABLE_SESSION_SECONDS.
+            # shorter than STABLE_SESSION_SECONDS, patched beyond any stall.
             client.registered_with_server = len(ports) == 2
             if len(ports) >= 3:
                 raise asyncio.CancelledError
@@ -438,6 +438,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(client, "run_connection", connection),
             patch("asyncio.sleep", record_sleep),
+            patch("botnats.irc.client.STABLE_SESSION_SECONDS", 3600.0),
             patch("secrets.randbelow", return_value=0),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),

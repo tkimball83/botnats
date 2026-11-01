@@ -157,6 +157,14 @@ class ConfigTests(unittest.TestCase):
         ):
             nickname({"nickname": "n" * 10})
 
+    def test_nickname_rejects_a_later_invalid_character(self) -> None:
+        """Reject a nickname whose invalid character follows a valid first one."""
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^bot\.nickname is not a valid IRC nickname$",
+        ):
+            nickname({"nickname": "bad.nick"})
+
     def test_optional_settings_default(self) -> None:
         """Load defaults for omitted optional keys and tables."""
         raw = json.loads(CONFIG)
@@ -311,6 +319,7 @@ class ConfigTests(unittest.TestCase):
     def test_port_validation(self) -> None:
         """Verify monitoring ports default and stay in the TCP port range."""
         assert port({}, "monitor_port", "nats", 8222) == 8222
+        assert port({"monitor_port": 65535}, "monitor_port", "nats", 8222) == 65535
         for bad in (True, 0, 65536, 8222.0, "8222"):
             with self.assertRaisesRegex(ValueError, "integer between 1 and 65535"):
                 port({"monitor_port": bad}, "monitor_port", "nats", 8222)
@@ -349,6 +358,7 @@ class ConfigTests(unittest.TestCase):
     def test_replica_count_validation(self) -> None:
         """Verify JetStream replicas default to one and stay in range."""
         assert replica_count({}) == 1
+        assert replica_count({"jetstream_replicas": 5}) == 5
         for bad in (True, 0, 6, 1.0, "3"):
             with self.assertRaisesRegex(ValueError, "integer between 1 and 5"):
                 replica_count({"jetstream_replicas": bad})

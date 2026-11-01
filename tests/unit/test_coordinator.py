@@ -579,7 +579,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         replaced = asyncio.Event()
 
         async def open_stores() -> None:
-            # init_stores returns once its client is no longer the current one.
+            # As init_stores stops retrying once its client disconnects, the
+            # first client's call returns only after the test closes it.
             if coordinator.nc is first:
                 opening.set()
                 await replaced.wait()

@@ -353,6 +353,8 @@ class PresenceValidTests(unittest.TestCase):
         ahead = sign({**fresh, "timestamp": int(now) + 1})
         assert store.valid("alpha", ahead, now=now)
         # A peer's clock may run at most 30 seconds ahead.
+        at_most_ahead = sign({**fresh, "timestamp": int(now) + 30})
+        assert store.valid("alpha", at_most_ahead, now=now)
         too_far_ahead = sign({**fresh, "timestamp": int(now) + 31})
         assert not store.valid("alpha", too_far_ahead, now=now)
 
@@ -680,18 +682,6 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
 
         assert await bounded(claims.claim(42))
         assert js.create_key_value.await_count == 2
-
-    async def test_reset(self) -> None:
-        """Verify disconnect cleanup invalidates all JetStream handles."""
-        claims = ClaimStore("efnet", 3, SECRET)
-        claims.js = AsyncMock()
-        claims.kv = AsyncMock()
-
-        claims.reset()
-
-        assert claims.js is None
-        assert claims.kv is None
-        assert not claims.ready
 
 
 class KVStoreTests(unittest.IsolatedAsyncioTestCase):

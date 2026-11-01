@@ -7,20 +7,10 @@ import asyncio
 import ipaddress
 import socket
 import unittest
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import patch
 
 from botnats.health_check import RESPONSE_NOT_FOUND, HealthCheck
-from tests.unit.helpers import bounded
-
-
-def mock_writer() -> MagicMock:
-    """Create a mock StreamWriter whose methods return None, as the real ones do."""
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    writer.write.return_value = None
-    writer.drain.return_value = None
-    writer.close.return_value = None
-    writer.wait_closed.return_value = None
-    return writer
+from tests.unit.helpers import bounded, mock_writer
 
 
 class HealthCheckTests(unittest.IsolatedAsyncioTestCase):

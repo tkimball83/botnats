@@ -625,12 +625,16 @@ class ChannelManager:
             self.pending_parts.pop(folded, None)
 
     def safe_join(self, runtime: ChannelRuntime) -> None:
-        """Send JOIN, or leave it due for the next tick while IRC is down."""
+        """Send JOIN, or leave it due for the next tick while IRC is down.
+
+        A copy still waiting to go out stands in for it: each peer answering
+        an invite request sends an INVITE, and each would queue another JOIN.
+        """
         try:
             params = (
                 (runtime.channel, runtime.key) if runtime.key else (runtime.channel,)
             )
-            self.bot.irc.send("JOIN", *params)
+            self.bot.irc.send("JOIN", *params, unless_waiting=True)
         except ConnectionError:
             return
         # Only a JOIN that actually reached the send queue is in flight.
