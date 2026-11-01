@@ -497,6 +497,21 @@ class TotpAuthorizer:
 
         return existing if existing.order > incoming.order else None
 
+    def live_prefixes(self, nick: str) -> list[str]:
+        """Return the prefixes of the unexpired, unrevoked sessions a nick holds.
+
+        A session is the nick's when the nick, with the session's own user
+        and host, folds to the session's identity.
+        """
+        now = time.time()
+        return [
+            record.prefix
+            for key, record in self.records.items()
+            if not record.revoked
+            and record.expires_at > now
+            and self.identity_fold(f"{nick}!{record.prefix.partition('!')[2]}") == key
+        ]
+
     def match(self, code: str, *, now: float | None = None) -> int | None:
         """Return the TOTP counter that produced the code, or None."""
         if not code.isascii() or len(code) != TOTP_CODE_LENGTH or not code.isdigit():

@@ -682,7 +682,9 @@ class IRCEventHandler:
         IRC reports a QUIT, NICK, or CHGHOST only to clients sharing a
         channel with the user, so an identity this bot no longer sees must
         authenticate again. A KICK names only the nick: the member's own
-        prefix completes it.
+        prefix completes it. A member known only from NAMES has none, so
+        every live session held for the nick is revoked, failing closed: one
+        nick belongs to one user at a time.
         """
         member = runtime.remove(prefix.nick)
         if self.bot.channel_mgr.sees(prefix.nick):
@@ -693,6 +695,9 @@ class IRCEventHandler:
 
         if prefix.complete:
             self.bot.sessions.revoke(prefix)
+        else:
+            for held in self.bot.authorizer.live_prefixes(prefix.nick):
+                self.bot.sessions.revoke(Prefix.parse(held))
 
     def handle_quit(self, message: IRCMessage) -> None:
         """Remove a user and revoke its session on QUIT."""

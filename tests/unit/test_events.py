@@ -7,7 +7,7 @@ import asyncio
 import time
 import unittest
 from dataclasses import asdict, replace
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, call, patch
 
 from botnats.channel import (
@@ -42,6 +42,9 @@ from tests.unit.helpers import (
     make_bot,
     settle,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 CUSTOM_ISUPPORT = IRCMessage(
     "005",
@@ -1639,13 +1642,18 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             *params: str,
             trailing: str | None = None,
             unless_waiting: bool = False,
+            check: Callable[[], bool] | None = None,
         ) -> bool:
             if (command, params) == ("MODE", ("#test",)):
                 msg = "IRC outbound queue is full"
                 raise ConnectionError(msg)
 
             return record(
-                command, *params, trailing=trailing, unless_waiting=unless_waiting
+                command,
+                *params,
+                trailing=trailing,
+                unless_waiting=unless_waiting,
+                check=check,
             )
 
         with patch.object(fake_irc, "send", refuse_mode_query):
@@ -2225,13 +2233,20 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_kick_from_last_shared_channel_revokes(self) -> None:
-        """Revoke the kicked member's session, by the identity WHO recorded."""
+        """Revoke the kicked member's session, by the identity WHO recorded.
+
+        Only the KICK from the last channel this bot shares with the member
+        revokes. The KICK names only the nick, which another channel still
+        shows although the bare nick matches no member's full prefix.
+        """
         bot, _, coordinator = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.member("owner").prefix = OWNER
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
         kicker = Prefix("op", "~op", "op.host")
-        runtime.member("op").prefix = kicker
+        for runtime in bot.channel_mgr.channels.values():
+            runtime.join = JoinState.JOINED
+            for prefix in (OWNER, kicker):
+                runtime.member(prefix.nick).prefix = prefix
+
         for prefix in (OWNER, kicker):
             bot.authorizer.grant(prefix.render())
 
@@ -2240,8 +2255,59 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         await drain_session_writes(bot)
 
+        # Still seen in #other.
+        assert bot.authorizer.authorized(OWNER.render())
+        assert coordinator.session_puts == []
+
+        bot.events.on_irc_message(
+            IRCMessage("KICK", ("#other", "Owner", "reason"), kicker),
+        )
+        await drain_session_writes(bot)
+
         assert not bot.authorizer.authorized(OWNER.render())
         assert bot.authorizer.authorized(kicker.render())
+        assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
+            (OWNER.render(), True),
+        ]
+
+    async def test_kick_of_names_only_member_revokes_its_nick(self) -> None:
+        """Revoke the live sessions held for a kicked nick that WHO has yet to report.
+
+        Only NAMES has listed the member, as while its WHO still waits in the
+        paced send queue, so the bare nick is all this bot knows of it. A
+        session held for another nick, whose holder this bot does not see
+        either, stays.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for channel in ("#test", "#other"):
+            runtime = bot.channel_mgr.channels[casefold(channel, "rfc1459")]
+            runtime.join = JoinState.JOINED
+            bot.events.on_irc_message(
+                IRCMessage("353", ("alpha", "=", channel, "owner")),
+            )
+
+        other = Prefix("other", "user", "real.host")
+        for prefix in (OWNER, other):
+            bot.authorizer.grant(prefix.render())
+
+        kicker = Prefix("op", "~op", "op.host")
+        bot.events.on_irc_message(
+            IRCMessage("KICK", ("#test", "OWNER", "reason"), kicker),
+        )
+        await drain_session_writes(bot)
+
+        # Still seen in #other.
+        assert bot.authorizer.authorized(OWNER.render())
+        assert coordinator.session_puts == []
+
+        bot.events.on_irc_message(
+            IRCMessage("KICK", ("#other", "OWNER", "reason"), kicker),
+        )
+        await drain_session_writes(bot)
+
+        assert not bot.authorizer.authorized(OWNER.render())
+        assert bot.authorizer.authorized(other.render())
         assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
             (OWNER.render(), True),
         ]
@@ -2761,6 +2827,7 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             *params: str,
             trailing: str | None = None,
             unless_waiting: bool = False,
+            check: Callable[[], bool] | None = None,
         ) -> bool:
             nonlocal refused
             if not refused:
@@ -2769,7 +2836,11 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
                 raise ConnectionError(msg)
 
             queued = record(
-                command, *params, trailing=trailing, unless_waiting=unless_waiting
+                command,
+                *params,
+                trailing=trailing,
+                unless_waiting=unless_waiting,
+                check=check,
             )
             fake_irc.current_nick = "alpha"
             if len(fake_irc.sent) == 2:
