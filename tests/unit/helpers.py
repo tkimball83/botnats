@@ -7,6 +7,7 @@ import asyncio
 import base64
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import MagicMock, create_autospec
 
 from nats.errors import Error as NatsError
 from nats.js.errors import (
@@ -216,9 +217,20 @@ def config() -> BotConfig:
         nats_token=NATS_CREDENTIAL,
         network="efnet",
         nickname="alpha",
-        presence_ttl=15,
+        # Long enough that peers stay present through any stall.
+        presence_ttl=3600,
         totp_secret=AUTH_KEY,
     )
+
+
+def mock_writer() -> MagicMock:
+    """Create a mock StreamWriter whose methods return None, as the real ones do."""
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.write.return_value = None
+    writer.drain.return_value = None
+    writer.close.return_value = None
+    writer.wait_closed.return_value = None
+    return writer
 
 
 class FakeIRC:

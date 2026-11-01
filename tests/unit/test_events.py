@@ -656,13 +656,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             # A pending JOIN already due for a resend.
             runtime.join = JoinState.JOINING
             runtime.join_retry_at = 0.0
+            refused_at = asyncio.get_running_loop().time()
             bot.events.on_irc_message(
                 IRCMessage(numeric, ("alpha", "#test", "cannot join channel")),
             )
             await settle(bot)
 
             # Every refusal paces the JOIN: the next tick does not resend it.
-            assert not runtime.join_due()
+            assert runtime.join_retry_at >= refused_at + JOIN_RETRY_DELAY
             keys.append(runtime.key)
 
         assert [kind for kind, _ in coordinator.help_requests] == [
@@ -723,13 +724,17 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         join = ("JOIN", ("#test",))
 
         bot.channel_mgr.join_desired()
+        refused_at = asyncio.get_running_loop().time()
         bot.events.on_irc_message(
             IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
         )
+        assert runtime.join_retry_at >= refused_at + JOIN_RETRY_DELAY
+        # A margin no stall outlasts; the bound above pins the retry delay.
+        runtime.join_retry_at -= JOIN_RETRY_DELAY - 3600
         bot.channel_mgr.join_desired()
         assert fake_irc.sent == [join]
 
-        runtime.join_retry_at -= JOIN_RETRY_DELAY
+        runtime.join_retry_at -= 3600
         bot.channel_mgr.join_desired()
         assert fake_irc.sent == [join, join]
 
@@ -785,6 +790,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         join = ("JOIN", ("#test",))
 
+        sent_at = asyncio.get_running_loop().time()
         bot.channel_mgr.join_desired()
         with self.assertLogs("botnats.events", level="WARNING"):
             bot.events.on_irc_message(
@@ -794,11 +800,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(
             IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
-        runtime.join_retry_at -= JOIN_RETRY_DELAY
+        assert runtime.join_retry_at >= sent_at + JOIN_REPLY_TIMEOUT
+        # A margin no stall outlasts; the bound above pins the reply timeout.
+        runtime.join_retry_at -= JOIN_REPLY_TIMEOUT - 3600
         bot.channel_mgr.join_desired()
         assert fake_irc.sent == [join]
 
-        runtime.join_retry_at -= JOIN_REPLY_TIMEOUT
+        runtime.join_retry_at -= 3600
         bot.channel_mgr.join_desired()
         assert fake_irc.sent == [join, join]
         await settle(bot)

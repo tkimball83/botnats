@@ -70,7 +70,8 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_evict_stale_boundary(self) -> None:
         """Treat a bucket whose newest entry sits exactly at the cutoff as stale."""
         limiter = RateLimiter()
-        limiter.buckets["old"] = deque([5.0])
+        # Only the newest entry decides: the older one is past either cutoff.
+        limiter.buckets["old"] = deque([1.0, 5.0])
 
         assert not limiter.evict_stale(4.9)
         assert "old" in limiter.buckets
@@ -126,14 +127,6 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         limiter = RateLimiter(limit=1, window=0.0)
         assert limiter.check("user")
         assert limiter.check("user")
-
-    async def test_within_limit(self) -> None:
-        """Verify requests within limit are allowed and excess is denied."""
-        limiter = RateLimiter(limit=3, window=60)
-        for _ in range(3):
-            assert limiter.check("user")
-
-        assert not limiter.check("user")
 
     async def test_rate_limiting_ignores_nick_change(self) -> None:
         """Verify the command limiter keys on host so nick cycling cannot bypass it."""

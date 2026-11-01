@@ -7,7 +7,7 @@ import asyncio
 import io
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
 from nats.errors import Error as NatsError
@@ -19,17 +19,7 @@ from botnats.nats.status import (
     route_count,
     stream_info,
 )
-from tests.unit.helpers import bounded, hang
-
-
-def mock_writer() -> MagicMock:
-    """Create a mock StreamWriter whose methods return None, as the real ones do."""
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    writer.write.return_value = None
-    writer.drain.return_value = None
-    writer.close.return_value = None
-    writer.wait_closed.return_value = None
-    return writer
+from tests.unit.helpers import bounded, hang, mock_writer
 
 
 class NATSStatusTests(unittest.IsolatedAsyncioTestCase):

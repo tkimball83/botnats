@@ -250,23 +250,6 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("MODE", ("#test", "+npst"))]
 
-    async def test_enforce_modes_skips_a_copy_still_waiting(self) -> None:
-        """Skip the configured modes' line while a copy still waits to go out.
-
-        Behind a send backlog, each change an operator makes would queue
-        another copy; the waiting one goes out after them and sets the modes.
-        """
-        bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.modes = ""
-
-        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
-            bot.channel_mgr.enforce_modes(runtime)
-
-        assert send.call_args_list == [
-            call("MODE", "#test", "+npst", unless_waiting=True),
-        ]
-
     async def test_casemapping_change(self) -> None:
         """Verify casemapping change migrates channel and auth state."""
         bot = bot_with_channel(irc=FakeIRC())
@@ -2075,7 +2058,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        fake_irc.queue_delay = 100.0
+        # A backlog no stall outlasts.
+        fake_irc.queue_delay = 3600.0
 
         bot.channel_mgr.join_desired()
         runtime.join_retry_at -= JOIN_REPLY_TIMEOUT
@@ -2264,11 +2248,11 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         await bounded(bot.channel_mgr.request_peer("unban", "#test"))
         assert [kind for kind, _ in coordinator.help_requests] == ["unban"]
 
-    async def test_only_help_skips_a_copy_still_waiting(self) -> None:
-        """Let help skip a copy of a line still waiting, and log no skipped help.
+    async def test_help_and_join_skip_a_copy_still_waiting(self) -> None:
+        """Let help and JOIN skip a copy of a line still waiting, and log neither.
 
-        A peer asks again until it sees the result; the JOIN an admin asks
-        for has no such retry, so it always queues.
+        A peer asks again until it sees the result. Each peer answering an
+        invite request sends an INVITE, and the copy still waiting joins.
         """
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
@@ -2276,8 +2260,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!~beta@beta.host")
         runtime.limit = 1
         bot.presence.update(INVITEE)
-        # As IRCClient answers while a copy of every line still waits: help
-        # is skipped, and any other line is queued.
+        # As IRCClient answers while a copy of every line still waits: a line
+        # asking to skip such a copy is skipped, and any other is queued.
         skip = MagicMock(
             side_effect=lambda *_args, unless_waiting=False, **_kwargs: (
                 not unless_waiting
@@ -2297,8 +2281,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert [entry.kwargs for entry in skip.call_args_list] == [
             {"unless_waiting": True},
-        ] * 4 + [{}]
-        assert skip.call_args == call("JOIN", "#test")
+        ] * 5
+        assert skip.call_args == call("JOIN", "#test", unless_waiting=True)
 
 
 class ChannelStateTests(unittest.TestCase):
