@@ -13,8 +13,8 @@ Fail closed. Mesh-wide auth limits. Signed records and envelopes.
 - Store revocations in JetStream KV with TTL matching session expiry.
 - Sign the network, identity, expiry, issuer, version, and revocation state of every durable
   session mutation.
-- Reject malformed, expired, future-dated, or incorrectly signed session records before they
-  affect local authorization.
+- Reject malformed, expired, or incorrectly signed session records, and future-dated grants,
+  before they affect local authorization; keep a future-dated revocation, which only denies.
 
 ## Coordination
 
