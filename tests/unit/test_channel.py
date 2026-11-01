@@ -17,6 +17,7 @@ from botnats.channel import (
     JOIN_REPLY_TIMEOUT,
     JOIN_RETRY_DELAY,
     PEER_HELP_DELAY,
+    ChannelMember,
     ChannelRecord,
     ChannelRuntime,
     JoinState,
@@ -832,6 +833,31 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not runtime.key_pending
         assert coordinator.channel_puts[0]["key"] == "recordkey"
+        assert bot.channel_mgr.channel_records[folded].key == "recordkey"
+
+    async def test_record_key_retries_unwritable_store_quietly(self) -> None:
+        """Keep a key pending, logging no error, while this bot cannot write.
+
+        A disconnected bot, or one whose bot ID another instance holds, has
+        its write refused before it reaches JetStream.
+        """
+        coordinator = FakeCoordinator()
+        bot = bot_with_channel(coordinator=coordinator)
+        folded = casefold("#test", "rfc1459")
+        before = bot.channel_mgr.channel_records[folded]
+        runtime = bot.channel_mgr.channels[folded]
+        runtime.join = JoinState.JOINED
+        coordinator.connected = False
+
+        with self.assertNoLogs("botnats", level="ERROR"):
+            await see_key(bot, runtime, "recordkey")
+
+        assert runtime.key_pending
+        assert bot.channel_mgr.channel_records[folded] == before
+        coordinator.connected = True
+        await bounded(bot.channel_mgr.retry_pending_keys())
+
+        assert not runtime.key_pending
         assert bot.channel_mgr.channel_records[folded].key == "recordkey"
 
     async def test_failed_key_write_does_not_override_a_later_part(self) -> None:
@@ -1650,9 +1676,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert [runtime.members for runtime in mgr.channels.values()] == [{}, {}]
 
     async def test_nick_prefix_outranks_stored_member_prefix(self) -> None:
-        """Return a complete NICK prefix over the member prefix stored for it.
+        """Return and keep a complete NICK prefix over the one stored for it.
 
-        Every channel renames the member.
+        Every channel renames the member to the NICK's user and host, so the
+        renamed user's commands are heard before WHO reports it again.
         """
         bot = bot_with_channel()
         mgr = bot.channel_mgr
@@ -1661,12 +1688,27 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             runtime.member("owner").prefix = Prefix("owner", "user", "stale.host")
 
         prefix = Prefix("owner", "user", "host.example")
+        renamed = Prefix("newowner", "user", "host.example")
 
         assert mgr.rename_member(prefix, "newowner") == prefix
-        assert [list(runtime.members) for runtime in mgr.channels.values()] == [
-            ["newowner"],
-            ["newowner"],
-        ]
+        assert [
+            {folded: member.prefix for folded, member in runtime.members.items()}
+            for runtime in mgr.channels.values()
+        ] == [{"newowner": renamed}, {"newowner": renamed}]
+        assert mgr.sees_prefix(renamed)
+
+    async def test_nick_only_prefix_completes_from_stored_member_prefix(self) -> None:
+        """Complete a nick-only NICK prefix, and each renamed member, from state."""
+        bot = bot_with_channel()
+        mgr = bot.channel_mgr
+        stored = Prefix("owner", "user", "stored.host")
+        mgr.channels[casefold("#test", "rfc1459")].member("owner").prefix = stored
+
+        assert mgr.rename_member(Prefix("Owner"), "newowner") == stored
+        renamed = Prefix("newowner", "user", "stored.host")
+        assert mgr.channels[casefold("#test", "rfc1459")].members == {
+            "newowner": ChannelMember("newowner", prefix=renamed)
+        }
 
     async def test_chghost_prefix_outranks_stored_member_prefix(self) -> None:
         """Return a complete CHGHOST prefix over the member prefix stored for it.

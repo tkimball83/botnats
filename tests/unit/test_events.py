@@ -370,27 +370,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         """Run no command from a prefix whose undecodable bytes became U+FFFD.
 
         Latin-1 nicks René and Renè with one user@host decode alike, so a
-        session granted to one would run the other's commands.
+        session granted to one would run the other's commands. Bytes lost from
+        a user or host refuse the sender too.
         """
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        granted, other = (
+        granted, other, user, host = (
             parse_message(line.decode(errors="replace"))
             for line in (
                 b":Ren\xe9!~ren@shared.host PRIVMSG alpha :BAN #test *!*@first",
                 b":Ren\xe8!~ren@shared.host PRIVMSG alpha :BAN #test *!*@second",
+                b":Rena!~ren\xe9@shared.host PRIVMSG alpha :BAN #test *!*@user",
+                b":Reno!~ren@shared.h\xe9st PRIVMSG alpha :BAN #test *!*@host",
             )
         )
-        assert granted.prefix is not None
         assert other.prefix == granted.prefix
-        for prefix in (granted.prefix, OWNER):
+        for prefix in (granted.prefix, user.prefix, host.prefix, OWNER):
+            assert prefix is not None
             bot.authorizer.grant(prefix.render())
             join_test_channel(bot, prefix)
 
         for message in (
             granted,
             other,
+            user,
+            host,
             IRCMessage("PRIVMSG", ("alpha", "BAN #test *!*@owner"), OWNER),
         ):
             bot.events.on_irc_message(message)
@@ -753,15 +758,18 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         Without multi-prefix, NAMES shows a +ao member only as &, so a -a
         that leaves no rank tracked leaves the +o unknown until the next
-        tick's NAMES. The op mode, the lowest rank tracked, hides none.
+        tick's NAMES. The op mode, the lowest rank tracked, hides none, and a
+        loss that leaves a rank tracked, here a +q seen by MODE, leaves the
+        member opped.
         """
         services = Prefix("ChanServ", "service", "services.host")
-        for multi_prefix, names, mode, due in (
-            (False, "&alpha", "a", True),
-            (True, "&alpha", "a", False),
-            (False, "@alpha", "o", False),
+        for multi_prefix, names, kept, mode, due in (
+            (False, "&alpha", "", "a", True),
+            (True, "&alpha", "", "a", False),
+            (False, "@alpha", "", "o", False),
+            (False, "&alpha", "q", "a", False),
         ):
-            with self.subTest(multi_prefix=multi_prefix, mode=mode):
+            with self.subTest(multi_prefix=multi_prefix, kept=kept, mode=mode):
                 bot, fake_irc = bot_with_irc()
                 bot.identity.current = BotPresence(
                     "alpha", "host.example", "inst", "alpha", "~alpha"
@@ -776,9 +784,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                     IRCMessage("353", ("alpha", "=", "#test", names)),
                 )
 
-                bot.events.on_irc_message(
-                    IRCMessage("MODE", ("#test", f"-{mode}", "alpha"), services),
-                )
+                for change in (*(f"+{rank}" for rank in kept), f"-{mode}"):
+                    bot.events.on_irc_message(
+                        IRCMessage("MODE", ("#test", change, "alpha"), services),
+                    )
+
                 assert runtime.names_due is due
 
                 bot.channel_mgr.join_desired()
