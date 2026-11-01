@@ -194,6 +194,27 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                     f"replicas=1/{replicas} lag=0"
                 )
 
+    async def test_collect_uses_stream_replica_count(self) -> None:
+        """Judge replicas against the stream's own count, not the configured one."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        # An operator scaled the open bucket's stream down to one replica.
+        kv.status.return_value = SimpleNamespace(
+            stream_info=StreamInfo.from_response(
+                {"config": {"num_replicas": 1}, "cluster": {"leader": "nats-1"}},
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 3, 8222))
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=1/1 lag=0"
+        )
+
     async def test_collect_unknown_when_disconnected(self) -> None:
         """Return unknown details without monitoring a disconnected client."""
         # nats-py reports no connected URL while it reconnects.
@@ -259,6 +280,41 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 request = writer.write.call_args.args[0]
                 assert f"\r\nHost: {location}\r\n".encode() in request
                 writer.close.assert_called_once_with()
+
+    async def test_route_count_standalone_server(self) -> None:
+        """Report a standalone server's zero routes as a known count."""
+        reader = AsyncMock()
+        reader.read.side_effect = [
+            b"HTTP/1.0 200 OK\r\n\r\n",
+            b'{"num_routes":0}',
+            b"",
+        ]
+        writer = mock_writer()
+
+        with patch(
+            "asyncio.open_connection",
+            AsyncMock(return_value=(reader, writer)),
+        ):
+            routes = await bounded(route_count("nats-1", 8222))
+
+        assert routes == 0
+
+    async def test_route_count_unknown_when_reset(self) -> None:
+        """Give up on a monitoring port that resets the connection."""
+        reader = AsyncMock()
+        reader.read.side_effect = ConnectionResetError("reset")
+        writer = mock_writer()
+        # After a reset, closing the writer reports the reset again.
+        writer.wait_closed.side_effect = ConnectionResetError("reset")
+
+        with patch(
+            "asyncio.open_connection",
+            AsyncMock(return_value=(reader, writer)),
+        ):
+            routes = await bounded(route_count("nats-1", 8222))
+
+        assert routes is None
+        writer.wait_closed.assert_awaited_once_with()
 
     async def test_route_count_unknown_when_unanswered(self) -> None:
         """Give up on a monitoring port that accepts but never answers."""

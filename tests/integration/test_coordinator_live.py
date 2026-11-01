@@ -74,7 +74,8 @@ def build_coordinator(
             instance_id=uuid.uuid4().hex,
             monitor_port=8222,
             network=network,
-            presence_ttl=15.0,
+            # Nothing refreshes presence here, so it outlasts a test's waits.
+            presence_ttl=120.0,
             replicas=JETSTREAM_REPLICAS,
             servers=tuple(nats_urls()),
             token=os.environ["BOTNATS_TEST_NATS_TOKEN"],
