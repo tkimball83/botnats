@@ -401,6 +401,8 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             routes = await bounded(route_count("nats-1", 8222))
 
         assert routes is None
+        # The read stops one byte past the limit instead of reading to EOF.
+        assert response.tell() == MAX_RESPONSE_BYTES + 1
 
     async def test_stream_info_surfaces_programming_errors(self) -> None:
         """Never render a code defect as a transient unknown status."""
