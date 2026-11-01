@@ -662,12 +662,15 @@ class TotpAuthorizer:
         return revocations
 
     def withdraw(self, session: Session) -> Session | None:
-        """Revoke a grant only while it is the record under its own key.
+        """Revoke a grant only while it, or no record, is under its own key.
 
         Returns the revocation, as revoke does. A record that replaced the
-        grant stands, as a peer's newer grant for the same identity.
+        grant stands, as a peer's newer grant for the same identity. With none
+        held, as when a delete dropped it during the grant's write, the grant
+        itself is revoked: it failed, and must not land from the queue.
         """
-        if self.source_records.get(casefold(session.prefix, "ascii")) != session:
+        key = casefold(session.prefix, "ascii")
+        if self.source_records.get(key, session) != session:
             return None
 
         return self.revoke(session)

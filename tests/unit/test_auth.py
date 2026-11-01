@@ -479,43 +479,51 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """Revoke AUTH's own grant when its failed write leaves no record held.
 
         The grant lands, then a NATS writer without the coordination secret
-        overwrites it, which the watch reports as a delete, so the user quits
-        with no session to revoke. The write's reply is lost. Left queued, the
-        grant would be written by the next retry and authorize the departed
-        identity on every bot.
+        overwrites it, which the watch reports as a delete, and the write's
+        reply is lost. Left queued, the failed grant would be written by the
+        next retry and authorize the identity on every bot, even after it
+        quits with no session left to revoke.
         """
-        bot, fake_irc, coordinator = bot_with_coordinator()
-        prefix = Prefix("owner", "user", "host.example")
-        key = coordinator.sessions.key(prefix.render())
-        kv = cast("FakeKV", coordinator.sessions.kv)
-        put_session = coordinator.put_session
-        dropped: list[Session] = []
 
-        async def drop_then_fail(record: Session) -> Session:
-            if dropped:
-                return await put_session(record)
+        async def dropped(*, quits: bool) -> None:
+            bot, fake_irc, coordinator = bot_with_coordinator()
+            prefix = Prefix("owner", "user", "host.example")
+            key = coordinator.sessions.key(prefix.render())
+            kv = cast("FakeKV", coordinator.sessions.kv)
+            put_session = coordinator.put_session
+            landed: list[Session] = []
 
-            dropped.append(await coordinator.sessions.put(record))
-            bot.sessions.observe(key, dropped[0])
-            kv.store(key, b"unsigned")
-            bot.sessions.forget(key)
-            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
-            msg = "publish timed out"
-            raise NatsError(msg)
+            async def drop_then_fail(record: Session) -> Session:
+                if landed:
+                    return await put_session(record)
 
-        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
-        with patch.object(coordinator, "put_session", drop_then_fail):
-            await send_command(bot, prefix, f"AUTH {code}")
-            await bounded(bot.sessions.retry())
+                landed.append(await coordinator.sessions.put(record))
+                bot.sessions.observe(key, landed[0])
+                kv.store(key, b"unsigned")
+                bot.sessions.forget(key)
+                if quits:
+                    bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
 
-        stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
-        assert stored is not None
-        assert stored.revoked
-        last = coordinator.session_puts[-1]
-        assert (last.prefix, last.revoked) == (prefix.render(), True)
-        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
-        assert not bot.authorizer.authorized(prefix.render())
-        assert not bot.sessions.pending
+                msg = "publish timed out"
+                raise NatsError(msg)
+
+            code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+            with patch.object(coordinator, "put_session", drop_then_fail):
+                await send_command(bot, prefix, f"AUTH {code}")
+                await bounded(bot.sessions.retry())
+
+            stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
+            assert stored is not None
+            assert stored.revoked
+            last = coordinator.session_puts[-1]
+            assert (last.prefix, last.revoked) == (prefix.render(), True)
+            assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+            assert not bot.authorizer.authorized(prefix.render())
+            assert not bot.sessions.pending
+
+        for quits in (False, True):
+            with self.subTest(quits=quits):
+                await dropped(quits=quits)
 
     async def test_auth_failure_adds_nothing_to_held_revocation(self) -> None:
         """Write no revocation of AUTH's own over one a mid-write QUIT queued.
