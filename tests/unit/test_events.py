@@ -136,16 +136,27 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert len(coordinator.session_puts) == 1
         assert coordinator.session_puts[0].revoked is True
 
-    async def test_chghost_without_identity_skips_revocation(self) -> None:
-        """Log and skip revocation when no complete old identity exists."""
-        bot, _ = bot_with_irc()
+    async def test_chghost_without_identity_revokes_its_nick(self) -> None:
+        """Revoke every live session held for a nick-only CHGHOST from an unseen nick.
 
-        with self.assertLogs("botnats.events", level="DEBUG") as logs:
-            bot.events.on_irc_message(
-                IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("owner")),
-            )
+        No member state completes the prefix, so the nick is all this bot
+        knows of the old identity.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        held = (OWNER, Prefix("owner", "other", "old.host"))
+        other = Prefix("other", "user", "real.host")
+        for prefix in (*held, other):
+            bot.authorizer.grant(prefix.render())
 
-        assert any("no complete identity" in line for line in logs.output)
+        bot.events.on_irc_message(
+            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("Owner")),
+        )
+        await drain_session_writes(bot)
+
+        assert not any(bot.authorizer.authorized(prefix.render()) for prefix in held)
+        assert bot.authorizer.authorized(other.render())
+        puts = sorted((put.prefix, put.revoked) for put in coordinator.session_puts)
+        assert puts == sorted((prefix.render(), True) for prefix in held)
 
     async def test_chghost_updates_member_prefix(self) -> None:
         """Update another user's member prefix, leaving this bot's identity."""
@@ -2311,6 +2322,38 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
             (OWNER.render(), True),
         ]
+
+    async def test_nick_only_identity_change_revokes_names_only_member(self) -> None:
+        """Revoke the live sessions held for a NAMES-only member's nick-only change.
+
+        A QUIT, NICK, or CHGHOST naming only the nick of a member WHO has yet
+        to report leaves the bare nick all this bot knows of the identity. A
+        session held for another nick stays.
+        """
+        for message in (
+            IRCMessage("QUIT", ("bye",), Prefix("Owner")),
+            IRCMessage("NICK", ("newowner",), Prefix("Owner")),
+            IRCMessage("CHGHOST", ("newuser", "new.host"), Prefix("Owner")),
+        ):
+            with self.subTest(command=message.command):
+                bot, _, coordinator = bot_with_coordinator()
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.join = JoinState.JOINED
+                bot.events.on_irc_message(
+                    IRCMessage("353", ("alpha", "=", "#test", "owner")),
+                )
+                other = Prefix("other", "user", "real.host")
+                for prefix in (OWNER, other):
+                    bot.authorizer.grant(prefix.render())
+
+                bot.events.on_irc_message(message)
+                await drain_session_writes(bot)
+
+                assert not bot.authorizer.authorized(OWNER.render())
+                assert bot.authorizer.authorized(other.render())
+                assert [
+                    (put.prefix, put.revoked) for put in coordinator.session_puts
+                ] == [(OWNER.render(), True)]
 
     async def test_bot_leaving_revokes_no_one(self) -> None:
         """Keep sessions when this bot itself parts or is kicked.
