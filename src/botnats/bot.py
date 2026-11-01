@@ -134,6 +134,7 @@ class Bot:
         here must not delay it past the presence TTL.
         """
         self.authorizer.prune()
+        self.sessions.prune()
         self.channel_mgr.retry_pending_parts()
         self.channel_mgr.join_desired()
         await self.channel_mgr.request_ops()
@@ -180,9 +181,9 @@ class NATSCallbackHandler:
         """Apply a validated channel configuration record from the KV watch."""
         self.bot.channel_mgr.apply_record(ChannelRecord(*fields))
 
-    def on_presence(self, presence: BotPresence) -> None:
+    def on_presence(self, presence: BotPresence, lifetime: float) -> None:
         """Register or refresh a peer bot's presence record from KV watch."""
-        self.bot.presence.update(presence)
+        self.bot.presence.update(presence, lifetime=lifetime)
 
     def on_presence_delete(self, bot_id: str) -> None:
         """Remove a deleted peer presence from the local registry."""
@@ -192,15 +193,9 @@ class NATSCallbackHandler:
         """Drop the session a deleted KV key held."""
         self.bot.sessions.forget(key)
 
-    def on_session_update(
-        self,
-        key: str,
-        session: Session,
-        *,
-        replaying: bool,
-    ) -> None:
+    def on_session_update(self, key: str, session: Session) -> None:
         """Apply a validated session record from the KV watch."""
-        self.bot.sessions.observe(key, session, replaying=replaying)
+        self.bot.sessions.observe(key, session)
 
     def on_sessions_replayed(self, keys: set[str]) -> None:
         """Drop sessions a completed watch replay no longer contains."""

@@ -62,6 +62,34 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "replicas=2/3 lag=4 offline=nats-3"
         )
 
+    async def test_collect_lagging_replica(self) -> None:
+        """Count an online replica that is not current as missing."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.return_value = SimpleNamespace(
+            stream_info=SimpleNamespace(
+                cluster=ClusterInfo(
+                    leader="nats-1",
+                    replicas=[
+                        PeerInfo(current=True, name="nats-2"),
+                        PeerInfo(current=False, lag=7, name="nats-3"),
+                    ],
+                ),
+                config=SimpleNamespace(num_replicas=3),
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 3, 8222))
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=degraded leader=nats-1 "
+            "replicas=2/3 lag=7"
+        )
+
     async def test_collect_healthy_cluster(self) -> None:
         """Report a fully current cluster with a leader as up."""
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))

@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import math
 import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, fields
@@ -90,11 +91,13 @@ class PresenceRegistry:
         self,
         presence: BotPresence,
         *,
+        lifetime: float = math.inf,
         now: float | None = None,
     ) -> None:
-        """Record or refresh a heartbeat for the given bot presence."""
+        """Record or refresh a heartbeat for the TTL, or its shorter lifetime."""
         current = time.monotonic() if now is None else now
-        self.entries[presence.bot_id.casefold()] = (presence, current + self.ttl)
+        deadline = current + min(self.ttl, lifetime)
+        self.entries[presence.bot_id.casefold()] = (presence, deadline)
 
 
 class SelfIdentity:

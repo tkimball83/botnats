@@ -386,6 +386,12 @@ class PresenceValidTests(unittest.TestCase):
                 record = sign({**fresh, "timestamp": flag})
                 assert not store.valid("alpha", record, now=now)
 
+        # JSON integers too large for a float are refused, never raise.
+        for sign_of in (-1, 1):
+            with self.subTest(huge=sign_of):
+                record = sign({**fresh, "timestamp": sign_of * 10**400})
+                assert not store.valid("alpha", record, now=now)
+
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
 
@@ -1008,8 +1014,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             revision=7,
             value=json.dumps(theirs).encode(),
         )
-        # Ours has the same counter and a suffix that sorts higher, so the old
-        # revision tie-break would have let it overwrite theirs.
+        # Ours has the same counter and a suffix that sorts higher; theirs
+        # stands because it is newer than the revision ours was written after.
         ours = {**channel_record(2), "revision": f"{2:020d}-{'f' * 32}"}
 
         stored = await bounded(
@@ -1145,8 +1151,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_put_stores_signed_record(self) -> None:
         """Store a session as the signed record that parse and verify accept.
 
-        session_record signs the fields itself, so the stored bytes match
-        records written before put took a Session.
+        session_record signs the fields itself, so put must store exactly
+        the canonical signed record.
         """
         sessions = SessionStore("efnet", 1, SECRET)
         kv = FakeKV()
