@@ -2490,6 +2490,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             version=0,
         )
         await bounded(coordinator.sessions.put(peer))
+        bot.sessions.observe(key, peer)
+        assert not bot.authorizer.authorized(prefix.render())
         coordinator.failing = False
         # The escalation waits for the second retry.
         await bounded(bot.sessions.retry())
