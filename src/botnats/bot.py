@@ -181,9 +181,9 @@ class NATSCallbackHandler:
         """Apply a validated channel configuration record from the KV watch."""
         self.bot.channel_mgr.apply_record(ChannelRecord(*fields))
 
-    def on_presence(self, presence: BotPresence, lifetime: float) -> None:
+    def on_presence(self, presence: BotPresence) -> None:
         """Register or refresh a peer bot's presence record from KV watch."""
-        self.bot.presence.update(presence, lifetime=lifetime)
+        self.bot.presence.update(presence)
 
     def on_presence_delete(self, bot_id: str) -> None:
         """Remove a deleted peer presence from the local registry."""

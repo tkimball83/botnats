@@ -86,17 +86,10 @@ class PresenceRegistry:
         """Remove a bot presence by stable ID."""
         self.entries.pop(bot_id.casefold(), None)
 
-    def update(
-        self,
-        presence: BotPresence,
-        *,
-        lifetime: float,
-        now: float | None = None,
-    ) -> None:
-        """Record or refresh a heartbeat for the TTL, or its shorter lifetime."""
+    def update(self, presence: BotPresence, *, now: float | None = None) -> None:
+        """Record or refresh a heartbeat for the given bot presence."""
         current = time.monotonic() if now is None else now
-        deadline = current + min(self.ttl, lifetime)
-        self.entries[presence.bot_id.casefold()] = (presence, deadline)
+        self.entries[presence.bot_id.casefold()] = (presence, current + self.ttl)
 
 
 class SelfIdentity:

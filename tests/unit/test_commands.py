@@ -1030,12 +1030,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             bot.caps, channel="#other", join=JoinState.JOINING
         )
         bot.presence.update(
-            BotPresence("Alpha-ID", "host.example", "inst", "alpha_", "~alpha"),
-            lifetime=bot.presence.ttl,
+            BotPresence("Alpha-ID", "host.example", "inst", "alpha_", "~alpha")
         )
         bot.presence.update(
-            BotPresence("beta-id", "peer.example", "inst2", "beta", "~beta"),
-            lifetime=bot.presence.ttl,
+            BotPresence("beta-id", "peer.example", "inst2", "beta", "~beta")
         )
 
         join_test_channel(bot, OWNER)

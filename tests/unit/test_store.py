@@ -390,28 +390,6 @@ class PresenceValidTests(unittest.TestCase):
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
 
-    def test_lifetime_ends_as_valid_refuses(self) -> None:
-        """Measure how much longer valid() accepts a record, drift included."""
-        store = PresenceStore("efnet", 1, 15.0, SECRET)
-        now = 1_000_000.0
-        record: dict[str, object] = {
-            "bot_id": "alpha",
-            "host": "host",
-            "instance_id": "inst",
-            "nick": "alpha",
-            "user": "user",
-            "timestamp": int(now) - 40,
-        }
-        record["signature"] = presence_signature(SECRET, "efnet", record)
-
-        with patch("botnats.nats.store.time") as clock:
-            clock.time.return_value = now
-            lifetime = store.lifetime(record)
-
-        assert lifetime == store.ttl + PRESENCE_DRIFT - 40
-        assert store.valid("alpha", record, now=now + lifetime)
-        assert not store.valid("alpha", record, now=now + lifetime + 1)
-
 
 def channel_revision(number: int) -> str:
     """Return the sortable revision channel_record(number) carries."""

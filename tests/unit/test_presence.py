@@ -49,25 +49,13 @@ class PresenceTests(unittest.TestCase):
         restored = BotPresence.from_dict(asdict(original))
         assert original == restored
 
-    def test_presence_expires_with_its_record(self) -> None:
-        """Count a heartbeat for the TTL, or only for its record's shorter lifetime.
-
-        A watch replay reads every stored record, however old; counted for a
-        full TTL from the read, a peer that stopped just before the replay
-        would stay active for up to two TTLs.
-        """
+    def test_presence_expires_after_ttl(self) -> None:
+        """Count a heartbeat as active until its TTL ends."""
         registry = PresenceRegistry(ttl=10)
-        fresh = BotPresence("fresh", "host", "instance", "fresh", "user")
-        replayed = BotPresence("replayed", "host", "instance", "replayed", "user")
-        aged = BotPresence("aged", "host", "instance", "aged", "user")
-        registry.update(fresh, lifetime=40, now=5)
-        registry.update(replayed, lifetime=3, now=5)
-        registry.update(aged, lifetime=0, now=5)
+        presence = BotPresence("vhagar", "host", "instance", "vhagar", "user")
+        registry.update(presence, now=5)
 
-        assert registry.active(now=5) == (fresh, replayed)
-        assert registry.active(now=7.9) == (fresh, replayed)
-        assert registry.active(now=8) == (fresh,)
-        assert registry.active(now=14.9) == (fresh,)
+        assert registry.active(now=14.9) == (presence,)
         assert registry.active(now=15) == ()
 
     def test_presence_membership(self) -> None:
@@ -76,7 +64,7 @@ class PresenceTests(unittest.TestCase):
         # A mixed-case bot ID: entries are keyed by its casefold.
         old = BotPresence("Vhagar", "old.host", "instance", "vhagar", "user")
         current = BotPresence("Vhagar", "new.host", "instance", "Vhagar", "user")
-        registry.update(current, lifetime=registry.ttl, now=5)
+        registry.update(current, now=5)
 
         assert registry.has(current, now=14.9)
         assert not registry.has(old, now=14.9)
@@ -86,9 +74,9 @@ class PresenceTests(unittest.TestCase):
         """Verify presence update overwrites the previous entry and deadline."""
         registry = PresenceRegistry(ttl=10)
         old = BotPresence("vhagar", "old.host", "instance", "vhagar", "user")
-        registry.update(old, lifetime=registry.ttl, now=5)
+        registry.update(old, now=5)
         new = BotPresence("vhagar", "new.host", "instance", "Vhagar", "user")
-        registry.update(new, lifetime=registry.ttl, now=12)
+        registry.update(new, now=12)
 
         # Past the old entry's deadline (15), within the new one's (22).
         active = registry.active(now=15.5)
@@ -100,7 +88,7 @@ class PresenceTests(unittest.TestCase):
         """Remove a presence immediately on a watch deletion."""
         registry = PresenceRegistry(ttl=10)
         presence = BotPresence("Vhagar", "host", "instance", "Vhagar", "user")
-        registry.update(presence, lifetime=registry.ttl, now=5)
+        registry.update(presence, now=5)
 
         registry.remove("VHAGAR")
 
@@ -112,8 +100,8 @@ class PresenceTests(unittest.TestCase):
         registry = PresenceRegistry(ttl=3600)
         own = BotPresence("Alpha", "host", "one", "alpha", "user")
         peer = BotPresence("Beta", "host", "two", "beta", "user")
-        registry.update(own, lifetime=registry.ttl)
-        registry.update(peer, lifetime=registry.ttl)
+        registry.update(own)
+        registry.update(peer)
 
         assert registry.peers("aLPHA") == (peer,)
 
