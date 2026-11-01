@@ -942,9 +942,11 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.presence.update(
             BotPresence("Alpha-ID", "host.example", "inst", "alpha_", "~alpha"),
+            lifetime=bot.presence.ttl,
         )
         bot.presence.update(
             BotPresence("beta-id", "peer.example", "inst2", "beta", "~beta"),
+            lifetime=bot.presence.ttl,
         )
 
         join_test_channel(bot, OWNER)

@@ -469,7 +469,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.identity.registered = True
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer)
+        bot.presence.update(peer, lifetime=bot.presence.ttl)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha")

@@ -53,7 +53,7 @@ class PresenceTests(unittest.TestCase):
         """Verify presence entries expire after TTL."""
         registry = PresenceRegistry(ttl=10)
         presence = BotPresence("vhagar", "host", "instance", "vhagar", "user")
-        registry.update(presence, now=5)
+        registry.update(presence, lifetime=registry.ttl, now=5)
 
         assert registry.active(now=14.9) == (presence,)
         assert registry.active(now=15) == ()
@@ -85,7 +85,7 @@ class PresenceTests(unittest.TestCase):
         # A mixed-case bot ID: entries are keyed by its casefold.
         old = BotPresence("Vhagar", "old.host", "instance", "vhagar", "user")
         current = BotPresence("Vhagar", "new.host", "instance", "Vhagar", "user")
-        registry.update(current, now=5)
+        registry.update(current, lifetime=registry.ttl, now=5)
 
         assert registry.has(current, now=14.9)
         assert not registry.has(old, now=14.9)
@@ -95,9 +95,9 @@ class PresenceTests(unittest.TestCase):
         """Verify presence update overwrites the previous entry and deadline."""
         registry = PresenceRegistry(ttl=10)
         old = BotPresence("vhagar", "old.host", "instance", "vhagar", "user")
-        registry.update(old, now=5)
+        registry.update(old, lifetime=registry.ttl, now=5)
         new = BotPresence("vhagar", "new.host", "instance", "Vhagar", "user")
-        registry.update(new, now=12)
+        registry.update(new, lifetime=registry.ttl, now=12)
 
         # Past the old entry's deadline (15), within the new one's (22).
         active = registry.active(now=15.5)
@@ -109,7 +109,7 @@ class PresenceTests(unittest.TestCase):
         """Remove a presence immediately on a watch deletion."""
         registry = PresenceRegistry(ttl=10)
         presence = BotPresence("Vhagar", "host", "instance", "Vhagar", "user")
-        registry.update(presence, now=5)
+        registry.update(presence, lifetime=registry.ttl, now=5)
 
         registry.remove("VHAGAR")
 
@@ -121,8 +121,8 @@ class PresenceTests(unittest.TestCase):
         registry = PresenceRegistry(ttl=3600)
         own = BotPresence("Alpha", "host", "one", "alpha", "user")
         peer = BotPresence("Beta", "host", "two", "beta", "user")
-        registry.update(own)
-        registry.update(peer)
+        registry.update(own, lifetime=registry.ttl)
+        registry.update(peer, lifetime=registry.ttl)
 
         assert registry.peers("aLPHA") == (peer,)
 

@@ -5,7 +5,6 @@
 
 import asyncio
 import logging
-import math
 import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, fields
@@ -91,7 +90,7 @@ class PresenceRegistry:
         self,
         presence: BotPresence,
         *,
-        lifetime: float = math.inf,
+        lifetime: float,
         now: float | None = None,
     ) -> None:
         """Record or refresh a heartbeat for the TTL, or its shorter lifetime."""
