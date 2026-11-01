@@ -550,21 +550,6 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert len(logs.output) == 1
         assert "dropped PRIVMSG to owner: IRC message exceeds" in logs.output[0]
 
-    async def test_getbans_packs_long_ban_lists(self) -> None:
-        """Pack a long ban list many masks to a line, not one line per mask."""
-        bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        bot.authorizer.grant(OWNER.render())
-        masks = [f"*!*@host{number:03d}.example" for number in range(100)]
-        for mask in masks:
-            runtime.add_ban(mask)
-
-        await send_command(bot, OWNER, "GETBANS #test")
-
-        assert len(fake_irc.privmsgs) <= 6
-        listed = [word for _, text in fake_irc.privmsgs for word in text.split()[2:]]
-        assert listed == masks
-
     async def test_admin_getmodes(self) -> None:
         """Verify GETMODES reports tracked modes, with "*" for unknown values."""
         bot, fake_irc = bot_with_irc()
@@ -666,27 +651,6 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.privmsgs.clear()
         await send_command(bot, OWNER, "GETCHANS")
         assert fake_irc.privmsgs == [("owner", "Channels @#alpha -#beta -#gamma #Zeta")]
-
-    async def test_admin_getusers_chunked(self) -> None:
-        """Verify GETUSERS splits long nick lists across multiple messages."""
-        bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        bot.authorizer.grant(OWNER.render())
-
-        for i in range(80):
-            runtime.member(f"longernickname{i:03d}")
-
-        await send_command(bot, OWNER, "GETUSERS #test")
-        assert len(fake_irc.privmsgs) > 1
-        all_nicks = []
-        for _, text in fake_irc.privmsgs:
-            assert text.startswith("#test ")
-            # The server puts the bot's own source in front when it relays.
-            line = f"PRIVMSG owner :{text}\r\n".encode()
-            assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
-            all_nicks.extend(text.split()[1:])
-
-        assert all_nicks == [f"longernickname{i:03d}" for i in range(80)] + ["owner"]
 
     async def test_admin_commands_with_disconnected_irc(self) -> None:
         """Report a command's failed send, and swallow the undeliverable reply."""

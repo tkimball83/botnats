@@ -127,8 +127,10 @@ async def check_after_failover(previous: str) -> None:
     nc, claims, kv = await open_claims()
     try:
         await wait_leader(kv, previous)
-        # The fresh claim shows the store accepts writes, so the refusal
-        # that follows is replay dedup rather than a failed publish.
+        # The claim survived the leader kill, and the store still accepts
+        # fresh claims; claim() also refuses on a failed publish, so its
+        # refusal alone would not show the stored claim.
+        assert (await kv.get(claims.key(COUNTER))).value == b"1"
         assert await claims.claim(FRESH_COUNTER)
         assert not await claims.claim(COUNTER)
     finally:
