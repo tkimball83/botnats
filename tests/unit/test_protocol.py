@@ -216,6 +216,19 @@ class IRCProtocolTests(unittest.TestCase):
             (False, "k", "key"),
         ]
 
+    def test_mode_parser_missing_argument(self) -> None:
+        """Verify a mode whose argument is missing yields None after the others."""
+        changes = list(
+            iter_mode_changes(
+                "+ob",
+                ("alpha",),
+                DEFAULT_CHANMODES,
+                DEFAULT_MEMBERSHIP_MODES,
+            ),
+        )
+
+        assert changes == [(True, "o", "alpha"), (True, "b", None)]
+
     def test_parse_rejects_control_chars_in_params(self) -> None:
         """Verify inbound controls are rejected throughout the message."""
         for line in (

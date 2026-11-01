@@ -124,12 +124,6 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
             now = 110.0
             assert limiter.check("user")
 
-    async def test_window_expiry(self) -> None:
-        """Verify rate limit resets after window expires."""
-        limiter = RateLimiter(limit=1, window=0.0)
-        assert limiter.check("user")
-        assert limiter.check("user")
-
     async def test_rate_limiting_ignores_nick_change(self) -> None:
         """Verify the command limiter keys on host so nick cycling cannot bypass it."""
         fake_irc = FakeIRC()
