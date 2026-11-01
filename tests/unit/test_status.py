@@ -90,6 +90,38 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "replicas=2/3 lag=7"
         )
 
+    async def test_collect_moving_stream_with_offline_peer(self) -> None:
+        """Report an offline peer as degraded even when enough peers are current."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.return_value = SimpleNamespace(
+            stream_info=SimpleNamespace(
+                # A moving stream lists its old and new peers together, so the
+                # current ones can reach the replica count while one is offline.
+                cluster=ClusterInfo(
+                    leader="nats-1",
+                    replicas=[
+                        PeerInfo(current=True, name="nats-2"),
+                        PeerInfo(current=True, name="nats-3"),
+                        PeerInfo(current=False, lag=5, name="nats-4"),
+                        PeerInfo(name="nats-5", offline=True),
+                    ],
+                ),
+                config=SimpleNamespace(num_replicas=3),
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 3, 8222))
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=degraded leader=nats-1 "
+            "replicas=3/3 lag=5 offline=nats-5"
+        )
+
     async def test_collect_healthy_cluster(self) -> None:
         """Report a fully current cluster with a leader as up."""
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
