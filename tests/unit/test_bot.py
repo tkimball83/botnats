@@ -246,12 +246,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
         session = session_value(time.time() + 60)
 
-        # A replayed record the store accepts for one more minute.
-        bot.callbacks.on_presence(peer, 60.0)
+        bot.callbacks.on_presence(peer)
         bot.callbacks.on_session_update("opaque", session)
 
         assert bot.presence.has(peer)
-        assert not bot.presence.has(peer, now=time.monotonic() + 60)
+        assert not bot.presence.has(peer, now=time.monotonic() + bot.presence.ttl)
         assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}
         assert bot.authorizer.authorized(session.prefix)
 
@@ -469,7 +468,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.identity.registered = True
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha")

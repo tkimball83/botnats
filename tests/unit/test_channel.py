@@ -1689,7 +1689,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         runtime.add_ban("*!~beta@beta.host")
         runtime.limit = 1
-        bot.presence.update(INVITEE, lifetime=bot.presence.ttl)
+        bot.presence.update(INVITEE)
         fake_irc.connected = False
 
         with (
@@ -1724,11 +1724,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!~beta@beta.host")
         runtime.limit = 2
         # beta's heartbeat has lapsed; gamma has not announced itself.
-        bot.presence.update(
-            INVITEE,
-            lifetime=bot.presence.ttl,
-            now=time.monotonic() - bot.presence.ttl - 1,
-        )
+        bot.presence.update(INVITEE, now=time.monotonic() - bot.presence.ttl - 1)
 
         await request_help(bot)
         assert fake_irc.sent == []
@@ -1736,15 +1732,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         # Both peers now run as new instances under other nicks.
         for peer in (INVITEE, OP_REQUESTER):
             bot.presence.update(
-                replace(peer, instance_id="three", nick=f"{peer.nick}_"),
-                lifetime=bot.presence.ttl,
+                replace(peer, instance_id="three", nick=f"{peer.nick}_")
             )
 
         await request_help(bot)
         assert fake_irc.sent == []
 
         for peer in (INVITEE, OP_REQUESTER):
-            bot.presence.update(peer, lifetime=bot.presence.ttl)
+            bot.presence.update(peer)
 
         await request_help(bot)
         assert fake_irc.sent == HELP_GIVEN
@@ -1758,7 +1753,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!~beta@beta.host")
         runtime.limit = 2
         for peer in (INVITEE, OP_REQUESTER):
-            bot.presence.update(peer, lifetime=bot.presence.ttl)
+            bot.presence.update(peer)
 
         await request_help(bot)
         assert fake_irc.sent == []
@@ -1772,7 +1767,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        bot.presence.update(OP_REQUESTER, lifetime=bot.presence.ttl)
+        bot.presence.update(OP_REQUESTER)
         runtime.member("gamma")  # listed by NAMES; WHO has not answered yet
 
         bot.channel_mgr.op_peer("#test", OP_REQUESTER)
@@ -1793,7 +1788,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             BotPresence("gamma-id", "gamma.host", "two", "gamma", "~gamma"),
         )
         for peer in peers:
-            bot.presence.update(peer, lifetime=bot.presence.ttl)
+            bot.presence.update(peer)
             runtime.member(peer.nick).prefix = peer.to_prefix()
 
         delays: list[float] = []
@@ -1843,7 +1838,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.join = JoinState.JOINED
         runtime.member("alpha").modes.add("o")
         peer = BotPresence("beta-id", "beta.host", "one", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         with (
             patch("botnats.channel.PEER_HELP_DELAY", 0),
             self.assertNoLogs("botnats", level="ERROR"),
@@ -1860,7 +1855,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.join = JoinState.JOINED
         runtime.member("alpha").modes.add("o")
         peer = BotPresence("beta-id", "beta.host", "one", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         with (
             patch("botnats.channel.PEER_HELP_DELAY", 0),
             self.assertNoLogs("botnats", level="ERROR"),
@@ -1879,7 +1874,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         invitee = replace(INVITEE, nick="Beta")
-        bot.presence.update(invitee, lifetime=bot.presence.ttl)
+        bot.presence.update(invitee)
         # Another peer's invite got beta in while this request waited.
         runtime.member("beta")
 
@@ -1901,7 +1896,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         runtime.member("gamma").prefix = OP_REQUESTER.to_prefix()
         for peer in (INVITEE, OP_REQUESTER):
-            bot.presence.update(peer, lifetime=bot.presence.ttl)
+            bot.presence.update(peer)
 
         with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
             bot.channel_mgr.invite_peer("#test", INVITEE)
@@ -1932,7 +1927,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             BotPresence("delta-id", "delta.host", "three", "Delta", "~delta"),
         )
         for peer in peers:
-            bot.presence.update(peer, lifetime=bot.presence.ttl)
+            bot.presence.update(peer)
 
         runtime.member("delta")
 
@@ -1950,7 +1945,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         peer = BotPresence("beta-id", "beta.host", "one", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
 
         bot.channel_mgr.make_room("#test", peer)
 
@@ -1963,7 +1958,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         runtime.member("user")
         runtime.limit = 1
-        bot.presence.update(INVITEE, lifetime=bot.presence.ttl)
+        bot.presence.update(INVITEE)
         # Another peer's help got beta in while this request waited.
         runtime.member("beta")
 
@@ -1986,7 +1981,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             BotPresence("gamma-id", "gamma.host", "two", "Gamma", "~gamma"),
         )
         for peer in peers:
-            bot.presence.update(peer, lifetime=bot.presence.ttl)
+            bot.presence.update(peer)
             # IRC shows each member in another case than its presence.
             nick = peer.nick.lower()
             runtime.member(nick).prefix = Prefix(nick, peer.user, peer.host)
@@ -2003,7 +1998,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         peer = BotPresence("beta-id", "real.host", "one", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime.member("beta").prefix = Prefix("beta", "~beta", "stolen.host")
 
         assert bot.channel_mgr.help_eligible("#test", peer) is None
@@ -2017,7 +2012,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             runtime.add_ban(mask)
 
         peer = BotPresence("beta-id", "bot.host", "one", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         bot.channel_mgr.unban_peer("#test", peer)
 
         assert fake_irc.modes == [
@@ -2208,7 +2203,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         for channel in ("#opped", "#unopped", "#waiting"):
             record = ChannelRecord.new(channel, None, present=True)
             bot.channel_mgr.apply_record(record)
@@ -2241,10 +2236,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
-        bot.presence.update(
-            BotPresence("beta-id", "beta.host", "two", "beta", "~beta"),
-            lifetime=bot.presence.ttl,
-        )
+        bot.presence.update(BotPresence("beta-id", "beta.host", "two", "beta", "~beta"))
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha").prefix = Prefix("alpha", "~alpha", "alpha.host")
@@ -2267,7 +2259,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = identity
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
         for presence in (identity, peer):
-            bot.presence.update(presence, lifetime=bot.presence.ttl)
+            bot.presence.update(presence)
 
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
@@ -2293,7 +2285,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         runtime.add_ban("*!~beta@beta.host")
         runtime.limit = 1
-        bot.presence.update(INVITEE, lifetime=bot.presence.ttl)
+        bot.presence.update(INVITEE)
         # As IRCClient answers while a copy of every line still waits: a line
         # asking to skip such a copy is skipped, and any other is queued.
         skip = MagicMock(

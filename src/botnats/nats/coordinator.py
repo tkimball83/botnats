@@ -644,9 +644,10 @@ class Coordinator:
             # duplicate to detect, not yet a peer to record.
             return
 
-        # A replay reads records however old: a peer counts as present only
-        # while the store would still accept its last heartbeat.
-        self.callbacks.on_presence(presence, self.presence_store.lifetime(data))
+        # Counted for a TTL from now, not from its heartbeat: a watch replay
+        # refreshes every stored record, so a peer that stopped just before it
+        # counts as present for up to two TTLs after its last heartbeat.
+        self.callbacks.on_presence(presence)
 
     async def watch_sessions(self, synced: Callable[[], None]) -> None:
         """Watch the sessions KV bucket and report validated records by key.

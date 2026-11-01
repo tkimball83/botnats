@@ -13,7 +13,6 @@ from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import (
-    ANY,
     AsyncMock,
     MagicMock,
     PropertyMock,
@@ -1349,48 +1348,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(coordinator.callbacks, "on_presence", update):
             await bounded(coordinator.watch_presence(MagicMock()))
 
-        update.assert_called_once_with(BotPresence(**BETA_PRESENCE), ANY)
+        update.assert_called_once_with(BotPresence(**BETA_PRESENCE))
         # Another instance's record on a peer's key is no duplicate of ours.
         assert coordinator.claim.owned
-
-    async def test_watch_presence_reports_record_lifetime(self) -> None:
-        """Report how much longer the store accepts each peer record.
-
-        A replay reads every stored record, however old: a peer that stopped
-        just before it counts only until the store would refuse its record.
-        """
-        coordinator = build_coordinator("alpha")
-        store = coordinator.presence_store
-        now = 1_000_000.0
-        records: list[dict[str, object]] = []
-        for age in (40, 0):
-            record: dict[str, object] = {**BETA_PRESENCE, "timestamp": int(now) - age}
-            record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
-            records.append(record)
-
-        replayed, live = (
-            SimpleNamespace(
-                key="beta",
-                operation=None,
-                revision=revision,
-                value=json.dumps(record).encode(),
-            )
-            for revision, record in enumerate(records, 1)
-        )
-        kv, _ = watcher(replayed, None, live)
-        store.kv = kv
-        update = MagicMock()
-
-        with (
-            patch("botnats.nats.store.time") as clock,
-            patch.object(coordinator.callbacks, "on_presence", update),
-        ):
-            clock.time.return_value = now
-            await bounded(coordinator.watch_presence(MagicMock()))
-            lifetimes = [store.lifetime(record) for record in records]
-
-        peer = BotPresence(**BETA_PRESENCE)
-        assert update.call_args_list == [call(peer, lifetime) for lifetime in lifetimes]
 
     async def test_watch_presence_detects_starting_duplicate(self) -> None:
         """Yield to another instance's placeholder claim, which is not yet a peer."""

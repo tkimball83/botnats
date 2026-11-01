@@ -87,7 +87,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "alpha.host", "inst", "alpha", "~alpha"
         )
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("beta").prefix = peer.to_prefix()
@@ -376,7 +376,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.modes = "+npst"
@@ -527,7 +527,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invite_ignores_joined_channel(self) -> None:
         """Verify a peer's INVITE to an already-joined channel is ignored."""
         bot, fake_irc = bot_with_irc()
-        bot.presence.update(PEER, lifetime=bot.presence.ttl)
+        bot.presence.update(PEER)
         bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
 
         bot.events.on_irc_message(
@@ -539,7 +539,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invite_ignores_unknown_channel(self) -> None:
         """Verify a peer's INVITE to an unconfigured channel is ignored."""
         bot, fake_irc = bot_with_irc()
-        bot.presence.update(PEER, lifetime=bot.presence.ttl)
+        bot.presence.update(PEER)
 
         bot.events.on_irc_message(
             IRCMessage("INVITE", ("alpha", "#other"), PEER.to_prefix()),
@@ -557,7 +557,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
-        bot.presence.update(PEER, lifetime=bot.presence.ttl)
+        bot.presence.update(PEER)
         bot.channel_mgr.join_desired()
         bot.events.on_irc_message(
             IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
@@ -576,9 +576,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invite_from_expired_peer_sends_no_join(self) -> None:
         """Send no JOIN for an INVITE from a peer whose presence expired."""
         bot, fake_irc = bot_with_irc()
-        bot.presence.update(
-            PEER, lifetime=bot.presence.ttl, now=time.monotonic() - bot.presence.ttl - 1
-        )
+        bot.presence.update(PEER, now=time.monotonic() - bot.presence.ttl - 1)
 
         bot.events.on_irc_message(
             IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
@@ -589,7 +587,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invite_for_another_nick_sends_no_join(self) -> None:
         """Send no JOIN for a peer's INVITE addressed to another nick."""
         bot, fake_irc = bot_with_irc()
-        bot.presence.update(PEER, lifetime=bot.presence.ttl)
+        bot.presence.update(PEER)
 
         bot.events.on_irc_message(
             IRCMessage("INVITE", ("gamma", "#test"), PEER.to_prefix()),
@@ -856,7 +854,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.channel_mgr.join_desired()
         assert fake_irc.sent == [join, join]
 
-        bot.presence.update(PEER, lifetime=bot.presence.ttl)
+        bot.presence.update(PEER)
         bot.events.on_irc_message(
             IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
         )
@@ -904,7 +902,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
-        bot.presence.update(PEER, lifetime=bot.presence.ttl)
+        bot.presence.update(PEER)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         join = ("JOIN", ("#test",))
 
@@ -938,7 +936,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         bot.identity.current = BotPresence(
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
-        bot.presence.update(PEER, lifetime=bot.presence.ttl)
+        bot.presence.update(PEER)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         join = ("JOIN", ("#test",))
 
@@ -1017,7 +1015,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         # An opped peer is present, so a spurious op request would be sent.
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.modes = "+npst"
@@ -1046,7 +1044,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             "alpha", "host.example", "inst", "alpha", "~alpha"
         )
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha")
@@ -1067,7 +1065,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         # An opped peer is present, so a spurious op request would be sent.
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha")
@@ -1096,7 +1094,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         # An opped peer is present, so a spurious op request would be sent.
         peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        bot.presence.update(peer, lifetime=bot.presence.ttl)
+        bot.presence.update(peer)
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.join = JoinState.JOINED
         runtime.member("alpha")
