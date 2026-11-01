@@ -8,7 +8,7 @@ import json
 import time
 import unittest
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 from nats.errors import Error as NatsError
 
@@ -216,6 +216,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.member("owner").prefix = OWNER
+        bot.authorizer.grant(OWNER.render())
 
         bot.auth_flow.auto_op(OWNER)
 
@@ -228,6 +229,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         runtime.member("owner").prefix = OWNER
         runtime.member("owner").modes.add("o")
+        bot.authorizer.grant(OWNER.render())
 
         bot.auth_flow.auto_op(OWNER)
 
@@ -239,6 +241,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.member("owner").prefix = Prefix("owner", "other", "other.host")
+        bot.authorizer.grant(OWNER.render())
 
         bot.auth_flow.auto_op(OWNER)
 
@@ -259,6 +262,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         # NAMES without userhost-in-names lists a nickname alone.
         runtimes["#names"].member("owner")
         runtimes["#test"].member("owner").prefix = OWNER
+        bot.authorizer.grant(OWNER.render())
 
         bot.auth_flow.auto_op(OWNER)
 
@@ -275,17 +279,44 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
             bot.auth_flow.auto_op(OWNER)
 
-        assert send.call_args_list == [call("MODE", "#test", "+o", "owner")]
+        assert send.call_args_list == [call("MODE", "#test", "+o", "owner", check=ANY)]
 
     async def test_auth_auto_op_skips_when_not_opped(self) -> None:
         """Verify auto-op skips channels where bot is not opped."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("owner").prefix = OWNER
+        bot.authorizer.grant(OWNER.render())
 
         bot.auth_flow.auto_op(OWNER)
 
         assert fake_irc.modes == []
+
+    async def test_auth_output_needs_live_session_when_sent(self) -> None:
+        """Bind the Authorized reply and auto-op to the session, checked when sent.
+
+        Flood pacing can hold them for minutes: the admin may quit meanwhile,
+        and another user take the nick.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            await send_command(bot, OWNER, f"AUTH {code}")
+
+        assert send.call_args_list == [
+            call("PRIVMSG", "owner", trailing="Authorized", check=ANY),
+            call("MODE", "#test", "+o", "owner", check=ANY),
+        ]
+        checks = [entry.kwargs["check"] for entry in send.call_args_list]
+        assert [check() for check in checks] == [True, True]
+
+        bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+        await drain_session_writes(bot)
+
+        assert [check() for check in checks] == [False, False]
 
     async def test_auth_claim_publish_failure_revokes(self) -> None:
         """Verify a publish failure after claim success revokes the session."""

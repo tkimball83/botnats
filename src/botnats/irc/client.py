@@ -54,6 +54,9 @@ STABLE_SESSION_SECONDS = 60.0
 USERNAME = "botnats"
 WRITE_TIMEOUT = 30.0
 
+# A line waiting to be written, and the check, if any, it must pass then.
+type QueuedLine = tuple[bytes, Callable[[], bool] | None]
+
 
 @dataclass(frozen=True, slots=True)
 class IRCServer:
@@ -107,7 +110,7 @@ class IRCClient:
         self.nickname_attempts = 0
         self.on_disconnect = on_disconnect
         self.on_message = on_message
-        self.outbound: asyncio.Queue[bytes] | None = None
+        self.outbound: asyncio.Queue[QueuedLine] | None = None
         # About how long the lines queued now take to go out.
         self.queue_delay = 0.0
         # The lines queued but not yet written, counted: copies may wait.
@@ -199,7 +202,7 @@ class IRCClient:
         self.writer = writer
         # The server charges each connection afresh.
         self.charged_until = 0.0
-        outbound: asyncio.Queue[bytes] = asyncio.Queue(maxsize=OUTBOUND_LIMIT)
+        outbound: asyncio.Queue[QueuedLine] = asyncio.Queue(maxsize=OUTBOUND_LIMIT)
         self.outbound = outbound
         self.sender_task = asyncio.create_task(
             self.send_loop(writer, outbound),
@@ -363,11 +366,13 @@ class IRCClient:
         *params: str,
         trailing: str | None = None,
         unless_waiting: bool = False,
+        check: Callable[[], bool] | None = None,
     ) -> bool:
         """Enqueue an IRC command for rate-limited delivery; return whether queued.
 
         With unless_waiting, a copy of a line still waiting to be written is
-        skipped instead.
+        skipped instead. With check, the line is written only if the check
+        still passes when its turn comes, and dropped otherwise.
         """
         encoded = format_message(command, params, trailing)
         outbound = self.outbound
@@ -378,18 +383,19 @@ class IRCClient:
         # Peer help, JOIN, mode enforcement, the op-gain MODE query, and the
         # nick watch ask for this. Under flood pacing a queued copy costs
         # seconds, and IRC state cannot show a command still queued. A help
-        # copy skipped before a line that reverses it heals: the peer asks
-        # again until it sees the result. A JOIN skipped before a PART heals
-        # too: the PART's echo makes the channel due to join again. A skipped
-        # enforcement or query is safe: the waiting copy goes out after the
-        # change already seen, so it still sets the configured modes, or the
-        # query's 324 still shows the operator's view. A skipped ISON or NICK
-        # heals too: the nick watch polls again until the nick is ours.
+        # copy skipped before a line that reverses it, or before a copy its
+        # check drops, heals: the peer asks again until it sees the result. A
+        # JOIN skipped before a PART heals too: the PART's echo makes the
+        # channel due to join again. A skipped enforcement or query is safe:
+        # the waiting copy goes out after the change already seen, so it still
+        # sets the configured modes, or the query's 324 still shows the
+        # operator's view. A skipped ISON or NICK heals too: the nick watch
+        # polls again until the nick is ours.
         if unless_waiting and self.queued_lines[encoded]:
             return False
 
         try:
-            outbound.put_nowait(encoded)
+            outbound.put_nowait((encoded, check))
         except asyncio.QueueFull as error:
             msg = "IRC outbound queue is full"
             raise ConnectionError(msg) from error
@@ -430,13 +436,13 @@ class IRCClient:
     async def send_loop(
         self,
         writer: asyncio.StreamWriter,
-        outbound: asyncio.Queue[bytes],
+        outbound: asyncio.Queue[QueuedLine],
     ) -> None:
         """Drain the outbound queue as fast as the flood credit allows."""
         loop = asyncio.get_running_loop()
         try:
             while True:
-                encoded = await outbound.get()
+                encoded, check = await outbound.get()
                 cost = send_cost(encoded)
                 # Checked again after each wait: a PONG sent meanwhile spends
                 # the same credit.
@@ -452,7 +458,11 @@ class IRCClient:
                 if self.queued_lines[encoded] <= 0:
                     del self.queued_lines[encoded]
 
-                await self.send_immediate(encoded, writer)
+                # Checked at the last moment: a backlog can hold a line for
+                # minutes, while the nick it addresses passes to another user.
+                # A dropped line spends no credit.
+                if check is None or check():
+                    await self.send_immediate(encoded, writer)
         except OSError:
             # Abort: a close() after an abort drops a TLS transport's protocol,
             # and the reader's next resume_reading() would then crash.

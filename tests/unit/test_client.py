@@ -10,7 +10,7 @@ import ssl
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from botnats.irc.client import (
     NICK_COLLISION_LIMIT,
@@ -18,6 +18,7 @@ from botnats.irc.client import (
     IRCClient,
     IRCClientConfig,
     IRCServer,
+    QueuedLine,
     next_nickname,
     pong_reply,
 )
@@ -28,7 +29,7 @@ from botnats.irc.protocol import (
     format_message,
     parse_message,
 )
-from tests.unit.helpers import bounded, hang
+from tests.unit.helpers import bounded, hang, mock_writer
 
 REAL_SLEEP = asyncio.sleep
 
@@ -112,17 +113,6 @@ def irc_client(
         on_disconnect=lambda: None,
         on_message=ignore_message,
     )
-
-
-def mock_writer() -> MagicMock:
-    """Create a mock StreamWriter that reports as connected."""
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    writer.is_closing.return_value = False
-    writer.write.return_value = None
-    writer.drain.return_value = None
-    writer.wait_closed.return_value = None
-    writer.transport.abort.return_value = None
-    return writer
 
 
 def queue_notice(client: IRCClient, text: str) -> bytes:
@@ -291,9 +281,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
         assert lines == [
-            b"CAP LS 302\r\n",
-            b"NICK _bot\r\n",
-            b"USER botnats 0 * :_bot\r\n",
+            (b"CAP LS 302\r\n", None),
+            (b"NICK _bot\r\n", None),
+            (b"USER botnats 0 * :_bot\r\n", None),
         ]
 
     async def test_establish_gives_up_after_connect_timeout(self) -> None:
@@ -570,6 +560,38 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert clock.timeline == [*burst, 2.0, op, 2.0, op, 2.0, op]
 
+    async def test_send_loop_drops_a_line_whose_check_fails_by_its_turn(self) -> None:
+        """Check a line when its turn comes, and drop it unwritten if that fails.
+
+        A dropped line spends no credit and leaves no count behind.
+        """
+        client, clock = self.paced_client()
+        burst = [queue_notice(client, str(index)) for index in range(5)]
+        valid = asyncio.Event()
+        valid.set()
+        kept = format_message("NOTICE", ("owner",), "kept")
+        client.send("NOTICE", "owner", trailing="kept", check=valid.is_set)
+        for _ in range(2):
+            client.send("NOTICE", "owner", trailing="key", check=valid.is_set)
+
+        later = queue_notice(client, "later")
+        clock.resume.clear()
+        async with asyncio.timeout(5):
+            # The first checked line waits on the credit, then passes.
+            await clock.sleeping.wait()
+            clock.sleeping.clear()
+            clock.resume.set()
+            clock.resume.clear()
+            # Both copies wait their turn, and their check fails meanwhile.
+            await clock.sleeping.wait()
+            valid.clear()
+            clock.resume.set()
+            await clock.drained.wait()
+
+        assert clock.timeline == [*burst, 2.0, kept, 2.0, later]
+        assert client.queue_delay == 0.0
+        assert not client.queued_lines
+
     async def test_stop_sender_forgets_waiting_lines(self) -> None:
         """Queue a help line on the next connection, though its copy never went out."""
         client, clock = self.paced_client()
@@ -658,7 +680,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             dispatched.append(message.command)
 
         client.on_message = record_message
-        retry = MagicMock()
+        retry = MagicMock(return_value=None)
         numerics = ["432", "433", "436", "437"]
 
         with patch.object(IRCClient, "nick_collision", retry):
@@ -695,14 +717,14 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_cap_line_reaches_capability_negotiation(self) -> None:
         """Route a CAP line to negotiation rather than the message handler."""
         client = self.cap_client()
-        handler = MagicMock()
+        handler = MagicMock(return_value=None)
         client.on_message = handler
         await dispatch(client, b":server CAP * LS :chghost\r\n")
 
         handler.assert_not_called()
         assert client.cap_available == {"chghost"}
         assert client.outbound is not None
-        assert client.outbound.get_nowait() == b"CAP REQ :chghost\r\n"
+        assert client.outbound.get_nowait() == (b"CAP REQ :chghost\r\n", None)
 
     async def test_reconnect_drops_socket_with_unsent_bytes(self) -> None:
         """Force a reconnection at once, though a peer never reads what is unsent.
@@ -759,8 +781,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert len(client.current_nick) == len("alpha")
         assert client.outbound is not None
-        assert (
-            client.outbound.get_nowait() == f"NICK {client.current_nick}\r\n".encode()
+        assert client.outbound.get_nowait() == (
+            f"NICK {client.current_nick}\r\n".encode(),
+            None,
         )
 
     async def test_matching_pong_clears_ping_token(self) -> None:
@@ -803,7 +826,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.handle_cap(second)
         assert "chghost" in client.cap_available
         sent = client.outbound.get_nowait()
-        assert sent == b"CAP REQ :chghost multi-prefix\r\n"
+        assert sent == (b"CAP REQ :chghost multi-prefix\r\n", None)
 
     async def test_dispatch_answers_ping_from_raw_bytes(self) -> None:
         """Verify dispatch_line answers inflated and bare PINGs from raw bytes."""
@@ -833,18 +856,18 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.outbound is not None
 
         client.handle_cap(parse_message(":server CAP * NEW :chghost\r\n"))
-        assert client.outbound.get_nowait() == b"CAP REQ :chghost\r\n"
+        assert client.outbound.get_nowait() == (b"CAP REQ :chghost\r\n", None)
 
         client.handle_cap(parse_message(":server CAP * ACK :chghost\r\n"))
         assert client.cap_negotiating
         assert client.outbound.empty()
 
         client.handle_cap(parse_message(":server CAP * LS :multi-prefix\r\n"))
-        assert client.outbound.get_nowait() == b"CAP REQ :multi-prefix\r\n"
+        assert client.outbound.get_nowait() == (b"CAP REQ :multi-prefix\r\n", None)
 
         client.handle_cap(parse_message(":server CAP * ACK :multi-prefix\r\n"))
         assert not client.cap_negotiating
-        assert client.outbound.get_nowait() == b"CAP END\r\n"
+        assert client.outbound.get_nowait() == (b"CAP END\r\n", None)
 
     async def test_cap_ls_no_desired(self) -> None:
         """Verify CAP END is sent when no desired capabilities are available."""
@@ -857,7 +880,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 assert not client.cap_negotiating
                 assert client.outbound is not None
                 sent = client.outbound.get_nowait()
-                assert sent == b"CAP END\r\n"
+                assert sent == (b"CAP END\r\n", None)
 
     async def test_cap_ls_strips_values(self) -> None:
         """Verify capability values are stripped when parsing LS."""
@@ -870,7 +893,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert client.cap_available == {"chghost", "sasl"}
         # The valued capability is still recognized and requested by name.
         assert client.outbound is not None
-        assert client.outbound.get_nowait() == b"CAP REQ :chghost\r\n"
+        assert client.outbound.get_nowait() == (b"CAP REQ :chghost\r\n", None)
 
     async def test_cap_nak_ends_negotiation(self) -> None:
         """Verify CAP NAK still sends CAP END."""
@@ -882,7 +905,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert not client.cap_negotiating
         assert client.outbound is not None
         sent = client.outbound.get_nowait()
-        assert sent == b"CAP END\r\n"
+        assert sent == (b"CAP END\r\n", None)
 
     async def test_cap_ls_after_registration_is_ignored(self) -> None:
         """Ignore a late CAP LS instead of restarting negotiation traffic.
@@ -914,7 +937,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             parse_message(":server CAP alpha NEW :multi-prefix sasl\r\n"),
         )
         assert client.outbound is not None
-        assert client.outbound.get_nowait() == b"CAP REQ :multi-prefix\r\n"
+        assert client.outbound.get_nowait() == (b"CAP REQ :multi-prefix\r\n", None)
 
         client.handle_cap(
             parse_message(":server CAP alpha ACK :multi-prefix\r\n"),
@@ -937,11 +960,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Drop a CAP NEW request that finds the send queue full, not the session."""
         client = self.cap_client(negotiating=False)
         client.outbound = asyncio.Queue(maxsize=1)
-        client.outbound.put_nowait(b"JOIN #queued\r\n")
+        client.outbound.put_nowait((b"JOIN #queued\r\n", None))
         raw = b":server CAP alpha NEW :chghost\r\n"
 
         assert await dispatch(client, raw, "token") == "token"
-        assert client.outbound.get_nowait() == b"JOIN #queued\r\n"
+        assert client.outbound.get_nowait() == (b"JOIN #queued\r\n", None)
         assert client.outbound.empty()
 
     async def test_close_drops_socket_with_unsent_bytes(self) -> None:
@@ -1351,8 +1374,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         client.nick_collision()
         assert client.nickname_attempts == NICK_COLLISION_LIMIT
         assert client.outbound is not None
-        assert (
-            client.outbound.get_nowait() == f"NICK {client.current_nick}\r\n".encode()
+        assert client.outbound.get_nowait() == (
+            f"NICK {client.current_nick}\r\n".encode(),
+            None,
         )
 
         with self.assertRaisesRegex(ConnectionError, "collision limit"):
@@ -1441,7 +1465,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         """Verify outbound queue raises ConnectionError when full."""
         client = self.cap_client()
         client.outbound = asyncio.Queue(maxsize=1)
-        client.outbound.put_nowait(b"PING :queued\r\n")
+        client.outbound.put_nowait((b"PING :queued\r\n", None))
 
         with self.assertRaisesRegex(ConnectionError, "queue is full"):
             client.send("NOTICE", "owner", trailing="hello")
@@ -1579,9 +1603,9 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         writer = mock_writer()
         writer.drain.side_effect = ConnectionResetError("peer reset")
         client.writer = writer
-        outbound: asyncio.Queue[bytes] = asyncio.Queue()
-        outbound.put_nowait(b"PING :one\r\n")
-        outbound.put_nowait(b"PING :two\r\n")
+        outbound: asyncio.Queue[QueuedLine] = asyncio.Queue()
+        outbound.put_nowait((b"PING :one\r\n", None))
+        outbound.put_nowait((b"PING :two\r\n", None))
 
         async with asyncio.timeout(5):
             await client.send_loop(writer, outbound)

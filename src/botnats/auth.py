@@ -7,6 +7,7 @@ import asyncio
 import hmac
 import time
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING
 
 from botnats.irc.protocol import casefold
@@ -43,8 +44,10 @@ class AuthFlow:
         if not await coordinator.request_auth(identity):
             return
 
+        # The usage and failure replies carry nothing private, and go to a
+        # sender who holds no session: they are sent unchecked.
         if len(arguments) != 1:
-            bot.commands.reply(prefix.nick, "AUTH <totp-code>")
+            bot.commands.reply(prefix, "AUTH <totp-code>", checked=False)
             return
 
         counter = bot.authorizer.match(arguments[0])
@@ -59,7 +62,7 @@ class AuthFlow:
             # one expiring past its horizon, as from a peer whose clock runs
             # ahead.
             if not bot.authorizer.authorized(rendered):
-                bot.commands.reply(prefix.nick, "Authorization failed")
+                bot.commands.reply(prefix, "Authorization failed", checked=False)
                 return
 
             try:
@@ -96,17 +99,22 @@ class AuthFlow:
                     )
                     await bot.sessions.retry()
 
-                bot.commands.reply(prefix.nick, "Authorization failed")
+                bot.commands.reply(prefix, "Authorization failed", checked=False)
                 return
 
-            bot.commands.reply(prefix.nick, "Authorized")
+            bot.commands.reply(prefix, "Authorized")
             self.auto_op(prefix)
         else:
-            bot.commands.reply(prefix.nick, "Authorization failed")
+            bot.commands.reply(prefix, "Authorization failed", checked=False)
 
     def auto_op(self, prefix: Prefix) -> None:
-        """Grant operator status on all channels where this bot is opped."""
+        """Grant operator status on all channels where this bot is opped.
+
+        Each MODE goes out only if the session still holds when its turn in
+        the send queue comes, as for a reply.
+        """
         bot = self.bot
+        check = partial(bot.authorizer.authorized, prefix.render())
         for runtime in tuple(bot.channel_mgr.channels.values()):
             channel = runtime.channel
             if not bot.channel_mgr.is_self_opped(runtime):
@@ -127,6 +135,7 @@ class AuthFlow:
                     channel,
                     f"+{bot.caps.op_mode}",
                     member.nick,
+                    check=check,
                 )
             except ConnectionError:
                 continue

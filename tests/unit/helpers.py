@@ -40,7 +40,7 @@ from botnats.nats.store import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Callable
 
     from nats.js.kv import KeyValue
 
@@ -230,12 +230,14 @@ def config() -> BotConfig:
 
 
 def mock_writer() -> MagicMock:
-    """Create a mock StreamWriter whose methods return None, as the real ones do."""
+    """Create a mock open StreamWriter that returns what the real one does."""
     writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.is_closing.return_value = False
     writer.write.return_value = None
     writer.drain.return_value = None
     writer.close.return_value = None
     writer.wait_closed.return_value = None
+    writer.transport.abort.return_value = None
     return writer
 
 
@@ -283,14 +285,22 @@ class FakeIRC:
         *params: str,
         trailing: str | None = None,
         unless_waiting: bool = False,
+        check: Callable[[], bool] | None = None,
     ) -> bool:
-        """Validate and record a raw command, failing when disconnected."""
+        """Validate and record a raw command, failing when disconnected.
+
+        A command whose check fails is queued but never recorded, as IRCClient
+        drops it when its turn comes, which here is at once.
+        """
         # Each command is delivered at once, so no copy waits to be skipped.
         del unless_waiting
         format_message(command, params, trailing)
         if not self.connected:
             msg = "IRC is not connected"
             raise ConnectionError(msg)
+
+        if check is not None and not check():
+            return True
 
         if command == "MODE" and params[1:]:
             self.modes.append((params[0], params[1], params[2:]))
@@ -317,6 +327,7 @@ class FailingPartIRC(FakeIRC):
         *params: str,
         trailing: str | None = None,
         unless_waiting: bool = False,
+        check: Callable[[], bool] | None = None,
     ) -> bool:
         """Raise ConnectionError for PART commands while failing."""
         if self.failing and command == "PART":
@@ -328,6 +339,7 @@ class FailingPartIRC(FakeIRC):
             *params,
             trailing=trailing,
             unless_waiting=unless_waiting,
+            check=check,
         )
 
 

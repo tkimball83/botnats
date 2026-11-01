@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
 from botnats.commands import RELAY_SOURCE_BYTES, RateLimiter, parse_command
@@ -412,6 +412,34 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await send_command(bot, OWNER, "GETMODES #test")
         assert fake_irc.privmsgs == [("owner", "#test +ntk hunter2")]
 
+    async def test_replies_need_live_session_when_sent(self) -> None:
+        """Bind each reply to the session, checked again when its turn comes.
+
+        Flood pacing can hold a reply for minutes: the admin may quit
+        meanwhile, and another user take the nick and learn the channel key.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.modes = "+ntk"
+        runtime.key = "hunter2"
+        bot.authorizer.grant(OWNER.render())
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            await send_command(bot, OWNER, "GETMODES #test")
+            await send_command(bot, OWNER, "GETMODES")
+
+        assert send.call_args_list == [
+            call("PRIVMSG", "owner", trailing="#test +ntk hunter2", check=ANY),
+            call("PRIVMSG", "owner", trailing="GETMODES <channel>", check=ANY),
+        ]
+        checks = [entry.kwargs["check"] for entry in send.call_args_list]
+        assert [check() for check in checks] == [True, True]
+
+        bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+        await drain_session_writes(bot)
+
+        assert [check() for check in checks] == [False, False]
+
     async def test_parse_error_reaches_authenticated_admin(self) -> None:
         """Explain an unparseable command to a sender who is authenticated."""
         bot, fake_irc = bot_with_irc()
@@ -466,7 +494,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "No bans tracked for #test")]
 
         fake_irc.privmsgs.clear()
-        for mask in ("*!*@bad.host", "*!*@evil.host"):
+        for mask in ("*!*@evil.host", "*!*@bad.host"):
             runtime.add_ban(mask)
 
         await send_command(bot, OWNER, "GETBANS #test")
@@ -475,6 +503,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_list_drops_items_too_long_to_relay(self) -> None:
         """Drop an item too long to relay whole, never sending a bare header."""
         bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
         # The shortest mask fits a relayed line alone, but not after the
         # header; the next fits the line the bot sends, but not the line the
         # server relays with the bot's source in front. The last is short in
@@ -488,19 +517,20 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(length=len(mask)):
                 fake_irc.privmsgs.clear()
                 with self.assertLogs("botnats.commands", level="WARNING"):
-                    bot.commands.reply_list("owner", "#test +b", [mask, "ok"])
-                    bot.commands.reply_list("owner", "#test +b", [mask])
+                    bot.commands.reply_list(OWNER, "#test +b", [mask, "ok"])
+                    bot.commands.reply_list(OWNER, "#test +b", [mask])
 
                 assert fake_irc.privmsgs == [("owner", "#test +b ok")]
 
     async def test_reply_list_packs_by_encoded_bytes(self) -> None:
         """Pack multibyte items by their encoded size, not their characters."""
         bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
         # Each "é" encodes to two bytes: packed by characters, a line would
         # hold nearly twice as many items and overflow 512 bytes.
         items = [f"{number:02d}" + "é" * 20 for number in range(30)]
 
-        bot.commands.reply_list("owner", "#test +b", items)
+        bot.commands.reply_list(OWNER, "#test +b", items)
 
         listed = [word for _, text in fake_irc.privmsgs for word in text.split()[2:]]
         assert listed == items
@@ -511,9 +541,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_drops_unsendable_line(self) -> None:
         """Log and drop a reply too long to send instead of raising."""
         bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
 
         with self.assertLogs("botnats.commands", level="WARNING") as logs:
-            bot.commands.reply("owner", "x" * MAX_IRC_MESSAGE_BYTES)
+            bot.commands.reply(OWNER, "x" * MAX_IRC_MESSAGE_BYTES)
 
         assert fake_irc.privmsgs == []
         assert len(logs.output) == 1
@@ -603,10 +634,11 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         fake_irc.privmsgs.clear()
         runtime.member("alpha").modes.add("o")
         runtime.member("beta")
+        runtime.member("Delta")
         runtime.member("gamma").modes.add("o")
         await send_command(bot, OWNER, "GETUSERS #test")
         assert fake_irc.privmsgs == [
-            ("owner", "#test @alpha beta @gamma owner"),
+            ("owner", "#test @alpha beta Delta @gamma owner"),
         ]
 
     async def test_admin_getchans(self) -> None:
@@ -669,7 +701,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert send.call_args_list == [
             call("MODE", "#test", "+b", "*!*@bad.host"),
-            call("PRIVMSG", "owner", trailing="IRC is not connected"),
+            call("PRIVMSG", "owner", trailing="IRC is not connected", check=ANY),
         ]
 
     async def test_admin_commands_always_queue(self) -> None:
