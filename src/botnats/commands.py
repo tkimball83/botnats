@@ -17,7 +17,7 @@ from botnats.validators import validate_channel, validate_key
 
 if TYPE_CHECKING:
     from botnats.bot import Bot
-    from botnats.channel import ChannelRuntime
+    from botnats.channel import ChannelMember, ChannelRuntime
     from botnats.irc.protocol import Prefix
 
 LOGGER = logging.getLogger(__name__)
@@ -289,8 +289,9 @@ class CommandHandler:
         highest = next(
             index for index, mode in enumerate(operator_modes) if mode in member.modes
         )
+        check = partial(self.target_holds, channel, member.nick, member)
         for mode in operator_modes[highest:]:
-            self.bot.irc.send("MODE", channel, f"-{mode}", member.nick)
+            self.bot.irc.send("MODE", channel, f"-{mode}", member.nick, check=check)
 
         self.reply(
             prefix,
@@ -334,7 +335,13 @@ class CommandHandler:
             return
 
         reason = " ".join(arguments[2:]) or None
-        self.bot.irc.send("KICK", channel, member.nick, trailing=reason)
+        self.bot.irc.send(
+            "KICK",
+            channel,
+            member.nick,
+            trailing=reason,
+            check=partial(self.target_holds, channel, member.nick, member),
+        )
         self.reply(prefix, f"Kicked {member.nick} from {channel}")
 
     async def cmd_op(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
@@ -366,6 +373,7 @@ class CommandHandler:
             channel,
             f"+{self.bot.caps.op_mode}",
             member.nick,
+            check=partial(self.target_holds, channel, member.nick, member),
         )
         self.reply(
             prefix,
@@ -460,6 +468,21 @@ class CommandHandler:
             raise ValueError(msg)
 
         return runtime
+
+    def target_holds(self, channel: str, nick: str, member: ChannelMember) -> bool:
+        """Return whether a member still holds, in a channel, the nick a line names.
+
+        An OP, DEOP, or KICK line goes out only if this holds when its turn in
+        the send queue comes: flood pacing can hold it for minutes, while the
+        target leaves or renames and another user takes the nick. A member
+        lasts while its user stays, so a newcomer's is another. The nick is
+        passed on its own, since a rename changes the member's.
+        """
+        runtime = self.bot.channel_mgr.runtime(channel)
+        return (
+            runtime is not None
+            and runtime.members.get(self.bot.caps.fold(nick)) is member
+        )
 
 
 class RateLimiter:

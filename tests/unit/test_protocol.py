@@ -195,6 +195,11 @@ class IRCProtocolTests(unittest.TestCase):
             (False, "k", "key"),
             (True, "o", "alpha"),
         ]
+        # Only an unset key may lack its argument: +k keeps the order it pairs in.
+        assert list(iter_mode_changes("+kl", ("10",), *defaults)) == [
+            (True, "k", "10"),
+            (True, "l", None),
+        ]
 
     def test_mode_parser_custom_modes(self) -> None:
         """Verify mode parser pairs arguments by the server's mode groups."""
