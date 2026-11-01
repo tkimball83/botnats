@@ -1632,11 +1632,12 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         client.sender_task = asyncio.create_task(slow_sender())
         stopper = asyncio.create_task(client.stop_sender())
-        async with asyncio.timeout(5):
-            await sender_stopping.wait()
-            stopper.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await stopper
+        await bounded(sender_stopping.wait())
+        stopper.cancel()
+        # Bounded inside: a stopper that hangs fails with TimeoutError, which
+        # assertRaises does not take for the cancellation it expects.
+        with self.assertRaises(asyncio.CancelledError):
+            await bounded(stopper)
 
         assert client.sender_task is None
 

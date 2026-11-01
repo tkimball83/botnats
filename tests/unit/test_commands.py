@@ -564,6 +564,28 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             line = f"PRIVMSG owner :{text}\r\n".encode()
             assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
 
+    async def test_reply_list_caps_lines(self) -> None:
+        """Send at most 10 lines, the last saying how many items are left out."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        # Ten of these 35-byte items fill a line after "#test" for "owner".
+        items = [f"{number:03d}" + "x" * 32 for number in range(250)]
+
+        bot.commands.reply_list(OWNER, "#test", items[:100])
+
+        assert len(fake_irc.privmsgs) == 10
+        listed = [word for _, text in fake_irc.privmsgs for word in text.split()[1:]]
+        assert listed == items[:100]
+
+        fake_irc.privmsgs.clear()
+        bot.commands.reply_list(OWNER, "#test", items)
+
+        assert len(fake_irc.privmsgs) == 10
+        *packed, last = fake_irc.privmsgs
+        listed = [word for _, text in packed for word in text.split()[1:]]
+        assert listed == items[:90]
+        assert last == ("owner", "#test ... and 160 more")
+
     async def test_reply_drops_unsendable_line(self) -> None:
         """Log and drop a reply too long to send instead of raising."""
         bot, fake_irc = bot_with_irc()

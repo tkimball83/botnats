@@ -21,6 +21,9 @@ if TYPE_CHECKING:
     from botnats.irc.protocol import Prefix
 
 LOGGER = logging.getLogger(__name__)
+# Each list line holds the send queue for seconds, ahead of the bot's own
+# commands: a large channel's members could hold it for minutes, or fill it.
+MAX_LIST_LINES = 10
 MAX_RATE_BUCKETS = 8192
 # Room for the ":nick!user@host " source a server puts in front of each line
 # it relays, which counts toward the recipient's 512-byte limit.
@@ -87,10 +90,15 @@ class CommandHandler:
             LOGGER.warning("dropped PRIVMSG to %s: %s", prefix.nick, error_label(error))
 
     def reply_list(self, prefix: Prefix, head: str, items: list[str]) -> None:
-        """Reply with items after head, packed into as few lines as fit."""
+        """Reply with items after head, packed into as few lines as fit.
+
+        Past MAX_LIST_LINES, the last line says how many items are left out.
+        """
         overhead = len(format_message("PRIVMSG", (prefix.nick,), ""))
         limit = MAX_IRC_MESSAGE_BYTES - RELAY_SOURCE_BYTES - overhead
-        current = head
+        # Each line, with the number of items it holds.
+        lines: list[tuple[str, int]] = []
+        current, count = head, 0
         for item in items:
             # An item too long for any line would be cut off in relay.
             if len(f"{head} {item}".encode()) > limit:
@@ -101,14 +109,21 @@ class CommandHandler:
 
             candidate = f"{current} {item}"
             if len(candidate.encode()) > limit:
-                self.reply(prefix, current)
-                current = f"{head} {item}"
+                lines.append((current, count))
+                current, count = f"{head} {item}", 1
             else:
-                current = candidate
+                current, count = candidate, count + 1
 
         # A header alone is never sent.
-        if current != head:
-            self.reply(prefix, current)
+        if count:
+            lines.append((current, count))
+
+        if len(lines) > MAX_LIST_LINES:
+            left_out = sum(held for _, held in lines[MAX_LIST_LINES - 1 :])
+            lines[MAX_LIST_LINES - 1 :] = [(f"{head} ... and {left_out} more", 0)]
+
+        for line, _ in lines:
+            self.reply(prefix, line)
 
     async def channel_update(
         self,
