@@ -463,5 +463,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 assert claim.owned
                 record = json.loads(kv.entries["alpha"][1])
                 assert claim.store.valid("alpha", record)
+                # Otherwise the watch echo would read as a duplicate's record.
+                assert record["instance_id"] == INSTANCE_ID
                 with self.assertRaisesRegex(ValueError, "invalid identity"):
                     BotPresence.from_dict(record)

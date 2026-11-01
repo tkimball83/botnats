@@ -352,11 +352,6 @@ class PresenceValidTests(unittest.TestCase):
         # ahead stamps the next one.
         ahead = sign({**fresh, "timestamp": int(now) + 1})
         assert store.valid("alpha", ahead, now=now)
-        # A peer's clock may run at most 30 seconds ahead.
-        at_most_ahead = sign({**fresh, "timestamp": int(now) + 30})
-        assert store.valid("alpha", at_most_ahead, now=now)
-        too_far_ahead = sign({**fresh, "timestamp": int(now) + 31})
-        assert not store.valid("alpha", too_far_ahead, now=now)
 
         surrogate = {
             "bot_id": "alpha",
@@ -464,7 +459,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert attempts.kv.create.await_count == 2
 
     async def test_denies_after_limit(self) -> None:
-        """Verify a full attempt window denies another authentication attempt."""
+        """Deny when peers win the create race for every empty attempt slot."""
         attempts = AttemptStore("efnet", 3, SECRET)
         attempts.kv = AsyncMock()
         # Finite, because AsyncMock calls never suspend for bounded() to

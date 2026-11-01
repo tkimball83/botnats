@@ -2178,3 +2178,9 @@ class SessionSyncWatchTests(unittest.TestCase):
         # The live session is held under second's IRC fold, not its ASCII fold.
         bot.sessions.forget("second-key")
         assert not bot.authorizer.records
+
+        # A deleted key whose identity no longer holds a session drops nothing.
+        bot.sessions.watched["first-key"] = (first, expiry)
+        bot.sessions.forget("first-key")
+        assert not bot.sessions.watched
+        assert not bot.authorizer.records
