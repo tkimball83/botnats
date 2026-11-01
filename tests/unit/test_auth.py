@@ -1993,17 +1993,30 @@ class SessionSyncWatchTests(unittest.TestCase):
         sessions.unwatch_identity("a!u@h")
         assert not sessions.watched_valid("a!u@h")
 
-    def test_session_identity_cache_prunes_during_updates(self) -> None:
-        """Prune expired key mappings whenever a watched record arrives."""
+    def test_prune_drops_expired_key_mappings(self) -> None:
+        """Drop expired key mappings and keep live ones."""
         sessions = SessionSync(authorizer(), FakeCoordinator(), Tasks())
-        now = time.time()
-        sessions.watched["expired"] = ("expired!user@host", now - 1)
-        expiry = now + 60
-        key = "opaque"
+        expiry = time.time() + 60
+        sessions.watched["expired"] = ("expired!user@host", time.time() - 1)
+        sessions.watched["live"] = ("live!user@host", expiry)
 
-        sessions.observe(key, session_value(expiry))
+        sessions.prune()
 
-        assert sessions.watched == {key: ("owner!user@host", expiry)}
+        assert sessions.watched == {"live": ("live!user@host", expiry)}
+
+    def test_observe_leaves_expired_key_mappings(self) -> None:
+        """Leave expired key mappings to maintenance, so a replay stays linear."""
+        sessions = SessionSync(authorizer(), FakeCoordinator(), Tasks())
+        expired = time.time() - 1
+        sessions.watched["expired"] = ("expired!user@host", expired)
+        expiry = time.time() + 60
+
+        sessions.observe("opaque", session_value(expiry))
+
+        assert sessions.watched == {
+            "expired": ("expired!user@host", expired),
+            "opaque": ("owner!user@host", expiry),
+        }
 
     def test_expired_record_forgets_key(self) -> None:
         """Treat an expired record as a delete of the session its key held."""

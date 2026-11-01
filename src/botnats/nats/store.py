@@ -466,10 +466,9 @@ class PresenceStore(KVStore):
         msg = "presence reclaim lost repeated update races"
         raise NatsError(msg)
 
-    def lifetime(self, data: dict[str, Any], now: float | None = None) -> float:
-        """Return how much longer valid() accepts a record's signed timestamp."""
-        current = time.time() if now is None else now
-        return data["timestamp"] + self.ttl + PRESENCE_DRIFT - current
+    def lifetime(self, data: dict[str, Any]) -> float:
+        """Return how much longer valid() accepts a valid record's timestamp."""
+        return data["timestamp"] + self.ttl + PRESENCE_DRIFT - time.time()
 
     def sign(self, data: dict[str, Any]) -> bytes:
         """Serialize a freshly timestamped, signed presence record."""
@@ -510,7 +509,13 @@ class PresenceStore(KVStore):
             return False
 
         current = time.time() if now is None else now
-        if timestamp > current + PRESENCE_DRIFT or self.lifetime(data, current) < 0:
+        # The window lifetime() measures, compared without arithmetic on the
+        # unchecked timestamp: an int too large for a float would raise.
+        if (
+            not current - self.ttl - PRESENCE_DRIFT
+            <= timestamp
+            <= current + PRESENCE_DRIFT
+        ):
             return False
 
         try:

@@ -386,6 +386,12 @@ class PresenceValidTests(unittest.TestCase):
                 record = sign({**fresh, "timestamp": flag})
                 assert not store.valid("alpha", record, now=now)
 
+        # JSON integers too large for a float are refused, never raise.
+        for sign_of in (-1, 1):
+            with self.subTest(huge=sign_of):
+                record = sign({**fresh, "timestamp": sign_of * 10**400})
+                assert not store.valid("alpha", record, now=now)
+
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
 

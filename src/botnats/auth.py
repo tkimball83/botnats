@@ -226,7 +226,6 @@ class SessionSync:
         bot's own write, so the write-back never escalates over a newer grant.
         """
         now = time.time()
-        self.prune(now)
         if session.expires_at > now:
             self.watched[key] = (session.prefix, session.expires_at)
             held = self.authorizer.keep(session)
@@ -264,9 +263,10 @@ class SessionSync:
             self.pending[identity] = self.yielding[identity] = held
             self.tasks.spawn(self.retry(), "session-sync")
 
-    def prune(self, now: float) -> None:
+    def prune(self) -> None:
         """Discard expired key mappings, which receive no TTL delete event."""
-        for key in [k for k, mapped in self.watched.items() if mapped[1] <= now]:
+        cutoff = time.time()
+        for key in [k for k, mapped in self.watched.items() if mapped[1] <= cutoff]:
             del self.watched[key]
 
     def queue(self, session: Session, *, yielding: bool = False) -> str:

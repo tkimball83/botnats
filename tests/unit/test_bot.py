@@ -498,11 +498,13 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         assert ("PART", ("#old",)) in fake_irc.sent
 
     async def test_prunes_expired_sessions_while_disconnected(self) -> None:
-        """Remove expired auth sessions even while IRC is disconnected."""
+        """Remove expired auth sessions and key mappings while disconnected."""
         bot = Bot(config())
         bot.authorizer.grant("owner!user@host.example", now=0)
+        bot.sessions.watched["expired-key"] = ("owner!user@host.example", 0.0)
 
         async with asyncio.timeout(1):
             await bot.maintenance_tick()
 
         assert not bot.authorizer.records
+        assert not bot.sessions.watched
