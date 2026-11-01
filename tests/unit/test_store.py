@@ -395,6 +395,28 @@ class PresenceValidTests(unittest.TestCase):
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
 
+    def test_lifetime_ends_as_valid_refuses(self) -> None:
+        """Measure how much longer valid() accepts a record, drift included."""
+        store = PresenceStore("efnet", 1, 15.0, SECRET)
+        now = 1_000_000.0
+        record: dict[str, object] = {
+            "bot_id": "alpha",
+            "host": "host",
+            "instance_id": "inst",
+            "nick": "alpha",
+            "user": "user",
+            "timestamp": int(now) - 40,
+        }
+        record["signature"] = presence_signature(SECRET, "efnet", record)
+
+        with patch("botnats.nats.store.time") as clock:
+            clock.time.return_value = now
+            lifetime = store.lifetime(record)
+
+        assert lifetime == store.ttl + PRESENCE_DRIFT - 40
+        assert store.valid("alpha", record, now=now + lifetime)
+        assert not store.valid("alpha", record, now=now + lifetime + 1)
+
 
 def channel_revision(number: int) -> str:
     """Return the sortable revision channel_record(number) carries."""
@@ -1112,6 +1134,30 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         sessions.kv.update.assert_awaited_once()
 
+    async def test_session_put_orders_expiry_before_version(self) -> None:
+        """Replace a stored revocation with a grant only if the grant expires later.
+
+        A user whose QUIT stored a version-1 revocation authenticates again
+        with a version-0 grant, which must replace it.
+        """
+        sessions = SessionStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        sessions.kv = cast("KeyValue", kv)
+        key = sessions.key("owner!user@host")
+        now = time.time()
+        revocation = session_record(now + 40, 1, revoked=True)
+        kv.store(key, json.dumps(revocation).encode())
+
+        earlier = parsed_session(session_record(now + 30))
+        assert await bounded(sessions.put(earlier)) == parsed_session(revocation)
+        assert json.loads(kv.entries[key][1]) == revocation
+
+        later = session_record(now + 50)
+        assert await bounded(sessions.put(parsed_session(later))) == parsed_session(
+            later
+        )
+        assert json.loads(kv.entries[key][1]) == later
+
     async def test_session_put_keeps_identical_record(self) -> None:
         """Return an identical stored record without writing it again.
 
@@ -1319,7 +1365,11 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert sessions.parse(sessions.key("owner!user@host"), record) is not None
 
     async def test_malformed_ordering_records_are_replaced(self) -> None:
-        """Prevent malformed durable values from blocking valid replacements."""
+        """Prevent malformed durable values from blocking valid replacements.
+
+        A signed revocation past the horizon is not malformed: it only denies,
+        so it stands, as in the watch.
+        """
         channels = ChannelStore("efnet", 1, SECRET)
         channels.kv = AsyncMock()
         malformed_channel = {**channel_record(1), "revision": "zzzz"}
@@ -1337,16 +1387,28 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
-        impossible = session_record(time.time() + 1_000_000, 1, revoked=True)
+        valid_session = parsed_session(session_record(time.time() + 40, 0))
+        future = time.time() + 1_000_000
+        impossible = session_record(future, 1)
         sessions.kv.get.return_value = SimpleNamespace(
             revision=1,
             value=json.dumps(impossible).encode(),
         )
         sessions.kv.update.return_value = 2
 
-        valid_session = parsed_session(session_record(time.time() + 40, 0))
         assert await bounded(sessions.put(valid_session)) == valid_session
         sessions.kv.update.assert_awaited_once()
+
+        sessions.kv.update.reset_mock()
+        revocation = session_record(future, 1, revoked=True)
+        sessions.kv.get.return_value = SimpleNamespace(
+            revision=2,
+            value=json.dumps(revocation).encode(),
+        )
+
+        stored = await bounded(sessions.put(valid_session))
+        assert stored == parsed_session(revocation)
+        sessions.kv.update.assert_not_awaited()
 
     async def test_oversized_json_integer_is_replaced(self) -> None:
         """Prevent Python's integer limit from blocking valid replacements."""

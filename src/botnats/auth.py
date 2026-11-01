@@ -58,9 +58,8 @@ class AuthFlow:
         if claimed and bot.sessions.watched_valid(rendered):
             session = bot.authorizer.grant(rendered)
             # A held revocation that outranks the grant blocks it. Writing the
-            # grant anyway could replace that revocation: the store disregards
-            # one expiring past its horizon, as from a peer whose clock runs
-            # ahead.
+            # grant anyway could land it where the store no longer holds that
+            # revocation, as after a delete the watch has yet to report.
             if not bot.authorizer.authorized(rendered):
                 bot.commands.reply(prefix, "Authorization failed", checked=False)
                 return

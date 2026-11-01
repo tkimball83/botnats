@@ -773,8 +773,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         """Refuse, without writing it, a grant a held revocation outranks.
 
         A peer whose clock runs ahead revoked the identity, so its revocation
-        expires past this bot's store horizon, where the store would let the
-        grant replace it; bots started later would then honor the grant.
+        outranks the grant. The store no longer holds it, as after a delete
+        the watch has yet to report: the grant would land there, and bots
+        started meanwhile would honor it.
         """
         bot, fake_irc, coordinator = bot_with_coordinator()
         prefix = Prefix("owner", "user", "host.example")
@@ -786,8 +787,6 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             version=1,
         )
         key = coordinator.sessions.key(prefix.render())
-        kv = cast("FakeKV", coordinator.sessions.kv)
-        kv.store(key, json.dumps(coordinator.sessions.sign(revocation)).encode())
         bot.sessions.observe(key, revocation)
         valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
 
@@ -795,8 +794,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.privmsgs == [("owner", "Authorization failed")]
         assert coordinator.session_puts == []
-        stored = coordinator.sessions.verify(key, json.loads(kv.entries[key][1]))
-        assert stored == revocation
+        assert cast("FakeKV", coordinator.sessions.kv).entries == {}
         assert not bot.authorizer.authorized(prefix.render())
 
     async def test_auth_revocation_survives_shutdown_awaiting_lock(self) -> None:

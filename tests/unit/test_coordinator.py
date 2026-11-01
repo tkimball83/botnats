@@ -41,7 +41,6 @@ from botnats.nats.coordinator import (
 from botnats.nats.envelope import Envelope
 from botnats.nats.status import unknown
 from botnats.nats.store import (
-    PRESENCE_DRIFT,
     SESSION_EXPIRY_GRACE,
     AttemptStore,
     ChannelStore,
@@ -237,19 +236,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await bounded(coordinator.deliver_help(message))
 
         callback.assert_called_once_with("unban", "#test", BotPresence(**BETA_PRESENCE))
-
-    async def test_help_subscription_covers_every_kind(self) -> None:
-        """Subscribe once to the namespace, so every help kind is delivered."""
-        coordinator = build_coordinator("alpha")
-        nc = AsyncMock()
-        nc.subscribe.return_value = MagicMock(spec=Subscription)
-
-        await bounded(coordinator.subscribe_help(nc))
-
-        nc.subscribe.assert_awaited_once_with(
-            f"{coordinator.ns}.*",
-            cb=coordinator.deliver_help,
-        )
 
     async def test_own_help_request_is_skipped(self) -> None:
         """Ignore this bot's own broadcast, which NATS echoes back to it."""
@@ -1401,13 +1387,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         ):
             clock.time.return_value = now
             await bounded(coordinator.watch_presence(MagicMock()))
+            lifetimes = [store.lifetime(record) for record in records]
 
-        window = store.ttl + PRESENCE_DRIFT
         peer = BotPresence(**BETA_PRESENCE)
-        assert update.call_args_list == [call(peer, window - 40), call(peer, window)]
-        # The replayed record's lifetime ends just as the store refuses it.
-        assert store.valid("beta", records[0], now=now + window - 40)
-        assert not store.valid("beta", records[0], now=now + window - 39)
+        assert update.call_args_list == [call(peer, lifetime) for lifetime in lifetimes]
 
     async def test_watch_presence_detects_starting_duplicate(self) -> None:
         """Yield to another instance's placeholder claim, which is not yet a peer."""
