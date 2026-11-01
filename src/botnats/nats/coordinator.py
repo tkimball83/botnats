@@ -301,7 +301,6 @@ class Coordinator:
         if task is None:
             return
 
-        self.resync_task = None
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

@@ -90,6 +90,38 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "replicas=2/3 lag=7"
         )
 
+    async def test_collect_moving_stream_with_offline_peer(self) -> None:
+        """Report an offline peer as degraded even when enough peers are current."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.return_value = SimpleNamespace(
+            stream_info=SimpleNamespace(
+                # A moving stream lists its old and new peers together, so the
+                # current ones can reach the replica count while one is offline.
+                cluster=ClusterInfo(
+                    leader="nats-1",
+                    replicas=[
+                        PeerInfo(current=True, name="nats-2"),
+                        PeerInfo(current=True, name="nats-3"),
+                        PeerInfo(current=False, lag=5, name="nats-4"),
+                        PeerInfo(name="nats-5", offline=True),
+                    ],
+                ),
+                config=SimpleNamespace(num_replicas=3),
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 3, 8222))
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=degraded leader=nats-1 "
+            "replicas=3/3 lag=5 offline=nats-5"
+        )
+
     async def test_collect_healthy_cluster(self) -> None:
         """Report a fully current cluster with a leader as up."""
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
@@ -194,6 +226,27 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                     f"replicas=1/{replicas} lag=0"
                 )
 
+    async def test_collect_uses_stream_replica_count(self) -> None:
+        """Judge replicas against the stream's own count, not the configured one."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        # An operator scaled the open bucket's stream down to one replica.
+        kv.status.return_value = SimpleNamespace(
+            stream_info=StreamInfo.from_response(
+                {"config": {"num_replicas": 1}, "cluster": {"leader": "nats-1"}},
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 3, 8222))
+
+        assert status.render() == (
+            "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=1/1 lag=0"
+        )
+
     async def test_collect_unknown_when_disconnected(self) -> None:
         """Return unknown details without monitoring a disconnected client."""
         # nats-py reports no connected URL while it reconnects.
@@ -259,6 +312,60 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 request = writer.write.call_args.args[0]
                 assert f"\r\nHost: {location}\r\n".encode() in request
                 writer.close.assert_called_once_with()
+
+    async def test_route_count_accepts_http_11(self) -> None:
+        """Accept an HTTP/1.1 server's answer to the HTTP/1.0 request."""
+        reader = AsyncMock()
+        # RFC 9110 lets a server reply with the highest version it supports.
+        reader.read.side_effect = [
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b'{"num_routes":2}',
+            b"",
+        ]
+        writer = mock_writer()
+
+        with patch(
+            "asyncio.open_connection",
+            AsyncMock(return_value=(reader, writer)),
+        ):
+            routes = await bounded(route_count("nats-1", 8222))
+
+        assert routes == 2
+
+    async def test_route_count_standalone_server(self) -> None:
+        """Report a standalone server's zero routes as a known count."""
+        reader = AsyncMock()
+        reader.read.side_effect = [
+            b"HTTP/1.0 200 OK\r\n\r\n",
+            b'{"num_routes":0}',
+            b"",
+        ]
+        writer = mock_writer()
+
+        with patch(
+            "asyncio.open_connection",
+            AsyncMock(return_value=(reader, writer)),
+        ):
+            routes = await bounded(route_count("nats-1", 8222))
+
+        assert routes == 0
+
+    async def test_route_count_unknown_when_reset(self) -> None:
+        """Give up on a monitoring port that resets the connection."""
+        reader = AsyncMock()
+        reader.read.side_effect = ConnectionResetError("reset")
+        writer = mock_writer()
+        # After a reset, closing the writer reports the reset again.
+        writer.wait_closed.side_effect = ConnectionResetError("reset")
+
+        with patch(
+            "asyncio.open_connection",
+            AsyncMock(return_value=(reader, writer)),
+        ):
+            routes = await bounded(route_count("nats-1", 8222))
+
+        assert routes is None
+        writer.wait_closed.assert_awaited_once_with()
 
     async def test_route_count_unknown_when_unanswered(self) -> None:
         """Give up on a monitoring port that accepts but never answers."""
