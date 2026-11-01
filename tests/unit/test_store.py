@@ -1042,6 +1042,30 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert stored == channel_fields(3)
         assert json.loads(kv.entries[key][1]) == channel_record(3)
 
+    async def test_channel_put_replaces_forged_newer_record(self) -> None:
+        """Replace, not return, a newer channel record with a bad signature.
+
+        A NATS writer without the coordination secret can store one; honoring
+        it would have put() return the forgery as the winner.
+        """
+        channels = ChannelStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        channels.kv = cast("KeyValue", kv)
+        key = channels.key("#test")
+        forged = {
+            **channel_record(9),
+            "key": "hijacked",
+            "signature": "0" * SHA256_HEX_LENGTH,
+        }
+        kv.store(key, json.dumps(forged).encode())
+
+        stored = await bounded(
+            channels.put(channel_record(2), after=channel_revision(1))
+        )
+
+        assert stored == channel_fields(2)
+        assert json.loads(kv.entries[key][1]) == channel_record(2)
+
     async def test_put_newer_bounds_lost_create_races(self) -> None:
         """Count lost create races toward the same CAS attempt bound."""
         channels = ChannelStore("efnet", 1, SECRET)
@@ -1212,6 +1236,33 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert stored == parsed_session(concurrent)
         sessions.kv.update.assert_awaited_once()
         assert sessions.kv.update.await_args.kwargs == {"last": 7}
+
+    async def test_session_put_replaces_forged_or_misplaced_record(self) -> None:
+        """Replace, not return, a later record that is forged or another identity's.
+
+        A NATS writer without the coordination secret can store either under
+        the key; honoring one would have put() return it as the winner.
+        """
+        sessions = SessionStore("efnet", 1, SECRET)
+        key = sessions.key("owner!user@host")
+        now = time.time()
+        written = session_record(now + 40, 1, revoked=True)
+        # Each expires later, so it would outrank the written revocation.
+        later = session_record(now + 50)
+        misplaced = {**later, "prefix": "other!user@host"}
+        misplaced["signature"] = session_signature(SECRET, "efnet", misplaced)
+        stored_records: dict[str, dict[str, object]] = {
+            "forged signature": {**later, "signature": "0" * SHA256_HEX_LENGTH},
+            "another identity's record": misplaced,
+        }
+        session = parsed_session(written)
+        for label, record in stored_records.items():
+            kv = FakeKV()
+            sessions.kv = cast("KeyValue", kv)
+            kv.store(key, json.dumps(record).encode())
+            with self.subTest(label):
+                assert await bounded(sessions.put(session)) == session
+                assert json.loads(kv.entries[key][1]) == written
 
     async def test_session_horizon_ends_one_ttl_plus_grace_away(self) -> None:
         """Accept a record expiring exactly at the horizon and refuse a later one."""

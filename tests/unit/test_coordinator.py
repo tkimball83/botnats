@@ -1130,6 +1130,48 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert task.cancelled()
         assert coordinator.resync_task is None
 
+    async def test_close_cancels_restart_after_cancelled_resync(self) -> None:
+        """Let close() stop a restart stored after a disconnect cancelled a resync.
+
+        nats-py closes a client for good with the disconnect callback and then
+        the closed one. The cancelled resync's done callback clears the slot;
+        running only after on_closed stored the restart, it would clear that
+        instead, and close() would leave the restart connecting.
+        """
+        coordinator = build_coordinator("alpha")
+        coordinator.nc = MagicMock(is_connected=True)
+        opening = asyncio.Event()
+        connecting = asyncio.Event()
+
+        async def open_stores() -> None:
+            # JetStream is still down.
+            opening.set()
+            await asyncio.Event().wait()
+
+        async def connect(**options: object) -> None:
+            del options
+            connecting.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch("nats.connect", connect),
+            patch.object(coordinator, "init_stores", open_stores),
+        ):
+            async with asyncio.timeout(5):
+                await coordinator.on_reconnected()
+                await opening.wait()
+                await coordinator.on_disconnected()
+                await coordinator.on_closed()
+                restart = coordinator.resync_task
+                assert restart is not None
+                await connecting.wait()
+                assert coordinator.resync_task is restart
+                await coordinator.close()
+                await asyncio.gather(restart, return_exceptions=True)
+
+        assert restart.cancelled()
+        assert coordinator.resync_task is None
+
     async def test_ready_waits_for_watch_replay(self) -> None:
         """Keep readiness false until every KV watch reaches its sentinel."""
         coordinator = build_coordinator("alpha")
@@ -1218,6 +1260,27 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await bounded(coordinator.watch_channels(MagicMock()))
 
         callback.assert_not_called()
+
+    async def test_watch_channel_rejects_forged_signature(self) -> None:
+        """Ignore a well-formed, key-bound channel record with a bad signature."""
+        coordinator = build_coordinator("alpha")
+        callback = MagicMock()
+        key = coordinator.channels_store.key("#test")
+        record = ChannelRecord.new("#test", None, present=True)
+        signed = coordinator.channels_store.sign(astuple(record))
+        forged = {**signed, "key": "hijacked", "signature": "0" * 64}
+        # The signed record after it shows the watch read past the forgery.
+        entries = (
+            SimpleNamespace(key=key, operation=None, value=json.dumps(value).encode())
+            for value in (forged, signed)
+        )
+        kv, _ = watcher(*entries, None)
+        coordinator.channels_store.kv = kv
+
+        with patch.object(coordinator.callbacks, "on_channel", callback):
+            await bounded(coordinator.watch_channels(MagicMock()))
+
+        callback.assert_called_once_with(astuple(record))
 
     async def test_watch_channel_skips_undecodable_value(self) -> None:
         """Skip a channel value that is not a JSON object and finish the replay.
@@ -1500,7 +1563,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         synced.assert_called_once_with()
 
     async def test_session_watch_reports_unauthentic_value_as_delete(self) -> None:
-        """Report an undecodable, unsigned, or misplaced value as its key's delete.
+        """Report an undecodable, forged, or misplaced value as its key's delete.
 
         Each hides the record it replaced, during the replay or after it.
         """
@@ -1520,8 +1583,16 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             )
             for record_key in (key, other)
         ]
-        unsigned = SimpleNamespace(key=key, operation=None, value=b"{}")
-        kv, _ = watcher(undecodable, *entries, None, unsigned)
+        # A well-formed later grant under its own key, so only the signature
+        # rejects it.
+        forged = SimpleNamespace(
+            key=key,
+            operation=None,
+            value=json.dumps(
+                {**session_record(expiry + 60), "signature": "0" * 64}
+            ).encode(),
+        )
+        kv, _ = watcher(undecodable, *entries, None, forged)
         coordinator.sessions.kv = kv
         delete = MagicMock()
         update = MagicMock()
