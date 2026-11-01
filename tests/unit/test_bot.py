@@ -8,7 +8,7 @@ import time
 import unittest
 from dataclasses import astuple, replace
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
 
@@ -246,18 +246,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
         session = session_value(time.time() + 60)
 
-        bot.callbacks.on_presence(peer)
-        with patch.object(
-            bot.sessions, "observe", wraps=bot.sessions.observe
-        ) as observe:
-            bot.callbacks.on_session_update("opaque", session, replaying=False)
-            bot.callbacks.on_session_update("opaque", session, replaying=True)
+        # A replayed record the store accepts for one more minute.
+        bot.callbacks.on_presence(peer, 60.0)
+        bot.callbacks.on_session_update("opaque", session)
 
-        assert observe.call_args_list == [
-            call("opaque", session, replaying=False),
-            call("opaque", session, replaying=True),
-        ]
         assert bot.presence.has(peer)
+        assert not bot.presence.has(peer, now=time.monotonic() + 60)
         assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}
         assert bot.authorizer.authorized(session.prefix)
 
@@ -268,7 +262,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.watched
         assert not bot.authorizer.authorized(session.prefix)
 
-        bot.callbacks.on_session_update("opaque", session, replaying=True)
+        bot.callbacks.on_session_update("opaque", session)
         bot.callbacks.on_sessions_replayed({"opaque"})
 
         assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}

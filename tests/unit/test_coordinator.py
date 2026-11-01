@@ -13,6 +13,7 @@ from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import (
+    ANY,
     AsyncMock,
     MagicMock,
     PropertyMock,
@@ -40,6 +41,7 @@ from botnats.nats.coordinator import (
 from botnats.nats.envelope import Envelope
 from botnats.nats.status import unknown
 from botnats.nats.store import (
+    PRESENCE_DRIFT,
     SESSION_EXPIRY_GRACE,
     AttemptStore,
     ChannelStore,
@@ -118,10 +120,9 @@ def closing_client(coordinator: Coordinator) -> MagicMock:
     nats-py awaits the disconnected and then the closed callback from inside
     close(), so the coordinator sees its own close as it happens.
     """
-    nc = MagicMock(is_closed=False, is_connected=True)
+    nc = MagicMock(is_connected=True)
 
     async def close() -> None:
-        nc.is_closed = True
         nc.is_connected = False
         await coordinator.on_disconnected()
         await coordinator.on_closed()
@@ -435,7 +436,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha")
         servers = ("nats://nats-1:4222", "nats://nats-2:4222")
         coordinator.config = replace(coordinator.config, servers=servers)
-        coordinator.nc = MagicMock(is_closed=True)
+        coordinator.nc = MagicMock()
         steps: list[str] = []
         nc = MagicMock(is_connected=True)
 
@@ -527,7 +528,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         callback, and the reconnect replays only subscriptions the client holds.
         """
         coordinator = build_coordinator("alpha")
-        coordinator.nc = MagicMock(is_closed=True)
+        coordinator.nc = MagicMock()
         nc = MagicMock(is_connected=True)
         nc.subscribe = AsyncMock(return_value=MagicMock(spec=Subscription))
         connect = AsyncMock(return_value=nc)
@@ -565,12 +566,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """
         coordinator = build_coordinator("alpha")
         first = MagicMock(
-            is_closed=False,
             is_connected=True,
             subscribe=AsyncMock(return_value=MagicMock(spec=Subscription)),
         )
         second = MagicMock(
-            is_closed=False,
             is_connected=True,
             subscribe=AsyncMock(return_value=MagicMock(spec=Subscription)),
         )
@@ -593,7 +592,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             initial = asyncio.create_task(coordinator.start())
             async with asyncio.timeout(5):
                 await opening.wait()
-                first.is_closed = True
                 first.is_connected = False
                 await coordinator.on_closed()
                 restart = coordinator.resync_task
@@ -609,7 +607,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_cancels_restart(self) -> None:
         """Stop a restart that is still connecting when the bot shuts down."""
         coordinator = build_coordinator("alpha")
-        coordinator.nc = MagicMock(is_closed=True)
+        coordinator.nc = MagicMock()
         connecting = asyncio.Event()
 
         async def connect(**options: object) -> None:
@@ -1126,8 +1124,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         whose restart takes the slot before the resync finishes.
         """
         coordinator = build_coordinator("alpha")
-        nc = MagicMock(is_closed=False)
-        coordinator.nc = nc
+        coordinator.nc = MagicMock()
         stopping = asyncio.Event()
 
         async def slow_to_stop() -> None:
@@ -1150,7 +1147,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 first = coordinator.resync_task
                 reconnect = asyncio.create_task(coordinator.on_disconnected())
                 await stopping.wait()
-                nc.is_closed = True
                 reconnect.cancel()
                 await coordinator.on_disconnected()
                 await coordinator.on_closed()
@@ -1367,9 +1363,51 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(coordinator.callbacks, "on_presence", update):
             await bounded(coordinator.watch_presence(MagicMock()))
 
-        update.assert_called_once_with(BotPresence(**BETA_PRESENCE))
+        update.assert_called_once_with(BotPresence(**BETA_PRESENCE), ANY)
         # Another instance's record on a peer's key is no duplicate of ours.
         assert coordinator.claim.owned
+
+    async def test_watch_presence_reports_record_lifetime(self) -> None:
+        """Report how much longer the store accepts each peer record.
+
+        A replay reads every stored record, however old: a peer that stopped
+        just before it counts only until the store would refuse its record.
+        """
+        coordinator = build_coordinator("alpha")
+        store = coordinator.presence_store
+        now = 1_000_000.0
+        records: list[dict[str, object]] = []
+        for age in (40, 0):
+            record: dict[str, object] = {**BETA_PRESENCE, "timestamp": int(now) - age}
+            record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
+            records.append(record)
+
+        replayed, live = (
+            SimpleNamespace(
+                key="beta",
+                operation=None,
+                revision=revision,
+                value=json.dumps(record).encode(),
+            )
+            for revision, record in enumerate(records, 1)
+        )
+        kv, _ = watcher(replayed, None, live)
+        store.kv = kv
+        update = MagicMock()
+
+        with (
+            patch("botnats.nats.store.time") as clock,
+            patch.object(coordinator.callbacks, "on_presence", update),
+        ):
+            clock.time.return_value = now
+            await bounded(coordinator.watch_presence(MagicMock()))
+
+        window = store.ttl + PRESENCE_DRIFT
+        peer = BotPresence(**BETA_PRESENCE)
+        assert update.call_args_list == [call(peer, window - 40), call(peer, window)]
+        # The replayed record's lifetime ends just as the store refuses it.
+        assert store.valid("beta", records[0], now=now + window - 40)
+        assert not store.valid("beta", records[0], now=now + window - 39)
 
     async def test_watch_presence_detects_starting_duplicate(self) -> None:
         """Yield to another instance's placeholder claim, which is not yet a peer."""
@@ -1488,30 +1526,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(coordinator.callbacks, "on_session_update", update):
             await bounded(coordinator.watch_sessions(MagicMock()))
 
-        update.assert_called_once_with(key, session_value(expiry), replaying=True)
-
-    async def test_live_session_update_is_not_replaying(self) -> None:
-        """Report records after the replay sentinel as live, not replayed."""
-        coordinator = build_coordinator("alpha")
-        key = coordinator.sessions.key("owner!user@host")
-        expiry = time.time() + 60
-        entry = SimpleNamespace(
-            key=key,
-            operation=None,
-            value=json.dumps(session_record(expiry)).encode(),
-        )
-        kv, _ = watcher(entry, None, entry)
-        coordinator.sessions.kv = kv
-        update = MagicMock()
-
-        with patch.object(coordinator.callbacks, "on_session_update", update):
-            await bounded(coordinator.watch_sessions(MagicMock()))
-
-        session = session_value(expiry)
-        assert update.call_args_list == [
-            call(key, session, replaying=True),
-            call(key, session, replaying=False),
-        ]
+        update.assert_called_once_with(key, session_value(expiry))
 
     async def test_help_ignored_until_watches_replay(self) -> None:
         """Ignore peer requests while watches replay, even with presence owned."""
@@ -1612,7 +1627,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await bounded(coordinator.watch_sessions(MagicMock()))
 
         assert delete.call_args_list == [call(key), call(other), call(key)]
-        update.assert_called_once_with(key, session_value(expiry), replaying=True)
+        update.assert_called_once_with(key, session_value(expiry))
         replayed.assert_called_once_with({key})
 
     async def test_session_watch_skips_grant_beyond_horizon(self) -> None:
@@ -1665,18 +1680,18 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             for record in (revoked, session_record(horizon + 120))
         )
         session = parse_session_record(COORDINATION_KEY, "efnet", revoked)
-        for replaying in (True, False):
-            entries = (revocation, None) if replaying else (None, revocation)
+        for in_replay in (True, False):
+            entries = (revocation, None) if in_replay else (None, revocation)
             kv, _ = watcher(*entries, grant)
             coordinator.sessions.kv = kv
             update = MagicMock()
             with (
-                self.subTest(replaying=replaying),
+                self.subTest(in_replay=in_replay),
                 patch.object(coordinator.callbacks, "on_session_update", update),
             ):
                 await bounded(coordinator.watch_sessions(MagicMock()))
 
-                update.assert_called_once_with(key, session, replaying=replaying)
+                update.assert_called_once_with(key, session)
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""

@@ -215,7 +215,7 @@ class SessionSync:
             key: (count, True) for key, (count, _) in self.watched_identities.items()
         }
 
-    def observe(self, key: str, session: Session, *, replaying: bool) -> None:
+    def observe(self, key: str, session: Session) -> None:
         """Apply a validated watched record: keep it, or forget its key if expired.
 
         A record below the one held for its key was rolled back, as when a
@@ -226,9 +226,7 @@ class SessionSync:
         bot's own write, so the write-back never escalates over a newer grant.
         """
         now = time.time()
-        if not replaying:
-            self.prune(now)
-
+        self.prune(now)
         if session.expires_at > now:
             self.watched[key] = (session.prefix, session.expires_at)
             held = self.authorizer.keep(session)

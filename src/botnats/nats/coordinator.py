@@ -644,7 +644,9 @@ class Coordinator:
             # duplicate to detect, not yet a peer to record.
             return
 
-        self.callbacks.on_presence(presence)
+        # A replay reads records however old: a peer counts as present only
+        # while the store would still accept its last heartbeat.
+        self.callbacks.on_presence(presence, self.presence_store.lifetime(data))
 
     async def watch_sessions(self, synced: Callable[[], None]) -> None:
         """Watch the sessions KV bucket and report validated records by key.
@@ -688,11 +690,7 @@ class Coordinator:
                 if not session.revoked and not self.sessions.within_horizon(session):
                     continue
 
-                self.callbacks.on_session_update(
-                    entry.key,
-                    session,
-                    replaying=replayed is not None,
-                )
+                self.callbacks.on_session_update(entry.key, session)
         finally:
             await watcher.stop()
 

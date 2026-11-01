@@ -58,6 +58,27 @@ class PresenceTests(unittest.TestCase):
         assert registry.active(now=14.9) == (presence,)
         assert registry.active(now=15) == ()
 
+    def test_presence_expires_with_its_record(self) -> None:
+        """Count a heartbeat for the TTL, or only for its record's shorter lifetime.
+
+        A watch replay reads every stored record, however old; counted for a
+        full TTL from the read, a peer that stopped just before the replay
+        would stay active for up to two TTLs.
+        """
+        registry = PresenceRegistry(ttl=10)
+        fresh = BotPresence("fresh", "host", "instance", "fresh", "user")
+        replayed = BotPresence("replayed", "host", "instance", "replayed", "user")
+        aged = BotPresence("aged", "host", "instance", "aged", "user")
+        registry.update(fresh, lifetime=40, now=5)
+        registry.update(replayed, lifetime=3, now=5)
+        registry.update(aged, lifetime=0, now=5)
+
+        assert registry.active(now=5) == (fresh, replayed)
+        assert registry.active(now=7.9) == (fresh, replayed)
+        assert registry.active(now=8) == (fresh,)
+        assert registry.active(now=14.9) == (fresh,)
+        assert registry.active(now=15) == ()
+
     def test_presence_membership(self) -> None:
         """Verify exact presence membership uses the current bot entry."""
         registry = PresenceRegistry(ttl=10)
