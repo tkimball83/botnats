@@ -2337,7 +2337,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         Only the KICK from the last channel this bot shares with the member
         revokes. The KICK names only the nick, which another channel still
-        shows although the bare nick matches no member's full prefix.
+        shows although the bare nick matches no member's full prefix. A
+        session another identity holds for the same nick stays.
         """
         bot, _, coordinator = bot_with_coordinator()
         bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
@@ -2347,7 +2348,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             for prefix in (OWNER, kicker):
                 runtime.member(prefix.nick).prefix = prefix
 
-        for prefix in (OWNER, kicker):
+        same_nick = Prefix("owner", "other", "old.host")
+        for prefix in (OWNER, kicker, same_nick):
             bot.authorizer.grant(prefix.render())
 
         bot.events.on_irc_message(
@@ -2366,6 +2368,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert not bot.authorizer.authorized(OWNER.render())
         assert bot.authorizer.authorized(kicker.render())
+        assert bot.authorizer.authorized(same_nick.render())
         assert [(put.prefix, put.revoked) for put in coordinator.session_puts] == [
             (OWNER.render(), True),
         ]
