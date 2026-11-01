@@ -221,18 +221,11 @@ class Prefix:
 
     def matches(self, other: Prefix, casemapping: str) -> bool:
         """Check whether two complete prefixes identify the same user."""
-        s_user = self.user
-        s_host = self.host
-        o_user = other.user
-        o_host = other.host
-        if s_user is None or s_host is None or o_user is None or o_host is None:
+        if not self.complete or not other.complete:
             return False
 
-        return (
-            casefold(self.nick, casemapping) == casefold(other.nick, casemapping)
-            and casefold(s_user, "ascii") == casefold(o_user, "ascii")
-            and casefold(s_host, "ascii") == casefold(o_host, "ascii")
-        )
+        fold = ISupportState(casemapping).fold_identity
+        return fold(self.render()) == fold(other.render())
 
     @classmethod
     def parse(cls, value: str) -> Prefix:

@@ -242,7 +242,11 @@ def nats_urls(section: dict[str, Any]) -> tuple[str, ...]:
         raise ValueError(msg)
 
     for server in servers:
-        validate_server_url(server, NATS_SCHEMES, "NATS")
+        _, hostname, _ = validate_server_url(server, NATS_SCHEMES, "NATS")
+        # nats-py refuses this hostname once, before its own retry loop.
+        if hostname == "none":
+            msg = "invalid NATS server URL"
+            raise ValueError(msg)
 
     return servers
 

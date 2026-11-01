@@ -381,6 +381,15 @@ class ConfigTests(unittest.TestCase):
             ):
                 nats_urls({"servers": [value]})
 
+    def test_nats_urls_reject_hostname_nats_refuses(self) -> None:
+        """Reject a NATS hostname nats-py refuses once instead of retrying."""
+        for value in ("nats://none:4222", "nats://NONE:4222"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "^invalid NATS server URL$"),
+            ):
+                nats_urls({"servers": [value]})
+
     def test_server_lists_must_hold_urls(self) -> None:
         """Reject an empty server list or one with a non-string or empty entry."""
         for section in ("irc", "nats"):
