@@ -250,9 +250,7 @@ class SessionSync:
         if session.expires_at > now:
             self.watched[key] = (session.prefix, session.expires_at)
             held = self.keep(session)
-            # A record of an IRC-equivalent identity lives under another key.
-            identity = casefold(session.prefix, "ascii")
-            if held is not None and casefold(held.prefix, "ascii") == identity:
+            if held is not None:
                 self.restore(held)
         else:
             self.forget(key)
@@ -361,12 +359,12 @@ class SessionSync:
                     return
 
     def revoke(self, prefix: Prefix) -> None:
-        """Revoke a session locally now and write the revocation in background.
+        """Revoke sessions locally now and write the revocations in background.
 
         The identity is gone, so whatever is queued for it escalates over a
-        newer grant, even when its record is already revoked. Like its
-        session, a queued record may spell the identity another way the
-        casemapping folds together.
+        newer grant, even when its record is already revoked. Its sessions,
+        like its queued records, may spell the identity any way the
+        casemapping folds together; each is revoked under its own key.
         """
         identity = prefix.render()
         self.invalidate(identity)
@@ -376,9 +374,11 @@ class SessionSync:
             for key, held in self.yielding.items()
             if fold(held.prefix) != fold(identity)
         }
-        revoked = self.authorizer.revoke(identity)
-        if revoked is not None:
+        revocations = self.authorizer.revoke_all(identity)
+        for revoked in revocations:
             self.queue(revoked)
+
+        if revocations:
             self.tasks.spawn(self.retry(), "session-sync")
 
     async def drain(self, key: str | None = None) -> bool:
@@ -460,9 +460,12 @@ class TotpAuthorizer:
         self.identity_fold = identity_fold
         self.issuer = issuer
         self.secret = secret
-        # Each identity's highest-ranked session or revocation, except that a
-        # grant replaces a held live session whatever its rank.
+        # Under the IRC fold, each identity's highest-ranked session or
+        # revocation, except that a grant replaces a held live session
+        # whatever its rank. Each durable identity's own record, under the
+        # ASCII fold that keys the store, is what a new fold regroups.
         self.records: dict[str, Session] = {}
+        self.source_records: dict[str, Session] = {}
 
     def authorized(self, prefix: str, *, now: float | None = None) -> bool:
         """Return whether the prefix has a valid, unexpired session.
@@ -472,8 +475,12 @@ class TotpAuthorizer:
         key = self.identity_fold(prefix)
         record = self.records.get(key)
         current = time.time() if now is None else now
-        if record is None or record.expires_at <= current:
-            self.records.pop(key, None)
+        if record is None:
+            return False
+
+        if record.expires_at <= current:
+            del self.records[key]
+            del self.source_records[casefold(record.prefix, "ascii")]
             return False
 
         return not record.revoked
@@ -481,18 +488,29 @@ class TotpAuthorizer:
     def drop_session(self, prefix: str) -> Session | None:
         """Remove a cached session whose durable record was deleted.
 
-        A revocation is kept, and returned while unexpired.
+        A revocation is kept, and returned while unexpired. An IRC-equivalent
+        identity's record, which has its own durable key, stays; the highest
+        of those takes a removed session's place, as a replay would leave it.
         """
-        key = self.identity_fold(prefix)
-        record = self.records.get(key)
         identity = casefold(prefix, "ascii")
-        if record is None or casefold(record.prefix, "ascii") != identity:
+        record = self.source_records.get(identity)
+        if record is None:
             return None
 
         if record.revoked:
             return record if record.expires_at > time.time() else None
 
-        del self.records[key]
+        del self.source_records[identity]
+        key = self.identity_fold(prefix)
+        if self.records.get(key) is record:
+            del self.records[key]
+            for source in [
+                s
+                for s in self.source_records.values()
+                if self.identity_fold(s.prefix) == key
+            ]:
+                self.keep(source)
+
         return None
 
     def grant(
@@ -512,40 +530,60 @@ class TotpAuthorizer:
         )
         key = self.identity_fold(prefix)
         existing = self.records.get(key)
-        # Only a revocation that outranks the new session blocks it. A held
-        # live session gives way even to a lower-ranked grant, so revoking
-        # the prefix when AUTH fails revokes this grant under its own key.
+        # Only a revocation that outranks the new session blocks it. AUTH runs
+        # under the server's casemapping, so every spelling the grant folds
+        # with is this user's, and the grant supersedes their records, even a
+        # higher live session: kept apart, one could outrank the grant's
+        # revocation, as when AUTH fails, once a rekey regroups them.
         if existing is None or not existing.revoked or session.order > existing.order:
-            self.records[key] = session
+            for identity in [
+                i
+                for i, r in self.source_records.items()
+                if self.identity_fold(r.prefix) == key
+            ]:
+                del self.source_records[identity]
+
+            self.records[key] = self.source_records[casefold(prefix, "ascii")] = session
 
         return session
 
     def keep(self, incoming: Session) -> Session | None:
         """Keep a session or revocation if it outranks the identity's record.
 
-        Returns the identity's record instead when that outranks incoming.
+        Returns the record held under incoming's own durable key instead when
+        that outranks incoming. A record outranked only by an IRC-equivalent
+        identity's is still kept as its own durable identity's, for a new
+        fold to regroup.
         """
+        identity = casefold(incoming.prefix, "ascii")
         key = self.identity_fold(incoming.prefix)
         existing = self.records.get(key)
         if existing is None or incoming.order > existing.order:
-            self.records[key] = incoming
+            self.records[key] = self.source_records[identity] = incoming
             return None
 
-        return existing if existing.order > incoming.order else None
+        source = self.source_records.get(identity)
+        if source is None or incoming.order > source.order:
+            self.source_records[identity] = incoming
+            return None
+
+        return source if source.order > incoming.order else None
 
     def live_prefixes(self, nick: str) -> list[str]:
         """Return the prefixes of the unexpired, unrevoked sessions a nick holds.
 
         A session is the nick's when the nick, with the session's own user
-        and host, folds to the session's identity.
+        and host, folds to the session's identity. One a higher record of an
+        IRC-equivalent identity outranks is the nick's too.
         """
         now = time.time()
         return [
             record.prefix
-            for key, record in self.records.items()
+            for record in self.source_records.values()
             if not record.revoked
             and record.expires_at > now
-            and self.identity_fold(f"{nick}!{record.prefix.partition('!')[2]}") == key
+            and self.identity_fold(f"{nick}!{record.prefix.partition('!')[2]}")
+            == self.identity_fold(record.prefix)
         ]
 
     def match(self, code: str, *, now: float | None = None) -> int | None:
@@ -568,25 +606,52 @@ class TotpAuthorizer:
     def prune(self) -> None:
         """Remove expired sessions and revocations."""
         cutoff = time.time()
-        for key in [k for k, r in self.records.items() if r.expires_at <= cutoff]:
-            del self.records[key]
+        for records in (self.records, self.source_records):
+            for key in [k for k, r in records.items() if r.expires_at <= cutoff]:
+                del records[key]
 
     def rekey(self) -> None:
-        """Collapse records onto a new identity fold, keeping the highest rank."""
-        records, self.records = self.records, {}
-        for record in records.values():
+        """Regroup records under a new identity fold, keeping the highest rank.
+
+        They regroup from each durable identity's own record: a fold that
+        merged two identities, as the default casemapping does until
+        ISUPPORT, must lose neither once a fold that parts them returns.
+        """
+        self.records = {}
+        for record in self.source_records.values():
             self.keep(record)
 
     def revoke(self, prefix: str) -> Session | None:
-        """Replace the prefix's session with a revocation; return it."""
-        key = self.identity_fold(prefix)
-        record = self.records.get(key)
+        """Replace the session under the prefix's own key with a revocation.
+
+        Returns the revocation. An IRC-equivalent identity's session, which
+        may outrank it under the fold, has its own key and stays.
+        """
+        record = self.source_records.get(casefold(prefix, "ascii"))
         if record is None or record.revoked:
             return None
 
         revoked = replace(record, revoked=True, version=record.version + 1)
-        self.records[key] = revoked
+        self.keep(revoked)
         return revoked
+
+    def revoke_all(self, prefix: str) -> list[Session]:
+        """Revoke every session the prefix folds with; return the revocations.
+
+        Under the casemapping in force each spelling is the same user, though
+        each has its own durable key: one left live would authorize the
+        departed identity again under a mapping that parts them.
+        """
+        key = self.identity_fold(prefix)
+        revocations = [
+            replace(record, revoked=True, version=record.version + 1)
+            for record in self.source_records.values()
+            if not record.revoked and self.identity_fold(record.prefix) == key
+        ]
+        for revoked in revocations:
+            self.keep(revoked)
+
+        return revocations
 
 
 def limit_identity(prefix: Prefix) -> str:

@@ -149,6 +149,25 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert auth.drop_session(live.prefix) == live
         assert auth.drop_session(expired.prefix) is None
 
+    def test_dropped_key_returns_revocation_an_equivalent_outranks(self) -> None:
+        """Return a deleted key's own revocation while an equivalent's outranks it.
+
+        foo[ and foo{ fold together under rfc1459 but have their own durable
+        keys: foo['s revocation is written back under its own, and foo{'s live
+        session stays.
+        """
+        auth = authorizer()
+        auth.identity_fold = lambda p: p.casefold().translate(
+            str.maketrans("[]\\^", "{}|~"),
+        )
+        now = time.time()
+        auth.keep(Session(now + 120, "beta", "foo{!u@h", revoked=False, version=0))
+        revoked = Session(now + 60, "beta", "foo[!u@h", revoked=True, version=1)
+        auth.keep(revoked)
+
+        assert auth.drop_session(revoked.prefix) == revoked
+        assert auth.authorized("foo{!u@h")
+
     def test_durable_revocation_blocks_stale_session(self) -> None:
         """Keep a watched revocation authoritative over its original session."""
         source = authorizer("alpha")
@@ -174,6 +193,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert auth.authorized(prefix, now=11 + 3599.9)
         assert not auth.authorized(prefix, now=11 + 3600)
         assert not auth.records
+        assert not auth.source_records
 
     def test_prune_drops_only_expired_records(self) -> None:
         """Prune expired sessions and revocations, and keep live ones."""
@@ -190,6 +210,7 @@ class TotpAuthorizerTests(unittest.TestCase):
             "live!user@example.test",
             "live-revoked!user@example.test",
         ]
+        assert auth.source_records == auth.records
 
     def test_live_prefixes_lists_a_nicks_live_sessions(self) -> None:
         """List the live sessions a nick folds to, under any user and host.
@@ -538,9 +559,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
 
         foo{ and foo[ fold together under rfc1459 but have their own durable
         keys. A peer whose clock runs ahead holds a live foo{ session that
-        outranks any grant for foo[; unless the grant replaces it, AUTH's
-        revocation lands on foo{'s key, and the retry writes the foo[ grant
-        live after AUTH reported failure.
+        outranks any grant for foo[. AUTH's revocation must land on foo['s
+        own key: on foo{'s, the retry would write the foo[ grant live after
+        AUTH reported failure.
         """
         coordinator = FailingWriteCoordinator()
         bot, fake_irc, _ = bot_with_coordinator(coordinator)
@@ -565,6 +586,82 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         puts = [(put.prefix, put.revoked) for put in coordinator.session_puts]
         assert puts == [("foo[!u@h", True)]
         assert not bot.sessions.pending
+
+    async def test_auth_failure_revokes_own_grant_under_equivalent_winner(
+        self,
+    ) -> None:
+        """Revoke the failed grant under its own key, not the fold's winner.
+
+        A peer's higher foo{ session can land while AUTH writes foo['s grant,
+        and win the fold under rfc1459. Revoking that winner would revoke on
+        every bot a peer session AUTH never granted, and leave this grant
+        live under foo['s key for a mapping that parts the spellings.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        peer = Session(
+            time.time() + SESSION_TTL + 30, "beta", "foo{!u@h", revoked=False, version=0
+        )
+
+        async def peer_lands_then_fail(record: Session) -> Session:
+            del record
+            bot.sessions.observe(coordinator.sessions.key(peer.prefix), peer)
+            msg = "unavailable"
+            raise NatsError(msg)
+
+        prefix = Prefix("foo[", "u", "h")
+        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        with patch.object(coordinator, "put_session", peer_lands_then_fail):
+            await send_command(bot, prefix, f"AUTH {code}")
+
+        assert fake_irc.privmsgs == [("foo[", "Authorization failed")]
+        pending = [(s.prefix, s.revoked) for s in bot.sessions.pending.values()]
+        assert pending == [("foo[!u@h", True)]
+        bot.channel_mgr.set_casemapping("ascii")
+        assert not bot.authorizer.authorized(prefix.render())
+        assert bot.authorizer.authorized(peer.prefix)
+
+    async def test_rekey_keeps_equivalent_session_a_grant_superseded(self) -> None:
+        """Leave the equivalent sessions a grant superseded out of every rekey.
+
+        foo[], foo{} and foo{] are one user under rfc1459 and strict-rfc1459
+        alike, so foo[]'s grant supersedes the peer's higher sessions for the
+        other two: the one it displaces and the one that one outranks. Kept
+        apart, either would outrank the grant's revocation, after a failed
+        AUTH or a QUIT, once a rekey regroups them, as every IRC disconnect
+        does, and authorize the departed identity again.
+        """
+        for failing in (True, False):
+            coordinator = FailingWriteCoordinator()
+            coordinator.failing = failing
+            bot, _, _ = bot_with_coordinator(coordinator)
+            with self.subTest(failing=failing):
+                for spelling, later in (("foo{}", 30), ("foo{]", 15)):
+                    peer = Session(
+                        time.time() + SESSION_TTL + later,
+                        "beta",
+                        f"{spelling}!u@h",
+                        revoked=False,
+                        version=0,
+                    )
+                    bot.authorizer.keep(peer)
+
+                prefix = Prefix("foo[]", "u", "h")
+                code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+
+                await send_command(bot, prefix, f"AUTH {code}")
+                if failing:
+                    assert not bot.authorizer.authorized(prefix.render())
+                else:
+                    assert bot.authorizer.authorized(prefix.render())
+                    bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+                    await drain_session_writes(bot)
+                    assert not bot.authorizer.authorized(prefix.render())
+
+                bot.channel_mgr.set_casemapping("strict-rfc1459")
+                assert not bot.authorizer.authorized(prefix.render())
+                bot.events.on_irc_disconnect()
+                assert bot.caps.casemapping == "rfc1459"
+                assert not bot.authorizer.authorized(prefix.render())
 
     async def test_auth_grant_does_not_replace_queued_revocation(self) -> None:
         """Persist a QUIT's revocation queued while AUTH waits for the lock."""
@@ -1505,6 +1602,105 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert puts == [("foo{!u@h", False), ("foo{!u@h", True)]
         assert not bot.sessions.pending
 
+    async def test_quit_revokes_every_equivalent_watched_session(self) -> None:
+        """Revoke every watched session the departed identity folds with.
+
+        foo{ and foo[ are one user under rfc1459 but have their own durable
+        keys. Revoking only the session that wins the fold would leave the
+        other live: a mapping that parts them, as after a failover to another
+        server family, would authorize the departed identity again, as would
+        any bot that replays the other key there.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        now = time.time()
+        sessions = [
+            Session(now + 2000, "beta", "foo{!u@h", revoked=False, version=0),
+            Session(now + 1000, "beta", "foo[!u@h", revoked=False, version=0),
+        ]
+        for session in sessions:
+            bot.sessions.observe(coordinator.sessions.key(session.prefix), session)
+
+        bot.events.on_irc_message(IRCMessage("QUIT", (), Prefix("foo[", "u", "h")))
+        await drain_session_writes(bot)
+        bot.channel_mgr.set_casemapping("ascii")
+
+        assert not any(bot.authorizer.authorized(s.prefix) for s in sessions)
+        puts = [(put.prefix, put.revoked) for put in coordinator.session_puts]
+        assert puts == [("foo{!u@h", True), ("foo[!u@h", True)]
+        assert not bot.sessions.pending
+
+    async def test_nick_only_kick_revokes_session_a_revocation_outranks(self) -> None:
+        """Revoke a kicked nick's live session that a higher revocation hides.
+
+        Under rfc1459 a revocation for foo{ outranks foo['s live session,
+        which has its own durable key. A KICK naming only the nick must revoke
+        it too: left live, a mapping that parts the spellings would authorize
+        the departed identity again.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        now = time.time()
+        live = Session(now + 1000, "beta", "foo[!u@h", revoked=False, version=0)
+        revoked = Session(now + 2000, "beta", "foo{!u@h", revoked=True, version=1)
+        for session in (live, revoked):
+            bot.sessions.observe(coordinator.sessions.key(session.prefix), session)
+
+        runtime = bot.channel_mgr.runtime("#test")
+        assert runtime is not None
+        runtime.member("foo[")
+        kicker = Prefix("op", "~op", "op.host")
+        bot.events.on_irc_message(IRCMessage("KICK", ("#test", "foo["), kicker))
+        await drain_session_writes(bot)
+        bot.channel_mgr.set_casemapping("ascii")
+
+        assert not bot.authorizer.authorized(live.prefix)
+        puts = [(put.prefix, put.revoked) for put in coordinator.session_puts]
+        assert puts == [("foo[!u@h", True)]
+
+    async def test_ascii_casemapping_regroups_sessions_the_default_merged(self) -> None:
+        """Regroup the sessions the default casemapping merged once ISUPPORT arrives.
+
+        dev[ and dev{ are distinct users under the server's ascii, but
+        rfc1459, which folds them together, holds until ISUPPORT: at startup,
+        when the watch replays first, and once an IRC disconnect restores it.
+        Merged, the lower session must not be lost: its identity would be
+        refused, and its QUIT would write no revocation, so peers would keep
+        honouring its grant.
+        """
+        for startup in (True, False):
+            bot, _, coordinator = bot_with_coordinator()
+            with self.subTest(startup=startup):
+                if not startup:
+                    bot.channel_mgr.set_casemapping("ascii")
+
+                now = time.time()
+                # The higher first: under a merged fold, the lower arrives outranked.
+                sessions = [
+                    Session(now + 2000, "beta", "dev{!u@gw", revoked=False, version=0),
+                    Session(now + 1000, "beta", "dev[!u@gw", revoked=False, version=0),
+                ]
+                for session in sessions:
+                    key = coordinator.sessions.key(session.prefix)
+                    bot.sessions.observe(key, session)
+
+                if not startup:
+                    bot.events.on_irc_disconnect()
+
+                folds = {bot.caps.fold_identity(s.prefix) for s in sessions}
+                assert len(folds) == 1
+                bot.channel_mgr.set_casemapping("ascii")
+
+                assert all(bot.authorizer.authorized(s.prefix) for s in sessions)
+                first, second = (Prefix.parse(s.prefix) for s in sessions)
+                bot.events.on_irc_message(IRCMessage("QUIT", (), first))
+                # Distinct under ascii, the other user keeps its session.
+                assert bot.authorizer.authorized(second.render())
+                bot.events.on_irc_message(IRCMessage("QUIT", (), second))
+                await drain_session_writes(bot)
+
+                puts = [(put.prefix, put.revoked) for put in coordinator.session_puts]
+                assert puts == [("dev{!u@gw", True), ("dev[!u@gw", True)]
+                assert not any(bot.authorizer.authorized(s.prefix) for s in sessions)
+
     async def test_requeued_revocation_does_not_block_later_writes(self) -> None:
         """Write a later grant when an earlier revocation meets a newer grant."""
         bot, _, coordinator = bot_with_coordinator()
@@ -1634,6 +1830,40 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         )
         assert not bot.sessions.pending
 
+    async def test_queued_revocation_keeps_outranking_stored_revocation(self) -> None:
+        """Keep a peer's revocation the store returns over a queued lower one.
+
+        A peer granted later, then revoked its grant on the QUIT first. Held
+        back like a grant, the peer's revocation would leave this bot's lower
+        one, which a re-put of the peer's grant outranks: the departed
+        identity would be authorized again.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        grant = bot.authorizer.grant(prefix.render())
+        assert await bounded(bot.sessions.sync(grant))
+        peer_grant = Session(
+            grant.expires_at + 30, "beta", prefix.render(), revoked=False, version=0
+        )
+        peer_revocation = Session(
+            peer_grant.expires_at, "beta", prefix.render(), revoked=True, version=1
+        )
+        await bounded(coordinator.sessions.put(peer_revocation))
+        bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+        await drain_session_writes(bot)
+        assert not bot.sessions.pending
+
+        # A NATS writer without the coordination secret re-puts the peer's grant.
+        key = coordinator.sessions.key(prefix.render())
+        kv = cast("FakeKV", coordinator.sessions.kv)
+        kv.store(key, json.dumps(coordinator.sessions.sign(peer_grant)).encode())
+        bot.sessions.observe(key, peer_grant)
+        await drain_session_writes(bot)
+
+        assert not bot.authorizer.authorized(prefix.render())
+        stored = json.loads(kv.entries[key][1])
+        assert coordinator.sessions.parse(key, stored) == peer_revocation
+
     async def test_rolled_back_grant_rewrites_held_revocation(self) -> None:
         """Write a held revocation again when its key rolls back to the grant.
 
@@ -1679,6 +1909,49 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         assert coordinator.sessions.parse(key, stored) == revocation
         assert not bot.authorizer.authorized(prefix)
         assert not bot.sessions.pending
+
+    async def test_rolled_back_grant_rewrites_revocation_an_equivalent_outranks(
+        self,
+    ) -> None:
+        """Write back a revocation a higher IRC-equivalent record hides.
+
+        Under rfc1459 foo{'s live session outranks foo['s revocation, but each
+        has its own key. A re-put of the grant the revocation replaced must
+        meet it and see it written back, also once foo{'s key is deleted and
+        the revocation decides the fold again; the grant would otherwise
+        authorize the departed identity, here and on bots that start later.
+        """
+        for deleted in (False, True):
+            bot, _, coordinator = bot_with_coordinator()
+            with self.subTest(deleted=deleted):
+                now = time.time()
+                grant = Session(
+                    now + 1000, "beta", "foo[!u@h", revoked=False, version=0
+                )
+                revocation = Session(
+                    now + 1000, "beta", "foo[!u@h", revoked=True, version=1
+                )
+                higher = Session(
+                    now + 2000, "beta", "foo{!u@h", revoked=False, version=0
+                )
+                for session in (revocation, higher):
+                    await bounded(coordinator.sessions.put(session))
+                    key = coordinator.sessions.key(session.prefix)
+                    bot.sessions.observe(key, session)
+
+                if deleted:
+                    bot.sessions.forget(coordinator.sessions.key(higher.prefix))
+
+                key = coordinator.sessions.key(grant.prefix)
+                kv = cast("FakeKV", coordinator.sessions.kv)
+                kv.store(key, json.dumps(coordinator.sessions.sign(grant)).encode())
+                bot.sessions.observe(key, grant)
+                await drain_session_writes(bot)
+
+                stored = coordinator.sessions.parse(key, json.loads(kv.entries[key][1]))
+                assert stored == revocation
+                bot.channel_mgr.set_casemapping("ascii")
+                assert not bot.authorizer.authorized(grant.prefix)
 
     async def test_rolled_back_revocation_rewrites_held_grant(self) -> None:
         """Write a held grant again when its key rolls back to the revocation.
@@ -2285,8 +2558,11 @@ class SessionSyncWatchTests(unittest.TestCase):
         assert bot.caps.fold_identity(first) == bot.caps.fold_identity(second)
         assert casefold(first, "ascii") != casefold(second, "ascii")
         now = time.time()
-        bot.authorizer.grant(first, now=now)
-        bot.authorizer.grant(second, now=now + 1)
+        for prefix, expires_at in ((first, now + 60), (second, now + 61)):
+            bot.authorizer.keep(
+                Session(expires_at, "beta", prefix, revoked=False, version=0)
+            )
+
         # Each prefix has its own ASCII-folded KV key; deletes arrive by key.
         expiry = now + 60
         bot.sessions.watched["first-key"] = (first, expiry)
@@ -2296,6 +2572,8 @@ class SessionSyncWatchTests(unittest.TestCase):
 
         assert [s.prefix for s in bot.authorizer.records.values()] == [second]
         assert bot.authorizer.authorized(second)
+        # The deleted identity's own record goes too: no new fold regroups it.
+        assert [s.prefix for s in bot.authorizer.source_records.values()] == [second]
 
         # The live session is held under second's IRC fold, not its ASCII fold.
         bot.sessions.forget("second-key")
