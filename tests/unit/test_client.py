@@ -1020,6 +1020,18 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
                 assert client.caps.multi_prefix is expected
 
+    async def test_cap_del_clears_multi_prefix(self) -> None:
+        """Forget multi-prefix once a DEL withdraws it, and only then."""
+        client = self.cap_client(negotiating=False)
+        client.cap_ls_done = True
+        client.handle_cap(parse_message(":server CAP * ACK :multi-prefix\r\n"))
+
+        client.handle_cap(parse_message(":server CAP * DEL :chghost\r\n"))
+        assert client.caps.multi_prefix
+
+        client.handle_cap(parse_message(":server CAP * DEL :multi-prefix\r\n"))
+        assert not client.caps.multi_prefix
+
     async def test_cap_new_without_desired_sends_nothing(self) -> None:
         """Spend no send credit on a NEW that offers no desired capability."""
         client = self.cap_client(negotiating=False)
