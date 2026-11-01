@@ -1675,6 +1675,16 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert mgr.forget_member(prefix) == prefix
         assert [runtime.members for runtime in mgr.channels.values()] == [{}, {}]
 
+    async def test_nick_only_quit_prefix_completes_from_stored_prefix(self) -> None:
+        """Complete a nick-only QUIT prefix from state before dropping the member."""
+        bot = bot_with_channel()
+        mgr = bot.channel_mgr
+        stored = Prefix("owner", "user", "stored.host")
+        mgr.channels[casefold("#test", "rfc1459")].member("owner").prefix = stored
+
+        assert mgr.forget_member(Prefix("Owner")) == stored
+        assert mgr.channels[casefold("#test", "rfc1459")].members == {}
+
     async def test_nick_prefix_outranks_stored_member_prefix(self) -> None:
         """Return and keep a complete NICK prefix over the one stored for it.
 
@@ -1728,6 +1738,18 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert [
             runtime.members["owner"].prefix for runtime in mgr.channels.values()
         ] == [new_prefix, new_prefix]
+
+    async def test_nick_only_chghost_prefix_completes_from_stored_prefix(self) -> None:
+        """Complete a nick-only CHGHOST prefix from state before overwriting it."""
+        bot = bot_with_channel()
+        mgr = bot.channel_mgr
+        stored = Prefix("owner", "user", "stored.host")
+        runtime = mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("owner").prefix = stored
+        new_prefix = Prefix("Owner", "newuser", "new.host")
+
+        assert mgr.change_member_host(Prefix("Owner"), new_prefix) == stored
+        assert runtime.members["owner"].prefix == new_prefix
 
     async def test_disconnected_bot_does_not_help(self) -> None:
         """Swallow a lost connection in every help action; report no help given."""
