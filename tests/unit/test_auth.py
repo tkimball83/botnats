@@ -35,6 +35,7 @@ from tests.unit.helpers import (
     bot_with_irc,
     bounded,
     drain_session_writes,
+    join_test_channel,
     make_bot,
     send_command,
     session_value,
@@ -566,6 +567,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             return stored
 
         valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        join_test_channel(bot, prefix)
         with patch.object(coordinator, "put_session", hang_after_first_put):
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
@@ -613,6 +615,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             time.time() + SESSION_TTL + 30,
             "beta",
         )
+        join_test_channel(bot, prefix)
         with patch.object(coordinator, "put_session", hang_after_first_put):
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
@@ -657,6 +660,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             newest = bot.authorizer.create(prefix.render(), later + 10, "beta")
             key = coordinator.sessions.key(prefix.render())
             valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+            join_test_channel(bot, prefix)
             with patch.object(coordinator, "put_session", hang_first_put):
                 bot.events.on_irc_message(
                     IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
@@ -739,6 +743,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             return stored
 
         valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        join_test_channel(bot, prefix)
         with patch.object(coordinator, "put_session", disconnect_during_put):
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
@@ -796,6 +801,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         prefix = Prefix("Owner", "user", "host.example")
         counter = int(time.time() // TOTP_PERIOD)
         valid_code = totp(bot.authorizer.secret, counter)
+        join_test_channel(bot, prefix)
 
         async with asyncio.timeout(1):
             # Nothing yields before the QUIT, so both commands are still queued.
@@ -825,11 +831,14 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
 
         async with asyncio.timeout(1):
             # Nothing yields, so the AUTH is still queued while its sender
-            # quits, reconnects as the same prefix, and sends another message.
+            # quits, reconnects as the same prefix, rejoins, and sends
+            # another message.
+            join_test_channel(bot, prefix)
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", f"AUTH {valid_code}"), prefix),
             )
             bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+            join_test_channel(bot, prefix)
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", "XYZZY"), prefix),
             )
@@ -851,6 +860,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         valid_code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
 
         # Both arrive before either runs.
+        join_test_channel(bot, prefix)
         bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", "XYZZY"), prefix))
         await send_command(bot, prefix, f"AUTH {valid_code}")
 

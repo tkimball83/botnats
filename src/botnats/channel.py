@@ -300,6 +300,29 @@ class ChannelManager:
         """Return the live owner of a desired channel, by IRC case folding."""
         return self.channels.get(self.bot.caps.fold(channel))
 
+    def sees(self, nickname: str) -> bool:
+        """Return whether a nick is a tracked member of any channel this bot is in."""
+        folded = self.bot.caps.fold(nickname)
+        return any(folded in runtime.members for runtime in self.channels.values())
+
+    def sees_prefix(self, prefix: Prefix) -> bool:
+        """Return whether a member of a channel this bot is in has this prefix.
+
+        Only a channel this bot is in tracks members. A member known only
+        from NAMES, whose prefix WHO has yet to report, has none.
+        """
+        folded = self.bot.caps.fold(prefix.nick)
+        for runtime in self.channels.values():
+            member = runtime.members.get(folded)
+            if (
+                member is not None
+                and member.prefix is not None
+                and prefix.matches(member.prefix, self.bot.caps.casemapping)
+            ):
+                return True
+
+        return False
+
     def forget_member(self, prefix: Prefix) -> Prefix:
         """Remove a user who quit IRC from every channel; return their full prefix.
 
@@ -810,9 +833,9 @@ class ChannelRuntime:
         member.nick = nickname
         return member
 
-    def remove(self, nickname: str) -> None:
-        """Drop a member from the channel by nickname."""
-        self.members.pop(self.caps.fold(nickname), None)
+    def remove(self, nickname: str) -> ChannelMember | None:
+        """Drop a member from the channel by nickname; return it, if tracked."""
+        return self.members.pop(self.caps.fold(nickname), None)
 
     def remove_ban(self, mask: str) -> None:
         """Delete a ban mask from the channel ban list."""

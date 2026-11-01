@@ -52,6 +52,19 @@ class CommandHandler:
         """Record one command from a sender and return whether it is within limits."""
         return self.command_limiter.check(limit_identity(prefix))
 
+    def holds(self, prefix: Prefix) -> bool:
+        """Return whether a command's sender still holds its session and nick.
+
+        Replies go by nick. An IRC disconnect revokes nothing, but this bot
+        sees no QUIT or NICK while away, so it no longer vouches for a sender
+        whose command it received before.
+        """
+        rendered = prefix.render()
+        if not self.bot.authorizer.authorized(rendered):
+            return False
+
+        return self.bot.sessions.watched_valid(rendered)
+
     def reply(self, nickname: str, message: str) -> None:
         """Send a private message, dropping unsendable or undeliverable lines."""
         try:
@@ -121,7 +134,7 @@ class CommandHandler:
 
         # The session may have ended during the write, and its nick passed to
         # another user: reply only while it still holds.
-        if not self.bot.authorizer.authorized(prefix.render()):
+        if not self.holds(prefix):
             return
 
         if not won:
@@ -371,7 +384,7 @@ class CommandHandler:
         )
         status = await self.bot.coordinator.status()
         # The session may have ended while NATS answered.
-        if self.bot.authorizer.authorized(prefix.render()):
+        if self.holds(prefix):
             self.reply(prefix.nick, status.render())
 
     async def cmd_unban(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
@@ -401,8 +414,7 @@ class CommandHandler:
         except ValueError as error:
             # Unauthenticated senders get silence, not a parse-error reply
             # that would confirm a bot is listening.
-            rendered = prefix.render()
-            if self.bot.authorizer.authorized(rendered):
+            if self.holds(prefix):
                 self.reply(prefix.nick, str(error))
 
             return
@@ -411,8 +423,7 @@ class CommandHandler:
             await self.bot.auth_flow.authenticate(prefix, arguments)
             return
 
-        rendered = prefix.render()
-        if not self.bot.authorizer.authorized(rendered):
+        if not self.holds(prefix):
             return
 
         handler = self.handlers.get(name)
@@ -424,7 +435,7 @@ class CommandHandler:
             await handler(prefix, arguments)
         except (*PUBLISH_ERRORS, ValueError) as error:
             # A handler may fail after an await that outlived the session.
-            if self.bot.authorizer.authorized(rendered):
+            if self.holds(prefix):
                 self.reply(prefix.nick, str(error) or "Command failed")
 
     def opped_channel(self, channel: str) -> ChannelRuntime:

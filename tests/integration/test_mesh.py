@@ -200,12 +200,22 @@ def fresh_code() -> str:
 
 
 async def join_as_operator(session: IRCSession) -> None:
-    """Join the second channel and wait until alpha has opped the owner there."""
+    """Join the second channel, authenticate to alpha, and get opped there.
+
+    Alpha hears only users it sees in its channels, so the owner joins first.
+    The AUTH ops the owner if alpha already holds op; OP covers the rest.
+    """
     channel, key = CHANNELS[1]
     await session.send("JOIN", channel, key)
-    await wait_for_reply(
-        session, "alpha", f"OP {channel} owner", f"Opped owner on {channel}"
-    )
+    await authenticate(session, "alpha", fresh_code())
+
+    async def opped() -> bool:
+        return await command(session, "alpha", f"OP {channel} owner") in {
+            f"Opped owner on {channel}",
+            f"owner is already opped on {channel}",
+        }
+
+    await poll_until(opped, interval=2.0)
     await wait_for_operators(session, channel, present=frozenset({"owner"}))
 
 
@@ -323,6 +333,14 @@ async def run() -> None:
             )
             await wait_for_channel(session, channel)
 
+        first, _ = CHANNELS[0]
+        second, second_key = CHANNELS[1]
+        third, _ = CHANNELS[2]
+        # Once a channel exists, a bot hears only users it sees in one. A bot
+        # that joined after the owner learns the owner's user and host only
+        # from its paced WHO; rejoining shows them to every bot at once.
+        await session.send("PART", third)
+        await wait_for_channel(session, third)
         await wait_for_status(session)
 
         for channel, key in CHANNELS:
@@ -345,10 +363,6 @@ async def run() -> None:
             assert "m" in channel_modes
             assert "n" in channel_modes
             assert "t" in channel_modes
-
-        first, _ = CHANNELS[0]
-        second, second_key = CHANNELS[1]
-        third, _ = CHANNELS[2]
 
         # Multiple channels with different modes: set an extra mode on the
         # first channel, then remove an enforced one. The bots must restore

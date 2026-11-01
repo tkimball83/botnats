@@ -18,7 +18,8 @@ stores shared durable state and atomic authentication controls.
   directly on the receiving bot.
 - Each bot ID atomically claims a case-insensitive presence key; duplicates remain unready.
 - Authorization binds the visible nick, user, and host. Any identity change,
-  NICK included, requires new authentication.
+  NICK included, requires new authentication. Leaving the last channel shared
+  with a bot, by PART or KICK, ends the session as QUIT does.
 
 ### State
 
@@ -137,6 +138,10 @@ Use private messages for every command. Each bot accepts eight private messages
 per host in a sliding 10-second window and drops the rest without reply, `AUTH`
 included. Commands other than `AUTH` require an active session and are ignored
 without one, as are commands from a nick, user, or host that is not valid UTF-8.
+Once any channel is configured, admins must share a channel with the bot they
+command: each bot ignores `AUTH` and commands from a nick, user, and host it does
+not see in its channels. With no channel configured, as in a new mesh, it accepts
+the first `AUTH` and `JOIN` from anywhere.
 
 | Command    | Arguments                   | Action                       |
 | ---------- | --------------------------- | ---------------------------- |
