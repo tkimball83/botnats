@@ -157,13 +157,20 @@ class ConfigTests(unittest.TestCase):
         ):
             nickname({"nickname": "n" * 10})
 
-    def test_nickname_rejects_a_later_invalid_character(self) -> None:
-        """Reject a nickname whose invalid character follows a valid first one."""
-        with self.assertRaisesRegex(
-            ValueError,
-            r"^bot\.nickname is not a valid IRC nickname$",
-        ):
-            nickname({"nickname": "bad.nick"})
+    def test_nickname_rejects_invalid_characters(self) -> None:
+        """Reject a nickname with an invalid later character, or a hyphen first.
+
+        A hyphen is valid only after the first character.
+        """
+        for value in ("bad.nick", "-nick"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    r"^bot\.nickname is not a valid IRC nickname$",
+                ),
+            ):
+                nickname({"nickname": value})
 
     def test_optional_settings_default(self) -> None:
         """Load defaults for omitted optional keys and tables."""

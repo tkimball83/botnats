@@ -2004,20 +2004,27 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.channel_mgr.help_eligible("#test", peer) is None
 
     async def test_unban_matching_masks(self) -> None:
-        """Verify an unban request removes only matching ban masks."""
+        """Verify an unban request removes only matching ban masks.
+
+        A nick mask matches under the server's casemapping: rfc1459 folds
+        the [ of beta[1 to {.
+        """
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        for mask in ("*!~beta@bot.host", "*!other@*", "*!*@bot.host"):
+        for mask in ("*!~beta@bot.host", "*!other@*", "*!*@bot.host", "Beta{*!*@*"):
             runtime.add_ban(mask)
 
         peer = BotPresence("beta-id", "bot.host", "one", "beta", "~beta")
-        bot.presence.update(peer)
-        bot.channel_mgr.unban_peer("#test", peer)
+        bracketed = BotPresence("gamma-id", "gamma.host", "two", "beta[1", "~gamma")
+        for presence in (peer, bracketed):
+            bot.presence.update(presence)
+            bot.channel_mgr.unban_peer("#test", presence)
 
         assert fake_irc.modes == [
             ("#test", "-b", ("*!*@bot.host",)),
             ("#test", "-b", ("*!~beta@bot.host",)),
+            ("#test", "-b", ("Beta{*!*@*",)),
         ]
 
     async def test_join_waits_for_identity(self) -> None:

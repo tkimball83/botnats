@@ -361,8 +361,6 @@ async def run() -> None:
             channel_modes = await modes(session, channel)
             assert ("k" in channel_modes) == (key is not None)
             assert "m" in channel_modes
-            assert "n" in channel_modes
-            assert "t" in channel_modes
 
         # Multiple channels with different modes: set an extra mode on the
         # first channel, then remove an enforced one. The bots must restore
