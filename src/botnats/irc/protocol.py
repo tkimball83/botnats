@@ -114,7 +114,15 @@ class ISupportState:
     )
     membership_modes: str = DEFAULT_MEMBERSHIP_MODES
     monitor: bool = False
-    op_mode: str = DEFAULT_OP_MODE
+
+    @property
+    def op_mode(self) -> str:
+        """Return the channel operator mode: the one PREFIX maps to "@".
+
+        Without "@" the default "o" stays the operator mode: a PREFIX that
+        lacks it too, such as "(qv)~+", counts no rank as opped.
+        """
+        return self.member_prefixes.get("@", DEFAULT_OP_MODE)
 
     @property
     def operator_modes(self) -> str:
@@ -150,7 +158,6 @@ class ISupportState:
             case "PREFIX":
                 self.member_prefixes = default.member_prefixes
                 self.membership_modes = default.membership_modes
-                self.op_mode = default.op_mode
 
     def fold(self, value: str) -> str:
         """Normalize a string using the server's casemapping rules."""
@@ -176,7 +183,6 @@ class ISupportState:
         if not value:
             self.member_prefixes = {}
             self.membership_modes = ""
-            self.op_mode = DEFAULT_OP_MODE
             return
 
         if not value.startswith("(") or ")" not in value:
@@ -188,9 +194,6 @@ class ISupportState:
 
         self.member_prefixes = dict(zip(symbols, modes, strict=True))
         self.membership_modes = modes
-        # Without "@" the default "o" stays the operator mode: a PREFIX that
-        # lacks it too, such as "(qv)~+", counts no rank as opped.
-        self.op_mode = self.member_prefixes.get("@", DEFAULT_OP_MODE)
 
     def reset(self) -> None:
         """Reset capabilities learned from the previous server connection."""

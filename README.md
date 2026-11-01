@@ -160,6 +160,9 @@ the first `AUTH` and `JOIN` from anywhere.
 | `STATUS`   |                             | Show bot and NATS status     |
 | `UNBAN`    | `<channel> <mask>`          | Remove a tracked ban         |
 
+`GETBANS`, `GETCHANS`, and `GETUSERS` reply in at most 10 lines; a longer list
+ends with the number of items left out.
+
 Name an IRCnet safe channel in full, with its five-character ID (`!ABCDEchat`,
 not `!chat`).
 

@@ -75,11 +75,12 @@ class IRCProtocolTests(unittest.TestCase):
 
             return count_lines
 
+        previous = sys.gettrace()
         sys.settrace(count_lines)
         try:
             matched = mask_matches("*a" * 13 + "b!*@*", prefix, "rfc1459")
         finally:
-            sys.settrace(None)
+            sys.settrace(previous)
 
         assert not matched
         assert mask_matches("*a" * 13 + "!*@*", prefix, "rfc1459")
@@ -417,7 +418,6 @@ class IRCProtocolTests(unittest.TestCase):
                     advertised,
                     member_prefixes=default.member_prefixes,
                     membership_modes=default.membership_modes,
-                    op_mode=default.op_mode,
                 ),
             ),
         ):
