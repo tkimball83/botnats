@@ -320,6 +320,13 @@ class IRCEventHandler:
             or len(message.params) < 2
             or not self.bot.irc.is_self(message.params[0])
             or message.params[-1].startswith("\x01")
+            # Once a channel is desired, only a sender this bot sees in one:
+            # it would miss anyone else's QUIT or NICK. With none, anyone may
+            # send the first JOIN.
+            or (
+                self.bot.channel_mgr.channels
+                and not self.bot.channel_mgr.sees_prefix(prefix)
+            )
             or not self.bot.commands.allow(prefix)
         ):
             return

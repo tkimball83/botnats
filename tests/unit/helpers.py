@@ -106,8 +106,14 @@ async def hang(*arguments: object) -> None:
     await asyncio.Event().wait()
 
 
+def join_test_channel(bot: Bot, prefix: Prefix) -> None:
+    """Show a user joining #test, so the bot hears its commands once desired."""
+    bot.events.on_irc_message(IRCMessage("JOIN", ("#test",), prefix))
+
+
 async def send_command(bot: Bot, prefix: Prefix, text: str) -> None:
-    """Queue a private-message command as IRC delivers it and wait for it."""
+    """Queue a command from a member of #test as IRC delivers it; wait for it."""
+    join_test_channel(bot, prefix)
     bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
     async with asyncio.timeout(5):
         await asyncio.gather(

@@ -38,6 +38,7 @@ from tests.unit.helpers import (
     bot_with_irc,
     bounded,
     drain_session_writes,
+    join_test_channel,
     make_bot,
     settle,
 )
@@ -186,6 +187,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         # Commands reach this bot on a fallback nick too.
         fake_irc.current_nick = "alpha_"
         prefix = Prefix("flooder", "user", "host.example")
+        join_test_channel(bot, prefix)
 
         for _ in range(100):
             bot.events.on_irc_message(
@@ -221,6 +223,79 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert not bot.sessions.watched_identities
         assert not bot.commands.command_limiter.buckets
 
+    async def test_commands_need_a_sender_seen_in_a_channel(self) -> None:
+        """Drop, unbudgeted, a command from a sender this bot does not see.
+
+        Once a channel is desired, this bot would miss an unseen sender's
+        QUIT or NICK. A member known only from NAMES, or with another user or
+        host, is not the sender.
+        """
+        seen = {
+            "absent": (),
+            "names only": (IRCMessage("353", ("alpha", "=", "#test", "owner")),),
+            "other user": (
+                IRCMessage("JOIN", ("#test",), Prefix("owner", "other", "real.host")),
+            ),
+            "other host": (
+                IRCMessage("JOIN", ("#test",), Prefix("owner", "user", "other.host")),
+            ),
+        }
+        for case, messages in seen.items():
+            with self.subTest(case=case):
+                bot, _ = bot_with_irc()
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.join = JoinState.JOINED
+                bot.authorizer.grant(OWNER.render())
+                for message in messages:
+                    bot.events.on_irc_message(message)
+
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", "STATUS"), OWNER),
+                )
+
+                # Every setup but the first leaves a member under the nick.
+                listed = casefold("owner", "rfc1459") in runtime.members
+                assert listed == bool(messages)
+                assert not bot.tasks
+                assert not bot.sessions.watched_identities
+                assert not bot.commands.command_limiter.buckets
+
+    async def test_commands_from_a_seen_member_are_queued(self) -> None:
+        """Run a command from a sender seen in a channel with its full prefix.
+
+        The nick folds by the server's casemapping, the user and host by ASCII.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        bot.events.on_irc_message(
+            IRCMessage("JOIN", ("#test",), Prefix("OWNER", "User", "Real.Host")),
+        )
+
+        bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", "XYZZY"), OWNER))
+        await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Unknown command")]
+
+    async def test_commands_need_no_channel_while_none_is_desired(self) -> None:
+        """Hear any sender while no channel is desired, so the first JOIN can come.
+
+        Once that channel is desired, the sender must be seen in one.
+        """
+        fake_irc = FakeIRC()
+        bot = make_bot(irc=fake_irc, coordinator=FakeCoordinator())
+        bot.authorizer.grant(OWNER.render())
+
+        bot.events.on_irc_message(
+            IRCMessage("PRIVMSG", ("alpha", "JOIN #first"), OWNER),
+        )
+        await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Joining #first")]
+        bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", "STATUS"), OWNER))
+        assert not bot.tasks
+        # Only the JOIN spent budget.
+        assert len(bot.commands.command_limiter.buckets["real.host"]) == 1
+
     async def test_commands_from_undecodable_prefixes_are_refused(self) -> None:
         """Run no command from a prefix whose undecodable bytes became U+FFFD.
 
@@ -239,8 +314,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert granted.prefix is not None
         assert other.prefix == granted.prefix
-        bot.authorizer.grant(granted.prefix.render())
-        bot.authorizer.grant(OWNER.render())
+        for prefix in (granted.prefix, OWNER):
+            bot.authorizer.grant(prefix.render())
+            join_test_channel(bot, prefix)
 
         for message in (
             granted,
@@ -1832,6 +1908,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("owner").prefix = OWNER
         bot.authorizer.grant(OWNER.render())
         stranger = Prefix("mallory", "user", "evil.example")
+        join_test_channel(bot, stranger)
         # Each attempt check waits for one release, as a stalled JetStream
         # round trip would.
         gate = asyncio.Semaphore(0)

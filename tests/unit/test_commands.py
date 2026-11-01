@@ -23,6 +23,7 @@ from tests.unit.helpers import (
     bot_with_irc,
     bounded,
     drain_session_writes,
+    join_test_channel,
     make_bot,
     send_command,
     settle,
@@ -295,6 +296,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
                 IRCMessage("MODE", ("#test", "+k", "k"), Prefix("op", "~op", "h")),
             )
             await bounded(stored.wait())
+            join_test_channel(bot, OWNER)
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", "PART #test"), OWNER),
             )
@@ -340,6 +342,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             # One turn writes the keys pending in #test, then in #other.
             bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "k"), op))
             await bounded(stored.wait())
+            join_test_channel(bot, OWNER)
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", "JOIN #other"), OWNER),
             )
@@ -399,6 +402,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             runtime.modes = "+ntk"
             return await put_channel(record, after=after)
 
+        join_test_channel(bot, OWNER)
         with patch.object(coordinator, "put_channel", put_across_reconnect):
             for text in ("JOIN #new", "GETMODES #test", "   "):
                 bot.events.on_irc_message(
@@ -594,11 +598,12 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_getusers(self) -> None:
         """Verify GETUSERS command lists channel members with op prefixes."""
         bot, fake_irc = bot_with_irc()
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await send_command(bot, OWNER, "GETUSERS #test")
-        assert fake_irc.privmsgs == [("owner", "No users tracked for #test")]
+        await send_command(bot, OWNER, "GETUSERS #other")
+        assert fake_irc.privmsgs == [("owner", "No users tracked for #other")]
 
         fake_irc.privmsgs.clear()
         runtime.member("alpha").modes.add("o")
@@ -606,7 +611,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("gamma").modes.add("o")
         await send_command(bot, OWNER, "GETUSERS #test")
         assert fake_irc.privmsgs == [
-            ("owner", "#test @alpha beta @gamma"),
+            ("owner", "#test @alpha beta @gamma owner"),
         ]
 
     async def test_admin_getchans(self) -> None:
@@ -627,9 +632,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             runtime = ChannelRuntime(bot.caps, channel=name, join=state)
             bot.channel_mgr.channels[casefold(name, "rfc1459")] = runtime
 
-        bot.channel_mgr.channels[casefold("#alpha", "rfc1459")].member(
-            "alpha"
-        ).modes.add("o")
+        alpha = bot.channel_mgr.channels[casefold("#alpha", "rfc1459")]
+        alpha.member("alpha").modes.add("o")
+        # Now that channels are desired, the admin must be seen in one.
+        alpha.member("owner").prefix = OWNER
         fake_irc.privmsgs.clear()
         await send_command(bot, OWNER, "GETCHANS")
         assert fake_irc.privmsgs == [("owner", "Channels @#alpha -#beta -#gamma #Zeta")]
@@ -653,7 +659,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
             all_nicks.extend(text.split()[1:])
 
-        assert all_nicks == [f"longernickname{i:03d}" for i in range(80)]
+        assert all_nicks == [f"longernickname{i:03d}" for i in range(80)] + ["owner"]
 
     async def test_admin_commands_with_disconnected_irc(self) -> None:
         """Report a command's failed send, and swallow the undeliverable reply."""
@@ -914,6 +920,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             BotPresence("beta-id", "peer.example", "inst2", "beta", "~beta"),
         )
 
+        join_test_channel(bot, OWNER)
         bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha_", "STATUS"), OWNER))
         await settle(bot)
         assert fake_irc.privmsgs == [

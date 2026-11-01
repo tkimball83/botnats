@@ -6,10 +6,8 @@
 from tests.integration.test_mesh import (
     BOTS,
     CHANNELS,
-    authenticate,
     command,
     connect,
-    fresh_code,
     join_as_operator,
     modes,
     poll_until,
@@ -30,7 +28,6 @@ async def change_key() -> None:
     channel, old_key = CHANNELS[1]
     session = await connect()
     try:
-        await authenticate(session, "alpha", fresh_code())
         await join_as_operator(session)
         await session.send("MODE", channel, "-k", old_key)
         await session.send("MODE", channel, "+k", ROTATED_KEY)

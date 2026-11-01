@@ -305,6 +305,24 @@ class ChannelManager:
         folded = self.bot.caps.fold(nickname)
         return any(folded in runtime.members for runtime in self.channels.values())
 
+    def sees_prefix(self, prefix: Prefix) -> bool:
+        """Return whether a member of a channel this bot is in has this prefix.
+
+        Only a channel this bot is in tracks members. A member known only
+        from NAMES, whose prefix WHO has yet to report, has none.
+        """
+        folded = self.bot.caps.fold(prefix.nick)
+        for runtime in self.channels.values():
+            member = runtime.members.get(folded)
+            if (
+                member is not None
+                and member.prefix is not None
+                and prefix.matches(member.prefix, self.bot.caps.casemapping)
+            ):
+                return True
+
+        return False
+
     def forget_member(self, prefix: Prefix) -> Prefix:
         """Remove a user who quit IRC from every channel; return their full prefix.
 

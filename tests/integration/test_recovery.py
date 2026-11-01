@@ -10,9 +10,7 @@ from tests.integration.test_mesh import (
     CHANNELS,
     COMMAND_TIMEOUT,
     IRCSession,
-    authenticate,
     connect,
-    fresh_code,
     join_as_operator,
     names,
     private_message,
@@ -35,9 +33,11 @@ STATUS_POLL_WAIT = 3.0
 
 
 async def wait_for_authorized_status(session: IRCSession) -> str:
-    """Poll alpha's STATUS until it answers; unauthorized senders get no reply.
+    """Poll alpha's STATUS until it answers.
 
-    Only a silent poll is retried: a closed connection fails at once.
+    Alpha ignores the owner until it holds the owner's session and has seen
+    the owner in a channel again. Only a silent poll is retried: a closed
+    connection fails at once.
     """
     async with asyncio.timeout(RESTART_TIMEOUT):
         while True:
@@ -121,8 +121,7 @@ async def run(restart: Callable[[str], Awaitable[None]]) -> None:
     session = await connect()
     try:
         await wait_for_bots(session)
-        await authenticate(session, "alpha", fresh_code())
-
+        # Authenticates once the owner shares a channel with alpha.
         await rejoin_after_ban(session)
         await rejoin_full_channel(session)
         await rejoin_invite_only(session)
