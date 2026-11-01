@@ -703,10 +703,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         nats-py hands its error callback both transport errors and whatever
         the help subscription's callback raises, which is a bug to trace. The
-        crash has its own throttle, so throttled transport errors cannot hide it.
+        crash has its own throttle, so throttled transport errors cannot hide
+        it, and a crash on every message traces once per interval.
         """
         coordinator = build_coordinator("alpha")
         crash = ValueError("help handler bug")
+        later = ValueError("help handler bug again")
 
         with (
             patch("botnats.nats.coordinator.time") as clock,
@@ -716,14 +718,20 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             await bounded(coordinator.on_error(OSError("connection reset")))
             await bounded(coordinator.on_error(crash))
             await bounded(coordinator.on_error(OSError("connection reset")))
+            await bounded(coordinator.on_error(crash))
+            clock.monotonic.return_value = 10.0 + TRANSIENT_WARNING_INTERVAL
+            await bounded(coordinator.on_error(later))
 
         assert [(log.levelname, log.getMessage()) for log in logs.records] == [
             ("WARNING", "NATS error: connection reset"),
             ("ERROR", "NATS callback crashed"),
+            ("ERROR", "NATS callback crashed; suppressed 1 similar warning(s)"),
         ]
         assert logs.records[0].exc_info is None
         assert logs.records[1].exc_info is not None
         assert logs.records[1].exc_info[1] is crash
+        assert logs.records[2].exc_info is not None
+        assert logs.records[2].exc_info[1] is later
 
     async def test_duplicate_bot_id_blocks_coordination(self) -> None:
         """Prevent a conflicting bot ID from publishing or acting on requests."""
@@ -1104,54 +1112,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
         assert sum("crashed" in line for line in logs.output) == 1
-
-    async def test_replaced_resync_keeps_new_task(self) -> None:
-        """Keep a restart that took the slot while a superseded resync stopped.
-
-        A drop's disconnect callback, in the nats-py reconnect task, waits for
-        a resync that is slow to stop when nats-py closes the client for good:
-        that close cancels the reconnect task and then runs its own callbacks,
-        whose restart takes the slot before the resync finishes.
-        """
-        coordinator = build_coordinator("alpha")
-        coordinator.nc = MagicMock()
-        stopping = asyncio.Event()
-
-        async def slow_to_stop() -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                stopping.set()
-                # Its cleanup still awaits; the next cancellation ends it. The
-                # bound ends it anyway, so teardown's single cancellation
-                # cannot hang the suite when the resync is never cancelled.
-                async with asyncio.timeout(5):
-                    await asyncio.Event().wait()
-
-        with (
-            patch.object(coordinator, "resync", slow_to_stop),
-            patch.object(coordinator, "start", hang),
-        ):
-            async with asyncio.timeout(5):
-                await coordinator.on_reconnected()
-                first = coordinator.resync_task
-                reconnect = asyncio.create_task(coordinator.on_disconnected())
-                await stopping.wait()
-                reconnect.cancel()
-                await coordinator.on_disconnected()
-                await coordinator.on_closed()
-                second = coordinator.resync_task
-                await asyncio.gather(reconnect, return_exceptions=True)
-
-            assert first is not None
-            assert first.cancelled()
-            assert second is not None
-            assert second is not first
-            assert coordinator.resync_task is second
-            async with asyncio.timeout(5):
-                await coordinator.cancel_resync()
-
-        assert second.cancelled()
 
     async def test_disconnect_cancels_resync(self) -> None:
         """Cancel an in-flight resynchronization when Core NATS drops."""

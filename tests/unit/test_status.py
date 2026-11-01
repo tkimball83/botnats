@@ -150,28 +150,6 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=3/3 lag=0"
         )
 
-    async def test_collect_one_replica_cluster(self) -> None:
-        """Report a clustered one-replica stream, which lists no peers, as up."""
-        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
-        kv = AsyncMock()
-        # NATS names a one-replica stream's leader but sends no replica list,
-        # which nats-py leaves as None.
-        kv.status.return_value = SimpleNamespace(
-            stream_info=StreamInfo.from_response(
-                {"config": {"num_replicas": 1}, "cluster": {"leader": "nats-1"}},
-            ),
-        )
-
-        with patch(
-            "botnats.nats.status.route_count",
-            AsyncMock(return_value=2),
-        ):
-            status = await bounded(collect(nc, kv, 1, 8222))
-
-        assert status.render() == (
-            "nats connection=up routes=2 jetstream=up leader=nats-1 replicas=1/1 lag=0"
-        )
-
     async def test_collect_leaderless_cluster(self) -> None:
         """Report a stream without a leader as degraded, even with current peers."""
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
@@ -227,10 +205,15 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_collect_uses_stream_replica_count(self) -> None:
-        """Judge replicas against the stream's own count, not the configured one."""
+        """Judge replicas against the stream's own count, not the configured one.
+
+        A clustered one-replica stream, which lists no peers, reports up.
+        """
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
         kv = AsyncMock()
-        # An operator scaled the open bucket's stream down to one replica.
+        # An operator scaled the open bucket's stream down to one replica. NATS
+        # names a one-replica stream's leader but sends no replica list, which
+        # nats-py leaves as None.
         kv.status.return_value = SimpleNamespace(
             stream_info=StreamInfo.from_response(
                 {"config": {"num_replicas": 1}, "cluster": {"leader": "nats-1"}},

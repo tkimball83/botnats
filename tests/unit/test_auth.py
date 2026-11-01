@@ -478,6 +478,34 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(disconnects=disconnects):
                 await failed_write(disconnects=disconnects)
 
+    async def test_auth_failure_refuses_after_dropped_grant(self) -> None:
+        """Refuse AUTH whose failed write leaves it no record to revoke.
+
+        The grant lands, then a NATS writer without the coordination secret
+        overwrites it, which the watch reports as a delete, so the user quits
+        with no session to revoke. The write's reply is lost, and AUTH's own
+        revocation finds no record either.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        prefix = Prefix("owner", "user", "host.example")
+        key = coordinator.sessions.key(prefix.render())
+        kv = cast("FakeKV", coordinator.sessions.kv)
+
+        async def drop_then_fail(record: Session) -> Session:
+            bot.sessions.observe(key, await coordinator.sessions.put(record))
+            kv.store(key, b"unsigned")
+            bot.sessions.forget(key)
+            bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
+            msg = "publish timed out"
+            raise NatsError(msg)
+
+        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        with patch.object(coordinator, "put_session", drop_then_fail):
+            await send_command(bot, prefix, f"AUTH {code}")
+
+        assert fake_irc.privmsgs == [("owner", "Authorization failed")]
+        assert not bot.authorizer.authorized(prefix.render())
+
     async def test_identity_change_escalates_auth_failure_revocation(self) -> None:
         """Escalate AUTH's queued revocation once its identity is gone.
 
@@ -1853,6 +1881,47 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         bot.sessions.observe(coordinator.sessions.key(peer.prefix), peer)
 
         assert bot.authorizer.authorized("foo[!u@h")
+
+    async def test_escalation_outranks_equivalent_spelling_grant_at_once(self) -> None:
+        """Rank an escalation in the folded view when it is queued, not written.
+
+        foo{ and foo[ fold together under rfc1459 but have their own durable
+        keys. foo{'s revocation meets a newer grant that a peer whose clock
+        runs ahead holds for foo{, and the escalation over it outranks foo['s
+        grant. Like any revocation it applies locally at once: ranked only
+        once written, foo['s grant would authorize the folded identity until
+        then.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        assert await bounded(bot.sessions.sync(bot.authorizer.grant("foo{!u@h")))
+        coordinator.duplicate = True
+        bot.sessions.revoke(Prefix("foo{", "u", "h"))
+        await drain_session_writes(bot)
+        now = time.time()
+        peer = Session(
+            now + SESSION_TTL + 10, "beta", "foo[!u@h", revoked=False, version=0
+        )
+        bot.sessions.observe(coordinator.sessions.key(peer.prefix), peer)
+        assert bot.authorizer.authorized("foo[!u@h")
+        ahead = Session(
+            now + SESSION_TTL + 30, "gamma", "foo{!u@h", revoked=False, version=0
+        )
+        await bounded(coordinator.sessions.put(ahead))
+        coordinator.duplicate = False
+
+        # The escalation waits for the second retry.
+        await bounded(bot.sessions.retry())
+        assert not bot.authorizer.authorized("foo[!u@h")
+        await bounded(bot.sessions.retry())
+
+        assert not bot.authorizer.authorized("foo[!u@h")
+        last = coordinator.session_puts[-1]
+        assert (last.prefix, last.expires_at, last.revoked) == (
+            "foo{!u@h",
+            ahead.expires_at,
+            True,
+        )
+        assert not bot.sessions.pending
 
     async def test_quit_during_write_holds_back_stored_grant(self) -> None:
         """Leave a newer grant the store returns unapplied after a mid-write QUIT.
