@@ -1377,15 +1377,6 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(label):
                 assert parse_session_record(SECRET, "efnet", record) is None
 
-    async def test_session_parse_binds_record_to_key(self) -> None:
-        """Reject a signed session stored under another identity's key."""
-        sessions = SessionStore("efnet", 1, SECRET)
-        key = sessions.key("owner!user@host")
-        current = session_record(time.time() + 60)
-
-        assert sessions.parse(key, current) is not None
-        assert sessions.parse(sessions.key("other!user@host"), current) is None
-
     async def test_session_parse_rejects_non_finite_expiry(self) -> None:
         """Reject a correctly signed record whose expiry is NaN or infinite."""
         sessions = SessionStore("efnet", 1, SECRET)

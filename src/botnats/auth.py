@@ -219,16 +219,23 @@ class SessionSync:
         }
 
     def invalidate_nick(self, nick: str) -> None:
-        """Invalidate the identity of every pending command sent from a nick.
+        """Invalidate every identity of a nick for pending commands and queued writes.
 
         For a departure member state could not complete, which names only the
-        nick. A command may spell the nick another way the casemapping folds
-        together.
+        nick. Its identities are gone, so whatever is queued for them
+        escalates over a newer grant, as revoke() does for one identity. A
+        command or record may spell the nick another way the casemapping
+        folds together.
         """
         fold = self.authorizer.identity_fold
         self.watched_identities = {
             key: (count, invalidated or fold(key.partition("!")[0]) == fold(nick))
             for key, (count, invalidated) in self.watched_identities.items()
+        }
+        self.yielding = {
+            key: held
+            for key, held in self.yielding.items()
+            if fold(held.prefix.partition("!")[0]) != fold(nick)
         }
 
     def invalidate_all(self) -> None:
