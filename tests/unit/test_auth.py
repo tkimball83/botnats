@@ -191,6 +191,30 @@ class TotpAuthorizerTests(unittest.TestCase):
             "live-revoked!user@example.test",
         ]
 
+    def test_live_prefixes_lists_a_nicks_live_sessions(self) -> None:
+        """List the live sessions a nick folds to, under any user and host.
+
+        Revoked and expired records are left out, as is a longer nick that
+        starts with the same letters.
+        """
+        auth = authorizer()
+        now = time.time()
+        for prefix in (
+            "Owner!user@host",
+            "owner!other@elsewhere",
+            "owner2!user@host",
+            "owner!revoked@host",
+        ):
+            auth.grant(prefix, now=now)
+
+        auth.revoke("owner!revoked@host")
+        auth.grant("owner!expired@host", now=now - SESSION_TTL)
+
+        assert sorted(auth.live_prefixes("OWNER")) == [
+            "Owner!user@host",
+            "owner!other@elsewhere",
+        ]
+
     def test_totp_matching_windows(self) -> None:
         """Accept codes one period either side of now, and none further out."""
         auth = authorizer()
