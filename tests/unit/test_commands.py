@@ -4,6 +4,7 @@
 """Tests for admin command parsing, dispatch, replies, and rate limiting."""
 
 import asyncio
+import math
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
@@ -143,6 +144,8 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         fake_irc = FakeIRC()
         # Ready, with no channel desired, so every sender is heard.
         bot = make_bot(irc=fake_irc, coordinator=FakeCoordinator())
+        # No command leaves the window, however long the test takes.
+        bot.commands.command_limiter.window = math.inf
 
         for index in range(20):
             prefix = Prefix(f"nick{index}", "user", "host.example")
@@ -1005,6 +1008,19 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.modes == [("#test", "+o", ("Target",))]
         assert fake_irc.privmsgs == [("owner", "Opped Target on #test")]
+
+    async def test_admin_op_uses_the_advertised_op_mode(self) -> None:
+        """Op with the mode letter the server's PREFIX maps to "@"."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.caps.parse_prefix("(yov)@%+")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("y")
+        runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "OP #test Target")
+
+        assert fake_irc.modes == [("#test", "+y", ("Target",))]
 
     async def test_admin_op_already_opped(self) -> None:
         """Verify OP reports when target is already opped."""

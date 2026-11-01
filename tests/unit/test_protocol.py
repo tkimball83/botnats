@@ -295,6 +295,12 @@ class IRCProtocolTests(unittest.TestCase):
             Prefix("srv"),
         )
 
+    def test_parse_uppercases_command(self) -> None:
+        """Upper-case the command, which IRC matches case-insensitively."""
+        message = parse_message(":nick!u@h privmsg #c :hi\r\n")
+
+        assert message.command == "PRIVMSG"
+
     def test_prefix_parse_host_without_user(self) -> None:
         """Parse the RFC 2812 nick@host prefix form without a user part."""
         prefix = Prefix.parse("owner@static.example")
