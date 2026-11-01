@@ -9,6 +9,7 @@ import secrets
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
+from functools import partial
 from typing import TYPE_CHECKING
 
 from botnats import error_label
@@ -425,7 +426,11 @@ class ChannelManager:
         return runtime
 
     def invite_peer(self, channel: str, presence: BotPresence) -> None:
-        """Invite a peer bot into a channel this bot holds operator status in."""
+        """Invite a peer bot into a channel this bot holds operator status in.
+
+        The INVITE goes out only if the peer's presence still holds when its
+        turn in the send queue comes: its nick may pass to another user.
+        """
         runtime = self.help_eligible(channel, presence, require_member=False)
         if runtime is None or self.bot.caps.fold(presence.nick) in runtime.members:
             return
@@ -436,6 +441,7 @@ class ChannelManager:
                 presence.nick,
                 channel,
                 unless_waiting=True,
+                check=partial(self.bot.presence.has, presence),
             )
         except ConnectionError:
             return
@@ -444,7 +450,7 @@ class ChannelManager:
             LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
     def op_peer(self, channel: str, presence: BotPresence) -> None:
-        """Grant operator status to a peer bot."""
+        """Grant operator status to a peer bot, rechecked at send as an invite is."""
         if self.help_eligible(channel, presence) is None:
             return
 
@@ -455,6 +461,7 @@ class ChannelManager:
                 f"+{self.bot.caps.op_mode}",
                 presence.nick,
                 unless_waiting=True,
+                check=partial(self.bot.presence.has, presence),
             )
         except ConnectionError:
             return

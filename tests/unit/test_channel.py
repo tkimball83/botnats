@@ -9,7 +9,7 @@ import time
 import unittest
 from dataclasses import asdict, astuple, replace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 from nats.errors import Error as NatsError
 
@@ -1706,10 +1706,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         # Each action reached IRC, so each swallowed its own ConnectionError.
         assert send.call_args_list == [
-            call("INVITE", "beta", "#test", unless_waiting=True),
+            call("INVITE", "beta", "#test", unless_waiting=True, check=ANY),
             call("MODE", "#test", "+l", "2", unless_waiting=True),
             call("MODE", "#test", "-b", "*!~beta@beta.host", unless_waiting=True),
-            call("MODE", "#test", "+o", "beta", unless_waiting=True),
+            call("MODE", "#test", "+o", "beta", unless_waiting=True, check=ANY),
         ]
 
     async def test_help_needs_active_peer_presence(self) -> None:
@@ -1885,6 +1885,35 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.remove("beta")
         bot.channel_mgr.invite_peer("#test", invitee)
         assert fake_irc.sent == [("INVITE", ("Beta", "#test"))]
+
+    async def test_peer_help_needs_presence_when_sent(self) -> None:
+        """Bind an invite or op to the peer's presence, checked when its turn comes.
+
+        Flood pacing can hold the line for minutes: the peer may leave
+        meanwhile, and another user take its nick.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("gamma").prefix = OP_REQUESTER.to_prefix()
+        for peer in (INVITEE, OP_REQUESTER):
+            bot.presence.update(peer)
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            bot.channel_mgr.invite_peer("#test", INVITEE)
+            bot.channel_mgr.op_peer("#test", OP_REQUESTER)
+
+        assert send.call_args_list == [
+            call("INVITE", "beta", "#test", unless_waiting=True, check=ANY),
+            call("MODE", "#test", "+o", "gamma", unless_waiting=True, check=ANY),
+        ]
+        checks = [entry.kwargs["check"] for entry in send.call_args_list]
+        assert [check() for check in checks] == [True, True]
+
+        for peer in (INVITEE, OP_REQUESTER):
+            bot.presence.remove(peer.bot_id)
+
+        assert [check() for check in checks] == [False, False]
 
     async def test_make_room_raises_limit_for_left_out_bots(self) -> None:
         """Raise a full channel's limit by the number of bots not in it."""
@@ -2279,8 +2308,8 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             bot.channel_mgr.op_peer("#test", INVITEE)
             bot.channel_mgr.safe_join(runtime)
 
-        assert [entry.kwargs for entry in skip.call_args_list] == [
-            {"unless_waiting": True},
+        assert [entry.kwargs["unless_waiting"] for entry in skip.call_args_list] == [
+            True,
         ] * 5
         assert skip.call_args == call("JOIN", "#test", unless_waiting=True)
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 STRICT_RFC1459_TABLE = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\",
@@ -67,10 +67,12 @@ class IRCSender(Protocol):
         *params: str,
         trailing: str | None = None,
         unless_waiting: bool = False,
+        check: Callable[[], bool] | None = None,
     ) -> bool:
         """Enqueue an IRC command, unless asked to skip a copy still waiting.
 
-        Return whether it was queued.
+        Return whether it was queued. A line with a check is written only if
+        the check still passes when its turn comes, and dropped otherwise.
         """
         ...
 
