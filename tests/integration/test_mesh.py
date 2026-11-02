@@ -187,14 +187,23 @@ async def connect() -> IRCSession:
     return session
 
 
-def fresh_code() -> str:
-    """Return a currently valid TOTP code whose counter this run has not spent."""
+async def fresh_code() -> str:
+    """Return a currently valid TOTP code whose counter this run has not spent.
+
+    Once both usable counters are spent, wait for the next 30-second period.
+    """
     secret = base64.b32decode(os.environ["BOTNATS_TEST_TOTP_SECRET"])
-    current = int(time.time() // 30)
-    # The bots accept one counter either side of the current one.
-    counter = next(
-        counter for counter in (current, current + 1) if counter not in USED_COUNTERS
-    )
+
+    def unspent() -> list[int]:
+        current = int(time.time() // 30)
+        # The bots accept one counter either side of the current one.
+        return [c for c in (current, current + 1) if c not in USED_COUNTERS]
+
+    async def available() -> bool:
+        return bool(unspent())
+
+    await poll_until(available)
+    counter = unspent()[0]
     USED_COUNTERS.add(counter)
     return totp(secret, counter)
 
@@ -207,7 +216,7 @@ async def join_as_operator(session: IRCSession) -> None:
     """
     channel, key = CHANNELS[1]
     await session.send("JOIN", channel, key)
-    await authenticate(session, "alpha", fresh_code())
+    await authenticate(session, "alpha", await fresh_code())
 
     async def opped() -> bool:
         return await command(session, "alpha", f"OP {channel} owner") in {
@@ -322,7 +331,7 @@ async def run() -> None:
         await wait_for_bots(session)
 
         # One code authenticates once across the whole mesh.
-        code = fresh_code()
+        code = await fresh_code()
         await authenticate(session, "alpha", code)
         await authenticate(session, "gamma", code, "Authorization failed")
 
