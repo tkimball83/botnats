@@ -2008,23 +2008,24 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ((offline, offline), []),
             ((offline, INVITEE_HOLDS_NICK), [("INVITE", ("beta", "#test"))]),
         ):
-            bot, fake_irc = bot_with_irc()
-            runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-            runtime.member("alpha").modes.add("o")
-            for peer in (INVITEE, INVITEE, OP_REQUESTER):
-                bot.presence.update(peer)
-                bot.channel_mgr.invite_peer("#test", peer)
+            with self.subTest(invited=invited):
+                bot, fake_irc = bot_with_irc()
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.member("alpha").modes.add("o")
+                for peer in (INVITEE, INVITEE, OP_REQUESTER):
+                    bot.presence.update(peer)
+                    bot.channel_mgr.invite_peer("#test", peer)
 
-            for reply in (*beta_replies, gamma_holds_nick):
-                bot.events.on_irc_message(reply)
+                for reply in (*beta_replies, gamma_holds_nick):
+                    bot.events.on_irc_message(reply)
 
-            assert fake_irc.sent == [
-                ("USERHOST", ("beta",)),
-                ("USERHOST", ("beta",)),
-                ("USERHOST", ("gamma",)),
-                *invited,
-                ("INVITE", ("gamma", "#test")),
-            ]
+                assert fake_irc.sent == [
+                    ("USERHOST", ("beta",)),
+                    ("USERHOST", ("beta",)),
+                    ("USERHOST", ("gamma",)),
+                    *invited,
+                    ("INVITE", ("gamma", "#test")),
+                ]
 
     async def test_invite_peer_counts_only_queries_queued(self) -> None:
         """Expect no reply for a USERHOST skipped for a copy still waiting."""
