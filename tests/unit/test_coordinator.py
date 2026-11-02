@@ -1086,7 +1086,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
-        assert sum("crashed" in line for line in logs.output) == 1
+        assert sum("watch watch-channels crashed" in line for line in logs.output) == 1
 
     async def test_disconnect_cancels_resync(self) -> None:
         """Cancel an in-flight resynchronization when Core NATS drops."""
@@ -2158,37 +2158,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert len(stops) == 1
         assert results == [None]
         subscription.stop.assert_not_awaited()
-
-    async def test_watch_surfaces_programming_errors(self) -> None:
-        """Verify a programming error in a watch is logged at ERROR and retried."""
-        coordinator = build_coordinator("alpha")
-        coordinator.nc = MagicMock(is_connected=True)
-        # A bare RuntimeError is a programming failure, unlike the
-        # StoreUnavailableError watches treat as transient.
-        crashes = [RuntimeError("missing attribute")]
-        retried = asyncio.Event()
-
-        async def crash_once(*arguments: object) -> None:
-            del arguments
-            if crashes:
-                raise crashes.pop()
-
-            retried.set()
-            await asyncio.Event().wait()
-
-        with (
-            patch.object(coordinator, "watch_channels", crash_once),
-            patch.object(coordinator, "watch_presence", hang),
-            patch.object(coordinator, "watch_sessions", hang),
-            patch("asyncio.sleep", yield_once),
-            self.assertLogs("botnats.nats.coordinator", level="ERROR") as logs,
-        ):
-            async with asyncio.timeout(5):
-                await coordinator.start_watches()
-                await retried.wait()
-                await coordinator.cancel_watches()
-
-        assert any("watch watch-channels crashed" in line for line in logs.output)
 
     async def test_durable_writes_require_owned_presence(self) -> None:
         """Refuse channel and session writes until this process owns its bot ID."""
