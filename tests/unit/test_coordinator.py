@@ -181,6 +181,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Publish one signed request on the kind's subject, with no reply inbox."""
         coordinator = build_coordinator("beta")
         coordinator.nc = AsyncMock()
+        coordinator.nc.publish.return_value = None
         payload = {"channel": "#test", "presence": BETA_PRESENCE}
 
         with patch.object(Coordinator, "ready", PropertyMock(return_value=True)):
@@ -369,6 +370,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """
         coordinator = build_coordinator("alpha")
         coordinator.nc = AsyncMock()
+        coordinator.nc.close.return_value = None
         coordinator.claim.adopt(7)
         resyncs: list[asyncio.Task[None] | None] = []
 

@@ -2763,6 +2763,19 @@ class SessionSyncWatchTests(unittest.TestCase):
         assert not sessions.watched_valid("a!u@h")
         assert sessions.watched_valid("b!u@h")
 
+    def test_invalidate_folds_by_casemapping(self) -> None:
+        """Invalidate an identity spelled another way the casemapping folds together.
+
+        Under rfc1459 a QUIT may name foo{ as foo[.
+        """
+        bot, _ = bot_with_irc()
+        assert bot.caps.casemapping == "rfc1459"
+        bot.sessions.watch_identity("foo{!u@h")
+
+        bot.sessions.invalidate("foo[!u@h")
+
+        assert not bot.sessions.watched_valid("foo{!u@h")
+
     def test_invalidate_nick_marks_every_identity_of_the_nick(self) -> None:
         """Invalidate each identity sent from a nick, folded by the casemapping.
 
