@@ -85,7 +85,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
                 "create",
                 AsyncMock(side_effect=(None, 1)),
             ) as create,
-            patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
+            patch.object(claim.store, "reclaim", AsyncMock(side_effect=[None])),
         ):
             await bounded(claim.put(PRESENCE))
             assert claim.duplicate
@@ -101,11 +101,11 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         reclaimed_revision = 7
 
         with (
-            patch.object(claim.store, "create", AsyncMock(return_value=None)),
+            patch.object(claim.store, "create", AsyncMock(side_effect=[None])),
             patch.object(
                 claim.store,
                 "reclaim",
-                AsyncMock(return_value=reclaimed_revision),
+                AsyncMock(side_effect=[reclaimed_revision]),
             ) as reclaim,
         ):
             await bounded(claim.put(PRESENCE))
@@ -119,11 +119,11 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         claim = build_claim()
 
         with (
-            patch.object(claim.store, "create", AsyncMock(return_value=None)),
+            patch.object(claim.store, "create", AsyncMock(side_effect=[None])),
             patch.object(
                 claim.store,
                 "reclaim",
-                AsyncMock(side_effect=OSError("blip")),
+                AsyncMock(side_effect=[OSError("blip")]),
             ),
             # By message: the bound's TimeoutError is an OSError too.
             self.assertRaisesRegex(OSError, "blip"),
@@ -168,7 +168,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         created_revision = 3
 
         with patch.object(
-            claim.store, "create", AsyncMock(return_value=created_revision)
+            claim.store, "create", AsyncMock(side_effect=[created_revision])
         ):
             await bounded(claim.reclaim())
 
@@ -179,7 +179,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         """Write nothing after a watch replay while this process owns its key."""
         claim = build_claim()
         claim.adopt(5)
-        create = AsyncMock(return_value=6)
+        create = AsyncMock(side_effect=[6])
 
         with patch.object(claim.store, "create", create):
             await bounded(claim.reclaim())
@@ -194,6 +194,8 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
         async def create_then_reset(*arguments: object) -> int:
             del arguments
+            # Yield, so the bound ends a reclaim that keeps retrying.
+            await asyncio.sleep(0)
             claim.reset()
             return 1
 
@@ -211,9 +213,9 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         claim.adopt(1)
 
         with (
-            patch.object(claim.store, "update", AsyncMock(return_value=None)),
-            patch.object(claim.store, "create", AsyncMock(return_value=None)),
-            patch.object(claim.store, "reclaim", AsyncMock(return_value=None)),
+            patch.object(claim.store, "update", AsyncMock(side_effect=[None])),
+            patch.object(claim.store, "create", AsyncMock(side_effect=[None])),
+            patch.object(claim.store, "reclaim", AsyncMock(side_effect=[None])),
             self.assertLogs("botnats.nats.claim", level="ERROR"),
         ):
             await bounded(claim.put(PRESENCE))
@@ -230,9 +232,11 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 claim.store,
                 "update",
-                AsyncMock(return_value=refreshed_revision),
+                AsyncMock(side_effect=[refreshed_revision]),
             ) as update,
-            patch.object(claim.store, "create", AsyncMock(return_value=None)) as create,
+            patch.object(
+                claim.store, "create", AsyncMock(side_effect=[None])
+            ) as create,
         ):
             await bounded(claim.put(PRESENCE))
 
@@ -248,7 +252,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                claim.store, "create", AsyncMock(side_effect=NatsError("down"))
+                claim.store, "create", AsyncMock(side_effect=[NatsError("down")])
             ),
             self.assertRaises(NatsError),
         ):
@@ -263,9 +267,9 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         claim.adopt(1)
 
         with (
-            patch.object(claim.store, "update", AsyncMock(return_value=None)),
+            patch.object(claim.store, "update", AsyncMock(side_effect=[None])),
             patch.object(
-                claim.store, "create", AsyncMock(side_effect=NatsError("down"))
+                claim.store, "create", AsyncMock(side_effect=[NatsError("down")])
             ),
             self.assertRaises(NatsError),
         ):
@@ -293,11 +297,11 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         reclaimed_revision = 2
 
         with (
-            patch.object(claim.store, "update", AsyncMock(return_value=None)),
+            patch.object(claim.store, "update", AsyncMock(side_effect=[None])),
             patch.object(
                 claim.store,
                 "create",
-                AsyncMock(return_value=reclaimed_revision),
+                AsyncMock(side_effect=[reclaimed_revision]),
             ),
             self.assertNoLogs("botnats.nats.claim", level="ERROR"),
         ):
@@ -310,7 +314,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         """Delete the owned revision of this instance's record, then stop owning it."""
         claim = build_claim()
         claim.adopt(3)
-        delete = AsyncMock(return_value=None)
+        delete = AsyncMock(side_effect=[None])
 
         with patch.object(claim.store, "delete", delete):
             await bounded(claim.release())
@@ -323,7 +327,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         """Stop owning the key on shutdown even when deleting it fails."""
         claim = build_claim()
         claim.adopt(3)
-        delete = AsyncMock(side_effect=NatsError("timeout"))
+        delete = AsyncMock(side_effect=[NatsError("timeout")])
 
         with patch.object(claim.store, "delete", delete):
             await bounded(claim.release())
@@ -341,7 +345,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("botnats.nats.claim", level="ERROR"):
             claim.observe("other-instance", 1)
 
-        delete = AsyncMock(return_value=None)
+        delete = AsyncMock(side_effect=[None])
 
         with patch.object(claim.store, "delete", delete):
             await bounded(claim.release())
@@ -373,7 +377,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             claim.observe("other-instance", 1)
 
         with (
-            patch.object(claim.store, "create", AsyncMock(return_value=2)),
+            patch.object(claim.store, "create", AsyncMock(side_effect=[2])),
             self.assertLogs("botnats.nats.claim", level="INFO") as logs,
         ):
             await bounded(claim.deleted())

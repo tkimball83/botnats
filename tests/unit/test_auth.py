@@ -191,6 +191,12 @@ class TotpAuthorizerTests(unittest.TestCase):
         # Every bot grants the same lifetime, so a changed one must fail here.
         assert auth.authorized(prefix, now=11 + 3599.9)
         assert not auth.authorized(prefix, now=11 + 3600)
+        # The check only reads; maintenance prunes.
+        assert prefix in auth.records
+        assert prefix in auth.source_records
+
+        auth.prune()
+
         assert not auth.records
         assert not auth.source_records
 
@@ -778,6 +784,8 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
 
         async def peer_lands_then_fail(record: Session) -> Session:
             del record
+            # Yield, so the timeout ends a drain that keeps retrying.
+            await asyncio.sleep(0)
             bot.sessions.observe(coordinator.sessions.key(peer.prefix), peer)
             msg = "unavailable"
             raise NatsError(msg)
@@ -1601,6 +1609,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async def put_session(payload: Session) -> Session:
+            # Yield, so the timeout ends a drain that keeps retrying.
+            await asyncio.sleep(0)
             if payload == blocked:
                 msg = "unavailable"
                 raise NatsError(msg)
@@ -1670,6 +1680,8 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         session = bot.authorizer.grant(identity)
 
         async def put_session(payload: Session) -> Session:
+            # Yield, so the timeout ends a drain that keeps retrying.
+            await asyncio.sleep(0)
             if payload.revoked:
                 msg = "unavailable"
                 raise NatsError(msg)
@@ -1797,7 +1809,7 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             coordinator,
             "put_session",
-            AsyncMock(side_effect=NatsError("unavailable")),
+            AsyncMock(side_effect=[NatsError("unavailable")]),
         ) as put:
             bot.events.on_irc_message(IRCMessage("QUIT", (), prefix))
             await drain_session_writes(bot)

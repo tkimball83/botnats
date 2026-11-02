@@ -480,22 +480,10 @@ class TotpAuthorizer:
         self.source_records: dict[str, Session] = {}
 
     def authorized(self, prefix: str, *, now: float | None = None) -> bool:
-        """Return whether the prefix has a valid, unexpired session.
-
-        An expired record is pruned on the way.
-        """
-        key = self.identity_fold(prefix)
-        record = self.records.get(key)
+        """Return whether the prefix has a valid, unexpired session."""
+        record = self.records.get(self.identity_fold(prefix))
         current = time.time() if now is None else now
-        if record is None:
-            return False
-
-        if record.expires_at <= current:
-            del self.records[key]
-            del self.source_records[casefold(record.prefix, "ascii")]
-            return False
-
-        return not record.revoked
+        return record is not None and record.expires_at > current and not record.revoked
 
     def drop_session(self, prefix: str) -> Session | None:
         """Remove a cached session whose durable record was deleted.

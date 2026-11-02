@@ -721,7 +721,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         kv = cast("KeyValue", FakeKV())
         newer.create_key_value.return_value = kv
 
-        assert await bounded(store.open(older)) is not kv
+        assert await bounded(store.open(older)) is older.create_key_value.return_value
         assert await bounded(store.open(newer)) is kv
         assert store.js is newer
         newer.create_key_value.assert_awaited_once()
