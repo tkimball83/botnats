@@ -2098,9 +2098,17 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.presence.update(INVITEE)
 
         bot.channel_mgr.invite_peer("#test", INVITEE)
-        bot.events.on_irc_message(
-            IRCMessage("302", ("alpha", "gamma=+~beta@beta.host"))
-        )
+        with self.assertLogs("botnats.channel", level="WARNING") as logs:
+            bot.events.on_irc_message(
+                IRCMessage("302", ("alpha", "gamma=+~beta@beta.host"))
+            )
+
+        assert logs.output == [
+            (
+                "WARNING:botnats.channel:"
+                "not inviting bot beta-id: another user holds nick beta"
+            ),
+        ]
         # beta's query was answered: an unasked reply invites no one.
         bot.events.on_irc_message(INVITEE_HOLDS_NICK)
 

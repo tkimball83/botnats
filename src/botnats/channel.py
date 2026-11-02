@@ -255,7 +255,12 @@ class ChannelManager:
             present=present,
             after=current.revision if current is not None else None,
         )
-        self.writing.add(record.revision)
+        # Only a key this bot sees on IRC is its own to keep: an admin's key
+        # replaces it here as on every peer.
+        runtime = self.runtime(channel)
+        if runtime is not None and runtime.key == key:
+            self.writing.add(record.revision)
+
         try:
             stored = await self.bot.coordinator.put_channel(
                 asdict(record),
