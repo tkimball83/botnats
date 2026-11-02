@@ -27,6 +27,8 @@ from tests.integration.test_failover import (
 if TYPE_CHECKING:
     from nats.js.kv import KeyValue
 
+    from botnats.validators import ChannelFields
+
 CHANNEL = "#botnats-restart"
 CHANNEL_KEY = "restart-key"
 COUNTER = 987_654_321
@@ -58,15 +60,32 @@ async def mark() -> None:
     nc = await connect()
     try:
         claims, channels, sessions = stores()
-        await claims.open(nc.jetstream())
-        assert await claims.claim(COUNTER)
-        await channels.open(nc.jetstream())
         record = asdict(ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True))
-        _, stored_key, _, _ = await channels.put(record, after=None)
-        assert stored_key == CHANNEL_KEY
-        await sessions.open(nc.jetstream())
         expires_at = time.time() + SESSION_TTL / 2
-        session = await sessions.put(session_value(expires_at))
+
+        async def write() -> tuple[ChannelFields, Session] | None:
+            # The failover phase's restarted node passes its healthcheck
+            # before rejoining the meta group, so retry. Both puts return the
+            # record already stored; claim() refuses a COUNTER stored by an
+            # attempt whose ack was lost, as it refuses a failed publish, so
+            # read the key to tell them apart.
+            claim_kv = await claims.open(nc.jetstream())
+            if (
+                not await claims.claim(COUNTER)
+                and (await claim_kv.get(claims.key(COUNTER))).value != b"1"
+            ):
+                return None
+
+            await channels.open(nc.jetstream())
+            channel = await channels.put(record, after=None)
+            await sessions.open(nc.jetstream())
+            return channel, await sessions.put(session_value(expires_at))
+
+        (_, stored_key, _, _), session = await keep_trying(
+            write,
+            "durable state not written before NATS restart",
+        )
+        assert stored_key == CHANNEL_KEY
         assert session.prefix == SESSION_IDENTITY
     finally:
         await nc.drain()

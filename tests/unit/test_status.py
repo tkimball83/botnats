@@ -249,13 +249,14 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         connect = AsyncMock(side_effect=ConnectionRefusedError("refused"))
 
         with patch("asyncio.open_connection", connect):
-            status = await bounded(collect(nc, None, 3, 8222))
+            status = await bounded(collect(nc, None, 3, 9222))
 
         assert status.render() == (
             "nats connection=up routes=? jetstream=unknown leader=? replicas=?/3 lag=?"
         )
-        # Monitoring was asked of the connected server, on the monitoring port.
-        connect.assert_awaited_once_with("nats-1", 8222)
+        # Monitoring was asked of the connected server, on the configured
+        # monitoring port rather than the NATS default.
+        connect.assert_awaited_once_with("nats-1", 9222)
 
     async def test_collect_keeps_routes_without_stream_info(self) -> None:
         """Report the route count even when stream information is unavailable."""
