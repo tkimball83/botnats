@@ -1640,13 +1640,16 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             kv, _ = watcher(*entries, grant)
             coordinator.sessions.kv = kv
             update = MagicMock()
+            replayed = MagicMock()
             with (
                 self.subTest(in_replay=in_replay),
                 patch.object(coordinator.callbacks, "on_session_update", update),
+                patch.object(coordinator.callbacks, "on_sessions_replayed", replayed),
             ):
                 await bounded(coordinator.watch_sessions(MagicMock()))
 
                 update.assert_called_once_with(key, session)
+                replayed.assert_called_once_with({key} if in_replay else set())
 
     async def test_watch_presence_keeps_conflict_during_replay(self) -> None:
         """Verify a duplicate detected during replay is not resolved by the sentinel."""
