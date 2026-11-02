@@ -111,9 +111,16 @@ class PresenceClaim:
             if not self.owned:
                 await self.claim(self.placeholder)
 
-    async def deleted(self) -> None:
-        """Handle this bot's key being deleted, then try to reclaim it."""
+    async def deleted(self, revision: int) -> None:
+        """Handle this bot's key being deleted, then try to reclaim it.
+
+        A delete older than the owned revision is ignored: this claim's own
+        write already replaced the record it removed.
+        """
         async with self.lock:
+            if self.revision is not None and revision < self.revision:
+                return
+
             if self.owned:
                 self.transition(PresenceState.UNCLAIMED, None)
 

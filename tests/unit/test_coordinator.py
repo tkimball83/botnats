@@ -1396,7 +1396,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_survives_lost_reclaim_races(self) -> None:
         """Contain reclaim exhaustion to the key instead of the whole watch."""
         coordinator = build_coordinator("alpha")
-        entry = SimpleNamespace(key="alpha", operation=KV_DEL, value=None)
+        entry = SimpleNamespace(key="alpha", operation=KV_DEL, revision=1, value=None)
         kv, _ = watcher(entry, None)
         coordinator.presence_store.kv = kv
         synced = MagicMock()
@@ -1698,6 +1698,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         delete_entry = SimpleNamespace(
             key="alpha",
             operation="DEL",
+            revision=2,
             value=None,
         )
         entry = presence_entry()
@@ -1746,7 +1747,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         # Differs from the deleted key in case only: claims ignore case.
         coordinator = build_coordinator("Alpha")
         coordinator.claim.adopt(5)
-        deleted = SimpleNamespace(key="alpha", operation=KV_DEL, value=None)
+        deleted = SimpleNamespace(key="alpha", operation=KV_DEL, revision=6, value=None)
         kv, _ = watcher(None, deleted)
         coordinator.presence_store.kv = kv
 
