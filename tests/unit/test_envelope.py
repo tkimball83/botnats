@@ -66,6 +66,23 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
+    def test_decode_rejects_non_string_sender(self) -> None:
+        """Reject a correctly signed sender that is not a string."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        encoded = json.loads(envelope.encode(SUBJECT, {}))
+        encoded["sender"] = 1
+        encoded["signature"] = envelope.mac(
+            envelope.body(
+                encoded["nonce"],
+                encoded["payload"],
+                encoded["sender"],
+                encoded["timestamp"],
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
     def test_decode_rejects_oversized_timestamp(self) -> None:
         """Reject an integer timestamp too large for float arithmetic."""
         envelope = Envelope("alpha", COORDINATION_KEY)

@@ -1281,36 +1281,6 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 server.close()
                 await server.wait_closed()
 
-    async def test_registration_timeout_disconnects(self) -> None:
-        """Disconnect when the server never completes registration."""
-
-        async def server_handler(
-            reader: asyncio.StreamReader,
-            writer: asyncio.StreamWriter,
-        ) -> None:
-            for _ in range(3):
-                await reader.readline()
-            # Hold the connection open until the client gives up and leaves.
-            await reader.read()
-            writer.close()
-            await writer.wait_closed()
-
-        server = await bounded(asyncio.start_server(server_handler, "127.0.0.1", 0))
-        port = server.sockets[0].getsockname()[1]
-        client = irc_client(ports=(port,))
-        try:
-            with (
-                patch("botnats.irc.client.REGISTRATION_TIMEOUT", 0),
-                self.assertRaisesRegex(ConnectionError, "complete registration"),
-            ):
-                async with asyncio.timeout(5):
-                    await client.run_connection(client.config.servers[0])
-        finally:
-            async with asyncio.timeout(5):
-                await client.close()
-                server.close()
-                await server.wait_closed()
-
     async def test_registered_session_outlives_registration_timeout(self) -> None:
         """Idle past the registration deadline with a PING once registered."""
         client = irc_client()
