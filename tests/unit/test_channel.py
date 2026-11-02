@@ -1786,6 +1786,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             call("MODE", "#test", "-b", "*!~beta@beta.host", unless_waiting=True),
             call("MODE", "#test", "+o", "beta", unless_waiting=True, check=ANY),
         ]
+        # No reply will come for the USERHOST that never went out.
+        assert bot.channel_mgr.pending_invites == {}
+        assert not bot.channel_mgr.userhost_queries
 
     async def test_help_needs_active_peer_presence(self) -> None:
         """Help no peer whose presence expired, was never announced, or changed.
@@ -2059,6 +2062,33 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ("USERHOST", ("gamma",)),
             ("INVITE", ("beta", "#test")),
             ("INVITE", ("gamma", "#test")),
+        ]
+
+    async def test_invite_peer_merges_requests_before_the_reply(self) -> None:
+        """Invite a peer into every channel it asked for before the reply.
+
+        The peer restarted between its requests; the reply to the last query
+        decides them all, under its newest presence.
+        """
+        bot, fake_irc = bot_with_irc()
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for channel in ("#test", "#other"):
+            runtime = bot.channel_mgr.channels[casefold(channel, "rfc1459")]
+            runtime.member("alpha").modes.add("o")
+
+        restarted = replace(INVITEE, instance_id="three")
+        for channel, peer in (("#test", INVITEE), ("#other", restarted)):
+            bot.presence.update(peer)
+            bot.channel_mgr.invite_peer(channel, peer)
+
+        for _ in range(2):
+            bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        assert fake_irc.sent == [
+            ("USERHOST", ("beta",)),
+            ("USERHOST", ("beta",)),
+            ("INVITE", ("beta", "#other")),
+            ("INVITE", ("beta", "#test")),
         ]
 
     async def test_invite_peer_needs_the_queried_nick_in_its_reply(self) -> None:
