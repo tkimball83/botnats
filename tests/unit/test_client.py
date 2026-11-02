@@ -8,13 +8,17 @@ import errno
 import socket
 import ssl
 import unittest
+from collections import deque
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from botnats.irc.client import (
+    IDLE_TIMEOUT,
     NICK_COLLISION_LIMIT,
     OUTBOUND_LIMIT,
+    PONG_TIMEOUT,
+    REGISTRATION_TIMEOUT,
     IRCClient,
     IRCClientConfig,
     IRCServer,
@@ -71,6 +75,47 @@ class FakeClock:
         self.timeline.append(encoded)
         if self.client.outbound is not None and self.client.outbound.empty():
             self.drained.set()
+
+
+class ServerLines:
+    """Serve scripted server lines on a loop clock moved only by the reads.
+
+    Each line arrives its delay after the read that takes it starts; a read
+    whose deadline comes first waits it out and returns None, as read_line
+    does. waits records how long each read was allowed to wait.
+    """
+
+    def __init__(self, *lines: tuple[float, bytes]) -> None:
+        self.lines = deque(lines)
+        self.now = 100.0
+        self.waits: list[float] = []
+
+    async def read_line(
+        self,
+        _reader: asyncio.StreamReader,
+        deadline: float,
+    ) -> bytes | None:
+        """Return the next line if it arrives before the deadline."""
+        allowed = deadline - self.now
+        self.waits.append(allowed)
+        # Yield as a real read does, so a loop that never waits spins into
+        # the test's bound instead of hanging it.
+        await REAL_SLEEP(0)
+        if self.lines and self.lines[0][0] < allowed:
+            delay, line = self.lines.popleft()
+            self.now += delay
+            return line
+
+        if self.lines:
+            delay, line = self.lines[0]
+            self.lines[0] = (delay - allowed, line)
+
+        self.now = max(self.now, deadline)
+        return None
+
+    def time(self) -> float:
+        """Return the fake loop time."""
+        return self.now
 
 
 async def dispatch(
@@ -1306,7 +1351,11 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert dispatched == ["001", "002"]
 
     async def test_answered_ping_lets_the_next_idle_spell_ping(self) -> None:
-        """Clear an answered PING, so a quiet session PINGs again and stays up."""
+        """Clear an answered PING, so a quiet session waits a full idle spell.
+
+        Each idle spell starts when the last one ends: a deadline kept from
+        before the PONG would PING back to back and flood the connection.
+        """
         client = irc_client()
         dispatched: list[str] = []
 
@@ -1315,28 +1364,28 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         client.on_message = record_message
         writer = mock_writer()
-        reader = asyncio.StreamReader()
-        reader.feed_data(b":server 001 alpha :Welcome\r\n")
+        lines = ServerLines((0, b":server 001 alpha :Welcome\r\n"))
         pings: list[bytes] = []
 
         def answer_ping(encoded: bytes) -> None:
-            # Answer before the client reads again, as the PONG wait is zero:
-            # a PING its PONG did not clear then fails at once.
             if encoded.startswith(b"PING :"):
                 pings.append(encoded)
                 token = encoded.removeprefix(b"PING :").removesuffix(b"\r\n")
-                reader.feed_data(b":server PONG server :" + token + b"\r\n")
+                lines.lines.append((1, b":server PONG server :" + token + b"\r\n"))
                 if len(pings) == 2:
-                    reader.feed_data(b":server 002 alpha :hi\r\n")
-                    reader.feed_eof()
+                    lines.lines.append((1, b":server 002 alpha :hi\r\n"))
+                    lines.lines.append((0, b""))
 
         writer.write.side_effect = answer_ping
-        connection = (reader, writer)
+        connection = (asyncio.StreamReader(), writer)
 
         with (
             patch.object(client, "establish", AsyncMock(return_value=connection)),
-            patch("botnats.irc.client.IDLE_TIMEOUT", 0),
-            patch("botnats.irc.client.PONG_TIMEOUT", 0),
+            patch(
+                "asyncio.get_running_loop",
+                return_value=SimpleNamespace(time=lines.time),
+            ),
+            patch("botnats.irc.client.read_line", lines.read_line),
             self.assertRaisesRegex(ConnectionError, "connection closed"),
         ):
             async with asyncio.timeout(5):
@@ -1344,6 +1393,44 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
 
         assert len(pings) == 2
         assert dispatched == ["001", "002"]
+        # Registration, idle, PONG wait, a full idle spell again, PONG wait,
+        # then the idle spells the 002 and the closed connection end.
+        assert lines.waits == [
+            REGISTRATION_TIMEOUT,
+            IDLE_TIMEOUT,
+            PONG_TIMEOUT,
+            IDLE_TIMEOUT,
+            PONG_TIMEOUT,
+            IDLE_TIMEOUT,
+            IDLE_TIMEOUT,
+        ]
+
+    async def test_registration_deadline_runs_from_connect(self) -> None:
+        """Disconnect at the registration deadline despite lines before 001."""
+        client = irc_client()
+        lines = ServerLines(
+            (25, b":server NOTICE * :*** Looking up your hostname\r\n"),
+            (25, b":server NOTICE * :*** Checking ident\r\n"),
+        )
+        connection = (asyncio.StreamReader(), mock_writer())
+
+        with (
+            patch.object(client, "establish", AsyncMock(return_value=connection)),
+            patch(
+                "asyncio.get_running_loop",
+                return_value=SimpleNamespace(time=lines.time),
+            ),
+            patch("botnats.irc.client.read_line", lines.read_line),
+            self.assertRaisesRegex(ConnectionError, "complete registration"),
+        ):
+            async with asyncio.timeout(5):
+                await client.run_connection(client.config.servers[0])
+
+        assert lines.waits == [
+            REGISTRATION_TIMEOUT,
+            REGISTRATION_TIMEOUT - 25,
+            REGISTRATION_TIMEOUT - 50,
+        ]
 
     async def test_socket_timeout_ends_session_without_ping(self) -> None:
         """End the session with a socket's ETIMEDOUT, not a PING as if idle."""
