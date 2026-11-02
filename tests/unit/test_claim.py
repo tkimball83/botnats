@@ -208,6 +208,32 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         assert not claim.owned
         assert claim.revision is None
 
+    async def test_put_after_reset_is_discarded(self) -> None:
+        """Record nothing from a refresh that finishes after a disconnect."""
+        claim = build_claim()
+        claim.adopt(1)
+
+        async def update_then_reset(*arguments: object) -> int:
+            del arguments
+            # Yield like a KV round trip; the reset lands while the update is
+            # in flight, and the bound fails a put that hangs instead.
+            await asyncio.sleep(0)
+            claim.reset()
+            return 2
+
+        update = AsyncMock(side_effect=update_then_reset)
+        create = AsyncMock(side_effect=[None])
+        with (
+            patch.object(claim.store, "update", update),
+            patch.object(claim.store, "create", create),
+        ):
+            await bounded(claim.put(PRESENCE))
+
+        update.assert_awaited_once()
+        create.assert_not_awaited()
+        assert not claim.owned
+        assert claim.revision is None
+
     async def test_stale_owner_cannot_overwrite_new_owner(self) -> None:
         """Fail closed when a heartbeat loses its owned KV revision."""
         claim = build_claim()

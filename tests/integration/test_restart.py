@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from botnats.channel import ChannelRecord
 from botnats.nats.store import (
     SESSION_TTL,
+    AttemptStore,
     ChannelStore,
     ClaimStore,
     Session,
@@ -33,6 +34,7 @@ CHANNEL = "#botnats-restart"
 CHANNEL_KEY = "restart-key"
 COUNTER = 987_654_321
 SESSION_IDENTITY = "restart!user@host.example"
+ATTEMPT_HOST = "host.example"
 
 
 def session_value(
@@ -45,21 +47,22 @@ def session_value(
     return Session(expires_at, "integration", SESSION_IDENTITY, revoked, version)
 
 
-def stores() -> tuple[ClaimStore, ChannelStore, SessionStore]:
-    """Return the claim, channel, and session stores of the restart network."""
+def stores() -> tuple[ClaimStore, ChannelStore, SessionStore, AttemptStore]:
+    """Return the claim, channel, session, and attempt stores of the network."""
     secret = coordination_key()
     return (
         ClaimStore("restart-test", JETSTREAM_REPLICAS, secret),
         ChannelStore("restart-test", JETSTREAM_REPLICAS, secret),
         SessionStore("restart-test", JETSTREAM_REPLICAS, secret),
+        AttemptStore("restart-test", JETSTREAM_REPLICAS, secret),
     )
 
 
 async def mark() -> None:
-    """Write a claim, channel, and session that must survive the restart."""
+    """Write a claim, channel, session, and attempt that must survive."""
     nc = await connect()
     try:
-        claims, channels, sessions = stores()
+        claims, channels, sessions, attempts = stores()
         record = asdict(ChannelRecord.new(CHANNEL, CHANNEL_KEY, present=True))
         expires_at = time.time() + SESSION_TTL / 2
 
@@ -79,7 +82,14 @@ async def mark() -> None:
             await channels.open(nc.jetstream())
             channel = await channels.put(record, after=None)
             await sessions.open(nc.jetstream())
-            return channel, await sessions.put(session_value(expires_at))
+            session = await sessions.put(session_value(expires_at))
+            # A retry after a lost ack takes a later slot; any attempt fills
+            # slot 0 first, so slot 0 alone shows the attempt was recorded.
+            attempt_kv = await attempts.open(nc.jetstream())
+            if not await attempts.allow(ATTEMPT_HOST):
+                await attempt_kv.get(attempts.key(ATTEMPT_HOST, 0))
+
+            return channel, session
 
         (_, stored_key, _, _), session = await keep_trying(
             write,
@@ -92,10 +102,10 @@ async def mark() -> None:
 
 
 async def check() -> None:
-    """Verify the marked claim, channel, and session after the restart."""
+    """Verify the marked claim, channel, session, and attempt after restart."""
     nc = await connect()
     try:
-        claims, channels, sessions = stores()
+        claims, channels, sessions, attempts = stores()
 
         async def read() -> tuple[KeyValue.Entry, ...]:
             # A missing key can be transient while JetStream replays after the
@@ -103,13 +113,15 @@ async def check() -> None:
             claim_kv = await claims.open(nc.jetstream())
             channel_kv = await channels.open(nc.jetstream())
             session_kv = await sessions.open(nc.jetstream())
+            attempt_kv = await attempts.open(nc.jetstream())
             return (
                 await claim_kv.get(claims.key(COUNTER)),
                 await channel_kv.get(channels.key(CHANNEL)),
                 await session_kv.get(sessions.key(SESSION_IDENTITY)),
+                await attempt_kv.get(attempts.key(ATTEMPT_HOST, 0)),
             )
 
-        entry, channel_entry, session_entry = await keep_trying(
+        entry, channel_entry, session_entry, attempt_entry = await keep_trying(
             read,
             "durable state missing after NATS restart",
         )
@@ -122,6 +134,13 @@ async def check() -> None:
         stored_session = json.loads(session_entry.value)
         assert stored_session["prefix"] == SESSION_IDENTITY
         assert stored_session["issuer"] == "integration"
-        await delete_buckets(nc, claims.bucket, channels.bucket, sessions.bucket)
+        assert attempt_entry.value is not None
+        await delete_buckets(
+            nc,
+            claims.bucket,
+            channels.bucket,
+            sessions.bucket,
+            attempts.bucket,
+        )
     finally:
         await nc.drain()
