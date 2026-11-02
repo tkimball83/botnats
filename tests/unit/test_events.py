@@ -836,6 +836,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         # The JOIN stays pending, to be resent after the reply timeout.
         assert runtime.join is JoinState.JOINING
 
+    async def test_join_refusal_logged_once(self) -> None:
+        """Log a refusal peers are asked to help with once, until it changes.
+
+        A channel no peer can help into is otherwise retried silently.
+        """
+        bot, _, _ = bot_with_coordinator()
+        bot.identity.current = BotPresence(
+            "alpha", "host.example", "inst", "alpha", "~alpha"
+        )
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINING
+        invite = IRCMessage("473", ("alpha", "#Test", "Cannot join channel (+i)"))
+        key = IRCMessage("475", ("alpha", "#Test", "Cannot join channel (+k)"))
+
+        with self.assertLogs("botnats.events", level="WARNING") as logs:
+            bot.events.on_irc_message(invite)
+            bot.events.on_irc_message(invite)
+            bot.events.on_irc_message(key)
+            bot.events.on_irc_message(key)
+
+        assert logs.output == [
+            "WARNING:botnats.events:cannot join #test: 473 Cannot join channel (+i)",
+            "WARNING:botnats.events:cannot join #test: 475 Cannot join channel (+k)",
+        ]
+        await settle(bot)
+
     async def test_messages_naming_no_desired_channel_are_ignored(self) -> None:
         """Ignore a user MODE, and errors and replies naming no desired channel."""
         bot, fake_irc = bot_with_irc()
@@ -1047,9 +1073,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         runtime.join_retry_at -= JOIN_REPLY_TIMEOUT
         bot.channel_mgr.join_desired()
-        bot.events.on_irc_message(
-            IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
-        )
+        with self.assertLogs("botnats.events", level="WARNING"):
+            bot.events.on_irc_message(
+                IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
+            )
+
         bot.events.on_irc_message(
             IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
@@ -2086,15 +2114,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             first = send(stranger, "AUTH 000000")
             send(stranger, "AUTH 000000")
             op = send(OWNER, "OP #test owner")
-            async with asyncio.timeout(1):
-                await op
+            await bounded(op)
 
             assert fake_irc.modes == [("#test", "+o", ("owner",))]
             # The stranger's second AUTH waits for its first.
             assert checks == ["evil.example"]
             gate.release()
-            async with asyncio.timeout(1):
-                await first
+            await bounded(first)
 
             assert checks == ["evil.example"] * 2
             # A third, sent while the second runs, waits for the second.
@@ -3069,12 +3095,10 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(fake_irc, "send", MagicMock(wraps=send_then_reclaim)) as send,
         ):
             poll = asyncio.create_task(bot.events.ison_poll_loop())
-            async with asyncio.timeout(1):
-                await polled_twice.wait()
+            await bounded(polled_twice.wait())
 
             poll.cancel()
-            async with asyncio.timeout(1):
-                await asyncio.gather(poll, return_exceptions=True)
+            await bounded(asyncio.gather(poll, return_exceptions=True))
 
         assert poll.cancelled()
         ison = call("ISON", "alpha", unless_waiting=True)

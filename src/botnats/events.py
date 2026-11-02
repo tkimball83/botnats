@@ -228,7 +228,7 @@ class IRCEventHandler:
         )
 
     def handle_join_refusal(self, message: IRCMessage) -> None:
-        """Pace a refused JOIN's retry and ask peers for the help it needs.
+        """Log a refused JOIN, pace its retry, and ask peers for the help it needs.
 
         A later tick tries the JOIN again, after the help or with the stored
         key, waiting longer after each consecutive refusal. A peer's INVITE
@@ -237,11 +237,11 @@ class IRCEventHandler:
         if len(message.params) < 2:
             return
 
+        self.log_join_error(message)
         channel = message.params[1]
         runtime = self.bot.channel_mgr.runtime(channel)
         if runtime is not None:
             runtime.refuse_join()
-            runtime.join_error = message.command
             if message.command == "475":
                 self.bot.channel_mgr.refuse_key(runtime)
 
