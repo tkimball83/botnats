@@ -1000,6 +1000,37 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         channels.kv.create.assert_awaited_once()
         channels.kv.update.assert_not_awaited()
 
+    async def test_channel_put_rereads_after_bucket_refuses_stale_revision(
+        self,
+    ) -> None:
+        """Retry against the bucket's revision check and keep the racing winner.
+
+        Another bot's write lands after our read, so the bucket itself must
+        refuse our update at the revision we read.
+        """
+        channels = ChannelStore("efnet", 1, SECRET)
+        kv = FakeKV()
+        channels.kv = cast("KeyValue", kv)
+        key = channels.key("#test")
+        kv.store(key, json.dumps(channel_record(1)).encode())
+        concurrent = json.dumps(channel_record(2)).encode()
+        read = kv.get
+
+        async def get_then_race(name: str) -> SimpleNamespace:
+            entry = await read(name)
+            if kv.entries[key][1] != concurrent:
+                kv.store(key, concurrent)
+
+            return entry
+
+        with patch.object(kv, "get", get_then_race):
+            stored = await bounded(
+                channels.put(channel_record(3), after=channel_revision(1))
+            )
+
+        assert stored == channel_fields(2)
+        assert kv.entries[key][1] == concurrent
+
     async def test_channel_put_rejects_same_number_from_stale_base(self) -> None:
         """Keep another bot's same-numbered record whatever the random suffix."""
         channels = ChannelStore("efnet", 1, SECRET)

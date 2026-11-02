@@ -2054,6 +2054,25 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
 
         assert bot.authorizer.authorized("foo[!u@h")
 
+    async def test_queued_grant_does_not_hold_back_watched_grant(self) -> None:
+        """Apply a peer's newer watched grant while this bot's grant waits unwritten.
+
+        Only a queued revocation escalates over the key; a queued grant
+        leaves the identity present, so the peer's grant stands.
+        """
+        bot, _, coordinator = bot_with_coordinator()
+        identity = "owner!user@host.example"
+        coordinator.duplicate = True
+        assert not await bounded(bot.sessions.sync(bot.authorizer.grant(identity)))
+        assert bot.sessions.pending
+        peer = Session(
+            time.time() + SESSION_TTL + 30, "beta", identity, revoked=False, version=0
+        )
+
+        bot.sessions.observe(coordinator.sessions.key(identity), peer)
+
+        assert bot.authorizer.records[bot.authorizer.identity_fold(identity)] == peer
+
     async def test_escalation_outranks_equivalent_spelling_grant_at_once(self) -> None:
         """Rank an escalation in the folded view when it is queued, not written.
 
