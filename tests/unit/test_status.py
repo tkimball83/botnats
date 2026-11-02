@@ -63,7 +63,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_collect_lagging_replica(self) -> None:
-        """Count an online replica that is not current as missing."""
+        """Count online replicas that are not current as missing, with the most lag."""
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
         kv = AsyncMock()
         kv.status.return_value = SimpleNamespace(
@@ -71,8 +71,8 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
                 cluster=ClusterInfo(
                     leader="nats-1",
                     replicas=[
-                        PeerInfo(current=True, name="nats-2"),
-                        PeerInfo(current=False, lag=7, name="nats-3"),
+                        PeerInfo(current=False, lag=7, name="nats-2"),
+                        PeerInfo(current=False, lag=3, name="nats-3"),
                     ],
                 ),
                 config=SimpleNamespace(num_replicas=3),
@@ -87,7 +87,7 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
 
         assert status.render() == (
             "nats connection=up routes=2 jetstream=degraded leader=nats-1 "
-            "replicas=2/3 lag=7"
+            "replicas=1/3 lag=7"
         )
 
     async def test_collect_moving_stream_with_offline_peer(self) -> None:

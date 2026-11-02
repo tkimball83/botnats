@@ -1750,8 +1750,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         # Differs from the deleted key in case only: claims ignore case.
         coordinator = build_coordinator("Alpha")
         coordinator.claim.adopt(5)
+        # A delete older than the owned revision must not trigger a reclaim.
+        stale = SimpleNamespace(key="alpha", operation=KV_DEL, revision=4, value=None)
         deleted = SimpleNamespace(key="alpha", operation=KV_DEL, revision=6, value=None)
-        kv, _ = watcher(None, deleted)
+        kv, _ = watcher(None, stale, deleted)
         coordinator.presence_store.kv = kv
 
         await bounded(coordinator.watch_presence(MagicMock()))
