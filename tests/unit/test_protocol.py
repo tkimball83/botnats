@@ -244,7 +244,10 @@ class IRCProtocolTests(unittest.TestCase):
             "@account=ba\x00d PING :token\r\n",
             "PI\x00NG :token\r\n",
         ):
-            with self.assertRaisesRegex(ValueError, "control characters"):
+            with (
+                self.subTest(line=line),
+                self.assertRaisesRegex(ValueError, "control characters"),
+            ):
                 parse_message(line)
 
     def test_parse_accepts_decode_inflated_message(self) -> None:
