@@ -56,6 +56,7 @@ class HealthCheck:
         self.server = None
         if server is not None:
             server.close()
+            server.close_clients()
             await server.wait_closed()
 
     async def handle(

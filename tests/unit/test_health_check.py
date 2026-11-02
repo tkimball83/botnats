@@ -58,6 +58,40 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
         assert health_check.server is None
         assert not server.is_serving()
 
+    async def test_close_drops_idle_connection(self) -> None:
+        """Close without waiting out a connection that sends nothing."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        handling = asyncio.Event()
+        handle = health_check.handle
+
+        async def tracked(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            handling.set()
+            await handle(reader, writer)
+
+        with patch.object(health_check, "handle", tracked):
+            await bounded(health_check.start())
+
+        server = health_check.server
+        assert server is not None
+        self.addAsyncCleanup(bounded, server.wait_closed())
+        self.addCleanup(server.close_clients)
+        self.addCleanup(server.close)
+        port = next(
+            sock.getsockname()[1]
+            for sock in server.sockets
+            if sock.family == socket.AF_INET
+        )
+        _, writer = await bounded(asyncio.open_connection("127.0.0.1", port))
+        self.addCleanup(writer.close)
+        await bounded(handling.wait())
+
+        # Well under the handler's 5 s request timeout.
+        async with asyncio.timeout(1):
+            await health_check.close()
+
     async def test_listens_on_every_interface(self) -> None:
         """Listen on every interface, so probes from other hosts reach it."""
         health_check = HealthCheck(ready=lambda: True, port=0)

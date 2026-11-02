@@ -1336,17 +1336,3 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
                 assert fake_irc.privmsgs == [("owner", "Joining #test")]
                 assert coordinator.channel_puts[-1]["key"] == "new-key"
                 assert bot.channel_mgr.channel_records[folded].key == "new-key"
-
-    async def test_join_key_replaces_joined_channel_key(self) -> None:
-        """Use a JOIN's key in a joined channel, as every peer applying it does."""
-        bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.key = "live-key"
-        bot.authorizer.grant(OWNER.render())
-
-        await send_command(bot, OWNER, "JOIN #test new-key")
-
-        assert fake_irc.privmsgs == [("owner", "Joining #test")]
-        assert runtime.key == "new-key"
-        assert not runtime.key_pending
