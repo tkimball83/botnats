@@ -313,6 +313,27 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         assert claim.revision == stored[0]
         assert kv.entries["alpha"] == stored
 
+    async def test_stale_duplicate_record_keeps_newer_owned_key(self) -> None:
+        """Ignore a duplicate's watched record older than the owned revision.
+
+        The duplicate's last heartbeat and its shutdown delete precede this
+        bot's create; yielding to that heartbeat would let the delete after it
+        reclaim the key with the identity-free placeholder.
+        """
+        claim, kv = open_claim()
+        claim.state = PresenceState.DUPLICATE
+        kv.sequence = 2
+        await bounded(claim.put(PRESENCE))
+        stored = kv.entries["alpha"]
+
+        with self.assertNoLogs("botnats.nats.claim", level="ERROR"):
+            claim.observe("other-instance", 1)
+            await bounded(claim.deleted(2))
+
+        assert claim.owned
+        assert claim.revision == stored[0] == 3
+        assert kv.entries["alpha"] == stored
+
     async def test_lost_revision_drops_ownership_before_reclaim(self) -> None:
         """Stop owning a key whose revision was lost even when reclaiming it fails."""
         claim = build_claim()
