@@ -523,6 +523,25 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             line = f"PRIVMSG owner :{text}\r\n".encode()
             assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
 
+    async def test_reply_list_fills_lines_to_the_byte(self) -> None:
+        """Pack a line up to exactly 512 relayed bytes, and not one byte more."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        # Under the largest relay source, a line to "owner" holds 367 bytes:
+        # "y" would take the first line one byte over 512, while the last
+        # item fills the second line exactly.
+        first = "é" * 178 + "x"
+        last = "é" * 178
+
+        bot.commands.reply_list(OWNER, "#test +b", [first, "y", last])
+
+        assert fake_irc.privmsgs == [
+            ("owner", f"#test +b {first}"),
+            ("owner", f"#test +b y {last}"),
+        ]
+        line = f"PRIVMSG owner :#test +b y {last}\r\n".encode()
+        assert RELAY_SOURCE_BYTES + len(line) == MAX_IRC_MESSAGE_BYTES
+
     async def test_reply_list_caps_lines(self) -> None:
         """Send at most 10 lines, the last saying how many items are left out."""
         bot, fake_irc = bot_with_irc()

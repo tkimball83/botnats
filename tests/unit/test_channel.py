@@ -1491,9 +1491,15 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             return await record_put(record, after=after)
 
         with patch.object(coordinator, "put_channel", counted_put):
-            for runtime in runtimes:
-                runtime.join = JoinState.JOINED
-                bot.events.process_key(runtime, "seen")
+            await bounded(mgr.write_lock.acquire())
+            try:
+                for runtime in runtimes:
+                    runtime.join = JoinState.JOINED
+                    bot.events.process_key(runtime, "seen")
+                    # The read loop yields between lines; the retry waits.
+                    await asyncio.sleep(0)
+            finally:
+                mgr.write_lock.release()
 
             await settle(bot)
             assert attempts == ["#test"]
@@ -2628,6 +2634,34 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.join = JoinState.JOINED
         runtime.member("alpha").prefix = identity.to_prefix()
         runtime.member("alpha").modes.add("o")
+        runtime.member("beta").prefix = peer.to_prefix()
+
+        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
+        assert coordinator.help_requests == []
+
+        runtime.member("beta").modes.add("o")
+        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
+        assert [kind for kind, _ in coordinator.help_requests] == ["unban"]
+
+    async def test_skips_unban_request_when_only_this_bot_opped_on_fallback(
+        self,
+    ) -> None:
+        """Know this bot by the nick it holds, not the one it was configured with.
+
+        On a fallback nick, its own op is still no peer's.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        fake_irc.current_nick = "alpha_"
+        identity = BotPresence("alpha-id", "alpha.host", "inst", "alpha_", "~alpha")
+        bot.identity.current = identity
+        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
+        for presence in (identity, peer):
+            bot.presence.update(presence)
+
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.member("alpha_").prefix = identity.to_prefix()
+        runtime.member("alpha_").modes.add("o")
         runtime.member("beta").prefix = peer.to_prefix()
 
         await bounded(bot.channel_mgr.request_peer("unban", "#test"))
