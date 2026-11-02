@@ -451,11 +451,9 @@ class ChannelManager:
 
         folded = self.bot.caps.fold(presence.nick)
         pending = self.pending_invites.get(folded)
-        # A request from the same presence adds its channel to the query still
-        # pending; one from another presence replaces it.
-        channels = (
-            pending[1] if pending is not None and pending[0] == presence else set()
-        )
+        # A later request adds its channel to the query still pending, under
+        # the newest presence: verify_invites rechecks every channel for it.
+        channels = set() if pending is None else pending[1]
         try:
             # A copy still waiting answers this request too.
             if self.bot.irc.send("USERHOST", presence.nick, unless_waiting=True):
