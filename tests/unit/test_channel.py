@@ -43,6 +43,8 @@ from tests.unit.helpers import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from botnats.bot import Bot
     from botnats.validators import ChannelFields
 
@@ -1991,27 +1993,107 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         bot.events.on_irc_message(INVITEE_HOLDS_NICK)
         assert fake_irc.sent == [("USERHOST", ("beta",))]
 
-    async def test_invite_peer_skips_an_offline_nick(self) -> None:
-        """Drop the oldest pending query once a reply shows its nick offline."""
+    async def test_invite_peer_answers_each_query_in_order(self) -> None:
+        """Match each reply to the oldest query outstanding, not to a nick.
+
+        beta asks again after its first USERHOST went out, so it is queried
+        twice; the reply to its last query decides its invite.
+        """
+        offline = IRCMessage("302", ("alpha", ""))
+        gamma_holds_nick = IRCMessage("302", ("alpha", "gamma=+~gamma@gamma.host"))
+        for beta_replies, invited in (
+            ((offline, offline), []),
+            ((offline, INVITEE_HOLDS_NICK), [("INVITE", ("beta", "#test"))]),
+        ):
+            bot, fake_irc = bot_with_irc()
+            runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+            runtime.member("alpha").modes.add("o")
+            for peer in (INVITEE, INVITEE, OP_REQUESTER):
+                bot.presence.update(peer)
+                bot.channel_mgr.invite_peer("#test", peer)
+
+            for reply in (*beta_replies, gamma_holds_nick):
+                bot.events.on_irc_message(reply)
+
+            assert fake_irc.sent == [
+                ("USERHOST", ("beta",)),
+                ("USERHOST", ("beta",)),
+                ("USERHOST", ("gamma",)),
+                *invited,
+                ("INVITE", ("gamma", "#test")),
+            ]
+
+    async def test_invite_peer_counts_only_queries_queued(self) -> None:
+        """Expect no reply for a USERHOST skipped for a copy still waiting."""
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        bot.presence.update(INVITEE)
-        bot.presence.update(OP_REQUESTER)
+        waiting: set[tuple[str, tuple[str, ...]]] = set()
+        record = fake_irc.send
 
-        bot.channel_mgr.invite_peer("#test", INVITEE)
-        bot.channel_mgr.invite_peer("#test", OP_REQUESTER)
-        bot.events.on_irc_message(IRCMessage("302", ("alpha", "")))
-        # beta's query was answered; gamma's is still pending.
-        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
-        bot.events.on_irc_message(
-            IRCMessage("302", ("alpha", "gamma=+~gamma@gamma.host"))
-        )
+        def send(
+            command: str,
+            *params: str,
+            unless_waiting: bool = False,
+            check: Callable[[], bool] | None = None,
+        ) -> bool:
+            """Skip a copy of a line still waiting, as IRCClient does."""
+            if unless_waiting and (command, params) in waiting:
+                return False
+
+            waiting.add((command, params))
+            return record(command, *params, unless_waiting=unless_waiting, check=check)
+
+        with patch.object(fake_irc, "send", send):
+            for peer in (INVITEE, INVITEE, OP_REQUESTER):
+                bot.presence.update(peer)
+                bot.channel_mgr.invite_peer("#test", peer)
+
+            bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+            bot.events.on_irc_message(
+                IRCMessage("302", ("alpha", "gamma=+~gamma@gamma.host"))
+            )
 
         assert fake_irc.sent == [
             ("USERHOST", ("beta",)),
             ("USERHOST", ("gamma",)),
+            ("INVITE", ("beta", "#test")),
             ("INVITE", ("gamma", "#test")),
+        ]
+
+    async def test_invite_peer_needs_the_queried_nick_in_its_reply(self) -> None:
+        """Invite no one on a reply naming another nick than its query did."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.presence.update(INVITEE)
+
+        bot.channel_mgr.invite_peer("#test", INVITEE)
+        bot.events.on_irc_message(
+            IRCMessage("302", ("alpha", "gamma=+~beta@beta.host"))
+        )
+        # beta's query was answered: an unasked reply invites no one.
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        assert fake_irc.sent == [("USERHOST", ("beta",))]
+
+    async def test_invite_peer_survives_a_casemapping_change(self) -> None:
+        """Verify an invite queried before the server's CASEMAPPING arrived."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        invitee = replace(INVITEE, nick="Beta[")
+        bot.presence.update(invitee)
+
+        bot.channel_mgr.invite_peer("#test", invitee)
+        bot.channel_mgr.set_casemapping("ascii")
+        bot.events.on_irc_message(
+            IRCMessage("302", ("alpha", "Beta[=+~beta@beta.host"))
+        )
+
+        assert fake_irc.sent == [
+            ("USERHOST", ("Beta[",)),
+            ("INVITE", ("Beta[", "#test")),
         ]
 
     async def test_invite_peer_rechecks_when_verified(self) -> None:
@@ -2039,18 +2121,31 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [("USERHOST", ("beta",))] * 3
 
     async def test_reset_drops_pending_invites(self) -> None:
-        """Answer no query from a connection that ended with its reply."""
+        """Forget the queries of a connection that ended before their replies.
+
+        The next connection's first reply answers its own first query.
+        """
         bot, fake_irc = bot_with_irc()
         runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         bot.presence.update(INVITEE)
+        bot.presence.update(OP_REQUESTER)
 
         bot.channel_mgr.invite_peer("#test", INVITEE)
         bot.channel_mgr.reset()
-        runtime.member("alpha").modes.add("o")
-        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+        assert bot.channel_mgr.pending_invites == {}
 
-        assert fake_irc.sent == [("USERHOST", ("beta",))]
+        runtime.member("alpha").modes.add("o")
+        bot.channel_mgr.invite_peer("#test", OP_REQUESTER)
+        bot.events.on_irc_message(
+            IRCMessage("302", ("alpha", "gamma=+~gamma@gamma.host"))
+        )
+
+        assert fake_irc.sent == [
+            ("USERHOST", ("beta",)),
+            ("USERHOST", ("gamma",)),
+            ("INVITE", ("gamma", "#test")),
+        ]
 
     async def test_peer_help_needs_presence_when_sent(self) -> None:
         """Bind an invite or op to the peer's presence, checked when its turn comes.

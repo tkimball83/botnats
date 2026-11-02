@@ -407,7 +407,7 @@ class IRCEventHandler:
             self.bot.channel_mgr.safe_join(runtime)
 
     def handle_userhost_reply(self, message: IRCMessage) -> None:
-        """Pass the users an RPL_USERHOST reply shows to the pending invites.
+        """Pass the users an RPL_USERHOST reply shows to the pending invite.
 
         Each entry reads nick[*]=+user@host or nick[*]=-user@host: "*" marks
         an IRC operator, and "-" an away user.

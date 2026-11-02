@@ -597,11 +597,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             bot.presence.update(peer)
             bot.channel_mgr.invite_peer("#test", peer)
 
-        bot.events.on_irc_message(
-            IRCMessage(
-                "302", ("alpha", "beta*=+~beta@beta.host gamma=-~gamma@gamma.host ")
-            ),
-        )
+        for entry in ("beta*=+~beta@beta.host", "gamma=-~gamma@gamma.host "):
+            bot.events.on_irc_message(IRCMessage("302", ("alpha", entry)))
 
         assert fake_irc.sent == [
             ("USERHOST", ("beta",)),
