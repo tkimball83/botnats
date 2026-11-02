@@ -3,8 +3,8 @@
 
 """Admin commands received as IRC private messages, and their rate limit."""
 
-import asyncio
 import logging
+import time
 from collections import OrderedDict, deque
 from functools import partial
 from itertools import batched
@@ -520,7 +520,7 @@ class RateLimiter:
 
     def check(self, key: str) -> bool:
         """Record an event and return whether the key is within its rate limit."""
-        now = asyncio.get_running_loop().time()
+        now = time.monotonic()
         cutoff = now - self.window
         bucket = self.buckets.get(key)
         if bucket is None:

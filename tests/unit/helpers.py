@@ -18,7 +18,7 @@ from nats.js.errors import (
 from nats.js.kv import VALID_KEY_RE
 
 from botnats.bot import Bot
-from botnats.channel import ChannelRecord
+from botnats.channel import ChannelRecord, JoinState
 from botnats.config import BotConfig
 from botnats.irc.client import IRCServer
 from botnats.irc.protocol import (
@@ -108,7 +108,14 @@ async def hang(*arguments: object) -> None:
 
 
 def join_test_channel(bot: Bot, prefix: Prefix) -> None:
-    """Show a user joining #test, so the bot hears its commands once desired."""
+    """Show a user joining #test, so the bot hears its commands once desired.
+
+    A server shows other users' JOINs only once this bot is in the channel.
+    """
+    runtime = bot.channel_mgr.runtime("#test")
+    if runtime is not None:
+        runtime.join = JoinState.JOINED
+
     bot.events.on_irc_message(IRCMessage("JOIN", ("#test",), prefix))
 
 

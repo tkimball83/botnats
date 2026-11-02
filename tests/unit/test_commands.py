@@ -8,7 +8,6 @@ import math
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
@@ -102,10 +101,8 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         limiter.buckets["other.example"] = deque([now - 9] * 8)
 
         # Judged at exactly now, however long the test takes.
-        with patch(
-            "asyncio.get_running_loop",
-            return_value=SimpleNamespace(time=lambda: now),
-        ):
+        with patch("botnats.commands.time") as clock:
+            clock.monotonic.return_value = now
             assert limiter.check("host.example")
             assert not limiter.check("other.example")
 
@@ -115,18 +112,15 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         Counted too, refusals would keep a sender who never pauses limited.
         """
         limiter = RateLimiter(limit=2, window=10)
-        now = 100.0
-        with patch(
-            "asyncio.get_running_loop",
-            return_value=SimpleNamespace(time=lambda: now),
-        ):
+        with patch("botnats.commands.time") as clock:
+            clock.monotonic.return_value = 100.0
             assert limiter.check("user")
             assert limiter.check("user")
             for second in range(101, 110):
-                now = second
+                clock.monotonic.return_value = float(second)
                 assert not limiter.check("user")
 
-            now = 110.0
+            clock.monotonic.return_value = 110.0
             assert limiter.check("user")
 
     async def test_window_forgets_only_expired_events(self) -> None:
@@ -134,13 +128,10 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         limiter = RateLimiter(limit=3, window=10)
         # By 11.5 only the event at 1 has left the window.
         limiter.buckets["user"] = deque([1.0, 5.0, 9.0])
-        now = 11.5
-        with patch(
-            "asyncio.get_running_loop",
-            return_value=SimpleNamespace(time=lambda: now),
-        ):
+        with patch("botnats.commands.time") as clock:
+            clock.monotonic.return_value = 11.5
             assert limiter.check("user")
-            now = 12.0
+            clock.monotonic.return_value = 12.0
             assert not limiter.check("user")
 
     async def test_rate_limiting_ignores_nick_change(self) -> None:
@@ -251,6 +242,32 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await send_command(bot, OWNER, "JOIN #new")
 
         assert fake_irc.privmsgs == [("owner", "Update superseded for #new")]
+
+    async def test_superseded_reply_needs_unbroken_connection(self) -> None:
+        """Send no superseded reply once IRC reconnected during the write."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        winner = ChannelRecord.new("#new", None, present=False)
+        await bounded(coordinator.channels.put(asdict(winner), after=None))
+        put_channel = coordinator.put_channel
+        attempted: list[str] = []
+
+        async def put_across_reconnect(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            attempted.append(record["channel"])
+            bot.events.on_irc_disconnect()
+            return await put_channel(record, after=after)
+
+        with patch.object(coordinator, "put_channel", put_across_reconnect):
+            await send_command(bot, OWNER, "JOIN #new")
+
+        # The write was attempted, and lost to the peer's record.
+        assert attempted == ["#new"]
+        assert bot.channel_mgr.channel_records[casefold("#new", "rfc1459")] == winner
+        assert fake_irc.privmsgs == []
 
     async def test_part_reports_parting(self) -> None:
         """Tell the admin a PART whose write won is under way."""
@@ -1120,7 +1137,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert bot.authorizer.authorized(OWNER.render())
         # Only the line sent before the await reached the admin.
         assert fake_irc.privmsgs == [
-            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=0"),
+            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=1"),
         ]
 
     async def test_cmd_status_with_nats_down(self) -> None:
@@ -1135,7 +1152,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await send_command(bot, OWNER, "STATUS")
 
         assert fake_irc.privmsgs == [
-            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=0"),
+            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=1"),
             (
                 "owner",
                 (
