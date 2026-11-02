@@ -122,6 +122,32 @@ class NATSStatusTests(unittest.IsolatedAsyncioTestCase):
             "replicas=3/3 lag=5 offline=nats-5"
         )
 
+    async def test_collect_skips_nameless_offline_peer(self) -> None:
+        """List only named offline peers, so a nameless one cannot break sorting."""
+        nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))
+        kv = AsyncMock()
+        kv.status.return_value = SimpleNamespace(
+            stream_info=SimpleNamespace(
+                cluster=ClusterInfo(
+                    leader="nats-1",
+                    replicas=[
+                        PeerInfo(name="nats-2", offline=True),
+                        PeerInfo(offline=True),
+                    ],
+                ),
+                config=SimpleNamespace(num_replicas=3),
+            ),
+        )
+
+        with patch(
+            "botnats.nats.status.route_count",
+            AsyncMock(return_value=2),
+        ):
+            status = await bounded(collect(nc, kv, 3, 8222))
+
+        assert status.jetstream == "degraded"
+        assert status.offline == ("nats-2",)
+
     async def test_collect_healthy_cluster(self) -> None:
         """Report a fully current cluster with a leader as up."""
         nc = MagicMock(is_connected=True, connected_url=urlparse("nats://nats-1:4222"))

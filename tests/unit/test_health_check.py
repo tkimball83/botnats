@@ -84,13 +84,23 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
             for sock in server.sockets
             if sock.family == socket.AF_INET
         )
-        _, writer = await bounded(asyncio.open_connection("127.0.0.1", port))
-        self.addCleanup(writer.close)
-        await bounded(handling.wait())
+        real_timeout = asyncio.timeout
+        delays: list[float | None] = []
 
-        # Well under the handler's 5 s request timeout.
-        async with asyncio.timeout(1):
-            await health_check.close()
+        def no_timeout(delay: float | None) -> asyncio.Timeout:
+            delays.append(delay)
+            return real_timeout(None)
+
+        # Without its request timeout the handler never ends on its own, so only
+        # close can end it before the test's bound.
+        async with real_timeout(5):
+            with patch("asyncio.timeout", no_timeout):
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+                self.addCleanup(writer.close)
+                await handling.wait()
+
+        assert delays == [5.0]
+        await bounded(health_check.close())
 
     async def test_listens_on_every_interface(self) -> None:
         """Listen on every interface, so probes from other hosts reach it."""
