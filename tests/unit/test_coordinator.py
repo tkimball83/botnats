@@ -1327,7 +1327,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         entry = SimpleNamespace(
             key="beta",
             operation=None,
-            revision=1,
+            revision=CREATED_REVISION + 1,
             value=json.dumps(record).encode(),
         )
         kv, _ = watcher(None, entry)
@@ -1358,13 +1358,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         entry = SimpleNamespace(
             key="alpha",
             operation=None,
-            revision=1,
+            revision=CREATED_REVISION + 1,
             value=json.dumps(record).encode(),
         )
-        kv, _ = watcher(entry, None)
-        # The other instance still holds the key when the replay ends.
-        kv.create = AsyncMock(side_effect=KeyWrongLastSequenceError)
-        kv.get = AsyncMock(return_value=entry)
+        # It arrives on the live watch, after this bot claimed the key.
+        kv, _ = watcher(None, entry)
         coordinator.presence_store.kv = kv
 
         with (
@@ -1386,7 +1384,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         entry = SimpleNamespace(
             key="alpha",
             operation=None,
-            revision=1,
+            revision=CREATED_REVISION + 1,
             value=json.dumps(record).encode(),
         )
         kv, _ = watcher(None, entry)

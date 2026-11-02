@@ -655,8 +655,8 @@ class IRCEventHandler:
             self.set_identity(
                 Prefix(
                     new_nick,
-                    old_prefix.user or identity.user or None,
-                    old_prefix.host or identity.host or None,
+                    old_prefix.user or identity.user,
+                    old_prefix.host or identity.host,
                 ),
             )
 
