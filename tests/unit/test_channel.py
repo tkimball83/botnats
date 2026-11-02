@@ -2176,6 +2176,20 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         assert fake_irc.sent == [("USERHOST", ("beta",))] * 3
 
+    async def test_invite_peer_drops_invite_when_disconnected(self) -> None:
+        """Drop the invite quietly when IRC disconnects before the reply arrives."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.presence.update(INVITEE)
+
+        bot.channel_mgr.invite_peer("#test", INVITEE)
+        fake_irc.connected = False
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        assert bot.channel_mgr.pending_invites == {}
+        assert fake_irc.sent == [("USERHOST", ("beta",))]
+
     async def test_reset_drops_pending_invites(self) -> None:
         """Forget the queries of a connection that ended before their replies.
 
