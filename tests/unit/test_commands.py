@@ -581,6 +581,34 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert listed == items[:90]
         assert last == ("owner", "#test ... and 160 more")
 
+        # One line past the cap is enough to cut the list short.
+        fake_irc.privmsgs.clear()
+        bot.commands.reply_list(OWNER, "#test", items[:110])
+
+        assert len(fake_irc.privmsgs) == 10
+        *packed, last = fake_irc.privmsgs
+        listed = [word for _, text in packed for word in text.split()[1:]]
+        assert listed == items[:90]
+        assert last == ("owner", "#test ... and 20 more")
+
+    async def test_reply_list_packs_for_the_sender_nick(self) -> None:
+        """Pack lines for the relay to the sender's own nick, however long."""
+        bot, fake_irc = bot_with_irc()
+        admin = Prefix("n" * 30, "user", "real.host")
+        bot.authorizer.grant(admin.render())
+        # Ten of these 35-byte items fill a line after "#test" for "owner",
+        # but a 30-character nick leaves room for only nine.
+        items = [f"{number:03d}" + "x" * 32 for number in range(30)]
+
+        bot.commands.reply_list(admin, "#test", items)
+
+        listed = [word for _, text in fake_irc.privmsgs for word in text.split()[1:]]
+        assert listed == items
+        for target, text in fake_irc.privmsgs:
+            assert target == admin.nick
+            line = f"PRIVMSG {target} :{text}\r\n".encode()
+            assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
+
     async def test_reply_drops_unsendable_line(self) -> None:
         """Log and drop a reply too long to send instead of raising."""
         bot, fake_irc = bot_with_irc()
@@ -667,6 +695,22 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         await send_command(bot, OWNER, "GETUSERS #test")
         assert fake_irc.privmsgs == [
             ("owner", "#test @alpha beta Delta @gamma owner"),
+        ]
+
+    async def test_getusers_marks_ranks_above_op(self) -> None:
+        """Mark a member ranked above op with "@", even without +o itself."""
+        bot, fake_irc = bot_with_irc()
+        bot.caps.apply("PREFIX", "(qaohv)~&@%+")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        bot.authorizer.grant(OWNER.render())
+        runtime.member("alpha").modes.add("q")
+        runtime.member("beta").modes.add("a")
+        runtime.member("gamma").modes.add("h")
+
+        await send_command(bot, OWNER, "GETUSERS #test")
+
+        assert fake_irc.privmsgs == [
+            ("owner", "#test @alpha @beta gamma owner"),
         ]
 
     async def test_admin_getchans(self) -> None:
