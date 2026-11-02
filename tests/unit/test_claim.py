@@ -17,7 +17,7 @@ from botnats.presence import BotPresence
 from tests.unit.helpers import COORDINATION_KEY, FakeKV, bounded
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Callable
 
     from nats.js.kv import KeyValue
 
@@ -31,6 +31,12 @@ PRESENCE = {
     "nick": "alpha",
     "user": "user",
 }
+
+# The watch's reclaims of an unowned key; the delete is newer than any write.
+TRANSITIONS: tuple[tuple[str, Callable[[PresenceClaim], Awaitable[None]]], ...] = (
+    ("reclaim", PresenceClaim.reclaim),
+    ("deleted", lambda claim: claim.deleted(100)),
+)
 
 
 def build_claim() -> PresenceClaim:
@@ -283,10 +289,29 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(NatsError),
         ):
-            await bounded(claim.deleted())
+            await bounded(claim.deleted(2))
 
         assert not claim.owned
         assert claim.revision is None
+
+    async def test_stale_delete_keeps_newer_owned_key(self) -> None:
+        """Ignore a watched delete older than the revision this claim owns.
+
+        A duplicate's occupant deleted the key, then this bot's heartbeat
+        created it before the watch delivered that delete: reclaiming would
+        overwrite this bot's record with the identity-free placeholder.
+        """
+        claim, kv = open_claim()
+        claim.state = PresenceState.DUPLICATE
+        kv.sequence = 1
+        await bounded(claim.put(PRESENCE))
+        stored = kv.entries["alpha"]
+
+        await bounded(claim.deleted(1))
+
+        assert claim.owned
+        assert claim.revision == stored[0]
+        assert kv.entries["alpha"] == stored
 
     async def test_lost_revision_drops_ownership_before_reclaim(self) -> None:
         """Stop owning a key whose revision was lost even when reclaiming it fails."""
@@ -407,7 +432,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             patch.object(claim.store, "create", AsyncMock(side_effect=[2])),
             self.assertLogs("botnats.nats.claim", level="INFO") as logs,
         ):
-            await bounded(claim.deleted())
+            await bounded(claim.deleted(1))
 
         assert [log.getMessage() for log in logs.records] == [
             "duplicate bot ID conflict resolved: alpha",
@@ -466,8 +491,8 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         changed and discard its revision, so the next heartbeat would lose the
         key.
         """
-        for transition in (PresenceClaim.reclaim, PresenceClaim.deleted):
-            with self.subTest(transition=transition.__name__):
+        for name, transition in TRANSITIONS:
+            with self.subTest(transition=name):
                 claim, kv = open_claim()
 
                 await overlap(claim, transition(claim), claim.put(PRESENCE))
@@ -481,8 +506,8 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         IRC may have dropped since that heartbeat: writing the identity again
         would have peers record, for a full TTL, a bot that is not on IRC.
         """
-        for transition in (PresenceClaim.reclaim, PresenceClaim.deleted):
-            with self.subTest(transition=transition.__name__):
+        for name, transition in TRANSITIONS:
+            with self.subTest(transition=name):
                 claim, kv = open_claim()
                 await bounded(claim.put(PRESENCE))
                 # The key expired or was deleted, and NATS dropped meanwhile.

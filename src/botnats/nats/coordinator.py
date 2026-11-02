@@ -616,7 +616,9 @@ class Coordinator:
                 if is_delete(entry.operation):
                     self.callbacks.on_presence_delete(entry.key)
                     if entry.key == self.claim.key:
-                        await self.try_reclaim(self.claim.deleted)
+                        await self.try_reclaim(
+                            partial(self.claim.deleted, entry.revision)
+                        )
 
                     continue
 
