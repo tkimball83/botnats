@@ -926,7 +926,7 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
                     IRCMessage("QUIT", ("Quit",), Prefix("Target", "user", "host")),
                 )
                 bot.events.on_irc_message(
-                    IRCMessage("NICK", ("Target",), Prefix("Other", "other", "host")),
+                    IRCMessage("NICK", ("Target",), Prefix("Other")),
                 )
 
                 assert not check()

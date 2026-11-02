@@ -188,8 +188,7 @@ async def recovery() -> None:
 async def serial_replacement() -> None:
     """Replace each bot in turn without losing channels, keys, or ops.
 
-    The last bot is killed, not stopped, so its replacement must outlast the
-    presence the dead process left behind; and a key change made while it is
+    The last bot is killed, not stopped, and a key change made while it is
     down must reach it through JetStream.
     """
     *restarted, killed = BOTS

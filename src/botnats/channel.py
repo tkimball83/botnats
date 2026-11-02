@@ -627,13 +627,9 @@ class ChannelManager:
 
     def retry_pending_parts(self) -> None:
         """Reattempt PART for channels that failed to leave previously."""
-        for folded, channel in tuple(self.pending_parts.items()):
-            try:
-                self.bot.irc.send("PART", channel)
-            except ConnectionError:
-                continue
-
-            self.pending_parts.pop(folded, None)
+        pending, self.pending_parts = self.pending_parts, {}
+        for channel in pending.values():
+            self.part(channel)
 
     def safe_join(self, runtime: ChannelRuntime) -> None:
         """Send JOIN, or leave it due for the next tick while IRC is down.

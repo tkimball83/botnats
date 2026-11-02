@@ -171,8 +171,7 @@ class ISupportState:
 
     def fold_identity(self, prefix: str) -> str:
         """Normalize a nick!user@host identity for case-insensitive comparison."""
-        nick, _, rest = prefix.partition("!")
-        return self.fold(nick) + "!" + casefold(rest, "ascii")
+        return casefold_identity(prefix, self.casemapping)
 
     def is_opped(self, modes: set[str]) -> bool:
         """Return whether the given mode set includes channel operator status."""
@@ -224,8 +223,9 @@ class Prefix:
         if not self.complete or not other.complete:
             return False
 
-        fold = ISupportState(casemapping).fold_identity
-        return fold(self.render()) == fold(other.render())
+        return casefold_identity(self.render(), casemapping) == casefold_identity(
+            other.render(), casemapping
+        )
 
     @classmethod
     def parse(cls, value: str) -> Prefix:
@@ -246,6 +246,12 @@ class Prefix:
 def casefold(value: str, casemapping: str) -> str:
     """Fold an IRC identifier using a server-advertised casemapping."""
     return value.translate(CASEMAP_TABLES[casemapping])
+
+
+def casefold_identity(prefix: str, casemapping: str) -> str:
+    """Fold a nick!user@host identity: the nick by casemapping, user@host as ascii."""
+    nick, _, rest = prefix.partition("!")
+    return casefold(nick, casemapping) + "!" + casefold(rest, "ascii")
 
 
 def format_message(
