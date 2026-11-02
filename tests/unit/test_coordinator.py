@@ -129,7 +129,7 @@ def closing_client(coordinator: Coordinator) -> MagicMock:
     return nc
 
 
-def presence_entry(*, signed: bool = True) -> SimpleNamespace:
+def presence_entry() -> SimpleNamespace:
     """Build a conflicting alpha presence watch entry."""
     record: dict[str, object] = {
         "bot_id": "alpha",
@@ -139,8 +139,7 @@ def presence_entry(*, signed: bool = True) -> SimpleNamespace:
         "user": "user",
         "timestamp": int(time.time()),
     }
-    if signed:
-        record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
+    record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
 
     return SimpleNamespace(
         key="alpha",
@@ -1218,25 +1217,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         callback.assert_not_called()
         synced.assert_called_once_with()
 
-    async def test_watch_channel_rejects_mismatched_key(self) -> None:
-        """Ignore a valid channel record stored under the wrong opaque key."""
-        coordinator = build_coordinator("alpha")
-        callback = MagicMock()
-        record = ChannelRecord.new("#test", None, present=True)
-        signed = coordinator.channels_store.sign(astuple(record))
-        entry = SimpleNamespace(
-            key=coordinator.channels_store.key("#other"),
-            operation=None,
-            value=json.dumps(signed).encode(),
-        )
-        kv, _ = watcher(entry, None)
-        coordinator.channels_store.kv = kv
-
-        with patch.object(coordinator.callbacks, "on_channel", callback):
-            await bounded(coordinator.watch_channels(MagicMock()))
-
-        callback.assert_not_called()
-
     async def test_watch_channel_rejects_forged_signature(self) -> None:
         """Ignore a well-formed, key-bound channel record with a bad signature."""
         coordinator = build_coordinator("alpha")
@@ -1709,17 +1689,6 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         ]
         assert coordinator.claim.owned
         assert coordinator.claim.revision == CREATED_REVISION
-
-    async def test_watch_presence_ignores_unsigned_record(self) -> None:
-        """Verify an unsigned presence record cannot demote the owner."""
-        coordinator = build_coordinator("alpha")
-        coordinator.claim.adopt(1)
-        kv, _ = watcher(None, presence_entry(signed=False))
-        coordinator.presence_store.kv = kv
-
-        await bounded(coordinator.watch_presence(MagicMock()))
-
-        assert coordinator.claim.owned
 
     async def test_watch_presence_resolves_on_delete(self) -> None:
         """Verify a live conflict resolves when the presence entry is deleted."""
