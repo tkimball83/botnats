@@ -11,14 +11,10 @@ import unittest
 from typing import TYPE_CHECKING
 
 from botnats import Tasks, error_label, log_task_failure
+from tests.unit.helpers import hang
 
 if TYPE_CHECKING:
     from _typeshed import TraceFunction
-
-
-async def block() -> None:
-    """Wait until cancelled."""
-    await asyncio.Event().wait()
 
 
 async def fail() -> None:
@@ -65,7 +61,7 @@ class LogTaskFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_ignores_cancellation_and_success(self) -> None:
         """Log nothing for a task that was cancelled or finished cleanly."""
         logger = logging.getLogger("botnats.test")
-        cancelled = asyncio.create_task(block())
+        cancelled = asyncio.create_task(hang())
         cancelled.cancel()
         succeeded = asyncio.create_task(succeed())
         async with asyncio.timeout(5):
@@ -100,9 +96,9 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
         async def parent() -> None:
             started.set()
             try:
-                await block()
+                await hang()
             finally:
-                tasks.spawn(block(), "child")
+                tasks.spawn(hang(), "child")
 
         tasks.spawn(parent(), "parent")
         async with asyncio.timeout(5):

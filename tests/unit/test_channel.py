@@ -717,27 +717,28 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert rejoined.limit is None
 
     async def test_part_queued_on_failure(self) -> None:
-        """Keep a failed part queued, retrying it each maintenance tick until sent."""
+        """Keep a failed part queued, retrying it on each retry until sent."""
         fake_irc = FailingPartIRC()
         bot = bot_with_channel(irc=fake_irc)
-        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        mgr = bot.channel_mgr
+        mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
 
-        current = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")]
+        current = mgr.channel_records[casefold("#test", "rfc1459")]
         tombstone = ChannelRecord.new(
             "#test", None, present=False, after=current.revision
         )
-        bot.channel_mgr.apply_record(tombstone)
+        mgr.apply_record(tombstone)
 
-        assert casefold("#test", "rfc1459") not in bot.channel_mgr.channels
-        assert "#test" in bot.channel_mgr.pending_parts
+        assert casefold("#test", "rfc1459") not in mgr.channels
+        assert "#test" in mgr.pending_parts
 
-        await tick(bot)
-        assert "#test" in bot.channel_mgr.pending_parts
+        mgr.retry_pending_parts()
+        assert "#test" in mgr.pending_parts
 
         fake_irc.failing = False
-        await tick(bot)
+        mgr.retry_pending_parts()
 
-        assert "#test" not in bot.channel_mgr.pending_parts
+        assert "#test" not in mgr.pending_parts
         assert ("PART", ("#test",)) in fake_irc.sent
 
     async def test_part_tombstone_precedence(self) -> None:
