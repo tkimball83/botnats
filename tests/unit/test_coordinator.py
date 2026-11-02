@@ -1175,7 +1175,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         assert not coordinator.ready
 
     async def test_watch_channel_applies_valid_record(self) -> None:
-        """Hand a signed, key-bound channel record to the bot as a ChannelRecord."""
+        """Hand a signed, key-bound channel record to the bot as its fields tuple."""
         coordinator = build_coordinator("alpha")
         callback = MagicMock()
         record = ChannelRecord.new("#test", "key", present=True)
