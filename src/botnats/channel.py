@@ -68,6 +68,10 @@ class ChannelManager:
         # Revisions of this bot's writes in flight: the KV watch can deliver
         # one before the store's reply reaches the writer.
         self.writing: set[str] = set()
+        # Peer invites awaiting the USERHOST reply that shows who holds the
+        # peer's nick: by folded nick, oldest query first, with the presence
+        # and the channels it asked into.
+        self.pending_invites: dict[str, tuple[BotPresence, set[str]]] = {}
         # Each peer help request kind, and the action that answers it.
         self.help_actions: dict[str, Callable[[str, BotPresence], None]] = {
             "invite": self.invite_peer,
@@ -423,29 +427,86 @@ class ChannelManager:
 
         return runtime
 
-    def invite_peer(self, channel: str, presence: BotPresence) -> None:
-        """Invite a peer bot into a channel this bot holds operator status in.
-
-        The INVITE goes out only if the peer's presence still holds when its
-        turn in the send queue comes: its nick may pass to another user.
-        """
+    def invite_due(self, channel: str, presence: BotPresence) -> bool:
+        """Return whether this bot can invite a peer bot not in the channel."""
         runtime = self.help_eligible(channel, presence, require_member=False)
-        if runtime is None or self.bot.caps.fold(presence.nick) in runtime.members:
+        return (
+            runtime is not None
+            and self.bot.caps.fold(presence.nick) not in runtime.members
+        )
+
+    def invite_peer(self, channel: str, presence: BotPresence) -> None:
+        """Ask who holds a peer bot's nick before inviting it into a channel.
+
+        Its presence alone does not show that: across a netsplit, another
+        user can take the peer's nick on this side. The USERHOST reply goes to
+        verify_invites, which invites only the user@host the presence names.
+        """
+        if not self.invite_due(channel, presence):
             return
 
+        folded = self.bot.caps.fold(presence.nick)
+        pending = self.pending_invites.get(folded)
+        # A request from the same presence adds its channel to the query still
+        # pending; one from another presence replaces it.
+        channels = (
+            pending[1] if pending is not None and pending[0] == presence else set()
+        )
         try:
-            queued = self.bot.irc.send(
-                "INVITE",
-                presence.nick,
-                channel,
-                unless_waiting=True,
-                check=partial(self.bot.presence.has, presence),
-            )
+            # A copy still waiting answers this request too.
+            self.bot.irc.send("USERHOST", presence.nick, unless_waiting=True)
         except ConnectionError:
             return
 
-        if queued:
-            LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
+        channels.add(channel)
+        self.pending_invites[folded] = (presence, channels)
+
+    def verify_invites(self, holders: list[Prefix]) -> None:
+        """Invite the peers a USERHOST reply shows holding their own nicks.
+
+        Each query names one nick, and replies come in query order, so a reply
+        naming no one answers the oldest pending query: its nick is offline.
+        A reply drops the query it answers, whatever it shows. The INVITE goes
+        out only if the peer's presence still holds when its turn in the send
+        queue comes.
+        """
+        if not holders:
+            if self.pending_invites:
+                del self.pending_invites[next(iter(self.pending_invites))]
+
+            return
+
+        for holder in holders:
+            pending = self.pending_invites.pop(self.bot.caps.fold(holder.nick), None)
+            if pending is None:
+                continue
+
+            presence, channels = pending
+            if not presence.to_prefix().matches(holder, self.bot.caps.casemapping):
+                LOGGER.warning(
+                    "not inviting bot %s: another user holds nick %s",
+                    presence.bot_id,
+                    presence.nick,
+                )
+                continue
+
+            for channel in sorted(channels):
+                if not self.invite_due(channel, presence):
+                    continue
+
+                try:
+                    queued = self.bot.irc.send(
+                        "INVITE",
+                        presence.nick,
+                        channel,
+                        unless_waiting=True,
+                        check=partial(self.bot.presence.has, presence),
+                    )
+                except ConnectionError:
+                    return
+
+                if queued:
+                    LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
     def op_peer(self, channel: str, presence: BotPresence) -> None:
         """Grant operator status to a peer bot that is a member of the channel.
@@ -623,6 +684,7 @@ class ChannelManager:
         for runtime in self.channels.values():
             runtime.reset()
 
+        self.pending_invites.clear()
         self.pending_parts.clear()
 
     def retry_pending_parts(self) -> None:

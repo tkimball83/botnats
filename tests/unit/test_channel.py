@@ -49,7 +49,10 @@ if TYPE_CHECKING:
 # A banned peer asking into a full #test, and one already in it asking for op.
 INVITEE = BotPresence("beta-id", "beta.host", "one", "beta", "~beta")
 OP_REQUESTER = BotPresence("gamma-id", "gamma.host", "two", "gamma", "~gamma")
+# The server shows INVITEE holding its own nick.
+INVITEE_HOLDS_NICK = IRCMessage("302", ("alpha", "beta=+~beta@beta.host"))
 HELP_GIVEN = [
+    ("USERHOST", ("beta",)),
     ("INVITE", ("beta", "#test")),
     ("MODE", ("#test", "-b", "*!~beta@beta.host")),
     ("MODE", ("#test", "+l", "3")),
@@ -91,7 +94,7 @@ async def request_help(bot: Bot) -> None:
     """Deliver INVITEE's invite, unban, and room requests, and OP_REQUESTER's op.
 
     Each arrives as the coordinator hands it over, by kind, and is answered
-    with no random delay.
+    with no random delay; the server answers any USERHOST the invite sends.
     """
     with patch("botnats.channel.PEER_HELP_DELAY", 0):
         for kind, peer in (
@@ -102,6 +105,8 @@ async def request_help(bot: Bot) -> None:
         ):
             bot.callbacks.on_help(kind, "#test", peer)
             await settle(bot)
+            if kind == "invite":
+                bot.events.on_irc_message(INVITEE_HOLDS_NICK)
 
 
 class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -1774,7 +1779,7 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         # Each action reached IRC, so each swallowed its own ConnectionError.
         assert send.call_args_list == [
-            call("INVITE", "beta", "#test", unless_waiting=True, check=ANY),
+            call("USERHOST", "beta", unless_waiting=True),
             call("MODE", "#test", "+l", "2", unless_waiting=True),
             call("MODE", "#test", "-b", "*!~beta@beta.host", unless_waiting=True),
             call("MODE", "#test", "+o", "beta", unless_waiting=True, check=ANY),
@@ -1952,7 +1957,100 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         runtime.remove("beta")
         bot.channel_mgr.invite_peer("#test", invitee)
-        assert fake_irc.sent == [("INVITE", ("Beta", "#test"))]
+        assert fake_irc.sent == [("USERHOST", ("Beta",))]
+
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+        assert fake_irc.sent == [
+            ("USERHOST", ("Beta",)),
+            ("INVITE", ("Beta", "#test")),
+        ]
+
+    async def test_invite_peer_needs_its_user_host_on_the_nick(self) -> None:
+        """Invite no other user holding a peer's nick, as across a netsplit.
+
+        The peer stays on NATS on the far side of the split while another user
+        takes its nick here. Each reply drops the query it answers.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.presence.update(INVITEE)
+        impostor = IRCMessage("302", ("alpha", "beta=+~evil@evil.host"))
+
+        with self.assertLogs("botnats.channel", level="WARNING") as logs:
+            bot.channel_mgr.invite_peer("#test", INVITEE)
+            bot.events.on_irc_message(impostor)
+
+        assert logs.output == [
+            (
+                "WARNING:botnats.channel:not inviting bot beta-id: "
+                "another user holds nick beta"
+            ),
+        ]
+        # The query was answered: the true holder's late reply invites no one.
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+        assert fake_irc.sent == [("USERHOST", ("beta",))]
+
+    async def test_invite_peer_skips_an_offline_nick(self) -> None:
+        """Drop the oldest pending query once a reply shows its nick offline."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.presence.update(INVITEE)
+        bot.presence.update(OP_REQUESTER)
+
+        bot.channel_mgr.invite_peer("#test", INVITEE)
+        bot.channel_mgr.invite_peer("#test", OP_REQUESTER)
+        bot.events.on_irc_message(IRCMessage("302", ("alpha", "")))
+        # beta's query was answered; gamma's is still pending.
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+        bot.events.on_irc_message(
+            IRCMessage("302", ("alpha", "gamma=+~gamma@gamma.host"))
+        )
+
+        assert fake_irc.sent == [
+            ("USERHOST", ("beta",)),
+            ("USERHOST", ("gamma",)),
+            ("INVITE", ("gamma", "#test")),
+        ]
+
+    async def test_invite_peer_rechecks_when_verified(self) -> None:
+        """Invite no peer that joined, or that this bot cannot help, by the reply."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.presence.update(INVITEE)
+
+        bot.channel_mgr.invite_peer("#test", INVITEE)
+        # Another peer's invite got beta in meanwhile.
+        runtime.member("beta")
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        runtime.remove("beta")
+        bot.channel_mgr.invite_peer("#test", INVITEE)
+        runtime.member("alpha").modes.clear()
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        runtime.member("alpha").modes.add("o")
+        bot.channel_mgr.invite_peer("#test", INVITEE)
+        bot.presence.remove(INVITEE.bot_id)
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        assert fake_irc.sent == [("USERHOST", ("beta",))] * 3
+
+    async def test_reset_drops_pending_invites(self) -> None:
+        """Answer no query from a connection that ended with its reply."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.presence.update(INVITEE)
+
+        bot.channel_mgr.invite_peer("#test", INVITEE)
+        bot.channel_mgr.reset()
+        runtime.member("alpha").modes.add("o")
+        bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        assert fake_irc.sent == [("USERHOST", ("beta",))]
 
     async def test_peer_help_needs_presence_when_sent(self) -> None:
         """Bind an invite or op to the peer's presence, checked when its turn comes.
@@ -1967,8 +2065,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         for peer in (INVITEE, OP_REQUESTER):
             bot.presence.update(peer)
 
+        bot.channel_mgr.invite_peer("#test", INVITEE)
         with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
-            bot.channel_mgr.invite_peer("#test", INVITEE)
+            bot.events.on_irc_message(INVITEE_HOLDS_NICK)
             bot.channel_mgr.op_peer("#test", OP_REQUESTER)
 
         assert send.call_args_list == [
