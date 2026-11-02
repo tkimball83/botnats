@@ -2109,6 +2109,29 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
             ("INVITE", ("beta", "#test")),
         ]
 
+    async def test_invite_peer_skips_only_channels_no_longer_due(self) -> None:
+        """Invite a verified peer into each channel still due, past one not."""
+        bot, fake_irc = bot_with_irc()
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        for channel in ("#test", "#other"):
+            runtime = bot.channel_mgr.channels[casefold(channel, "rfc1459")]
+            runtime.member("alpha").modes.add("o")
+
+        bot.presence.update(INVITEE)
+        for channel in ("#other", "#test"):
+            bot.channel_mgr.invite_peer(channel, INVITEE)
+
+        # Another peer's invite got beta into #other, checked first, meanwhile.
+        bot.channel_mgr.channels[casefold("#other", "rfc1459")].member("beta")
+        for _ in range(2):
+            bot.events.on_irc_message(INVITEE_HOLDS_NICK)
+
+        assert fake_irc.sent == [
+            ("USERHOST", ("beta",)),
+            ("USERHOST", ("beta",)),
+            ("INVITE", ("beta", "#test")),
+        ]
+
     async def test_invite_peer_needs_the_queried_nick_in_its_reply(self) -> None:
         """Invite no one on a reply naming another nick than its query did."""
         bot, fake_irc = bot_with_irc()
@@ -2632,37 +2655,14 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         op_requests = [r for r in coordinator.help_requests if r[0] == "op"]
         assert len(op_requests) == 0
 
-    async def test_skips_unban_request_when_only_this_bot_opped(self) -> None:
-        """Request no unban while only this bot holds op; it cannot serve itself.
-
-        Its own presence matches its own member entry, as a peer's would.
-        """
-        bot, _, coordinator = bot_with_coordinator()
-        identity = BotPresence("alpha-id", "alpha.host", "inst", "alpha", "~alpha")
-        bot.identity.current = identity
-        peer = BotPresence("beta-id", "beta.host", "two", "beta", "~beta")
-        for presence in (identity, peer):
-            bot.presence.update(presence)
-
-        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
-        runtime.join = JoinState.JOINED
-        runtime.member("alpha").prefix = identity.to_prefix()
-        runtime.member("alpha").modes.add("o")
-        runtime.member("beta").prefix = peer.to_prefix()
-
-        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
-        assert coordinator.help_requests == []
-
-        runtime.member("beta").modes.add("o")
-        await bounded(bot.channel_mgr.request_peer("unban", "#test"))
-        assert [kind for kind, _ in coordinator.help_requests] == ["unban"]
-
     async def test_skips_unban_request_when_only_this_bot_opped_on_fallback(
         self,
     ) -> None:
-        """Know this bot by the nick it holds, not the one it was configured with.
+        """Request no unban while only this bot holds op; it cannot serve itself.
 
-        On a fallback nick, its own op is still no peer's.
+        It is known by the nick it holds, not the one it was configured with:
+        on a fallback nick, its own presence matches its own member entry, as
+        a peer's would, and its own op is still no peer's.
         """
         bot, fake_irc, coordinator = bot_with_coordinator()
         fake_irc.current_nick = "alpha_"
