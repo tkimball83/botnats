@@ -1431,6 +1431,32 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         synced.assert_called_once_with()
 
+    async def test_watch_survives_unavailable_store_on_replay_reclaim(self) -> None:
+        """Contain a store that becomes unavailable during the replay's reclaim.
+
+        A JetStream context replaced mid-reconnect is transient too; it must
+        not restart the watch and drop readiness for another full replay.
+        """
+        coordinator = build_coordinator("alpha")
+        kv, _ = watcher(None)
+        coordinator.presence_store.kv = kv
+        synced = MagicMock()
+        unavailable = StoreUnavailableError("JetStream changed while opening a bucket")
+
+        with (
+            patch.object(
+                coordinator.presence_store,
+                "create",
+                AsyncMock(side_effect=unavailable),
+            ) as create,
+            self.assertLogs("botnats.nats.coordinator", level="WARNING"),
+        ):
+            await bounded(coordinator.watch_presence(synced))
+
+        create.assert_awaited_once()
+        synced.assert_called_once_with()
+        assert not coordinator.claim.owned
+
     async def test_session_delete_event_reports_key(self) -> None:
         """Report a live session delete by its opaque key."""
         coordinator = build_coordinator("alpha")
