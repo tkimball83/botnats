@@ -1610,6 +1610,19 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         assert mgr.runtime("#new") is None
         assert mgr.channel_records[casefold("#new", "rfc1459")] == winner
 
+    async def test_write_record_replaces_joined_channel_key(self) -> None:
+        """Apply a new key to a joined channel, as every peer applying it does."""
+        bot, _, _ = bot_with_coordinator()
+        mgr = bot.channel_mgr
+        runtime = mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINED
+        runtime.key = "live-key"
+
+        assert await bounded(mgr.write_record("#test", "new-key", present=True))
+
+        assert runtime.key == "new-key"
+        assert not runtime.key_pending
+
     async def test_write_record_refuses_counter_past_maximum(self) -> None:
         """Refuse a write after the last revision counter, storing nothing."""
         bot, _, coordinator = bot_with_coordinator()
