@@ -7,6 +7,7 @@ import asyncio
 import logging
 import secrets
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from functools import partial
@@ -68,6 +69,13 @@ class ChannelManager:
         # Revisions of this bot's writes in flight: the KV watch can deliver
         # one before the store's reply reaches the writer.
         self.writing: set[str] = set()
+        # Peer invites awaiting the USERHOST reply that shows who holds the
+        # peer's nick: by folded nick, with the presence and the channels it
+        # asked into.
+        self.pending_invites: dict[str, tuple[BotPresence, set[str]]] = {}
+        # The nick each USERHOST queued names, oldest first: the server
+        # answers each with one RPL_USERHOST, in order.
+        self.userhost_queries: deque[str] = deque()
         # Each peer help request kind, and the action that answers it.
         self.help_actions: dict[str, Callable[[str, BotPresence], None]] = {
             "invite": self.invite_peer,
@@ -423,29 +431,87 @@ class ChannelManager:
 
         return runtime
 
-    def invite_peer(self, channel: str, presence: BotPresence) -> None:
-        """Invite a peer bot into a channel this bot holds operator status in.
-
-        The INVITE goes out only if the peer's presence still holds when its
-        turn in the send queue comes: its nick may pass to another user.
-        """
+    def invite_due(self, channel: str, presence: BotPresence) -> bool:
+        """Return whether this bot can invite a peer bot not in the channel."""
         runtime = self.help_eligible(channel, presence, require_member=False)
-        if runtime is None or self.bot.caps.fold(presence.nick) in runtime.members:
+        return (
+            runtime is not None
+            and self.bot.caps.fold(presence.nick) not in runtime.members
+        )
+
+    def invite_peer(self, channel: str, presence: BotPresence) -> None:
+        """Ask who holds a peer bot's nick before inviting it into a channel.
+
+        Its presence alone does not show that: across a netsplit, another
+        user can take the peer's nick on this side. The USERHOST reply goes to
+        verify_invites, which invites only the user@host the presence names.
+        """
+        if not self.invite_due(channel, presence):
             return
 
+        folded = self.bot.caps.fold(presence.nick)
+        pending = self.pending_invites.get(folded)
+        # A request from the same presence adds its channel to the query still
+        # pending; one from another presence replaces it.
+        channels = (
+            pending[1] if pending is not None and pending[0] == presence else set()
+        )
         try:
-            queued = self.bot.irc.send(
-                "INVITE",
-                presence.nick,
-                channel,
-                unless_waiting=True,
-                check=partial(self.bot.presence.has, presence),
-            )
+            # A copy still waiting answers this request too.
+            if self.bot.irc.send("USERHOST", presence.nick, unless_waiting=True):
+                self.userhost_queries.append(presence.nick)
         except ConnectionError:
             return
 
-        if queued:
-            LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
+        channels.add(channel)
+        self.pending_invites[folded] = (presence, channels)
+
+    def verify_invites(self, holders: list[Prefix]) -> None:
+        """Invite the peer a USERHOST reply shows holding its own nick.
+
+        Each reply answers the oldest query still outstanding, naming its one
+        nick. The last query for a nick decides its pending invite, whatever
+        its reply shows: no entry, as when the nick is offline, or one for
+        another user, sends nothing. The INVITE goes out only if the peer's
+        presence still holds when its turn in the send queue comes.
+        """
+        if not self.userhost_queries:
+            return
+
+        folded = self.bot.caps.fold(self.userhost_queries.popleft())
+        if any(self.bot.caps.fold(nick) == folded for nick in self.userhost_queries):
+            return
+
+        pending = self.pending_invites.pop(folded, None)
+        if pending is None or not holders:
+            return
+
+        presence, channels = pending
+        if not presence.to_prefix().matches(holders[0], self.bot.caps.casemapping):
+            LOGGER.warning(
+                "not inviting bot %s: another user holds nick %s",
+                presence.bot_id,
+                presence.nick,
+            )
+            return
+
+        for channel in sorted(channels):
+            if not self.invite_due(channel, presence):
+                continue
+
+            try:
+                queued = self.bot.irc.send(
+                    "INVITE",
+                    presence.nick,
+                    channel,
+                    unless_waiting=True,
+                    check=partial(self.bot.presence.has, presence),
+                )
+            except ConnectionError:
+                return
+
+            if queued:
+                LOGGER.info("invited bot %s to %s", presence.bot_id, channel)
 
     def op_peer(self, channel: str, presence: BotPresence) -> None:
         """Grant operator status to a peer bot that is a member of the channel.
@@ -623,7 +689,9 @@ class ChannelManager:
         for runtime in self.channels.values():
             runtime.reset()
 
+        self.pending_invites.clear()
         self.pending_parts.clear()
+        self.userhost_queries.clear()
 
     def retry_pending_parts(self) -> None:
         """Reattempt PART for channels that failed to leave previously."""
@@ -662,6 +730,10 @@ class ChannelManager:
 
         self.bot.caps.casemapping = casemapping
         self.bot.authorizer.rekey()
+        self.pending_invites = {
+            self.bot.caps.fold(presence.nick): (presence, channels)
+            for presence, channels in self.pending_invites.values()
+        }
 
         records: dict[str, ChannelRecord] = {}
         for record in self.source_records.values():

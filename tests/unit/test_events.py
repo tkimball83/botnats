@@ -587,6 +587,26 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         assert ("JOIN", ("#test",)) not in fake_irc.sent
 
+    async def test_userhost_reply_reads_operator_and_away_markers(self) -> None:
+        """Read each entry's user@host past the operator and away markers."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        gamma = BotPresence("gamma-id", "gamma.host", "three", "gamma", "~gamma")
+        for peer in (PEER, gamma):
+            bot.presence.update(peer)
+            bot.channel_mgr.invite_peer("#test", peer)
+
+        for entry in ("beta*=+~beta@beta.host", "gamma=-~gamma@gamma.host "):
+            bot.events.on_irc_message(IRCMessage("302", ("alpha", entry)))
+
+        assert fake_irc.sent == [
+            ("USERHOST", ("beta",)),
+            ("USERHOST", ("gamma",)),
+            ("INVITE", ("beta", "#test")),
+            ("INVITE", ("gamma", "#test")),
+        ]
+
     async def test_invite_ignores_unknown_channel(self) -> None:
         """Verify a peer's INVITE to an unconfigured channel is ignored."""
         bot, fake_irc = bot_with_irc()

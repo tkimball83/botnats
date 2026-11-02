@@ -56,6 +56,7 @@ class IRCEventHandler:
         self.handlers: dict[str, Callable[[IRCMessage], None]] = {
             "001": self.handle_welcome,
             "005": self.handle_isupport,
+            "302": self.handle_userhost_reply,
             "303": self.handle_ison_reply,
             "324": self.handle_channel_modes,
             "352": self.handle_who,
@@ -404,6 +405,21 @@ class IRCEventHandler:
             )
         ):
             self.bot.channel_mgr.safe_join(runtime)
+
+    def handle_userhost_reply(self, message: IRCMessage) -> None:
+        """Pass the users an RPL_USERHOST reply shows to the pending invite.
+
+        Each entry reads nick[*]=+user@host or nick[*]=-user@host: "*" marks
+        an IRC operator, and "-" an away user.
+        """
+        entries = message.params[1].split() if len(message.params) > 1 else []
+        holders: list[Prefix] = []
+        for entry in entries:
+            nick, separator, address = entry.partition("=")
+            if separator:
+                holders.append(Prefix.parse(f"{nick.removesuffix('*')}!{address[1:]}"))
+
+        self.bot.channel_mgr.verify_invites(holders)
 
     def handle_ison_reply(self, message: IRCMessage) -> None:
         """Reclaim the desired nickname when ISON reports it offline."""
