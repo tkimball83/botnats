@@ -41,6 +41,7 @@ class ValidatorTests(unittest.TestCase):
             ("#bad\tchannel", "channel contains unsupported characters"),
             ("#bad,channel", "channel contains unsupported characters"),
             ("#bad\x07channel", "channel contains unsupported characters"),
+            ("#bad\x00channel", "channel contains unsupported characters"),
             # A Latin-1 "#caf\xe9" as the IRC read loop decodes it.
             ("#caf\ufffd", "channel contains unsupported characters"),
         ):
@@ -59,6 +60,7 @@ class ValidatorTests(unittest.TestCase):
             "two words",
             "one,two",
             "safe\r\nOPER root pass",
+            "nul\x00key",
             "cl\ufffd",
         ):
             with (

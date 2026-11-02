@@ -1267,7 +1267,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Mark no watch synced while its replay has not reached the sentinel."""
         coordinator = build_coordinator("alpha")
         # A peer's key deleted mid-replay, which each watch handles.
-        entry = SimpleNamespace(key="beta", operation=KV_DEL, value=None)
+        entry = SimpleNamespace(key="beta", operation=KV_DEL, revision=1, value=None)
         for name, watch in coordinator.watches().items():
             with self.subTest(watch=name):
                 kv, _ = watcher(entry)
@@ -1299,7 +1299,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             revision=2,
             value=b"x",
         )
-        removed = SimpleNamespace(key="beta", operation="DEL", value=None)
+        removed = SimpleNamespace(key="beta", operation="DEL", revision=6, value=None)
         kv, _ = watcher(misplaced, undecodable, removed, None)
         coordinator.presence_store.kv = kv
 
@@ -2041,7 +2041,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             value=json.dumps(signed).encode(),
         )
         # A peer's key deleted, which the presence and session watches report.
-        deleted = SimpleNamespace(key="beta", operation=KV_DEL, value=None)
+        deleted = SimpleNamespace(key="beta", operation=KV_DEL, revision=1, value=None)
         deliveries = {
             "watch-channels": ("on_channel", channel),
             "watch-presence": ("on_presence_delete", deleted),
