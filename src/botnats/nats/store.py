@@ -129,7 +129,9 @@ class KVStore:
         difference, such as the replica count, fails as it did the first time.
         """
         stream = (await context.stream_info(f"KV_{self.bucket}")).config
-        if stream.max_age != self.ttl:
+        # Compare in the whole nanoseconds nats-py truncates the TTL to; it
+        # reads back None for a missing max_age and sends None as 0.
+        if round((stream.max_age or 0) * 1e9) != int(self.ttl * 1e9):
             # create_key_value's duplicate window, so creating again matches.
             window = min(DUPLICATE_WINDOW, self.ttl or DUPLICATE_WINDOW)
             await context.update_stream(

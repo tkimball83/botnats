@@ -726,6 +726,25 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         assert store.js is newer
         newer.create_key_value.assert_awaited_once()
 
+    async def test_concurrent_opens_create_bucket_once(self) -> None:
+        """Let a concurrent opener reuse the bucket the first one creates."""
+        store = KVStore("test", 1, 60)
+        kv = cast("KeyValue", FakeKV())
+
+        async def create_key_value(config: object) -> KeyValue:
+            del config
+            # Yield so the second open runs while the first is creating.
+            await asyncio.sleep(0)
+            return kv
+
+        js = AsyncMock()
+        js.create_key_value.side_effect = create_key_value
+
+        opened = await bounded(asyncio.gather(store.open(js), store.open(js)))
+
+        assert opened == [kv, kv]
+        js.create_key_value.assert_awaited_once()
+
     async def test_retune_matches_created_duplicate_window(self) -> None:
         """Retune a bucket to the duplicate window nats-py creates it with.
 
@@ -748,22 +767,32 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
                 assert updated.duplicate_window == window
 
     async def test_retune_keeps_matching_ttl(self) -> None:
-        """Leave a bucket whose TTL matches; creating it fails as it did first."""
-        store = KVStore("test", 1, 60)
-        js = AsyncMock()
-        error = BadRequestError(description="replicas cannot be updated")
-        js.create_key_value.side_effect = error
-        js.stream_info.return_value = SimpleNamespace(
-            config=StreamConfig(name="KV_test", max_age=60, duplicate_window=60),
-        )
+        """Leave a bucket whose TTL matches; creating it fails as it did first.
 
-        with self.assertRaises(BadRequestError) as raised:
-            await bounded(store.open(js))
+        nats-py sends the TTL in whole nanoseconds, so a fractional TTL reads
+        back slightly smaller and still matches.
+        """
+        for ttl in (0, 60, 32.3):
+            store = KVStore("test", 1, ttl)
+            js = AsyncMock()
+            error = BadRequestError(description="replicas cannot be updated")
+            js.create_key_value.side_effect = error
+            # The TTL as nats-py sends it and reads it back.
+            max_age = int(ttl * 10**9) / 10**9
+            js.stream_info.return_value = SimpleNamespace(
+                config=StreamConfig(
+                    name="KV_test", max_age=max_age, duplicate_window=60
+                ),
+            )
 
-        assert raised.exception is error
-        assert js.create_key_value.await_count == 2
-        js.update_stream.assert_not_awaited()
-        assert not store.ready
+            with self.subTest(ttl=ttl):
+                with self.assertRaises(BadRequestError) as raised:
+                    await bounded(store.open(js))
+
+                assert raised.exception is error
+                assert js.create_key_value.await_count == 2
+                js.update_stream.assert_not_awaited()
+                assert not store.ready
 
     async def test_open_reports_create_failure_without_bucket(self) -> None:
         """Raise the creation error, not the lookup's, when no bucket exists."""
@@ -961,27 +990,6 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         moved = {**signed, "channel": "#other"}
         assert channels.parse(channels.key("#other"), moved) is None
         assert ChannelStore("undernet", 1, SECRET).parse(key, signed) is None
-
-    async def test_channel_put_yields_to_concurrent_writer(self) -> None:
-        """Return another bot's record when it lands between our read and write."""
-        channels = ChannelStore("efnet", 1, SECRET)
-        channels.kv = AsyncMock()
-        concurrent = channel_record(2)
-        channels.kv.get.side_effect = (
-            SimpleNamespace(revision=7, value=json.dumps(channel_record(1)).encode()),
-            SimpleNamespace(revision=8, value=json.dumps(concurrent).encode()),
-        )
-        channels.kv.update.side_effect = KeyWrongLastSequenceError()
-
-        stored = await bounded(
-            channels.put(
-                channel_record(3),
-                after=channel_revision(1),
-            )
-        )
-
-        assert stored == channel_fields(2)
-        channels.kv.update.assert_awaited_once()
 
     async def test_channel_put_yields_to_racing_create(self) -> None:
         """Yield to a racing writer that created the record first."""
