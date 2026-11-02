@@ -314,6 +314,7 @@ class ConfigTests(unittest.TestCase):
             ("+", "contains unsupported characters"),
             ("+nt1", "contains unsupported characters"),
             ("+k", "contains a mode that requires an argument"),
+            ("+l", "contains a mode that requires an argument"),
             ("-b", "contains a mode that requires an argument"),
             ("+o", "contains a mode that requires an argument"),
         ):
