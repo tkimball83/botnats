@@ -129,13 +129,18 @@ class PresenceClaim:
     def observe(self, instance_id: str, revision: int) -> None:
         """Apply a validly signed record on this bot's key.
 
-        Needs no KV round trip, so it never waits behind a presence write.
+        Needs no KV round trip, so it never waits behind a presence write. A
+        record older than the owned revision is ignored, like a stale delete:
+        this claim's own write already replaced it.
         """
+        if self.revision is not None and revision < self.revision:
+            return
+
         if instance_id != self.instance_id:
             self.yield_key()
             return
 
-        self.adopt(max(self.revision or 0, revision))
+        self.adopt(revision)
 
     async def release(self) -> None:
         """Delete the owned key on shutdown so a replacement can claim it."""

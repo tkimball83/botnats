@@ -73,7 +73,9 @@ BETA_PRESENCE = {
     "nick": "beta",
     "user": "user",
 }
-CREATED_REVISION = 2
+# Above every revision a test delivers before its create, as JetStream's
+# stream sequence would be.
+CREATED_REVISION = 7
 NOT_OWNED = "bot ID alpha does not own its presence key"
 # Bound before any test patches asyncio.sleep.
 REAL_SLEEP = asyncio.sleep
@@ -1359,7 +1361,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             revision=1,
             value=json.dumps(record).encode(),
         )
-        kv, _ = watcher(None, entry)
+        kv, _ = watcher(entry, None)
+        # The other instance still holds the key when the replay ends.
+        kv.create = AsyncMock(side_effect=KeyWrongLastSequenceError)
+        kv.get = AsyncMock(return_value=entry)
         coordinator.presence_store.kv = kv
 
         with (
