@@ -630,10 +630,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         bot.presence.update(PEER)
         bot.channel_mgr.join_desired()
-        bot.events.on_irc_message(
-            IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
-        )
+        with self.assertLogs("botnats.events", level="WARNING") as logs:
+            bot.events.on_irc_message(
+                IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
+            )
 
+        assert logs.output == [
+            "WARNING:botnats.events:cannot join #test: 474 Cannot join channel (+b)",
+        ]
         # A member, and one who took a peer's nick from another host.
         for sender in (
             Prefix("mallory", "~m", "evil.example"),
@@ -898,9 +902,17 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             runtime.join = JoinState.JOINING
             runtime.join_retry_at = 0.0
             refused_at = asyncio.get_running_loop().time()
-            bot.events.on_irc_message(
-                IRCMessage(numeric, ("alpha", "#test", "cannot join channel")),
-            )
+            with self.assertLogs("botnats.events", level="WARNING") as logs:
+                bot.events.on_irc_message(
+                    IRCMessage(numeric, ("alpha", "#test", "cannot join channel")),
+                )
+
+            assert logs.output == [
+                (
+                    f"WARNING:botnats.events:cannot join #test: {numeric} "
+                    "cannot join channel"
+                ),
+            ]
             await settle(bot)
 
             # Every refusal paces the JOIN: the next tick does not resend it.
@@ -936,9 +948,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
         )
-        bot.events.on_irc_message(
-            IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
-        )
+        with self.assertLogs("botnats.events", level="WARNING") as logs:
+            bot.events.on_irc_message(
+                IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
+            )
+
+        assert logs.output == [
+            "WARNING:botnats.events:cannot join #test: 474 Cannot join channel (+b)",
+        ]
         await settle(bot)
 
         presence = BotPresence(
@@ -966,9 +983,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         bot.channel_mgr.join_desired()
         refused_at = asyncio.get_running_loop().time()
-        bot.events.on_irc_message(
-            IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
-        )
+        with self.assertLogs("botnats.events", level="WARNING") as logs:
+            bot.events.on_irc_message(
+                IRCMessage("474", ("alpha", "#test", "Cannot join channel (+b)")),
+            )
+
+        assert logs.output == [
+            "WARNING:botnats.events:cannot join #test: 474 Cannot join channel (+b)",
+        ]
         assert runtime.join_retry_at >= refused_at + JOIN_RETRY_DELAY
         # A margin no stall outlasts; the bound above pins the retry delay.
         runtime.join_retry_at -= JOIN_RETRY_DELAY - 3600
@@ -980,9 +1002,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.sent == [join, join]
 
         bot.presence.update(PEER)
-        bot.events.on_irc_message(
-            IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
-        )
+        with self.assertLogs("botnats.events", level="WARNING") as logs:
+            bot.events.on_irc_message(
+                IRCMessage("473", ("alpha", "#test", "Cannot join channel (+i)")),
+            )
+
+        assert logs.output == [
+            "WARNING:botnats.events:cannot join #test: 473 Cannot join channel (+i)",
+        ]
         bot.events.on_irc_message(
             IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),
         )
@@ -1110,9 +1137,14 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await settle(bot)
 
         mgr.safe_join(runtime)
-        bot.events.on_irc_message(
-            IRCMessage("475", ("alpha", "#test", "Cannot join channel (+k)")),
-        )
+        with self.assertLogs("botnats.events", level="WARNING") as logs:
+            bot.events.on_irc_message(
+                IRCMessage("475", ("alpha", "#test", "Cannot join channel (+k)")),
+            )
+
+        assert logs.output == [
+            "WARNING:botnats.events:cannot join #Test: 475 Cannot join channel (+k)",
+        ]
         mgr.safe_join(runtime)
 
         assert fake_irc.sent == [("JOIN", ("#Test", "A")), ("JOIN", ("#Test", "B"))]
