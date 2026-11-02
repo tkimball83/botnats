@@ -10,11 +10,12 @@ from collections import deque
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import ANY, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
 from botnats.commands import RELAY_SOURCE_BYTES, RateLimiter, parse_command
 from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, IRCMessage, Prefix, casefold
+from botnats.nats.store import StoreUnavailableError
 from botnats.presence import BotPresence
 from tests.unit.helpers import (
     OWNER,
@@ -413,8 +414,14 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         checks = [entry.kwargs["check"] for entry in send.call_args_list]
         assert [check() for check in checks] == [True, True]
 
-        bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
-        await drain_session_writes(bot)
+        # The unconnected coordinator refuses the revocation's write at once;
+        # once only, so a drain that keeps retrying fails instead of hanging.
+        refused = StoreUnavailableError("bot ID alpha-id does not own its presence key")
+        with patch.object(
+            bot.coordinator, "put_session", AsyncMock(side_effect=[refused])
+        ):
+            bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+            await drain_session_writes(bot)
 
         assert [check() for check in checks] == [False, False]
 

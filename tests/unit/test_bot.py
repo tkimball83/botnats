@@ -286,10 +286,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                coordinator, "put_session", AsyncMock(side_effect=outage)
+                coordinator, "put_session", AsyncMock(side_effect=[outage])
             ) as put_session,
             patch.object(
-                coordinator, "put_channel", AsyncMock(side_effect=outage)
+                coordinator, "put_channel", AsyncMock(side_effect=[outage])
             ) as put_channel,
         ):
             async with asyncio.timeout(1):
