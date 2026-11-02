@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from botnats import error_label
 from botnats.irc.protocol import (
-    CASEMAPPINGS,
+    CASEMAP_TABLES,
     ISupportState,
     Prefix,
     casefold,
@@ -722,7 +722,7 @@ class ChannelManager:
         """
         # Fold an unknown casemapping least, so no nicks the server keeps
         # apart share a session.
-        casemapping = casemapping if casemapping in CASEMAPPINGS else "ascii"
+        casemapping = casemapping if casemapping in CASEMAP_TABLES else "ascii"
         if casemapping == self.bot.caps.casemapping:
             return
 

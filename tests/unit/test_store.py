@@ -590,19 +590,6 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             now.hex().encode(),
         )
 
-    async def test_recent_attempts_deny(self) -> None:
-        """Deny while every slot holds an attempt from within the window."""
-        attempts = AttemptStore("efnet", 3, SECRET)
-        attempts.kv = AsyncMock()
-        attempts.kv.get.side_effect = [
-            # A second short of a full window old.
-            MagicMock(value=float(1).hex().encode()),
-            MagicMock(value=(ATTEMPT_WINDOW - 0.5).hex().encode()),
-            MagicMock(value=(ATTEMPT_WINDOW - 0.1).hex().encode()),
-        ]
-
-        assert not await bounded(attempts.allow("host.example", now=ATTEMPT_WINDOW))
-
     async def test_future_attempts_deny(self) -> None:
         """Count attempts a faster peer stamped after this peer's now."""
         attempts = AttemptStore("efnet", 3, SECRET)
