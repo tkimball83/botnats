@@ -444,16 +444,18 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             key = coordinator.sessions.key(prefix.render())
             landing = [peer]
+            writes_fail = True
             put_session = coordinator.put_session
 
             async def peer_lands_then_fail(record: Session) -> Session:
-                if not landing:
+                if not writes_fail:
                     return await put_session(record)
 
-                await coordinator.sessions.put(landing.pop())
-                bot.sessions.observe(key, peer)
-                if disconnects:
-                    bot.events.on_irc_disconnect()
+                if landing:
+                    await coordinator.sessions.put(landing.pop())
+                    bot.sessions.observe(key, peer)
+                    if disconnects:
+                        bot.events.on_irc_disconnect()
 
                 msg = "publish timed out"
                 raise NatsError(msg)
@@ -461,6 +463,11 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
             code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
             with patch.object(coordinator, "put_session", peer_lands_then_fail):
                 await send_command(bot, prefix, f"AUTH {code}")
+                if disconnects:
+                    # The revocation denies the peer's grant while writes fail.
+                    assert not bot.authorizer.authorized(prefix.render())
+
+                writes_fail = False
                 # An escalation would wait for the second retry.
                 await bounded(bot.sessions.retry())
                 await bounded(bot.sessions.retry())

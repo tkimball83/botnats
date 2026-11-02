@@ -341,6 +341,8 @@ class IRCProtocolTests(unittest.TestCase):
                 assert not incomplete.matches(incomplete, "rfc1459")
                 assert not prefix.matches(incomplete, "rfc1459")
                 assert not incomplete.matches(prefix, "rfc1459")
+        # A missing part never matches the text an incomplete prefix renders.
+        assert not Prefix("n", "u", "None").matches(Prefix("n", "u"), "rfc1459")
 
     def test_isupport_chanmodes_extra_groups(self) -> None:
         """Verify CHANMODES with more than four groups keeps the first four."""
