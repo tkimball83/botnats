@@ -195,6 +195,15 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
         kv.update = AsyncMock(return_value=reclaimed_revision)
         assert await bounded(store.reclaim("Alpha", data, "inst")) == reclaimed_revision
 
+        unsigned = {k: v for k, v in data.items() if k != "signature"}
+        kv.get = AsyncMock(
+            return_value=SimpleNamespace(
+                revision=5, value=json.dumps(unsigned).encode()
+            ),
+        )
+        kv.update = AsyncMock(return_value=reclaimed_revision)
+        assert await bounded(store.reclaim("Alpha", data, "inst")) == reclaimed_revision
+
         # Another bot's validly signed record, copied onto this bot's key, is
         # a clobber to overwrite, not a duplicate to yield to.
         copied: dict[str, object] = {**data, "bot_id": "beta", "instance_id": "other"}
@@ -389,6 +398,12 @@ class PresenceValidTests(unittest.TestCase):
 
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
         assert not store.valid("alpha", non_ascii_signature, now=now)
+
+        # A missing or non-string signature is refused before the pattern
+        # match, which raises on one.
+        unsigned = {k: v for k, v in fresh.items() if k != "signature"}
+        assert not store.valid("alpha", unsigned, now=now)
+        assert not store.valid("alpha", {**fresh, "signature": 5}, now=now)
 
 
 def channel_revision(number: int) -> str:

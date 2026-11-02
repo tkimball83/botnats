@@ -194,7 +194,8 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
 
         async def create_then_reset(*arguments: object) -> int:
             del arguments
-            # Yield, so the bound ends a reclaim that keeps retrying.
+            # Yield like a KV round trip; the reset lands while the create is
+            # in flight, and the bound fails a reclaim that hangs instead.
             await asyncio.sleep(0)
             claim.reset()
             return 1
