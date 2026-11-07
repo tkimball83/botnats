@@ -62,18 +62,18 @@ class PresenceRegistry:
     ttl: float
     entries: dict[str, tuple[BotPresence, float]] = field(default_factory=dict)
 
-    def active(self, *, now: float | None = None) -> tuple[BotPresence, ...]:
+    def active(self) -> tuple[BotPresence, ...]:
         """Return all presences whose heartbeats have not expired."""
-        current = time.monotonic() if now is None else now
+        current = time.monotonic()
         return tuple(
             presence
             for presence, deadline in self.entries.values()
             if deadline > current
         )
 
-    def has(self, presence: BotPresence, *, now: float | None = None) -> bool:
+    def has(self, presence: BotPresence) -> bool:
         """Return whether the exact presence is active."""
-        current = time.monotonic() if now is None else now
+        current = time.monotonic()
         entry = self.entries.get(presence.bot_id.casefold())
         return entry is not None and entry[1] > current and entry[0] == presence
 
@@ -86,9 +86,9 @@ class PresenceRegistry:
         """Remove a bot presence by stable ID."""
         self.entries.pop(bot_id.casefold(), None)
 
-    def update(self, presence: BotPresence, *, now: float | None = None) -> None:
+    def update(self, presence: BotPresence) -> None:
         """Record or refresh a heartbeat for the given bot presence."""
-        current = time.monotonic() if now is None else now
+        current = time.monotonic()
         self.entries[presence.bot_id.casefold()] = (presence, current + self.ttl)
 
 

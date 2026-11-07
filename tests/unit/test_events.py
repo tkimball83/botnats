@@ -651,7 +651,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invite_from_expired_peer_sends_no_join(self) -> None:
         """Send no JOIN for an INVITE from a peer whose presence expired."""
         bot, fake_irc = bot_with_irc()
-        bot.presence.update(PEER, now=time.monotonic() - bot.presence.ttl - 1)
+        with patch("botnats.presence.time") as clock:
+            clock.monotonic.return_value = time.monotonic() - bot.presence.ttl - 1
+            bot.presence.update(PEER)
 
         bot.events.on_irc_message(
             IRCMessage("INVITE", ("alpha", "#test"), PEER.to_prefix()),

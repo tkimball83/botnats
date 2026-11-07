@@ -252,7 +252,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.callbacks.on_session_update("opaque", session)
 
         assert bot.presence.has(peer)
-        assert not bot.presence.has(peer, now=time.monotonic() + bot.presence.ttl)
+        with patch("botnats.presence.time") as clock:
+            clock.monotonic.return_value = time.monotonic() + bot.presence.ttl
+            assert not bot.presence.has(peer)
+
         assert bot.sessions.watched == {"opaque": (session.prefix, session.expires_at)}
         assert bot.authorizer.authorized(session.prefix)
 

@@ -1823,7 +1823,9 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.add_ban("*!~beta@beta.host")
         runtime.limit = 2
         # beta's heartbeat has lapsed; gamma has not announced itself.
-        bot.presence.update(INVITEE, now=time.monotonic() - bot.presence.ttl - 1)
+        with patch("botnats.presence.time") as clock:
+            clock.monotonic.return_value = time.monotonic() - bot.presence.ttl - 1
+            bot.presence.update(INVITEE)
 
         await request_help(bot)
         assert fake_irc.sent == []
