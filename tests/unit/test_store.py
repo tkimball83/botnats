@@ -257,10 +257,13 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
 class PresenceValidTests(unittest.TestCase):
     """Tests for presence record freshness, signatures, and key binding."""
 
+    def setUp(self) -> None:
+        """Pin the store's clock to NOW."""
+        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
+
     def test_valid_binds_record_to_key(self) -> None:
         """Accept a signed record only under its own bot ID's key."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
-        now = 1_000_000.0
 
         def signed(bot_id: str) -> dict[str, object]:
             data: dict[str, object] = {
@@ -269,33 +272,32 @@ class PresenceValidTests(unittest.TestCase):
                 "instance_id": "inst",
                 "nick": "nick",
                 "user": "user",
-                "timestamp": int(now),
+                "timestamp": NOW,
             }
             data["signature"] = presence_signature(SECRET, "efnet", data)
             return data
 
         beta = signed("Beta")
-        assert store.valid("beta", beta, now=now)
-        assert not store.valid("alpha", beta, now=now)
+        assert store.valid("beta", beta)
+        assert not store.valid("alpha", beta)
 
         # A key the record names exactly is still refused for a bot ID that
         # is not an identifier.
-        assert not store.valid("be.ta", signed("be.ta"), now=now)
+        assert not store.valid("be.ta", signed("be.ta"))
 
     def test_presence_signature_covers_every_field(self) -> None:
         """Refuse a record whose signed fields or network changed after signing."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
-        now = 1_000_000.0
         valid: dict[str, object] = {
             "bot_id": "alpha",
             "host": "host",
             "instance_id": "inst",
             "nick": "nick",
             "user": "user",
-            "timestamp": int(now),
+            "timestamp": NOW,
         }
         valid["signature"] = presence_signature(SECRET, "efnet", valid)
-        assert store.valid("alpha", valid, now=now)
+        assert store.valid("alpha", valid)
         # Each change is well-formed, fresh, and keeps the "alpha" key, so
         # only the signature rejects it.
         changes: dict[str, dict[str, object]] = {
@@ -309,26 +311,25 @@ class PresenceValidTests(unittest.TestCase):
             "instance_id changed": {"instance_id": "other"},
             "nick changed": {"nick": "other"},
             "user changed": {"user": "other"},
-            "timestamp changed": {"timestamp": int(now) - 1},
+            "timestamp changed": {"timestamp": NOW - 1},
         }
         for label, change in changes.items():
             record = {**valid, **change}
             resigned = {**record}
             resigned["signature"] = presence_signature(SECRET, "efnet", record)
             with self.subTest(label):
-                assert not store.valid("alpha", record, now=now)
-                assert store.valid("alpha", resigned, now=now)
+                assert not store.valid("alpha", record)
+                assert store.valid("alpha", resigned)
 
         undernet = PresenceStore("undernet", 1, 15.0, SECRET)
-        assert not undernet.valid("alpha", valid, now=now)
+        assert not undernet.valid("alpha", valid)
         other_network = {**valid}
         other_network["signature"] = presence_signature(SECRET, "undernet", valid)
-        assert undernet.valid("alpha", other_network, now=now)
+        assert undernet.valid("alpha", other_network)
 
     def test_valid_rejects_stale_and_uncrashable(self) -> None:
         """Reject stale or future-dated replays and malformed fields without raising."""
         store = PresenceStore("efnet", 1, 15.0, SECRET)
-        now = 1_000_000.0
 
         def sign(data: dict[str, object]) -> dict[str, object]:
             data["signature"] = presence_signature(SECRET, "efnet", data)
@@ -341,10 +342,10 @@ class PresenceValidTests(unittest.TestCase):
                 "instance_id": "inst",
                 "nick": "alpha",
                 "user": "user",
-                "timestamp": int(now),
+                "timestamp": NOW,
             },
         )
-        assert store.valid("alpha", fresh, now=now)
+        assert store.valid("alpha", fresh)
 
         # Fresh from one TTL plus 30 s of drift ago to 30 s ahead, inclusive.
         bounds = {
@@ -353,17 +354,15 @@ class PresenceValidTests(unittest.TestCase):
             -store.ttl - 30: True,
             -store.ttl - 31: False,
         }
-        with patch("botnats.nats.store.time") as clock:
-            clock.time.return_value = now
-            for offset, fresh_at in bounds.items():
-                record = sign({**fresh, "timestamp": int(now + offset)})
-                with self.subTest(offset=offset):
-                    assert store.valid("alpha", record) is fresh_at
+        for offset, fresh_at in bounds.items():
+            record = sign({**fresh, "timestamp": int(NOW + offset)})
+            with self.subTest(offset=offset):
+                assert store.valid("alpha", record) is fresh_at
 
         # Heartbeats carry whole seconds, so a peer even a fraction of a second
         # ahead stamps the next one.
-        ahead = sign({**fresh, "timestamp": int(now) + 1})
-        assert store.valid("alpha", ahead, now=now)
+        ahead = sign({**fresh, "timestamp": NOW + 1})
+        assert store.valid("alpha", ahead)
 
         surrogate = {
             "bot_id": "alpha",
@@ -371,42 +370,42 @@ class PresenceValidTests(unittest.TestCase):
             "instance_id": "inst",
             "nick": "alpha",
             "user": "user",
-            "timestamp": int(now),
+            "timestamp": NOW,
             "signature": "0" * SHA256_HEX_LENGTH,
         }
-        assert not store.valid("alpha", surrogate, now=now)
+        assert not store.valid("alpha", surrogate)
 
         # A missing or mistyped signed field fails the signature, never raises.
         missing_host = {k: v for k, v in surrogate.items() if k != "host"}
-        assert not store.valid("alpha", missing_host, now=now)
-        assert not store.valid("alpha", {**surrogate, "host": 5}, now=now)
+        assert not store.valid("alpha", missing_host)
+        assert not store.valid("alpha", {**surrogate, "host": 5})
 
         # A string or missing timestamp is refused before the freshness
-        # comparison, which raises on one; "1000000" even signs like int(now).
-        assert not store.valid("alpha", {**fresh, "timestamp": "1000000"}, now=now)
+        # comparison, which raises on one; "1000000" even signs like NOW.
+        assert not store.valid("alpha", {**fresh, "timestamp": "1000000"})
         missing_timestamp = {k: v for k, v in fresh.items() if k != "timestamp"}
-        assert not store.valid("alpha", missing_timestamp, now=now)
+        assert not store.valid("alpha", missing_timestamp)
 
         # A signed boolean is an int only the freshness window refuses.
         for flag in (True, False):
             with self.subTest(timestamp=flag):
                 record = sign({**fresh, "timestamp": flag})
-                assert not store.valid("alpha", record, now=now)
+                assert not store.valid("alpha", record)
 
         # JSON integers too large for a float are refused, never raise.
         for sign_of in (-1, 1):
             with self.subTest(huge=sign_of):
                 record = sign({**fresh, "timestamp": sign_of * 10**400})
-                assert not store.valid("alpha", record, now=now)
+                assert not store.valid("alpha", record)
 
         non_ascii_signature = {**fresh, "signature": "ñ" * SHA256_HEX_LENGTH}
-        assert not store.valid("alpha", non_ascii_signature, now=now)
+        assert not store.valid("alpha", non_ascii_signature)
 
         # A missing or non-string signature is refused before the pattern
         # match, which raises on one.
         unsigned = {k: v for k, v in fresh.items() if k != "signature"}
-        assert not store.valid("alpha", unsigned, now=now)
-        assert not store.valid("alpha", {**fresh, "signature": 5}, now=now)
+        assert not store.valid("alpha", unsigned)
+        assert not store.valid("alpha", {**fresh, "signature": 5})
 
 
 def channel_revision(number: int) -> str:
@@ -441,6 +440,10 @@ def parsed_session(record: dict[str, object]) -> Session:
 class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
     """Tests for fail-closed mesh-wide authentication limits."""
 
+    def setUp(self) -> None:
+        """Pin the store's clock, for each test to set."""
+        self.clock = self.enterContext(patch("botnats.nats.store.time"))
+
     async def test_allows_available_slot(self) -> None:
         """Verify the first available atomic slot permits an attempt."""
         attempts = AttemptStore("efnet", 3, SECRET)
@@ -451,7 +454,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             1,
         ]
 
-        assert await bounded(attempts.allow("host.example", now=60))
+        self.clock.time.return_value = 60
+        assert await bounded(attempts.allow("host.example"))
         assert attempts.kv.create.await_count == 2
 
     async def test_denies_after_limit(self) -> None:
@@ -463,7 +467,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.get.side_effect = [KeyNotFoundError()] * ATTEMPT_LIMIT
         attempts.kv.create.side_effect = [KeyWrongLastSequenceError()] * ATTEMPT_LIMIT
 
-        assert not await bounded(attempts.allow("host.example", now=60))
+        self.clock.time.return_value = 60
+        assert not await bounded(attempts.allow("host.example"))
         assert attempts.kv.create.await_count == ATTEMPT_LIMIT
 
     async def test_error_fails_closed(self) -> None:
@@ -473,14 +478,16 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.get.side_effect = KeyNotFoundError()
         attempts.kv.create.side_effect = NatsError("unavailable")
 
+        self.clock.time.return_value = 60
         with self.assertLogs("botnats.nats.store", level="WARNING"):
-            assert not await bounded(attempts.allow("host.example", now=60))
+            assert not await bounded(attempts.allow("host.example"))
 
         # One error must not leave the store unready: nothing would reopen it.
         assert attempts.ready
         attempts.kv.create.side_effect = None
         attempts.kv.create.return_value = 1
-        assert await bounded(attempts.allow("host.example", now=61))
+        self.clock.time.return_value = 61
+        assert await bounded(attempts.allow("host.example"))
 
     async def test_keys_are_secret_derived(self) -> None:
         """Derive per-identity, per-slot attempt keys from the coordination secret.
@@ -504,8 +511,9 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         """Verify authentication is denied until the bucket is open."""
         attempts = AttemptStore("efnet", 3, SECRET)
 
+        self.clock.time.return_value = 60
         with self.assertLogs("botnats.nats.store", level="WARNING"):
-            assert not await bounded(attempts.allow("host.example", now=60))
+            assert not await bounded(attempts.allow("host.example"))
 
     async def test_sliding_window_reuses_slot_at_cutoff(self) -> None:
         """Reuse a slot whose attempt sits exactly one window before now."""
@@ -518,7 +526,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         attempts.kv.update.return_value = 8
 
-        assert await bounded(attempts.allow("host.example", now=now))
+        self.clock.time.return_value = now
+        assert await bounded(attempts.allow("host.example"))
         attempts.kv.update.assert_awaited_once_with(
             attempts.key("host.example", 0),
             now.hex().encode(),
@@ -531,11 +540,14 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv = cast("KeyValue", FakeKV())
         start = 1_000_000.0
         # Every bot shares these slots, so a changed limit must fail here.
+        self.clock.time.return_value = start
         for _ in range(3):
-            assert await bounded(attempts.allow("host.example", now=start))
+            assert await bounded(attempts.allow("host.example"))
 
-        assert not await bounded(attempts.allow("host.example", now=start + 3599.5))
-        assert await bounded(attempts.allow("host.example", now=start + 3600.5))
+        self.clock.time.return_value = start + 3599.5
+        assert not await bounded(attempts.allow("host.example"))
+        self.clock.time.return_value = start + 3600.5
+        assert await bounded(attempts.allow("host.example"))
 
     async def test_unreadable_attempts_fail_closed(self) -> None:
         """Count slots holding no value, non-hex, or non-UTF-8 bytes as taken."""
@@ -547,7 +559,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             MagicMock(revision=3, value=b"\xff\xfe"),
         ]
 
-        assert not await bounded(attempts.allow("host.example", now=60))
+        self.clock.time.return_value = 60
+        assert not await bounded(attempts.allow("host.example"))
 
     async def test_overflowing_attempt_is_skipped(self) -> None:
         """Count a slot too large for a float as taken, and try the next one."""
@@ -557,7 +570,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         slot = attempts.key("host.example", 0)
         kv.store(slot, b"0x1p+1024")
 
-        assert await bounded(attempts.allow("host.example", now=60))
+        self.clock.time.return_value = 60
+        assert await bounded(attempts.allow("host.example"))
         assert kv.entries[slot] == (1, b"0x1p+1024")
         assert attempts.key("host.example", 1) in kv.entries
 
@@ -572,7 +586,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
         attempts.kv.update.side_effect = KeyWrongLastSequenceError()
 
-        assert not await bounded(attempts.allow("host.example", now=ATTEMPT_WINDOW + 1))
+        self.clock.time.return_value = ATTEMPT_WINDOW + 1
+        assert not await bounded(attempts.allow("host.example"))
         attempts.kv.update.assert_awaited_once()
 
     async def test_sliding_window_update_conflict_tries_next_slot(self) -> None:
@@ -587,7 +602,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.create.return_value = 1
         now = float(ATTEMPT_WINDOW + 1)
 
-        assert await bounded(attempts.allow("host.example", now=now))
+        self.clock.time.return_value = now
+        assert await bounded(attempts.allow("host.example"))
         attempts.kv.create.assert_awaited_once_with(
             attempts.key("host.example", 1),
             now.hex().encode(),
@@ -603,7 +619,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             MagicMock(value=(61.2).hex().encode()),
         ]
 
-        assert not await bounded(attempts.allow("host.example", now=59))
+        self.clock.time.return_value = 59
+        assert not await bounded(attempts.allow("host.example"))
 
     async def test_non_finite_attempts_fail_closed(self) -> None:
         """Verify non-finite stored timestamps consume attempt slots."""
@@ -615,7 +632,8 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             MagicMock(value=b"-inf"),
         ]
 
-        assert not await bounded(attempts.allow("host.example", now=60))
+        self.clock.time.return_value = 60
+        assert not await bounded(attempts.allow("host.example"))
 
 
 class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):

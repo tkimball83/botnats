@@ -499,7 +499,10 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_prunes_expired_sessions_while_disconnected(self) -> None:
         """Remove expired auth sessions and key mappings while disconnected."""
         bot = Bot(config())
-        bot.authorizer.grant("owner!user@host.example", now=0)
+        with patch("botnats.auth.time") as clock:
+            clock.time.return_value = 0
+            bot.authorizer.grant("owner!user@host.example")
+
         bot.sessions.watched["expired-key"] = ("owner!user@host.example", 0.0)
 
         async with asyncio.timeout(1):

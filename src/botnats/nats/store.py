@@ -202,9 +202,9 @@ class AttemptStore(KVStore):
         super().__init__(f"botnats_v1_{network}_auth_attempts", replicas, ATTEMPT_TTL)
         self.secret = secret
 
-    async def allow(self, identity: str, *, now: float | None = None) -> bool:
+    async def allow(self, identity: str) -> bool:
         """Claim one attempt slot, failing closed when KV is unavailable."""
-        current = time.time() if now is None else now
+        current = time.time()
         cutoff = current - ATTEMPT_WINDOW
         encoded = float(current).hex().encode()
         try:
@@ -487,7 +487,7 @@ class PresenceStore(KVStore):
         except KeyWrongLastSequenceError:
             return None
 
-    def valid(self, key: str, data: dict[str, Any], now: float | None = None) -> bool:
+    def valid(self, key: str, data: dict[str, Any]) -> bool:
         """Return whether a presence record is fresh, signed, and bound to its key.
 
         The signature does not cover the KV key, so a record copied from
@@ -506,7 +506,7 @@ class PresenceStore(KVStore):
         ):
             return False
 
-        current = time.time() if now is None else now
+        current = time.time()
         # Compared without arithmetic on the unchecked timestamp: an int too
         # large for a float would raise.
         if (

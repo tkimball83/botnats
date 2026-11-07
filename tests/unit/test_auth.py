@@ -42,10 +42,19 @@ from tests.unit.helpers import (
 NOW = 1_000_000
 
 
-def pin_clocks(test: unittest.TestCase) -> None:
-    """Pin the auth and store clocks to NOW for the rest of a test."""
-    for module in ("botnats.auth", "botnats.nats.store"):
-        test.enterContext(patch(f"{module}.time")).time.return_value = NOW
+def pin_clocks(test: unittest.TestCase) -> MagicMock:
+    """Pin the auth and store clocks to NOW for the rest of a test.
+
+    Returns the auth clock, for a test to move.
+    """
+    clocks = [
+        test.enterContext(patch(f"{module}.time"))
+        for module in ("botnats.auth", "botnats.nats.store")
+    ]
+    for clock in clocks:
+        clock.time.return_value = NOW
+
+    return clocks[0]
 
 
 def authorizer(issuer: str = "alpha") -> TotpAuthorizer:
@@ -62,7 +71,7 @@ class TotpAuthorizerTests(unittest.TestCase):
 
     def setUp(self) -> None:
         """Pin the auth and store clocks to NOW."""
-        pin_clocks(self)
+        self.clock = pin_clocks(self)
 
     def test_rfc_vector_and_invalid_codes(self) -> None:
         """Match the RFC 4226 test vector and reject malformed or wrong codes."""
@@ -71,9 +80,10 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert totp(AUTH_KEY, 1) == "287082"
         # A code keeps its leading zeros.
         assert totp(AUTH_KEY, 36) == "003784"
-        assert auth.match("not-a-code", now=59) is None
-        assert auth.match("000000", now=59) is None
-        assert auth.match("²" * 6, now=59) is None
+        self.clock.time.return_value = 59
+        assert auth.match("not-a-code") is None
+        assert auth.match("000000") is None
+        assert auth.match("²" * 6) is None
 
     def test_rekey_collision_keeps_highest_ranked(self) -> None:
         """Keep the later-expiring session when two prefixes collide on rekey.
@@ -82,8 +92,10 @@ class TotpAuthorizerTests(unittest.TestCase):
         record came last would keep the wrong one.
         """
         auth = authorizer()
-        auth.grant("Owner{!user@host", now=15)
-        auth.grant("Owner[!user@host", now=10)
+        self.clock.time.return_value = 15
+        auth.grant("Owner{!user@host")
+        self.clock.time.return_value = 10
+        auth.grant("Owner[!user@host")
 
         auth.identity_fold = lambda p: p.casefold().translate(
             str.maketrans("[]\\^", "{}|~"),
@@ -97,8 +109,9 @@ class TotpAuthorizerTests(unittest.TestCase):
     def test_rekey_revocation_wins(self) -> None:
         """Verify rekey drops a session when a revocation collides."""
         auth = authorizer()
-        auth.revoke(auth.grant("Owner[!user@host", now=10))
-        auth.grant("Owner{!user@host", now=10)
+        self.clock.time.return_value = 10
+        auth.revoke(auth.grant("Owner[!user@host"))
+        auth.grant("Owner{!user@host")
 
         auth.identity_fold = lambda p: p.casefold().translate(
             str.maketrans("[]\\^", "{}|~"),
@@ -106,8 +119,9 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth.rekey()
 
         assert [record.revoked for record in auth.records.values()] == [True]
-        assert not auth.authorized("Owner[!user@host", now=15)
-        assert not auth.authorized("Owner{!user@host", now=15)
+        self.clock.time.return_value = 15
+        assert not auth.authorized("Owner[!user@host")
+        assert not auth.authorized("Owner{!user@host")
 
     def test_outlasting_revocation_blocks_grant(self) -> None:
         """Keep a held revocation that expires after a new session would."""
@@ -117,9 +131,11 @@ class TotpAuthorizerTests(unittest.TestCase):
             Session(10 + SESSION_TTL + 1, "beta", prefix, revoked=True, version=0)
         )
 
-        auth.grant(prefix, now=10)
+        self.clock.time.return_value = 10
+        auth.grant(prefix)
 
-        assert not auth.authorized(prefix, now=20)
+        self.clock.time.return_value = 20
+        assert not auth.authorized(prefix)
 
     def test_dropped_key_keeps_revocation(self) -> None:
         """Keep a revocation when its durable key is deleted.
@@ -129,18 +145,19 @@ class TotpAuthorizerTests(unittest.TestCase):
         """
         auth = authorizer("alpha")
         prefix = "owner!user@example.test"
-        session = auth.grant(prefix, now=NOW)
+        session = auth.grant(prefix)
         revoked = auth.revoke(session)
 
         assert auth.drop_session(prefix) == revoked
         auth.keep(session)
 
         assert [record.revoked for record in auth.records.values()] == [True]
-        assert not auth.authorized(prefix, now=NOW + 11)
+        self.clock.time.return_value = NOW + 11
+        assert not auth.authorized(prefix)
         # The stale grant is still kept where no revocation is held.
         fresh = authorizer("beta")
         fresh.keep(session)
-        assert fresh.authorized(prefix, now=NOW + 11)
+        assert fresh.authorized(prefix)
 
     def test_dropped_key_returns_only_live_revocation(self) -> None:
         """Return a held revocation to write back only while it is unexpired.
@@ -180,25 +197,31 @@ class TotpAuthorizerTests(unittest.TestCase):
         source = authorizer("alpha")
         target = authorizer("beta")
         prefix = "owner!user@example.test"
-        session = source.grant(prefix, now=10)
+        self.clock.time.return_value = 10
+        session = source.grant(prefix)
         revoked = source.revoke(session)
         assert revoked is not None
 
         target.keep(revoked)
         target.keep(session)
 
-        assert not target.authorized(prefix, now=21)
+        self.clock.time.return_value = 21
+        assert not target.authorized(prefix)
 
     def test_session_binding_and_expiry(self) -> None:
         """Bind a session to its prefix, expire it after an hour, and prune it."""
         auth = authorizer()
         prefix = "owner!user@example.test"
 
-        auth.grant(prefix, now=11)
-        assert not auth.authorized("other!user@example.test", now=12)
+        self.clock.time.return_value = 11
+        auth.grant(prefix)
+        self.clock.time.return_value = 12
+        assert not auth.authorized("other!user@example.test")
         # Every bot grants the same lifetime, so a changed one must fail here.
-        assert auth.authorized(prefix, now=11 + 3599.9)
-        assert not auth.authorized(prefix, now=11 + 3600)
+        self.clock.time.return_value = 11 + 3599.9
+        assert auth.authorized(prefix)
+        self.clock.time.return_value = 11 + 3600
+        assert not auth.authorized(prefix)
         # The check only reads; maintenance prunes.
         assert prefix in auth.records
         assert prefix in auth.source_records
@@ -212,9 +235,11 @@ class TotpAuthorizerTests(unittest.TestCase):
         """Prune expired sessions and revocations, and keep live ones."""
         auth = authorizer()
         for nick, granted in (("expired", NOW - SESSION_TTL - 30), ("live", NOW)):
-            auth.grant(f"{nick}!user@example.test", now=granted)
-            auth.revoke(auth.grant(f"{nick}-revoked!user@example.test", now=granted))
+            self.clock.time.return_value = granted
+            auth.grant(f"{nick}!user@example.test")
+            auth.revoke(auth.grant(f"{nick}-revoked!user@example.test"))
 
+        self.clock.time.return_value = NOW
         auth.prune()
 
         assert sorted(auth.records) == [
@@ -235,10 +260,12 @@ class TotpAuthorizerTests(unittest.TestCase):
             "owner!other@elsewhere",
             "owner2!user@host",
         ):
-            auth.grant(prefix, now=NOW)
+            auth.grant(prefix)
 
-        auth.revoke(auth.grant("owner!revoked@host", now=NOW))
-        auth.grant("owner!expired@host", now=NOW - SESSION_TTL)
+        auth.revoke(auth.grant("owner!revoked@host"))
+        self.clock.time.return_value = NOW - SESSION_TTL
+        auth.grant("owner!expired@host")
+        self.clock.time.return_value = NOW
 
         assert sorted(auth.live_prefixes("OWNER")) == [
             "Owner!user@host",
@@ -248,17 +275,16 @@ class TotpAuthorizerTests(unittest.TestCase):
     def test_totp_matching_windows(self) -> None:
         """Accept codes one period either side of now, and none further out."""
         auth = authorizer()
-        now = 1_000_000.0
-        current = int(now // TOTP_PERIOD)
+        current = NOW // TOTP_PERIOD
 
         for offset in (-1, 0, 1):
             with self.subTest(offset=offset):
                 counter = current + offset
-                assert auth.match(totp(AUTH_KEY, counter), now=now) == counter
+                assert auth.match(totp(AUTH_KEY, counter)) == counter
 
         for offset in (-2, 2):
             with self.subTest(offset=offset):
-                assert auth.match(totp(AUTH_KEY, current + offset), now=now) is None
+                assert auth.match(totp(AUTH_KEY, current + offset)) is None
 
 
 class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
