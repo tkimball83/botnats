@@ -49,14 +49,27 @@ class PresenceTests(unittest.TestCase):
         restored = BotPresence.from_dict(asdict(original))
         assert original == restored
 
+    def setUp(self) -> None:
+        """Drive the registry's monotonic clock from each test."""
+        patcher = patch("botnats.presence.time")
+        self.clock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def at(self, now: float) -> None:
+        """Set the registry's monotonic clock to now."""
+        self.clock.monotonic.return_value = now
+
     def test_presence_expires_after_ttl(self) -> None:
         """Count a heartbeat as active until its TTL ends."""
         registry = PresenceRegistry(ttl=10)
         presence = BotPresence("vhagar", "host", "instance", "vhagar", "user")
-        registry.update(presence, now=5)
+        self.at(5)
+        registry.update(presence)
 
-        assert registry.active(now=14.9) == (presence,)
-        assert registry.active(now=15) == ()
+        self.at(14.9)
+        assert registry.active() == (presence,)
+        self.at(15)
+        assert registry.active() == ()
 
     def test_presence_membership(self) -> None:
         """Verify exact presence membership uses the current bot entry."""
@@ -64,42 +77,51 @@ class PresenceTests(unittest.TestCase):
         # A mixed-case bot ID: entries are keyed by its casefold.
         old = BotPresence("Vhagar", "old.host", "instance", "vhagar", "user")
         current = BotPresence("Vhagar", "new.host", "instance", "Vhagar", "user")
-        registry.update(current, now=5)
+        self.at(5)
+        registry.update(current)
 
-        assert registry.has(current, now=14.9)
-        assert not registry.has(old, now=14.9)
-        assert not registry.has(current, now=15.1)
+        self.at(14.9)
+        assert registry.has(current)
+        assert not registry.has(old)
+        self.at(15.1)
+        assert not registry.has(current)
 
     def test_presence_update_overwrites(self) -> None:
         """Verify presence update overwrites the previous entry and deadline."""
         registry = PresenceRegistry(ttl=10)
         old = BotPresence("vhagar", "old.host", "instance", "vhagar", "user")
-        registry.update(old, now=5)
+        self.at(5)
+        registry.update(old)
         new = BotPresence("vhagar", "new.host", "instance", "Vhagar", "user")
-        registry.update(new, now=12)
+        self.at(12)
+        registry.update(new)
 
         # Past the old entry's deadline (15), within the new one's (22).
-        active = registry.active(now=15.5)
+        self.at(15.5)
+        active = registry.active()
         assert len(active) == 1
         assert active[0].host == "new.host"
-        assert registry.active(now=22.1) == ()
+        self.at(22.1)
+        assert registry.active() == ()
 
     def test_presence_remove(self) -> None:
         """Remove a presence immediately on a watch deletion."""
         registry = PresenceRegistry(ttl=10)
         presence = BotPresence("Vhagar", "host", "instance", "Vhagar", "user")
-        registry.update(presence, now=5)
+        self.at(5)
+        registry.update(presence)
 
         registry.remove("VHAGAR")
 
-        assert registry.active(now=6) == ()
+        self.at(6)
+        assert registry.active() == ()
 
     def test_presence_peers_exclude_own_id(self) -> None:
         """Exclude this bot from its peers whatever the case of either bot ID."""
-        # The TTL outlasts the test, since peers() reads the monotonic clock.
-        registry = PresenceRegistry(ttl=3600)
+        registry = PresenceRegistry(ttl=10)
         own = BotPresence("Alpha", "host", "one", "alpha", "user")
         peer = BotPresence("Beta", "host", "two", "beta", "user")
+        self.at(5)
         registry.update(own)
         registry.update(peer)
 
