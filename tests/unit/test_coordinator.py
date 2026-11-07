@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import time
 import unittest
 import uuid
 from dataclasses import asdict, astuple, replace
@@ -84,10 +83,20 @@ REAL_SLEEP = asyncio.sleep
 SUBJECT = "botnats.v1.efnet.channel"
 
 
+def handler() -> MagicMock:
+    """Return a callback stub that returns None, as NATSCallbackHandler's do."""
+    return MagicMock(return_value=None)
+
+
 def build_coordinator(bot_id: str, network: str = "efnet") -> Coordinator:
     """Build a coordinator whose callbacks check each call's shape and ignore it."""
+    callbacks = create_autospec(NATSCallbackHandler, instance=True)
+    for name in vars(NATSCallbackHandler):
+        if name.startswith("on_"):
+            getattr(callbacks, name).return_value = None
+
     return Coordinator(
-        callbacks=create_autospec(NATSCallbackHandler, instance=True),
+        callbacks=callbacks,
         config=NATSConfig(
             instance_id=uuid.uuid4().hex,
             monitor_port=8222,
@@ -228,7 +237,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_peer_help_request_reaches_callback(self) -> None:
         """Hand a peer's signed request to the bot with the kind its subject names."""
         coordinator = build_coordinator("alpha")
-        callback = MagicMock()
+        callback = handler()
         subject = f"{coordinator.ns}.unban"
         payload = {"channel": "#test", "presence": BETA_PRESENCE}
         message = Msg(
@@ -251,7 +260,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_own_help_request_is_skipped(self) -> None:
         """Ignore this bot's own broadcast, which NATS echoes back to it."""
         coordinator = build_coordinator("beta")
-        callback = MagicMock()
+        callback = handler()
         subject = f"{coordinator.ns}.op"
         message = Msg(
             MagicMock(),
@@ -727,7 +736,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha")
         nc = connect_owned(coordinator)
         coordinator.synced_watches.update(coordinator.watches())
-        callback = MagicMock()
+        callback = handler()
         subject = f"{coordinator.ns}.op"
         message = Msg(
             MagicMock(),
@@ -912,7 +921,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_message_is_ignored(self) -> None:
         """Verify malformed wire data never reaches its callback."""
         coordinator = build_coordinator("alpha")
-        callback = MagicMock()
+        callback = handler()
         message = Msg(MagicMock(), subject="bad", data=b"not-json")
 
         with (
@@ -1190,7 +1199,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_channel_applies_valid_record(self) -> None:
         """Hand a signed, key-bound channel record to the bot as its fields tuple."""
         coordinator = build_coordinator("alpha")
-        callback = MagicMock()
+        callback = handler()
         record = ChannelRecord.new("#test", "key", present=True)
         signed = coordinator.channels_store.sign(astuple(record))
         entry = SimpleNamespace(
@@ -1211,7 +1220,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_channel_skips_delete(self) -> None:
         """Skip a delete marker, even one carrying a signed channel record."""
         coordinator = build_coordinator("alpha")
-        callback = MagicMock()
+        callback = handler()
         record = ChannelRecord.new("#test", None, present=True)
         signed = coordinator.channels_store.sign(astuple(record))
         # JetStream sends delete markers without a value; this one keeps the
@@ -1234,7 +1243,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_channel_rejects_forged_signature(self) -> None:
         """Ignore a well-formed, key-bound channel record with a bad signature."""
         coordinator = build_coordinator("alpha")
-        callback = MagicMock()
+        callback = handler()
         key = coordinator.channels_store.key("#test")
         record = ChannelRecord.new("#test", None, present=True)
         signed = coordinator.channels_store.sign(astuple(record))
@@ -1259,7 +1268,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         and no bot would become ready.
         """
         coordinator = build_coordinator("alpha")
-        callback = MagicMock()
+        callback = handler()
         entry = SimpleNamespace(
             key=coordinator.channels_store.key("#test"),
             operation=None,
@@ -1298,8 +1307,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha")
         self.pin_store_clock()
         coordinator.claim.adopt(5)
-        update = MagicMock()
-        delete = MagicMock()
+        update = handler()
+        delete = handler()
         misplaced = SimpleNamespace(
             key="beta",
             operation=None,
@@ -1333,7 +1342,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Hand a peer's signed, key-bound presence record to the bot."""
         coordinator = build_coordinator("alpha")
         self.pin_store_clock()
-        update = MagicMock()
+        update = handler()
         record: dict[str, object] = {**BETA_PRESENCE, "timestamp": NOW}
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         entry = SimpleNamespace(
@@ -1357,7 +1366,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         # Differs from the record's bot ID in case only: claims ignore case.
         coordinator = build_coordinator("Alpha")
         self.pin_store_clock()
-        update = MagicMock()
+        update = handler()
         # A starting process claims its key before it knows its IRC identity.
         record: dict[str, object] = {
             "bot_id": "alpha",
@@ -1391,7 +1400,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Ignore a peer's signed record copied onto this bot's presence key."""
         coordinator = build_coordinator("alpha")
         self.pin_store_clock()
-        update = MagicMock()
+        update = handler()
         record: dict[str, object] = {**BETA_PRESENCE, "timestamp": NOW}
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         assert coordinator.presence_store.valid("beta", record)
@@ -1458,6 +1467,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_delete_event_reports_key(self) -> None:
         """Report a live session delete by its opaque key."""
+        self.pin_store_clock()
         coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
         # JetStream sends delete markers without a value; this one keeps a
@@ -1465,12 +1475,12 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         deleted = SimpleNamespace(
             key=key,
             operation=KV_DEL,
-            value=json.dumps(session_record(time.time() + 60)).encode(),
+            value=json.dumps(session_record(NOW + 60)).encode(),
         )
         kv, _ = watcher(None, deleted)
         coordinator.sessions.kv = kv
-        delete = MagicMock()
-        update = MagicMock()
+        delete = handler()
+        update = handler()
 
         with (
             patch.object(coordinator.callbacks, "on_session_delete", delete),
@@ -1483,9 +1493,10 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_session_update_reaches_owner(self) -> None:
         """Hand an expired session record to its owner, which drops it."""
+        self.pin_store_clock()
         coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
-        expiry = time.time() - 1
+        expiry = NOW - 1
         entry = SimpleNamespace(
             key=key,
             operation=None,
@@ -1493,7 +1504,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(entry, None)
         coordinator.sessions.kv = kv
-        update = MagicMock()
+        update = handler()
 
         with patch.object(coordinator.callbacks, "on_session_update", update):
             await bounded(coordinator.watch_sessions(MagicMock()))
@@ -1504,7 +1515,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Ignore peer requests while watches replay, even with presence owned."""
         coordinator = build_coordinator("alpha")
         connect_owned(coordinator)
-        callback = MagicMock()
+        callback = handler()
         subject = f"{coordinator.ns}.op"
         payload = {"channel": "#test", "presence": BETA_PRESENCE}
         message = Msg(
@@ -1554,7 +1565,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha")
         kv, _ = watcher(None)
         coordinator.sessions.kv = kv
-        replayed = MagicMock()
+        replayed = handler()
         synced = MagicMock()
 
         with patch.object(coordinator.callbacks, "on_sessions_replayed", replayed):
@@ -1568,10 +1579,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         Each hides the record it replaced, during the replay or after it.
         """
+        self.pin_store_clock()
         coordinator = build_coordinator("alpha")
         key = coordinator.sessions.key("owner!user@host")
         other = coordinator.sessions.key("other!user@host")
-        expiry = time.time() + 60
+        expiry = NOW + 60
         valid = session_record(expiry)
         undecodable = SimpleNamespace(key=key, operation=None, value=b"not json")
         # Correctly signed, but held under another identity's key. The store
@@ -1595,9 +1607,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(undecodable, *entries, None, forged)
         coordinator.sessions.kv = kv
-        delete = MagicMock()
-        update = MagicMock()
-        replayed = MagicMock()
+        delete = handler()
+        update = handler()
+        replayed = handler()
 
         with (
             patch.object(coordinator.callbacks, "on_session_delete", delete),
@@ -1628,9 +1640,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(entry, None, entry)
         coordinator.sessions.kv = kv
-        delete = MagicMock()
-        update = MagicMock()
-        replayed = MagicMock()
+        delete = handler()
+        update = handler()
+        replayed = handler()
 
         with (
             patch.object(coordinator.callbacks, "on_session_delete", delete),
@@ -1666,8 +1678,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             entries = (revocation, None) if in_replay else (None, revocation)
             kv, _ = watcher(*entries, grant)
             coordinator.sessions.kv = kv
-            update = MagicMock()
-            replayed = MagicMock()
+            update = handler()
+            replayed = handler()
             with (
                 self.subTest(in_replay=in_replay),
                 patch.object(coordinator.callbacks, "on_session_update", update),
@@ -1759,7 +1771,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(None, heartbeat)
         coordinator.presence_store.kv = kv
-        update = MagicMock()
+        update = handler()
 
         with patch.object(coordinator.callbacks, "on_presence", update):
             await bounded(coordinator.watch_presence(MagicMock()))
@@ -2196,13 +2208,14 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_durable_writes_require_owned_presence(self) -> None:
         """Refuse channel and session writes until this process owns its bot ID."""
+        self.pin_store_clock()
         coordinator = build_coordinator("alpha")
         channels = FakeKV()
         sessions = FakeKV()
         coordinator.channels_store.kv = cast("KeyValue", channels)
         coordinator.sessions.kv = cast("KeyValue", sessions)
         channel = asdict(ChannelRecord.new("#test", None, present=True))
-        session = session_value(time.time() + 60)
+        session = session_value(NOW + 60)
 
         for state in (PresenceState.UNCLAIMED, PresenceState.DUPLICATE):
             coordinator.claim.state = state

@@ -479,10 +479,10 @@ class TotpAuthorizer:
         self.records: dict[str, Session] = {}
         self.source_records: dict[str, Session] = {}
 
-    def authorized(self, prefix: str, *, now: float | None = None) -> bool:
+    def authorized(self, prefix: str) -> bool:
         """Return whether the prefix has a valid, unexpired session."""
         record = self.records.get(self.identity_fold(prefix))
-        current = time.time() if now is None else now
+        current = time.time()
         return record is not None and record.expires_at > current and not record.revoked
 
     def drop_session(self, prefix: str) -> Session | None:
@@ -513,14 +513,9 @@ class TotpAuthorizer:
 
         return None
 
-    def grant(
-        self,
-        prefix: str,
-        *,
-        now: float | None = None,
-    ) -> Session:
+    def grant(self, prefix: str) -> Session:
         """Create an authenticated session for the given IRC prefix."""
-        current = time.time() if now is None else now
+        current = time.time()
         session = Session(
             expires_at=current + SESSION_TTL,
             issuer=self.issuer,
@@ -586,12 +581,12 @@ class TotpAuthorizer:
             == self.identity_fold(record.prefix)
         ]
 
-    def match(self, code: str, *, now: float | None = None) -> int | None:
+    def match(self, code: str) -> int | None:
         """Return the TOTP counter that produced the code, or None."""
         if not code.isascii() or len(code) != TOTP_CODE_LENGTH or not code.isdigit():
             return None
 
-        current_counter = int((time.time() if now is None else now) // TOTP_PERIOD)
+        current_counter = int(time.time() // TOTP_PERIOD)
         for offset in (
             0,
             *range(-1, -TOTP_WINDOW - 1, -1),
