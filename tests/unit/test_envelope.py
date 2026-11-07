@@ -4,19 +4,24 @@
 """Tests for the signed NATS message envelope."""
 
 import json
-import time
 import unittest
 from unittest.mock import patch
 
 from botnats.nats.envelope import Envelope
 from tests.unit.helpers import COORDINATION_KEY
 
+NOW = 1_000_000
 OVERSIZED_TIMESTAMP = 10**400
 SUBJECT = "botnats.v1.efnet.channel"
 
 
 class EnvelopeTests(unittest.TestCase):
     """Tests for envelope signing, replay protection, and decoding safety."""
+
+    def setUp(self) -> None:
+        """Pin the envelope clock, so no test races the drift window."""
+        self.clock = self.enterContext(patch("botnats.nats.envelope.time"))
+        self.clock.time.return_value = NOW
 
     def test_decode_rejects_large_payload(self) -> None:
         """Verify oversized envelopes are rejected before JSON parsing."""
@@ -109,7 +114,7 @@ class EnvelopeTests(unittest.TestCase):
         """Reject an envelope with a timestamp too far in the future."""
         envelope = Envelope("alpha", COORDINATION_KEY)
         encoded = json.loads(envelope.encode(SUBJECT, {}))
-        encoded["timestamp"] = int(time.time()) + 60
+        encoded["timestamp"] = NOW + 60
 
         with self.assertRaisesRegex(ValueError, "allowed window"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
@@ -119,7 +124,7 @@ class EnvelopeTests(unittest.TestCase):
         sender = Envelope("alpha", COORDINATION_KEY)
         nonce = "a" * 32
         payload: dict[str, object] = {}
-        timestamp = int(time.time())
+        timestamp = NOW
         encoded = json.dumps(
             {
                 "nonce": nonce,
@@ -189,7 +194,7 @@ class EnvelopeTests(unittest.TestCase):
         receiver = Envelope("beta", COORDINATION_KEY)
         receiver.seen_nonces["a" * 32] = 1.0
         receiver.seen_nonces["b" * 32] = 2.0
-        receiver.seen_nonces["c" * 32] = time.time() + 60
+        receiver.seen_nonces["c" * 32] = NOW + 60
         encoded = Envelope("alpha", COORDINATION_KEY).encode(SUBJECT, {})
 
         receiver.decode(SUBJECT, encoded)
@@ -200,22 +205,19 @@ class EnvelopeTests(unittest.TestCase):
         """Reject a replay for as long as the 30-second drift window accepts it."""
         sender = Envelope("alpha", COORDINATION_KEY)
         receiver = Envelope("beta", COORDINATION_KEY)
-        signed_at = 1_000_000.0
+        encoded = sender.encode(SUBJECT, {})
 
-        with patch("botnats.nats.envelope.time") as clock:
-            clock.time.return_value = signed_at
-            encoded = sender.encode(SUBJECT, {})
-            # First seen at the window's future edge and replayed at its past
-            # edge, so the nonce must outlive both halves of the window.
-            clock.time.return_value = signed_at - 30
-            assert receiver.decode(SUBJECT, encoded) == ("alpha", {})
-            clock.time.return_value = signed_at + 30
-            with self.assertRaisesRegex(ValueError, "replayed"):
-                receiver.decode(SUBJECT, encoded)
+        # First seen at the window's future edge and replayed at its past
+        # edge, so the nonce must outlive both halves of the window.
+        self.clock.time.return_value = NOW - 30
+        assert receiver.decode(SUBJECT, encoded) == ("alpha", {})
+        self.clock.time.return_value = NOW + 30
+        with self.assertRaisesRegex(ValueError, "replayed"):
+            receiver.decode(SUBJECT, encoded)
 
-            clock.time.return_value = signed_at + 31
-            with self.assertRaisesRegex(ValueError, "allowed window"):
-                receiver.decode(SUBJECT, encoded)
+        self.clock.time.return_value = NOW + 31
+        with self.assertRaisesRegex(ValueError, "allowed window"):
+            receiver.decode(SUBJECT, encoded)
 
     def test_subject_substitution(self) -> None:
         """Verify a signed message cannot be moved to another NATS subject."""

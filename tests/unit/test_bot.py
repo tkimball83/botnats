@@ -36,6 +36,8 @@ from tests.unit.helpers import (
 if TYPE_CHECKING:
     from botnats.nats.store import Session
 
+# 2100-01-01: a session that cannot expire while a test runs.
+FAR_FUTURE = 4_102_444_800.0
 # Bound before any test patches asyncio.sleep.
 REAL_SLEEP = asyncio.sleep
 
@@ -244,7 +246,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         """Route presence and session watch callbacks to the owners that hold them."""
         bot = Bot(config())
         peer = BotPresence("beta", "beta.host", "two", "beta", "~beta")
-        session = session_value(time.time() + 60)
+        session = session_value(FAR_FUTURE)
 
         bot.callbacks.on_presence(peer)
         bot.callbacks.on_session_update("opaque", session)
