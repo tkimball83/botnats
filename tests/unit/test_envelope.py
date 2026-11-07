@@ -21,7 +21,7 @@ class EnvelopeTests(unittest.TestCase):
     def setUp(self) -> None:
         """Pin the envelope clock, so no test races the drift window."""
         self.clock = self.enterContext(patch("botnats.nats.envelope.time"))
-        self.clock.time.return_value = NOW
+        self.clock.time.return_value = float(NOW)
 
     def test_decode_rejects_large_payload(self) -> None:
         """Verify oversized envelopes are rejected before JSON parsing."""
@@ -209,13 +209,13 @@ class EnvelopeTests(unittest.TestCase):
 
         # First seen at the window's future edge and replayed at its past
         # edge, so the nonce must outlive both halves of the window.
-        self.clock.time.return_value = NOW - 30
+        self.clock.time.return_value = NOW - 30.0
         assert receiver.decode(SUBJECT, encoded) == ("alpha", {})
-        self.clock.time.return_value = NOW + 30
+        self.clock.time.return_value = NOW + 30.0
         with self.assertRaisesRegex(ValueError, "replayed"):
             receiver.decode(SUBJECT, encoded)
 
-        self.clock.time.return_value = NOW + 31
+        self.clock.time.return_value = NOW + 31.0
         with self.assertRaisesRegex(ValueError, "allowed window"):
             receiver.decode(SUBJECT, encoded)
 

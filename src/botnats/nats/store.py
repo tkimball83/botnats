@@ -206,7 +206,7 @@ class AttemptStore(KVStore):
         """Claim one attempt slot, failing closed when KV is unavailable."""
         current = time.time()
         cutoff = current - ATTEMPT_WINDOW
-        encoded = float(current).hex().encode()
+        encoded = current.hex().encode()
         try:
             kv = await self.open()
             for slot in range(ATTEMPT_LIMIT):

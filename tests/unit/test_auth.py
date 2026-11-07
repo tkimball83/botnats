@@ -52,7 +52,7 @@ def pin_clocks(test: unittest.TestCase) -> MagicMock:
         for module in ("botnats.auth", "botnats.nats.store")
     ]
     for clock in clocks:
-        clock.time.return_value = NOW
+        clock.time.return_value = float(NOW)
 
     return clocks[0]
 
@@ -80,7 +80,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         assert totp(AUTH_KEY, 1) == "287082"
         # A code keeps its leading zeros.
         assert totp(AUTH_KEY, 36) == "003784"
-        self.clock.time.return_value = 59
+        self.clock.time.return_value = 59.0
         assert auth.match("not-a-code") is None
         assert auth.match("000000") is None
         assert auth.match("²" * 6) is None
@@ -92,9 +92,9 @@ class TotpAuthorizerTests(unittest.TestCase):
         record came last would keep the wrong one.
         """
         auth = authorizer()
-        self.clock.time.return_value = 15
+        self.clock.time.return_value = 15.0
         auth.grant("Owner{!user@host")
-        self.clock.time.return_value = 10
+        self.clock.time.return_value = 10.0
         auth.grant("Owner[!user@host")
 
         auth.identity_fold = lambda p: p.casefold().translate(
@@ -109,7 +109,7 @@ class TotpAuthorizerTests(unittest.TestCase):
     def test_rekey_revocation_wins(self) -> None:
         """Verify rekey drops a session when a revocation collides."""
         auth = authorizer()
-        self.clock.time.return_value = 10
+        self.clock.time.return_value = 10.0
         auth.revoke(auth.grant("Owner[!user@host"))
         auth.grant("Owner{!user@host")
 
@@ -119,7 +119,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth.rekey()
 
         assert [record.revoked for record in auth.records.values()] == [True]
-        self.clock.time.return_value = 15
+        self.clock.time.return_value = 15.0
         assert not auth.authorized("Owner[!user@host")
         assert not auth.authorized("Owner{!user@host")
 
@@ -131,10 +131,10 @@ class TotpAuthorizerTests(unittest.TestCase):
             Session(10 + SESSION_TTL + 1, "beta", prefix, revoked=True, version=0)
         )
 
-        self.clock.time.return_value = 10
+        self.clock.time.return_value = 10.0
         auth.grant(prefix)
 
-        self.clock.time.return_value = 20
+        self.clock.time.return_value = 20.0
         assert not auth.authorized(prefix)
 
     def test_dropped_key_keeps_revocation(self) -> None:
@@ -152,7 +152,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth.keep(session)
 
         assert [record.revoked for record in auth.records.values()] == [True]
-        self.clock.time.return_value = NOW + 11
+        self.clock.time.return_value = NOW + 11.0
         assert not auth.authorized(prefix)
         # The stale grant is still kept where no revocation is held.
         fresh = authorizer("beta")
@@ -197,7 +197,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         source = authorizer("alpha")
         target = authorizer("beta")
         prefix = "owner!user@example.test"
-        self.clock.time.return_value = 10
+        self.clock.time.return_value = 10.0
         session = source.grant(prefix)
         revoked = source.revoke(session)
         assert revoked is not None
@@ -205,7 +205,7 @@ class TotpAuthorizerTests(unittest.TestCase):
         target.keep(revoked)
         target.keep(session)
 
-        self.clock.time.return_value = 21
+        self.clock.time.return_value = 21.0
         assert not target.authorized(prefix)
 
     def test_session_binding_and_expiry(self) -> None:
@@ -213,14 +213,14 @@ class TotpAuthorizerTests(unittest.TestCase):
         auth = authorizer()
         prefix = "owner!user@example.test"
 
-        self.clock.time.return_value = 11
+        self.clock.time.return_value = 11.0
         auth.grant(prefix)
-        self.clock.time.return_value = 12
+        self.clock.time.return_value = 12.0
         assert not auth.authorized("other!user@example.test")
         # Every bot grants the same lifetime, so a changed one must fail here.
         self.clock.time.return_value = 11 + 3599.9
         assert auth.authorized(prefix)
-        self.clock.time.return_value = 11 + 3600
+        self.clock.time.return_value = 11.0 + 3600
         assert not auth.authorized(prefix)
         # The check only reads; maintenance prunes.
         assert prefix in auth.records
@@ -235,11 +235,11 @@ class TotpAuthorizerTests(unittest.TestCase):
         """Prune expired sessions and revocations, and keep live ones."""
         auth = authorizer()
         for nick, granted in (("expired", NOW - SESSION_TTL - 30), ("live", NOW)):
-            self.clock.time.return_value = granted
+            self.clock.time.return_value = float(granted)
             auth.grant(f"{nick}!user@example.test")
             auth.revoke(auth.grant(f"{nick}-revoked!user@example.test"))
 
-        self.clock.time.return_value = NOW
+        self.clock.time.return_value = float(NOW)
         auth.prune()
 
         assert sorted(auth.records) == [
@@ -263,9 +263,9 @@ class TotpAuthorizerTests(unittest.TestCase):
             auth.grant(prefix)
 
         auth.revoke(auth.grant("owner!revoked@host"))
-        self.clock.time.return_value = NOW - SESSION_TTL
+        self.clock.time.return_value = float(NOW - SESSION_TTL)
         auth.grant("owner!expired@host")
-        self.clock.time.return_value = NOW
+        self.clock.time.return_value = float(NOW)
 
         assert sorted(auth.live_prefixes("OWNER")) == [
             "Owner!user@host",
@@ -1513,7 +1513,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         valid_code = totp(bot.authorizer.secret, NOW // TOTP_PERIOD)
 
         with patch("botnats.nats.store.time") as clock:
-            clock.time.return_value = NOW - 120
+            clock.time.return_value = NOW - 120.0
             await send_command(bot, prefix, f"AUTH {valid_code}")
 
         assert not bot.authorizer.authorized(prefix.render())
@@ -2392,7 +2392,7 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
             bot.sessions.observe(key, record)
 
         with patch("botnats.auth.time") as clock:
-            clock.time.return_value = NOW + 200
+            clock.time.return_value = NOW + 200.0
             bot.sessions.prune()
             bot.sessions.forget(key)
 

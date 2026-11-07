@@ -111,7 +111,8 @@ class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         """Pin the store's clock to NOW."""
-        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
+        clock = self.enterContext(patch("botnats.nats.store.time"))
+        clock.time.return_value = float(NOW)
 
     async def test_create_and_reclaim_sign_heartbeat(self) -> None:
         """Store the unsigned heartbeat a claim passes as a signed record."""
@@ -259,7 +260,8 @@ class PresenceValidTests(unittest.TestCase):
 
     def setUp(self) -> None:
         """Pin the store's clock to NOW."""
-        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
+        clock = self.enterContext(patch("botnats.nats.store.time"))
+        clock.time.return_value = float(NOW)
 
     def test_valid_binds_record_to_key(self) -> None:
         """Accept a signed record only under its own bot ID's key."""
@@ -454,7 +456,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             1,
         ]
 
-        self.clock.time.return_value = 60
+        self.clock.time.return_value = 60.0
         assert await bounded(attempts.allow("host.example"))
         assert attempts.kv.create.await_count == 2
 
@@ -467,7 +469,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.get.side_effect = [KeyNotFoundError()] * ATTEMPT_LIMIT
         attempts.kv.create.side_effect = [KeyWrongLastSequenceError()] * ATTEMPT_LIMIT
 
-        self.clock.time.return_value = 60
+        self.clock.time.return_value = 60.0
         assert not await bounded(attempts.allow("host.example"))
         assert attempts.kv.create.await_count == ATTEMPT_LIMIT
 
@@ -478,7 +480,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         attempts.kv.get.side_effect = KeyNotFoundError()
         attempts.kv.create.side_effect = NatsError("unavailable")
 
-        self.clock.time.return_value = 60
+        self.clock.time.return_value = 60.0
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await bounded(attempts.allow("host.example"))
 
@@ -486,7 +488,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         assert attempts.ready
         attempts.kv.create.side_effect = None
         attempts.kv.create.return_value = 1
-        self.clock.time.return_value = 61
+        self.clock.time.return_value = 61.0
         assert await bounded(attempts.allow("host.example"))
 
     async def test_keys_are_secret_derived(self) -> None:
@@ -511,7 +513,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         """Verify authentication is denied until the bucket is open."""
         attempts = AttemptStore("efnet", 3, SECRET)
 
-        self.clock.time.return_value = 60
+        self.clock.time.return_value = 60.0
         with self.assertLogs("botnats.nats.store", level="WARNING"):
             assert not await bounded(attempts.allow("host.example"))
 
@@ -559,7 +561,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             MagicMock(revision=3, value=b"\xff\xfe"),
         ]
 
-        self.clock.time.return_value = 60
+        self.clock.time.return_value = 60.0
         assert not await bounded(attempts.allow("host.example"))
 
     async def test_overflowing_attempt_is_skipped(self) -> None:
@@ -570,7 +572,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         slot = attempts.key("host.example", 0)
         kv.store(slot, b"0x1p+1024")
 
-        self.clock.time.return_value = 60
+        self.clock.time.return_value = 60.0
         assert await bounded(attempts.allow("host.example"))
         assert kv.entries[slot] == (1, b"0x1p+1024")
         assert attempts.key("host.example", 1) in kv.entries
@@ -586,7 +588,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
         attempts.kv.update.side_effect = KeyWrongLastSequenceError()
 
-        self.clock.time.return_value = ATTEMPT_WINDOW + 1
+        self.clock.time.return_value = ATTEMPT_WINDOW + 1.0
         assert not await bounded(attempts.allow("host.example"))
         attempts.kv.update.assert_awaited_once()
 
@@ -619,7 +621,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             MagicMock(value=(61.2).hex().encode()),
         ]
 
-        self.clock.time.return_value = 59
+        self.clock.time.return_value = 59.0
         assert not await bounded(attempts.allow("host.example"))
 
     async def test_non_finite_attempts_fail_closed(self) -> None:
@@ -632,7 +634,7 @@ class AttemptStoreTests(unittest.IsolatedAsyncioTestCase):
             MagicMock(value=b"-inf"),
         ]
 
-        self.clock.time.return_value = 60
+        self.clock.time.return_value = 60.0
         assert not await bounded(attempts.allow("host.example"))
 
 
@@ -713,7 +715,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         """Pin the store's clock to NOW."""
-        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
+        clock = self.enterContext(patch("botnats.nats.store.time"))
+        clock.time.return_value = float(NOW)
 
     async def test_open_reuses_bucket(self) -> None:
         """Create a replicated file bucket once, then reuse it on the same context."""
