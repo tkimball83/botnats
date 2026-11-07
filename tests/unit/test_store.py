@@ -7,7 +7,6 @@ import asyncio
 import json
 import math
 import re
-import time
 import unittest
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -52,6 +51,7 @@ if TYPE_CHECKING:
 
     from botnats.validators import ChannelFields
 
+NOW = 1_000_000
 OTHER_SECRET = b"a-different-coordination-secret!"
 SHA256_HEX_LENGTH = 64
 SESSION_PAST_HORIZON = "session record expires past this bot's horizon"
@@ -65,7 +65,7 @@ def signed_presence(instance_id: str) -> dict[str, object]:
         "instance_id": instance_id,
         "nick": "Alpha",
         "user": "user",
-        "timestamp": int(time.time()),
+        "timestamp": NOW,
     }
     data["signature"] = presence_signature(SECRET, "efnet", data)
     return data
@@ -108,6 +108,10 @@ async def stale_presence(instance_id: str) -> tuple[PresenceStore, DeletableKV]:
 
 class PresenceReclaimTests(unittest.IsolatedAsyncioTestCase):
     """Tests for reclaiming an occupied presence key after reconnect."""
+
+    def setUp(self) -> None:
+        """Pin the store's clock to NOW."""
+        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
 
     async def test_create_and_reclaim_sign_heartbeat(self) -> None:
         """Store the unsigned heartbeat a claim passes as a signed record."""
@@ -689,6 +693,10 @@ class ClaimStoreTests(unittest.IsolatedAsyncioTestCase):
 class KVStoreTests(unittest.IsolatedAsyncioTestCase):
     """Tests for bucket handles and the channel, presence, and session stores."""
 
+    def setUp(self) -> None:
+        """Pin the store's clock to NOW."""
+        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
+
     async def test_open_reuses_bucket(self) -> None:
         """Create a replicated file bucket once, then reuse it on the same context."""
         store = KVStore("test", 3, 60)
@@ -1149,7 +1157,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         """Order a revocation over an active session that ties on everything else."""
         sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
-        expires_at = time.time() + 40
+        expires_at = NOW + 40
         revocation = session_record(expires_at, 1, revoked=True)
         active = session_record(expires_at, 1, revoked=False)
         winner = parsed_session(revocation)
@@ -1181,15 +1189,14 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
         key = sessions.key("owner!user@host")
-        now = time.time()
-        revocation = session_record(now + 40, 1, revoked=True)
+        revocation = session_record(NOW + 40, 1, revoked=True)
         kv.store(key, json.dumps(revocation).encode())
 
-        earlier = parsed_session(session_record(now + 30))
+        earlier = parsed_session(session_record(NOW + 30))
         assert await bounded(sessions.put(earlier)) == parsed_session(revocation)
         assert json.loads(kv.entries[key][1]) == revocation
 
-        later = session_record(now + 50)
+        later = session_record(NOW + 50)
         assert await bounded(sessions.put(parsed_session(later))) == parsed_session(
             later
         )
@@ -1205,7 +1212,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
         key = sessions.key("owner!user@host")
-        revocation = session_record(time.time() + 40, 1, revoked=True)
+        revocation = session_record(NOW + 40, 1, revoked=True)
         kv.store(key, json.dumps(revocation).encode())
         stored = kv.entries[key]
         session = parsed_session(revocation)
@@ -1223,7 +1230,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
         key = sessions.key("owner!user@host")
-        expired = time.time() - 10
+        expired = NOW - 10
         kv.store(key, json.dumps(session_record(expired, 1)).encode())
         revocation = session_record(expired, 2, revoked=True)
         session = parsed_session(revocation)
@@ -1241,7 +1248,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
         key = sessions.key("owner!user@host")
-        expires_at = time.time() + 40
+        expires_at = NOW + 40
         revocation = Session(
             expires_at, "alpha", "owner!user@host", revoked=True, version=1
         )
@@ -1258,7 +1265,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         """Return and keep a newer session that lands between our read and write."""
         sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
-        expires_at = time.time() + 40
+        expires_at = NOW + 40
         concurrent = session_record(expires_at, 2)
         sessions.kv.get.side_effect = (
             SimpleNamespace(
@@ -1285,10 +1292,9 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         """
         sessions = SessionStore("efnet", 1, SECRET)
         key = sessions.key("owner!user@host")
-        now = time.time()
-        written = session_record(now + 40, 1, revoked=True)
+        written = session_record(NOW + 40, 1, revoked=True)
         # Each expires later, so it would outrank the written revocation.
-        later = session_record(now + 50)
+        later = session_record(NOW + 50)
         misplaced = {**later, "prefix": "other!user@host"}
         misplaced["signature"] = session_signature(SECRET, "efnet", misplaced)
         stored_records: dict[str, dict[str, object]] = {
@@ -1310,21 +1316,18 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         kv = FakeKV()
         sessions.kv = cast("KeyValue", kv)
         key = sessions.key("owner!user@host")
-        now = 1_000_000.0
         # A grant from a peer whose clock runs up to a minute ahead is in horizon.
-        edge = session_record(now + SESSION_TTL + 60)
-        future = session_record(now + SESSION_TTL + 61)
+        edge = session_record(NOW + SESSION_TTL + 60)
+        future = session_record(NOW + SESSION_TTL + 61)
 
-        with patch("botnats.nats.store.time") as clock:
-            clock.time.return_value = now
-            assert sessions.parse(key, future) is None
-            with self.assertRaisesRegex(ValueError, SESSION_PAST_HORIZON):
-                await bounded(sessions.put(parsed_session(future)))
+        assert sessions.parse(key, future) is None
+        with self.assertRaisesRegex(ValueError, SESSION_PAST_HORIZON):
+            await bounded(sessions.put(parsed_session(future)))
 
-            assert kv.entries == {}
-            session = parsed_session(edge)
-            assert sessions.parse(key, edge) == session
-            assert await bounded(sessions.put(session)) == session
+        assert kv.entries == {}
+        session = parsed_session(edge)
+        assert sessions.parse(key, edge) == session
+        assert await bounded(sessions.put(session)) == session
 
         assert list(kv.entries) == [key]
 
@@ -1332,7 +1335,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         """Verify a signed, key-bound record beyond the horizon parse refuses."""
         sessions = SessionStore("efnet", 1, SECRET)
         key = sessions.key("owner!user@host")
-        future = session_record(time.time() + SESSION_TTL + SESSION_EXPIRY_GRACE + 60)
+        future = session_record(NOW + SESSION_TTL + SESSION_EXPIRY_GRACE + 60)
         unsigned = {k: v for k, v in future.items() if k != "signature"}
 
         assert sessions.verify(key, future) == parsed_session(future)
@@ -1343,7 +1346,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_stands_within_horizon_unless_revoked(self) -> None:
         """Let a grant stand only within the horizon, and a revocation past it."""
         sessions = SessionStore("efnet", 1, SECRET)
-        horizon = time.time() + SESSION_TTL + SESSION_EXPIRY_GRACE
+        horizon = NOW + SESSION_TTL + SESSION_EXPIRY_GRACE
 
         assert sessions.stands(parsed_session(session_record(horizon - 60)))
         assert not sessions.stands(parsed_session(session_record(horizon + 60)))
@@ -1353,7 +1356,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_signature_covers_every_field(self) -> None:
         """Refuse a record whose signed fields changed or whose signature is bad."""
         sessions = SessionStore("efnet", 1, SECRET)
-        expiry = time.time() + 30
+        expiry = NOW + 30
         valid = session_record(expiry, 1, revoked=True)
         other_network = {k: v for k, v in valid.items() if k != "signature"}
         other_network["signature"] = session_signature(SECRET, "undernet", valid)
@@ -1390,7 +1393,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_parse_rejects_malformed_signed_fields(self) -> None:
         """Reject a correctly signed record whose fields have the wrong shape."""
-        valid = session_record(time.time() + 30)
+        valid = session_record(NOW + 30)
         malformed: dict[str, dict[str, object]] = {
             "negative version": {"version": -1},
             "boolean version": {"version": True},
@@ -1426,7 +1429,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
                 record = session_record(expiry)
                 assert sessions.parse(sessions.key("owner!user@host"), record) is None
 
-        record = session_record(time.time() + 30)
+        record = session_record(NOW + 30)
         assert sessions.parse(sessions.key("owner!user@host"), record) is not None
 
     async def test_malformed_ordering_records_are_replaced(self) -> None:
@@ -1452,8 +1455,8 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
 
         sessions = SessionStore("efnet", 1, SECRET)
         sessions.kv = AsyncMock()
-        valid_session = parsed_session(session_record(time.time() + 40, 0))
-        future = time.time() + 1_000_000
+        valid_session = parsed_session(session_record(NOW + 40, 0))
+        future = NOW + 1_000_000
         impossible = session_record(future, 1)
         sessions.kv.get.return_value = SimpleNamespace(
             revision=1,
@@ -1497,7 +1500,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         sessions.kv.get.return_value = oversized
         sessions.kv.update.return_value = 2
 
-        valid_session = parsed_session(session_record(time.time() + 40))
+        valid_session = parsed_session(session_record(NOW + 40))
         assert await bounded(sessions.put(valid_session)) == valid_session
         sessions.kv.update.assert_awaited_once()
 
@@ -1565,7 +1568,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         sessions = SessionStore("efnet", 1, SECRET)
         prefix = "owner!user@" + chr(0xD800)
         record = {
-            "expires_at": time.time() + 30,
+            "expires_at": NOW + 30,
             "issuer": "alpha",
             "prefix": prefix,
             "revoked": False,
