@@ -733,6 +733,16 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         assert bot.caps.casemapping == "ascii"
         assert bot.caps.monitor
 
+    async def test_isupport_casemapping_ignores_case(self) -> None:
+        """Select a known casemapping however the server capitalizes it."""
+        bot, _ = bot_with_irc()
+        # Away from the default, so only the uppercase token can restore it.
+        bot.events.handle_isupport(IRCMessage("005", ("alpha", "CASEMAPPING=ascii")))
+
+        bot.events.handle_isupport(IRCMessage("005", ("alpha", "CASEMAPPING=RFC1459")))
+
+        assert bot.caps.casemapping == "rfc1459"
+
     async def test_higher_prefix_counts_as_opped(self) -> None:
         """Verify PREFIX modes above operator retain operator privileges."""
         bot, _ = bot_with_irc()
@@ -2535,7 +2545,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return True
 
-        code = totp(bot.authorizer.secret, int(time.time() // TOTP_PERIOD))
+        # Pinned, so the code cannot age out of the TOTP window mid-test.
+        clock = self.enterContext(patch("botnats.auth.time"))
+        clock.time.return_value = 1_000_000.0
+        code = totp(bot.authorizer.secret, int(clock.time() // TOTP_PERIOD))
         kicker = Prefix("op", "~op", "op.host")
         with patch.object(coordinator, "request_claim", slow_claim):
             bot.events.on_irc_message(

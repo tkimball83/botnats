@@ -77,6 +77,8 @@ BETA_PRESENCE = {
 # stream sequence would be.
 CREATED_REVISION = 7
 NOT_OWNED = "bot ID alpha does not own its presence key"
+# The pinned wall clock, so no signed envelope or record ages out mid-test.
+NOW = 1_000_000
 # Bound before any test patches asyncio.sleep.
 REAL_SLEEP = asyncio.sleep
 SUBJECT = "botnats.v1.efnet.channel"
@@ -139,7 +141,7 @@ def presence_entry() -> SimpleNamespace:
         "instance_id": "other-instance",
         "nick": "alpha",
         "user": "user",
-        "timestamp": int(time.time()),
+        "timestamp": NOW,
     }
     record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
 
@@ -178,6 +180,14 @@ async def yield_once(delay: float) -> None:
 
 class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     """Tests for coordinator boundaries that do not require live NATS."""
+
+    def setUp(self) -> None:
+        """Pin the envelope clock, so no signed request leaves its drift window."""
+        self.enterContext(patch("botnats.nats.envelope.time")).time.return_value = NOW
+
+    def pin_store_clock(self) -> None:
+        """Pin the store clock, so no signed record ages out of its window."""
+        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
 
     async def test_help_request_broadcasts_signed_message(self) -> None:
         """Publish one signed request on the kind's subject, with no reply inbox."""
@@ -1286,6 +1296,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_presence_binds_key_and_applies_delete(self) -> None:
         """Reject misplaced or undecodable values; a peer's delete keeps the claim."""
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         coordinator.claim.adopt(5)
         update = MagicMock()
         delete = MagicMock()
@@ -1321,8 +1332,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_presence_applies_valid_peer_record(self) -> None:
         """Hand a peer's signed, key-bound presence record to the bot."""
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         update = MagicMock()
-        record: dict[str, object] = {**BETA_PRESENCE, "timestamp": int(time.time())}
+        record: dict[str, object] = {**BETA_PRESENCE, "timestamp": NOW}
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         entry = SimpleNamespace(
             key="beta",
@@ -1344,6 +1356,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Yield to another instance's placeholder claim, which is not yet a peer."""
         # Differs from the record's bot ID in case only: claims ignore case.
         coordinator = build_coordinator("Alpha")
+        self.pin_store_clock()
         update = MagicMock()
         # A starting process claims its key before it knows its IRC identity.
         record: dict[str, object] = {
@@ -1352,7 +1365,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             "instance_id": "other-instance",
             "nick": "",
             "user": "",
-            "timestamp": int(time.time()),
+            "timestamp": NOW,
         }
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         entry = SimpleNamespace(
@@ -1377,8 +1390,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_presence_ignores_record_copied_to_own_key(self) -> None:
         """Ignore a peer's signed record copied onto this bot's presence key."""
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         update = MagicMock()
-        record: dict[str, object] = {**BETA_PRESENCE, "timestamp": int(time.time())}
+        record: dict[str, object] = {**BETA_PRESENCE, "timestamp": NOW}
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         assert coordinator.presence_store.valid("beta", record)
         entry = SimpleNamespace(
@@ -1604,8 +1618,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         The replay still counts its key, so it is not treated as missing.
         """
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         key = coordinator.sessions.key("owner!user@host")
-        horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
+        horizon = NOW + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
         entry = SimpleNamespace(
             key=key,
             operation=None,
@@ -1638,8 +1653,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         is not, so it cannot undo the revocation.
         """
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         key = coordinator.sessions.key("owner!user@host")
-        horizon = time.time() + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
+        horizon = NOW + coordinator.sessions.ttl + SESSION_EXPIRY_GRACE
         revoked = session_record(horizon + 60, 1, revoked=True)
         revocation, grant = (
             SimpleNamespace(key=key, operation=None, value=json.dumps(record).encode())
@@ -1666,6 +1682,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         """Verify a duplicate detected during replay is not resolved by the sentinel."""
         # Differs from the record's bot ID in case only: claims ignore case.
         coordinator = build_coordinator("Alpha")
+        self.pin_store_clock()
         entry = presence_entry()
         kv, _ = watcher(entry, None)
         # The occupant still holds the key when the replay ends.
@@ -1681,6 +1698,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_presence_reclaims_key_expired_after_replay(self) -> None:
         """Resolve a replayed duplicate whose record expired before the replay ended."""
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         # TTL expiry emits no watch event; creating the free key succeeds.
         kv, _ = watcher(presence_entry(), None)
         coordinator.presence_store.kv = kv
@@ -1698,6 +1716,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_presence_resolves_on_delete(self) -> None:
         """Verify a live conflict resolves when the presence entry is deleted."""
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         delete_entry = SimpleNamespace(
             key="alpha",
             operation="DEL",
@@ -1722,13 +1741,14 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_watch_presence_keeps_own_heartbeat(self) -> None:
         """Keep owning the key at the revision of this instance's own heartbeat."""
         coordinator = build_coordinator("alpha")
+        self.pin_store_clock()
         record: dict[str, object] = {
             "bot_id": "alpha",
             "host": "host",
             "instance_id": coordinator.config.instance_id,
             "nick": "alpha",
             "user": "user",
-            "timestamp": int(time.time()),
+            "timestamp": NOW,
         }
         record["signature"] = presence_signature(COORDINATION_KEY, "efnet", record)
         heartbeat = SimpleNamespace(
@@ -1739,11 +1759,18 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(None, heartbeat)
         coordinator.presence_store.kv = kv
+        update = MagicMock()
 
-        await bounded(coordinator.watch_presence(MagicMock()))
+        with patch.object(coordinator.callbacks, "on_presence", update):
+            await bounded(coordinator.watch_presence(MagicMock()))
 
         assert coordinator.claim.owned
         assert coordinator.claim.revision == CREATED_REVISION + 1
+        # Recorded like a peer's; the peer lookups leave this bot out.
+        instance_id = coordinator.config.instance_id
+        update.assert_called_once_with(
+            BotPresence("alpha", "host", instance_id, "alpha", "user")
+        )
 
     async def test_watch_presence_recreates_own_deleted_key(self) -> None:
         """Stop owning this bot's deleted key and create it again."""

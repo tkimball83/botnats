@@ -1768,6 +1768,25 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         writer.transport.abort.assert_called_once_with()
         writer.close.assert_not_called()
 
+    async def test_send_loop_aborts_writer_after_non_connection_os_error(self) -> None:
+        """Abort and end quietly on a TLS or socket write error, not only a reset."""
+        # A socket's ETIMEDOUT is no write deadline, so send_immediate re-raises it.
+        for error in (
+            ssl.SSLError("bad record mac"),
+            TimeoutError(errno.ETIMEDOUT, "timed out"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                client = irc_client()
+                writer = mock_writer()
+                writer.drain.side_effect = error
+                outbound: asyncio.Queue[QueuedLine] = asyncio.Queue()
+                outbound.put_nowait((b"PING :one\r\n", None))
+
+                async with asyncio.timeout(5):
+                    await client.send_loop(writer, outbound)
+
+                writer.transport.abort.assert_called_once_with()
+
     async def test_stop_sender_propagates_caller_cancellation(self) -> None:
         """Re-raise cancellation aimed at the caller, not only the sender's own."""
         client = irc_client()
