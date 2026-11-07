@@ -1938,7 +1938,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.member("alpha").modes.add("o")
         peer = BotPresence("beta-id", "beta.host", "one", "beta", "~beta")
         bot.presence.update(peer)
-        with self.assertNoLogs("botnats", level="ERROR"):
+        with (
+            patch("botnats.channel.PEER_HELP_DELAY", 0),
+            self.assertNoLogs("botnats", level="ERROR"),
+        ):
             bot.callbacks.on_help("unknown", "#test", peer)
             await settle(bot)
 
