@@ -192,11 +192,13 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         """Pin the envelope clock, so no signed request leaves its drift window."""
-        self.enterContext(patch("botnats.nats.envelope.time")).time.return_value = NOW
+        clock = self.enterContext(patch("botnats.nats.envelope.time"))
+        clock.time.return_value = float(NOW)
 
     def pin_store_clock(self) -> None:
         """Pin the store clock, so no signed record ages out of its window."""
-        self.enterContext(patch("botnats.nats.store.time")).time.return_value = NOW
+        clock = self.enterContext(patch("botnats.nats.store.time"))
+        clock.time.return_value = float(NOW)
 
     async def test_help_request_broadcasts_signed_message(self) -> None:
         """Publish one signed request on the kind's subject, with no reply inbox."""

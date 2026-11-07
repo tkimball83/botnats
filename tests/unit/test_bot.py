@@ -503,7 +503,7 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         """Remove expired auth sessions and key mappings while disconnected."""
         bot = Bot(config())
         with patch("botnats.auth.time") as clock:
-            clock.time.return_value = 0
+            clock.time.return_value = 0.0
             bot.authorizer.grant("owner!user@host.example")
 
         bot.sessions.watched["expired-key"] = ("owner!user@host.example", 0.0)

@@ -106,10 +106,6 @@ class ServerLines:
             self.now += delay
             return line
 
-        if self.lines:
-            delay, line = self.lines[0]
-            self.lines[0] = (delay - allowed, line)
-
         self.now = max(self.now, deadline)
         return None
 
