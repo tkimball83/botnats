@@ -3016,8 +3016,12 @@ class NickWatchTests(unittest.IsolatedAsyncioTestCase):
             IRCMessage("NICK", ("forced",), Prefix("alpha", "~alpha", "host")),
         )
 
-        assert bot.events.nick_watch_task is not None
+        poll = bot.events.nick_watch_task
+        assert poll is not None
         bot.events.stop_nick_watch()
+        await bounded(asyncio.gather(poll, return_exceptions=True))
+
+        assert poll.cancelled()
 
     async def test_other_user_nick_change_does_not_start_watch(self) -> None:
         """Ignore another user's nick change for this bot's identity and watch."""

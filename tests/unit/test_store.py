@@ -27,7 +27,6 @@ from botnats.nats.store import (
     ATTEMPT_LIMIT,
     ATTEMPT_WINDOW,
     CAS_ATTEMPT_LIMIT,
-    PRESENCE_DRIFT,
     SESSION_EXPIRY_GRACE,
     SESSION_TTL,
     AttemptStore,
@@ -343,12 +342,12 @@ class PresenceValidTests(unittest.TestCase):
         )
         assert store.valid("alpha", fresh, now=now)
 
-        # Fresh from one TTL plus drift ago to one drift ahead, inclusive.
+        # Fresh from one TTL plus 30 s of drift ago to 30 s ahead, inclusive.
         bounds = {
-            PRESENCE_DRIFT: True,
-            PRESENCE_DRIFT + 1: False,
-            -store.ttl - PRESENCE_DRIFT: True,
-            -store.ttl - PRESENCE_DRIFT - 1: False,
+            30: True,
+            31: False,
+            -store.ttl - 30: True,
+            -store.ttl - 31: False,
         }
         with patch("botnats.nats.store.time") as clock:
             clock.time.return_value = now
