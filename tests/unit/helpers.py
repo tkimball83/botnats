@@ -450,8 +450,8 @@ class FakeCoordinator:
         after: str | None,
     ) -> ChannelFields:
         """Record a channel write and store it as ChannelStore would."""
-        await asyncio.sleep(0)
         self.require_writable()
+        await asyncio.sleep(0)
         self.channel_puts.append(record)
         self.channel_after.append(after)
         return await self.channels.put(record, after=after)
@@ -473,8 +473,8 @@ class FakeCoordinator:
 
     async def put_session(self, session: Session) -> Session:
         """Record a session write and store it as SessionStore would."""
-        await asyncio.sleep(0)
         self.require_writable()
+        await asyncio.sleep(0)
         self.session_puts.append(session)
         return await self.sessions.put(session)
 
@@ -524,7 +524,7 @@ class FailingWriteCoordinator(FakeCoordinator):
     It models JetStream refusing writes while NATS stays connected: it stays
     ready, and each write raises NatsError. A disconnect would instead drop
     readiness, and writes would raise StoreUnavailableError. A failing write
-    suspends first, as FakeCoordinator's do.
+    checks the write gate and then suspends, as FakeCoordinator's do.
     """
 
     def __init__(self) -> None:
@@ -540,6 +540,7 @@ class FailingWriteCoordinator(FakeCoordinator):
     ) -> ChannelFields:
         """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
+            self.require_writable()
             await asyncio.sleep(0)
             msg = f"JetStream write failed: channel {record['channel']}"
             raise NatsError(msg)
@@ -549,6 +550,7 @@ class FailingWriteCoordinator(FakeCoordinator):
     async def put_session(self, session: Session) -> Session:
         """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
+            self.require_writable()
             await asyncio.sleep(0)
             msg = f"JetStream write failed: session {session.prefix}"
             raise NatsError(msg)
