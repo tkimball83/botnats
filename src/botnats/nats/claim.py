@@ -128,12 +128,20 @@ class PresenceClaim:
         self.adopt(revision)
 
     async def release(self) -> None:
-        """Delete the owned key on shutdown so a replacement can claim it."""
+        """Delete this instance's key on shutdown so a replacement can claim it.
+
+        An unowned claim may still have its record on the key, from a claim
+        cancelled after its write reached the server; the store deletes it
+        only if it is this instance's. A duplicate never deletes.
+        """
         async with self.lock:
-            revision = self.revision
-            if revision is not None:
+            if not self.duplicate:
                 with suppress(*PUBLISH_ERRORS):
-                    await self.store.delete(self.bot_id, revision, self.instance_id)
+                    await self.store.delete(
+                        self.bot_id,
+                        self.revision,
+                        self.instance_id,
+                    )
 
             self.reset()
 

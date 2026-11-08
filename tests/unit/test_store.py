@@ -44,7 +44,7 @@ from botnats.nats.store import (
     session_signature,
 )
 from tests.unit.helpers import COORDINATION_KEY as SECRET
-from tests.unit.helpers import FakeKV, bounded, check_key, session_record
+from tests.unit.helpers import DeletableKV, FakeKV, bounded, session_record
 
 if TYPE_CHECKING:
     from nats.js.kv import KeyValue
@@ -69,25 +69,6 @@ def signed_presence(instance_id: str) -> dict[str, object]:
     }
     data["signature"] = presence_signature(SECRET, "efnet", data)
     return data
-
-
-class DeletableKV(FakeKV):
-    """In-memory bucket whose delete checks the last revision as nats-py does."""
-
-    async def delete(self, key: str, last: int | None = None) -> bool:
-        """Delete a key, checking only a positive last revision, as nats-py does.
-
-        A mismatch raises a bare BadRequestError. JetStream holds a missing
-        key at revision 0, so any positive revision mismatches it.
-        """
-        await asyncio.sleep(0)
-        check_key(key)
-        revision = self.entries[key][0] if key in self.entries else 0
-        if last and last > 0 and revision != last:
-            raise BadRequestError(code=400, err_code=10071)
-
-        self.entries.pop(key, None)
-        return True
 
 
 async def stale_presence(instance_id: str) -> tuple[PresenceStore, DeletableKV]:
@@ -854,6 +835,16 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         presence, kv = await stale_presence("inst")
 
         await bounded(presence.delete("Alpha", 1, "inst"))
+
+        assert not kv.entries
+
+    async def test_presence_delete_without_revision_rereads(self) -> None:
+        """Delete this instance's record, but not another's, with no owned revision."""
+        presence, kv = await stale_presence("inst")
+        await bounded(presence.delete("Alpha", None, "other"))
+        assert "alpha" in kv.entries
+
+        await bounded(presence.delete("Alpha", None, "inst"))
 
         assert not kv.entries
 

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, create_autospec
 
 from nats.errors import Error as NatsError
 from nats.js.errors import (
+    BadRequestError,
     InvalidKeyError,
     KeyNotFoundError,
     KeyWrongLastSequenceError,
@@ -400,6 +401,25 @@ class FakeKV:
             raise KeyWrongLastSequenceError
 
         return self.store(key, value)
+
+
+class DeletableKV(FakeKV):
+    """In-memory bucket whose delete checks the last revision as nats-py does."""
+
+    async def delete(self, key: str, last: int | None = None) -> bool:
+        """Delete a key, checking only a positive last revision, as nats-py does.
+
+        A mismatch raises a bare BadRequestError. JetStream holds a missing
+        key at revision 0, so any positive revision mismatches it.
+        """
+        await asyncio.sleep(0)
+        check_key(key)
+        revision = self.entries[key][0] if key in self.entries else 0
+        if last and last > 0 and revision != last:
+            raise BadRequestError(code=400, err_code=10071)
+
+        self.entries.pop(key, None)
+        return True
 
 
 def check_key(key: str) -> None:

@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -392,23 +393,26 @@ class PresenceStore(KVStore):
         except KeyWrongLastSequenceError:
             return None
 
-    async def delete(self, bot_id: str, revision: int, instance_id: str) -> None:
+    async def delete(self, bot_id: str, revision: int | None, instance_id: str) -> None:
         """Delete the presence key at its owned revision, if still this instance's.
 
         A heartbeat cancelled after its write reached the server leaves the
-        owned revision stale. nats-py reports that delete's revision mismatch
-        as a bare BadRequestError; the record is then deleted at its current
-        revision if it is still this instance's.
+        owned revision stale, and a claim cancelled after its write reached
+        the server leaves none (None). nats-py reports a stale delete's
+        revision mismatch as a bare BadRequestError; either way, the record is
+        then deleted at its current revision if it is still this instance's.
         """
         kv = await self.open()
         key = self.key(bot_id)
-        try:
-            await kv.delete(key, last=revision)
-        except BadRequestError:
-            entry = await kv.get(key)
-            record = decode_record(entry.value)
-            if record and record.get("instance_id") == instance_id:
-                await kv.delete(key, last=entry.revision)
+        if revision is not None:
+            with suppress(BadRequestError):
+                await kv.delete(key, last=revision)
+                return
+
+        entry = await kv.get(key)
+        record = decode_record(entry.value)
+        if record and record.get("instance_id") == instance_id:
+            await kv.delete(key, last=entry.revision)
 
     async def reclaim(
         self,
