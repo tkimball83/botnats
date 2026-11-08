@@ -267,7 +267,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         }
         for case, messages in seen.items():
             with self.subTest(case=case):
-                bot, _ = bot_with_irc()
+                # Ready, so only the unseen sender refuses the command.
+                bot, _, _ = bot_with_coordinator()
                 runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
                 runtime.join = JoinState.JOINED
                 bot.authorizer.grant(OWNER.render())
