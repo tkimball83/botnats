@@ -1521,9 +1521,9 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         assert next(iter(bot.sessions.pending.values())).revoked
 
     async def test_auth_attempt_limit(self) -> None:
-        """Answer only the AUTH attempts the limit allows, however nicks cycle.
+        """Answer only the AUTH attempts the limit allows, however nicks or users cycle.
 
-        The limit keys on the host, so a new nick on the same host gets no
+        The limit keys on the host, so a new nick or user on the same host gets no
         fresh attempts, whatever its ASCII case. Only ASCII case folds, so été
         is another host than Été.
         """
@@ -1537,7 +1537,7 @@ class AuthFlowTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot.authorizer, "match", return_value=None):
             for nick in nicks:
                 host = "Été.EXAMPLE" if nick[-1] in "13" else "Été.example"
-                prefix = Prefix(nick, "user", host)
+                prefix = Prefix(nick, f"user{nick[-1]}", host)
                 await send_command(bot, prefix, "AUTH 000000")
 
             other = Prefix("other", "user", "été.example")
