@@ -29,7 +29,6 @@ from nats.js.kv import KV_DEL
 
 from botnats.bot import NATSCallbackHandler
 from botnats.channel import ChannelRecord
-from botnats.nats.claim import PresenceState
 from botnats.nats.coordinator import (
     RECONNECT_WAIT,
     TRANSIENT_WARNING_INTERVAL,
@@ -789,7 +788,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         # The duplicate claim is the only thing standing between it and ready.
         assert coordinator.ready
-        coordinator.claim.transition(PresenceState.DUPLICATE, None)
+        coordinator.claim.transition(None, duplicate=True)
 
         await bounded(
             coordinator.request_help(
@@ -1234,7 +1233,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         nc.is_connected = True
         assert coordinator.ready
-        coordinator.claim.transition(PresenceState.UNCLAIMED, None)
+        coordinator.claim.transition(None, duplicate=False)
         assert not coordinator.ready
 
     async def test_watch_channel_applies_valid_record(self) -> None:
@@ -1598,8 +1597,8 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await write
 
-        assert coordinator.claim.state is PresenceState.UNCLAIMED
-        assert coordinator.claim.revision is None
+        assert not coordinator.claim.owned
+        assert not coordinator.claim.duplicate
 
     async def test_empty_session_replay_reports_no_keys(self) -> None:
         """Report an empty replay, so the owner drops every cached session."""
@@ -2258,9 +2257,9 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         channel = asdict(ChannelRecord.new("#test", None, present=True))
         session = session_value(NOW + 60)
 
-        for state in (PresenceState.UNCLAIMED, PresenceState.DUPLICATE):
-            coordinator.claim.state = state
-            with self.subTest(state=state):
+        for duplicate in (False, True):
+            coordinator.claim.duplicate = duplicate
+            with self.subTest(duplicate=duplicate):
                 with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
                     await bounded(coordinator.put_channel(channel, after=None))
 

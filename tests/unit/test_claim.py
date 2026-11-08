@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from nats.errors import Error as NatsError
 
-from botnats.nats.claim import PresenceClaim, PresenceState
+from botnats.nats.claim import PresenceClaim
 from botnats.nats.store import PresenceStore, StoreUnavailableError
 from botnats.presence import BotPresence
 from tests.unit.helpers import COORDINATION_KEY, FakeKV, bounded
@@ -83,7 +83,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_reclaims_after_duplicate(self) -> None:
         """Retry atomic presence reclaim when TTL expiry emits no watch event."""
         claim = build_claim()
-        claim.state = PresenceState.DUPLICATE
+        claim.duplicate = True
 
         with (
             patch.object(
@@ -302,7 +302,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         overwrite this bot's record with the identity-free placeholder.
         """
         claim, kv = open_claim()
-        claim.state = PresenceState.DUPLICATE
+        claim.duplicate = True
         kv.sequence = 1
         await bounded(claim.put(PRESENCE))
         stored = kv.entries["alpha"]
@@ -321,7 +321,7 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         reclaim the key with the identity-free placeholder.
         """
         claim, kv = open_claim()
-        claim.state = PresenceState.DUPLICATE
+        claim.duplicate = True
         kv.sequence = 2
         await bounded(claim.put(PRESENCE))
         stored = kv.entries["alpha"]

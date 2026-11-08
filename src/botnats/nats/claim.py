@@ -6,7 +6,6 @@
 import asyncio
 import logging
 from contextlib import suppress
-from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
 from botnats.nats.store import PUBLISH_ERRORS, StoreUnavailableError
@@ -15,14 +14,6 @@ if TYPE_CHECKING:
     from botnats.nats.store import PresenceStore
 
 LOGGER = logging.getLogger(__name__)
-
-
-class PresenceState(Enum):
-    """This process's hold on its bot ID's presence key."""
-
-    UNCLAIMED = auto()
-    OWNED = auto()
-    DUPLICATE = auto()
 
 
 class PresenceClaim:
@@ -38,6 +29,8 @@ class PresenceClaim:
 
     def __init__(self, store: PresenceStore, bot_id: str, instance_id: str) -> None:
         self.bot_id = bot_id
+        # Whether a live peer holds this bot ID.
+        self.duplicate = False
         self.generation = 0
         self.instance_id = instance_id
         self.key = store.key(bot_id)
@@ -51,19 +44,14 @@ class PresenceClaim:
             "nick": "",
             "user": "",
         }
+        # The owned revision; None while this process does not own the key.
         self.revision: int | None = None
-        self.state = PresenceState.UNCLAIMED
         self.store = store
-
-    @property
-    def duplicate(self) -> bool:
-        """Return whether a live peer holds this bot ID."""
-        return self.state is PresenceState.DUPLICATE
 
     @property
     def owned(self) -> bool:
         """Return whether this process owns its presence key."""
-        return self.state is PresenceState.OWNED
+        return self.revision is not None
 
     def require(self) -> None:
         """Require ownership before any write that speaks for this bot ID."""
@@ -75,17 +63,14 @@ class PresenceClaim:
         """Drop ownership when Core NATS disconnects; a duplicate stays one."""
         # Always invalidate writes in flight: their connection is gone.
         self.generation += 1
-        if self.owned:
-            self.state = PresenceState.UNCLAIMED
-
         self.revision = None
 
-    def transition(self, state: PresenceState, revision: int | None) -> None:
+    def transition(self, revision: int | None, *, duplicate: bool) -> None:
         """Move to a state; a real change invalidates writes in flight."""
-        if state is not self.state:
+        if (revision is not None) != self.owned or duplicate != self.duplicate:
             self.generation += 1
 
-        self.state = state
+        self.duplicate = duplicate
         self.revision = revision
 
     async def put(self, presence: dict[str, Any]) -> None:
@@ -101,7 +86,7 @@ class PresenceClaim:
                     self.revision = revision
                     return
 
-                self.transition(PresenceState.UNCLAIMED, None)
+                self.transition(None, duplicate=False)
 
             await self.claim(presence)
 
@@ -122,7 +107,7 @@ class PresenceClaim:
                 return
 
             if self.owned:
-                self.transition(PresenceState.UNCLAIMED, None)
+                self.transition(None, duplicate=False)
 
             await self.claim(self.placeholder)
 
@@ -182,11 +167,11 @@ class PresenceClaim:
         if self.duplicate:
             LOGGER.info("duplicate bot ID conflict resolved: %s", self.bot_id)
 
-        self.transition(PresenceState.OWNED, revision)
+        self.transition(revision, duplicate=False)
 
     def yield_key(self) -> None:
         """Yield this bot ID to a live peer."""
         if not self.duplicate:
             LOGGER.error("duplicate bot ID detected: %s", self.bot_id)
 
-        self.transition(PresenceState.DUPLICATE, None)
+        self.transition(None, duplicate=True)
