@@ -1426,9 +1426,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_mode_key_recorded_under_configured_spelling(self) -> None:
         """Record a key seen under an equivalent spelling on the channel's record.
 
-        Under rfc1459, MODE #a{ changes the configured #A[. The store keys
-        records by exact name, so the write must name #A[ and compare against
-        its revision, never start a second record for #a{.
+        Under rfc1459, MODE #a{ changes the configured #A[. The store folds
+        record keys only to ASCII lower case, under which #A[ and #a{ differ,
+        so the write must name #A[ and compare against its revision, never
+        start a second record for #a{.
         """
         bot, _, coordinator = bot_with_coordinator()
         kv = cast("FakeKV", coordinator.channels.kv)
