@@ -835,6 +835,6 @@ class IRCEventHandler:
             if (
                 not member.modes
                 and not self.bot.caps.multi_prefix
-                and mode != self.bot.caps.operator_modes[-1]
+                and mode != self.bot.caps.op_mode
             ):
                 runtime.names_due = True
