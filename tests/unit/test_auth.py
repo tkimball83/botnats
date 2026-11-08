@@ -2404,8 +2404,7 @@ class SessionSyncWriteTests(unittest.IsolatedAsyncioTestCase):
     async def test_lost_key_writes_back_only_live_revocations(self) -> None:
         """Write back neither a lost key's grant nor an expired key's revocation.
 
-        The expired key's mapping expired with its revocation, so forget
-        returns before asking the authorizer for it.
+        The lost grant no longer authorizes its identity.
         """
         bot, _, coordinator = bot_with_coordinator()
         granted = bot.authorizer.grant("granted!user@host.example")
