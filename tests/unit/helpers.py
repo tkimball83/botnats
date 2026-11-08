@@ -374,14 +374,17 @@ class FakeKV:
         return self.store(key, value)
 
     async def get(self, key: str) -> SimpleNamespace:
-        """Return the stored entry, or fail as JetStream does when it is absent."""
+        """Return the stored entry, or fail as JetStream does when it is absent.
+
+        As in nats-py, an empty value reads back as None.
+        """
         await asyncio.sleep(0)
         check_key(key)
         if key not in self.entries:
             raise KeyNotFoundError
 
         revision, value = self.entries[key]
-        return SimpleNamespace(key=key, revision=revision, value=value)
+        return SimpleNamespace(key=key, revision=revision, value=value or None)
 
     def store(self, key: str, value: bytes) -> int:
         """Write a value under the next stream sequence and return it."""

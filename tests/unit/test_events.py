@@ -852,6 +852,24 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         # The JOIN stays pending, to be resent after the reply timeout.
         assert runtime.join is JoinState.JOINING
 
+    async def test_5xx_join_error_logged(self) -> None:
+        """Log a 5xx refusal of a pending JOIN as a 4xx one is.
+
+        UnrealIRCd and InspIRCd refuse an oper-only channel with 520.
+        """
+        bot, _ = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.join = JoinState.JOINING
+
+        with self.assertLogs("botnats.events", level="WARNING") as logs:
+            bot.events.on_irc_message(
+                IRCMessage("520", ("alpha", "#Test", "Cannot join channel (+O)")),
+            )
+
+        assert logs.output == [
+            "WARNING:botnats.events:cannot join #test: 520 Cannot join channel (+O)",
+        ]
+
     async def test_join_refusal_logged_once(self) -> None:
         """Log a refusal peers are asked to help with once, until it changes.
 
