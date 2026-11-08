@@ -84,7 +84,7 @@ SUBJECT = "botnats.v1.efnet.channel"
 
 
 def handler() -> MagicMock:
-    """Return a callback stub that returns None, as NATSCallbackHandler's do."""
+    """Return a callback stub that returns None, as the real callbacks do."""
     return MagicMock(return_value=None)
 
 
@@ -1250,7 +1250,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(entry, None)
         coordinator.channels_store.kv = kv
-        synced = MagicMock()
+        synced = handler()
 
         with patch.object(coordinator.callbacks, "on_channel", callback):
             await bounded(coordinator.watch_channels(synced))
@@ -1273,7 +1273,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(entry, None)
         coordinator.channels_store.kv = kv
-        synced = MagicMock()
+        synced = handler()
 
         with patch.object(coordinator.callbacks, "on_channel", callback):
             await bounded(coordinator.watch_channels(synced))
@@ -1298,7 +1298,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.channels_store.kv = kv
 
         with patch.object(coordinator.callbacks, "on_channel", callback):
-            await bounded(coordinator.watch_channels(MagicMock()))
+            await bounded(coordinator.watch_channels(handler()))
 
         callback.assert_called_once_with(astuple(record))
 
@@ -1317,7 +1317,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         kv, _ = watcher(entry, None)
         coordinator.channels_store.kv = kv
-        synced = MagicMock()
+        synced = handler()
 
         with patch.object(coordinator.callbacks, "on_channel", callback):
             await bounded(coordinator.watch_channels(synced))
@@ -1337,7 +1337,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 for store in coordinator.stores:
                     store.kv = kv
 
-                synced = MagicMock()
+                synced = handler()
 
                 await bounded(watch(synced))
 
@@ -1370,7 +1370,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.callbacks, "on_presence", update),
             patch.object(coordinator.callbacks, "on_presence_delete", delete),
         ):
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         update.assert_not_called()
         delete.assert_called_once_with("beta")
@@ -1396,7 +1396,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.presence_store.kv = kv
 
         with patch.object(coordinator.callbacks, "on_presence", update):
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         update.assert_called_once_with(BotPresence(**BETA_PRESENCE))
         # Another instance's record on a peer's key is no duplicate of ours.
@@ -1432,7 +1432,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.callbacks, "on_presence", update),
             self.assertLogs("botnats.nats.claim", level="ERROR"),
         ):
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         assert coordinator.claim.duplicate
         update.assert_not_called()
@@ -1455,7 +1455,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.presence_store.kv = kv
 
         with patch.object(coordinator.callbacks, "on_presence", update):
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         update.assert_not_called()
         assert coordinator.claim.owned
@@ -1466,7 +1466,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         entry = SimpleNamespace(key="alpha", operation=KV_DEL, revision=1, value=None)
         kv, _ = watcher(entry, None)
         coordinator.presence_store.kv = kv
-        synced = MagicMock()
+        synced = handler()
 
         with (
             patch.object(
@@ -1489,7 +1489,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator = build_coordinator("alpha")
         kv, _ = watcher(None)
         coordinator.presence_store.kv = kv
-        synced = MagicMock()
+        synced = handler()
         unavailable = StoreUnavailableError("JetStream changed while opening a bucket")
 
         with (
@@ -1527,7 +1527,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.callbacks, "on_session_delete", delete),
             patch.object(coordinator.callbacks, "on_session_update", update),
         ):
-            await bounded(coordinator.watch_sessions(MagicMock()))
+            await bounded(coordinator.watch_sessions(handler()))
 
         delete.assert_called_once_with(key)
         update.assert_not_called()
@@ -1548,7 +1548,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         update = handler()
 
         with patch.object(coordinator.callbacks, "on_session_update", update):
-            await bounded(coordinator.watch_sessions(MagicMock()))
+            await bounded(coordinator.watch_sessions(handler()))
 
         update.assert_called_once_with(key, session_value(expiry))
 
@@ -1607,7 +1607,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         kv, _ = watcher(None)
         coordinator.sessions.kv = kv
         replayed = handler()
-        synced = MagicMock()
+        synced = handler()
 
         with patch.object(coordinator.callbacks, "on_sessions_replayed", replayed):
             await bounded(coordinator.watch_sessions(synced))
@@ -1657,7 +1657,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.callbacks, "on_session_update", update),
             patch.object(coordinator.callbacks, "on_sessions_replayed", replayed),
         ):
-            await bounded(coordinator.watch_sessions(MagicMock()))
+            await bounded(coordinator.watch_sessions(handler()))
 
         assert delete.call_args_list == [call(key), call(other), call(key)]
         update.assert_called_once_with(key, session_value(expiry))
@@ -1690,7 +1690,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
             patch.object(coordinator.callbacks, "on_session_update", update),
             patch.object(coordinator.callbacks, "on_sessions_replayed", replayed),
         ):
-            await bounded(coordinator.watch_sessions(MagicMock()))
+            await bounded(coordinator.watch_sessions(handler()))
 
         delete.assert_not_called()
         update.assert_not_called()
@@ -1726,7 +1726,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(coordinator.callbacks, "on_session_update", update),
                 patch.object(coordinator.callbacks, "on_sessions_replayed", replayed),
             ):
-                await bounded(coordinator.watch_sessions(MagicMock()))
+                await bounded(coordinator.watch_sessions(handler()))
 
                 update.assert_called_once_with(key, session)
                 replayed.assert_called_once_with({key} if in_replay else set())
@@ -1744,7 +1744,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.presence_store.kv = kv
 
         with self.assertLogs("botnats.nats.claim", level="ERROR"):
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         assert coordinator.claim.duplicate
 
@@ -1757,7 +1757,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.presence_store.kv = kv
 
         with self.assertLogs("botnats.nats.claim", level="INFO") as logs:
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         assert [log.getMessage() for log in logs.records] == [
             "duplicate bot ID detected: alpha",
@@ -1786,7 +1786,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         coordinator.presence_store.kv = kv
 
         with self.assertLogs("botnats.nats.claim", level="ERROR"):
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         assert not coordinator.claim.duplicate
         assert coordinator.claim.revision == CREATED_REVISION
@@ -1815,7 +1815,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         update = handler()
 
         with patch.object(coordinator.callbacks, "on_presence", update):
-            await bounded(coordinator.watch_presence(MagicMock()))
+            await bounded(coordinator.watch_presence(handler()))
 
         assert coordinator.claim.owned
         assert coordinator.claim.revision == CREATED_REVISION + 1
@@ -1836,7 +1836,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         kv, _ = watcher(None, stale, deleted)
         coordinator.presence_store.kv = kv
 
-        await bounded(coordinator.watch_presence(MagicMock()))
+        await bounded(coordinator.watch_presence(handler()))
 
         kv.create.assert_awaited_once()
         assert coordinator.claim.owned
@@ -2145,7 +2145,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
                     store.kv = kv
 
                 with self.assertRaisesRegex(RuntimeError, "callback crashed"):
-                    await bounded(watch(MagicMock()))
+                    await bounded(watch(handler()))
 
                 subscription.stop.assert_awaited_once()
 
@@ -2169,7 +2169,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         kv.watchall = watchall
         coordinator.channels_store.kv = kv
-        watch = asyncio.create_task(coordinator.watch_channels(MagicMock()))
+        watch = asyncio.create_task(coordinator.watch_channels(handler()))
         async with asyncio.timeout(5):
             await setting_up.wait()
             watch.cancel()
@@ -2199,7 +2199,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         kv.watchall = watchall
         coordinator.channels_store.kv = kv
-        watch = asyncio.create_task(coordinator.watch_channels(MagicMock()))
+        watch = asyncio.create_task(coordinator.watch_channels(handler()))
         with self.assertNoLogs("botnats", level="ERROR"):
             async with asyncio.timeout(5):
                 await setting_up.wait()
@@ -2231,7 +2231,7 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
 
         kv.watchall = watchall
         coordinator.channels_store.kv = kv
-        watch = asyncio.create_task(coordinator.watch_channels(MagicMock()))
+        watch = asyncio.create_task(coordinator.watch_channels(handler()))
         with self.assertNoLogs("asyncio", level="ERROR"):
             async with asyncio.timeout(5):
                 await setting_up.wait()
