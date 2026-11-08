@@ -127,6 +127,19 @@ class ConfigTests(unittest.TestCase):
                 with self.subTest(variable=variable, fragment=fragment):
                     assert fragment not in rendered
 
+        # A non-ASCII TOTP secret fails inside an ASCII encode whose error
+        # holds the whole value, so the chain to it must be dropped.
+        for secret in ("canary base32!", "canaryé" * 5):
+            with (
+                self.subTest(secret=secret),
+                self.assertRaisesRegex(ValueError, "valid base32") as raised,
+            ):
+                load_config(json.loads(CONFIG), BOTNATS_TOTP_SECRET=secret)
+
+            assert raised.exception.__cause__ is None
+            assert raised.exception.__suppress_context__
+            assert "canary" not in str(raised.exception).lower()
+
     def test_totp_secret_normalization(self) -> None:
         """Decode a TOTP secret written in lowercase groups split by whitespace."""
         encoded = base64.b32encode(AUTH_KEY).decode().lower()
