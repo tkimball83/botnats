@@ -134,8 +134,8 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
             clock.monotonic.return_value = 12.0
             assert not limiter.check("user")
 
-    async def test_rate_limiting_ignores_nick_change(self) -> None:
-        """Verify the command limiter keys on host so nick cycling cannot bypass it."""
+    async def test_rate_limiting_ignores_nick_and_user_change(self) -> None:
+        """Verify the limiter keys on host, so nick or user cycling cannot bypass it."""
         fake_irc = FakeIRC()
         # Ready, with no channel desired, so every sender is heard.
         bot = make_bot(irc=fake_irc, coordinator=FakeCoordinator())
@@ -143,7 +143,7 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         bot.commands.command_limiter.window = math.inf
 
         for index in range(20):
-            prefix = Prefix(f"nick{index}", "user", "host.example")
+            prefix = Prefix(f"nick{index}", f"user{index}", "host.example")
             bot.authorizer.grant(prefix.render())
             await send_command(bot, prefix, "BOGUS")
 

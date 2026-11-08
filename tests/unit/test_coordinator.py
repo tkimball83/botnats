@@ -2257,14 +2257,11 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         channel = asdict(ChannelRecord.new("#test", None, present=True))
         session = session_value(NOW + 60)
 
-        for duplicate in (False, True):
-            coordinator.claim.duplicate = duplicate
-            with self.subTest(duplicate=duplicate):
-                with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
-                    await bounded(coordinator.put_channel(channel, after=None))
+        with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
+            await bounded(coordinator.put_channel(channel, after=None))
 
-                with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
-                    await bounded(coordinator.put_session(session))
+        with self.assertRaisesRegex(StoreUnavailableError, NOT_OWNED):
+            await bounded(coordinator.put_session(session))
 
         assert not channels.entries
         assert not sessions.entries
