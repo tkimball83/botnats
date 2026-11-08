@@ -3,10 +3,17 @@
 
 """Verify a restarted bot rebuilds its channels, keys, and ops from the mesh."""
 
+import json
+
+from botnats.nats.store import ChannelStore
+from tests.integration.test_failover import (
+    JETSTREAM_REPLICAS,
+    coordination_key,
+)
+from tests.integration.test_failover import connect as connect_nats
 from tests.integration.test_mesh import (
     BOTS,
     CHANNELS,
-    command,
     connect,
     join_as_operator,
     modes,
@@ -23,22 +30,30 @@ async def change_key() -> None:
     """Change the keyed channel's key while a bot is down.
 
     The running bots must record the new key in JetStream, where the missing
-    bot finds it once it is back.
+    bot finds it once it is back; this reads the durable channel record, not
+    a bot's in-memory state.
     """
     channel, old_key = CHANNELS[1]
-    session = await connect()
+    channels = ChannelStore("integration", JETSTREAM_REPLICAS, coordination_key())
+    nc = await connect_nats()
     try:
-        await join_as_operator(session)
-        await session.send("MODE", channel, "-k", old_key)
-        await session.send("MODE", channel, "+k", ROTATED_KEY)
+        kv = await channels.open(nc.jetstream())
+        session = await connect()
+        try:
+            await join_as_operator(session)
+            await session.send("MODE", channel, "-k", old_key)
+            await session.send("MODE", channel, "+k", ROTATED_KEY)
 
-        async def recorded() -> bool:
-            reply = await command(session, "beta", f"GETMODES {channel}")
-            return ROTATED_KEY in reply.split()
+            async def recorded() -> bool:
+                entry = await kv.get(channels.key(channel))
+                assert entry.value is not None
+                return json.loads(entry.value)["key"] == ROTATED_KEY
 
-        await poll_until(recorded, interval=2.0)
+            await poll_until(recorded)
+        finally:
+            await session.close()
     finally:
-        await session.close()
+        await nc.drain()
 
 
 async def run(key: str = CHANNELS[1][1]) -> None:
