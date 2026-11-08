@@ -829,6 +829,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         await bounded(presence.delete("Alpha", 8, "one"))
 
         presence.kv.delete.assert_awaited_once_with("alpha", last=8)
+        presence.kv.get.assert_not_awaited()
 
     async def test_presence_delete_retries_at_current_revision(self) -> None:
         """Delete this instance's newer record when the owned revision is stale."""
