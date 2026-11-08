@@ -14,7 +14,7 @@ from nats.errors import Error as NatsError
 from botnats.nats.claim import PresenceClaim
 from botnats.nats.store import PresenceStore, StoreUnavailableError
 from botnats.presence import BotPresence
-from tests.unit.helpers import COORDINATION_KEY, FakeKV, bounded
+from tests.unit.helpers import COORDINATION_KEY, DeletableKV, FakeKV, bounded
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -424,6 +424,47 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
             await bounded(claim.release())
 
         delete.assert_not_awaited()
+
+    async def test_release_deletes_unrecorded_own_record(self) -> None:
+        """Delete this instance's record that a cancelled claim left unrecorded.
+
+        Shutdown can cancel a claim after its create reached the server but
+        before its revision was recorded; a replacement would otherwise yield
+        to the record as a duplicate until it expires.
+        """
+        claim = build_claim()
+        kv = DeletableKV()
+        claim.store.kv = cast("KeyValue", kv)
+        await bounded(claim.store.create("alpha", PRESENCE))
+        assert not claim.owned
+
+        await bounded(claim.release())
+
+        assert not kv.entries
+
+    async def test_unowned_release_leaves_another_instance(self) -> None:
+        """Leave another instance's record when an unowned claim shuts down."""
+        claim = build_claim()
+        kv = DeletableKV()
+        claim.store.kv = cast("KeyValue", kv)
+        other = {**PRESENCE, "instance_id": "other-instance"}
+        await bounded(claim.store.create("alpha", other))
+
+        await bounded(claim.release())
+
+        assert json.loads(kv.entries["alpha"][1])["instance_id"] == "other-instance"
+
+    async def test_unowned_release_without_key_succeeds(self) -> None:
+        """Shut down quietly when an unowned claim finds no key to delete."""
+        claim = build_claim()
+        kv = DeletableKV()
+        claim.store.kv = cast("KeyValue", kv)
+
+        with self.assertNoLogs("botnats", level="DEBUG"):
+            await bounded(claim.release())
+
+        assert not kv.entries
+        assert not claim.owned
 
     def test_reset_keeps_duplicate(self) -> None:
         """Report a duplicate once across reconnects, and its resolution later."""
