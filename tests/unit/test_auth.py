@@ -2868,6 +2868,7 @@ class SessionSyncWatchTests(unittest.TestCase):
         auth = authorizer()
         sessions = SessionSync(auth, FakeCoordinator(), Tasks())
         sessions.observe("opaque", session_value(NOW + 60))
+        sessions.observe("opaque", session_value(NOW + 60))  # the watch echo
         assert auth.authorized("owner!user@host")
 
         sessions.observe("opaque", session_value(NOW - 1))
@@ -2880,6 +2881,7 @@ class SessionSyncWatchTests(unittest.TestCase):
         auth = authorizer()
         sessions = SessionSync(auth, FakeCoordinator(), Tasks())
         sessions.observe("opaque", session_value(NOW + 60))
+        sessions.observe("opaque", session_value(NOW + 60))  # the watch echo
 
         sessions.forget("opaque")
         sessions.forget("unknown")
@@ -2896,6 +2898,8 @@ class SessionSyncWatchTests(unittest.TestCase):
         gone = Session(expiry, "beta", "gone!user@host", revoked=False, version=0)
         sessions.observe("kept-key", kept)
         sessions.observe("gone-key", gone)
+        echo = Session(expiry, "beta", gone.prefix, revoked=False, version=0)
+        sessions.observe("gone-key", echo)
 
         sessions.replayed({"kept-key"})
 
