@@ -176,6 +176,12 @@ def load_secrets() -> tuple[bytes, str, bytes]:
         raise ValueError(msg)
 
     try:
+        nats_token.encode()
+    except UnicodeEncodeError:
+        msg = "BOTNATS_NATS_TOKEN must be valid UTF-8"
+        raise ValueError(msg) from None
+
+    try:
         coordination_secret = os.environ.get("BOTNATS_COORDINATION_SECRET", "").encode()
     except UnicodeEncodeError:
         msg = "BOTNATS_COORDINATION_SECRET must be valid UTF-8"

@@ -112,16 +112,20 @@ class ConfigTests(unittest.TestCase):
         # reject the value, and the single surrogate is one that a chained
         # UnicodeEncodeError would quote.
         secret = "canary-" * 5 + "\udcff"
-        with self.assertRaisesRegex(
-            ValueError,
-            "^BOTNATS_COORDINATION_SECRET must be valid UTF-8$",
-        ) as raised:
-            load_config(json.loads(CONFIG), BOTNATS_COORDINATION_SECRET=secret)
+        for variable in ("BOTNATS_COORDINATION_SECRET", "BOTNATS_NATS_TOKEN"):
+            with (
+                self.subTest(variable=variable),
+                self.assertRaisesRegex(
+                    ValueError,
+                    f"^{variable} must be valid UTF-8$",
+                ) as raised,
+            ):
+                load_config(json.loads(CONFIG), **{variable: secret})
 
-        rendered = "".join(traceback.format_exception(raised.exception))
-        for fragment in ("canary", "udcff"):
-            with self.subTest(fragment=fragment):
-                assert fragment not in rendered
+            rendered = "".join(traceback.format_exception(raised.exception))
+            for fragment in ("canary", "udcff"):
+                with self.subTest(variable=variable, fragment=fragment):
+                    assert fragment not in rendered
 
     def test_totp_secret_normalization(self) -> None:
         """Decode a TOTP secret written in lowercase groups split by whitespace."""
