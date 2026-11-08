@@ -168,6 +168,38 @@ class PresenceClaimTests(unittest.IsolatedAsyncioTestCase):
         assert claim.duplicate
         assert claim.revision is None
 
+    async def test_duplicate_seen_during_unowned_claim_wins(self) -> None:
+        """Yield to a duplicate the watch shows while an unowned claim is in flight.
+
+        A watch replay shows only the newest record per key, so the claim's
+        older revision must not be adopted over the newer duplicate.
+        """
+        claim = build_claim()
+        creating = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_create(*arguments: object) -> int:
+            del arguments
+            creating.set()
+            await release.wait()
+            return 5
+
+        with patch.object(claim.store, "create", slow_create):
+            write = asyncio.create_task(claim.put(PRESENCE))
+            async with asyncio.timeout(5):
+                await creating.wait()
+
+            with self.assertLogs("botnats.nats.claim", level="ERROR"):
+                claim.observe("other-instance", 7)
+
+            release.set()
+            async with asyncio.timeout(5):
+                await write
+
+        assert claim.duplicate
+        assert not claim.owned
+        assert claim.revision is None
+
     async def test_reclaim_owns_created_key(self) -> None:
         """Own the key at the revision a reclaim after a replay creates."""
         claim = build_claim()
