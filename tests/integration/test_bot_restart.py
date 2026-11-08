@@ -75,8 +75,9 @@ async def run(key: str = CHANNELS[1][1]) -> None:
         await wait_for_names(session, third, present=BOTS | {"owner"})
         await wait_for_operators(session, third, present=BOTS)
         # Checked once every bot is back, so a late rejoin is caught too. The
-        # bots are invisible (+i), so only a member of the channel sees them.
+        # bots are invisible (+i), so only a member of the channel sees them;
+        # the owner listed proves its keyless JOIN was accepted.
         await session.send("JOIN", first)
-        await wait_for_names(session, first, absent=BOTS)
+        await wait_for_names(session, first, absent=BOTS, present=frozenset({"owner"}))
     finally:
         await session.close()
