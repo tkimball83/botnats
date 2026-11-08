@@ -13,6 +13,20 @@ from botnats.health_check import RESPONSE_NOT_FOUND, HealthCheck
 from tests.unit.helpers import bounded, mock_writer
 
 
+def ipv6_binds() -> bool:
+    """Return whether this host can listen on IPv6."""
+    if not socket.has_ipv6:
+        return False
+
+    try:
+        with socket.socket(socket.AF_INET6) as sock:
+            sock.bind(("::", 0))
+    except OSError:
+        return False
+
+    return True
+
+
 class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     """Tests for health check callable and HTTP responses."""
 
@@ -113,6 +127,10 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
 
         assert hosts
         assert all(ipaddress.ip_address(host).is_unspecified for host in hosts)
+        # Probes may come over IPv6 alone, which an IPv4 wildcard misses.
+        if ipv6_binds():
+            families = {sock.family for sock in health_check.server.sockets}
+            assert socket.AF_INET6 in families
 
     async def test_request_timeout_closes_connection(self) -> None:
         """Close a connection that sends no request line within the timeout."""

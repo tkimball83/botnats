@@ -352,6 +352,15 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         put_channel = coordinator.put_channel
         stored = asyncio.Event()
         release = asyncio.Event()
+        lock = mgr.write_lock
+        acquire = lock.acquire
+        blocked = asyncio.Event()
+
+        async def blocking_acquire() -> Literal[True]:
+            if lock.locked():
+                blocked.set()
+
+            return await acquire()
 
         async def unanswered_test_write(
             record: dict[str, Any],
@@ -365,7 +374,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
             return fields
 
-        with patch.object(coordinator, "put_channel", unanswered_test_write):
+        with (
+            patch.object(coordinator, "put_channel", unanswered_test_write),
+            patch.object(lock, "acquire", blocking_acquire),
+        ):
             # One turn writes the keys pending in #test, then in #other.
             bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "k"), op))
             await bounded(stored.wait())
@@ -373,8 +385,8 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", "JOIN #other"), OWNER),
             )
-            # Let the JOIN run until it waits for its turn.
-            await asyncio.sleep(0)
+            # Change the key only once the JOIN waits for its turn.
+            await bounded(blocked.wait())
             bot.events.on_irc_message(IRCMessage("MODE", ("#other", "+k", "new"), op))
             release.set()
             await settle(bot)
