@@ -158,6 +158,11 @@ class CommandHandler:
         # beat this write's compare-and-set. The key is read at the turn, or
         # the write could put back a key one of them replaced.
         async with self.bot.channel_mgr.write_lock:
+            # The session may have ended while waiting: write nothing for a
+            # sender who must authenticate again.
+            if not self.holds(prefix):
+                return
+
             if present and key is None:
                 runtime = self.bot.channel_mgr.runtime(channel)
                 if runtime is not None:
@@ -165,8 +170,8 @@ class CommandHandler:
 
             won = await self.bot.channel_mgr.write_record(channel, key, present=present)
 
-        # The session may have ended during the write, and its nick passed to
-        # another user: reply only while it still holds.
+        # The session may also have ended during the write, and its nick
+        # passed to another user: reply only while it still holds.
         if not self.holds(prefix):
             return
 

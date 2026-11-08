@@ -394,6 +394,45 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         assert fake_irc.privmsgs == [("owner", "Joining #other")]
         assert mgr.channel_records[casefold("#other", "rfc1459")].key == "new"
 
+    async def test_update_needs_a_session_that_outlasts_its_turn(self) -> None:
+        """Write no channel record for a sender who quit while it waited.
+
+        A quit revokes the session, so the sender must authenticate again
+        before its commands change the mesh's channels.
+        """
+
+        async def quit_while_waiting(command: str) -> None:
+            bot, fake_irc, coordinator = bot_with_coordinator()
+            bot.authorizer.grant(OWNER.render())
+            lock = bot.channel_mgr.write_lock
+            acquire = lock.acquire
+            blocked = asyncio.Event()
+
+            async def blocking_acquire() -> Literal[True]:
+                if lock.locked():
+                    blocked.set()
+
+                return await acquire()
+
+            # Stands in for one of this bot's key writes in flight.
+            await bounded(acquire())
+            with patch.object(lock, "acquire", blocking_acquire):
+                join_test_channel(bot, OWNER)
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", command), OWNER),
+                )
+                await bounded(blocked.wait())
+                bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+                lock.release()
+                await settle(bot)
+
+            assert coordinator.channel_puts == []
+            assert fake_irc.privmsgs == []
+
+        for command in ("JOIN #new", "PART #test"):
+            with self.subTest(command=command):
+                await quit_while_waiting(command)
+
     async def test_replies_need_unbroken_connection(self) -> None:
         """Answer no command received before IRC reconnected.
 

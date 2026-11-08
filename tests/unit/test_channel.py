@@ -1005,7 +1005,10 @@ class ChannelManagerTests(unittest.IsolatedAsyncioTestCase):
         runtime.join = JoinState.JOINED
         # A key write names the channel's newest record, #room[...
         await see_key(bot, runtime, "secret")
-        # ...and a command the spelling it was given.
+        # ...and a command the spelling it was given, from a session that
+        # holds as dispatch sees it.
+        bot.authorizer.grant(OWNER.render())
+        bot.sessions.watch_identity(OWNER.render())
         await bounded(bot.commands.cmd_join(OWNER, ("#room{", "other")))
 
         assert coordinator.channel_after == [bracket.revision, brace.revision]
