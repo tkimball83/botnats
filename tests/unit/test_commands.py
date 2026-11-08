@@ -8,7 +8,7 @@ import math
 import unittest
 from collections import deque
 from dataclasses import asdict, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
@@ -293,6 +293,15 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
         put_channel = coordinator.put_channel
         stored = asyncio.Event()
         release = asyncio.Event()
+        lock = bot.channel_mgr.write_lock
+        acquire = lock.acquire
+        blocked = asyncio.Event()
+
+        async def blocking_acquire() -> Literal[True]:
+            if lock.locked():
+                blocked.set()
+
+            return await acquire()
 
         async def unanswered_key_write(
             record: dict[str, Any],
@@ -306,7 +315,10 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
 
             return fields
 
-        with patch.object(coordinator, "put_channel", unanswered_key_write):
+        with (
+            patch.object(coordinator, "put_channel", unanswered_key_write),
+            patch.object(lock, "acquire", blocking_acquire),
+        ):
             bot.events.on_irc_message(
                 IRCMessage("MODE", ("#test", "+k", "k"), Prefix("op", "~op", "h")),
             )
@@ -315,8 +327,8 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             bot.events.on_irc_message(
                 IRCMessage("PRIVMSG", ("alpha", "PART #test"), OWNER),
             )
-            # Let the PART run until it waits for its turn.
-            await asyncio.sleep(0)
+            # Release the key write only once the PART waits for its turn.
+            await bounded(blocked.wait())
             release.set()
             await settle(bot)
 
