@@ -351,9 +351,9 @@ def totp_key(value: str) -> bytes:
     padding = "=" * (-len(normalized) % 8)
     try:
         decoded = base64.b32decode(normalized + padding)
-    except ValueError as error:
+    except ValueError:
         msg = "BOTNATS_TOTP_SECRET must be valid base32"
-        raise ValueError(msg) from error
+        raise ValueError(msg) from None
 
     if len(decoded) < MIN_TOTP_SECRET_BYTES:
         msg = "BOTNATS_TOTP_SECRET must contain at least 160 bits"
