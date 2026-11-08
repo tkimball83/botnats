@@ -783,7 +783,7 @@ class KVStoreTests(unittest.IsolatedAsyncioTestCase):
         nats-py sends the TTL in whole nanoseconds, so a fractional TTL reads
         back slightly smaller and still matches.
         """
-        for ttl in (0, 60, 32.3):
+        for ttl in (0, 60, 4.1):
             store = KVStore("test", 1, ttl)
             js = AsyncMock()
             error = BadRequestError(description="replicas cannot be updated")
