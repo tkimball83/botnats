@@ -1371,6 +1371,42 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             IDLE_TIMEOUT,
         ]
 
+    async def test_other_lines_do_not_extend_the_pong_wait(self) -> None:
+        """Disconnect at the PONG deadline although other lines still arrive.
+
+        A server that relays traffic but never answers our PING is still
+        not answering it, so a line other than the PONG keeps the deadline.
+        """
+        client = irc_client()
+        writer = mock_writer()
+        lines = ServerLines((0, b":server 001 alpha :Welcome\r\n"))
+
+        def notice_after_ping(encoded: bytes) -> None:
+            if encoded.startswith(b"PING :"):
+                lines.lines.append((10, b":server NOTICE alpha :hi\r\n"))
+
+        writer.write.side_effect = notice_after_ping
+        connection = (asyncio.StreamReader(), writer)
+
+        with (
+            patch.object(client, "establish", AsyncMock(return_value=connection)),
+            patch(
+                "asyncio.get_running_loop",
+                return_value=SimpleNamespace(time=lines.time),
+            ),
+            patch("botnats.irc.client.read_line", lines.read_line),
+            self.assertRaisesRegex(ConnectionError, "did not answer"),
+        ):
+            async with asyncio.timeout(5):
+                await client.run_connection(client.config.servers[0])
+
+        assert lines.waits == [
+            REGISTRATION_TIMEOUT,
+            IDLE_TIMEOUT,
+            PONG_TIMEOUT,
+            PONG_TIMEOUT - 10,
+        ]
+
     async def test_registration_deadline_runs_from_connect(self) -> None:
         """Disconnect at the registration deadline despite lines before 001."""
         client = irc_client()

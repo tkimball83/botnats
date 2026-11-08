@@ -474,6 +474,40 @@ class CoordinatorUnitTests(unittest.IsolatedAsyncioTestCase):
         nc.close.assert_awaited_once_with()
         assert coordinator.nc is None
 
+    async def test_close_during_resync_cancel_does_not_restart(self) -> None:
+        """Start no restart when nats-py closes the client while close() cancels.
+
+        A server error can close the client while close() waits for a resync
+        or restart to end; close() dropped the client first, so on_closed
+        leaves it closed.
+        """
+        coordinator = build_coordinator("alpha")
+        nc = MagicMock(is_connected=True, close=AsyncMock(return_value=None))
+        coordinator.nc = nc
+
+        async def resync() -> None:
+            try:
+                await hang()
+            finally:
+                await coordinator.on_closed()
+
+        task = asyncio.create_task(resync())
+        coordinator.resync_task = task
+
+        with patch("nats.connect", AsyncMock()) as connect:
+            async with asyncio.timeout(5):
+                # Let the resync start, so cancelling it runs its cleanup.
+                await asyncio.sleep(0)
+                await coordinator.close()
+                restart = coordinator.resync_task
+                await coordinator.cancel_resync()
+
+        assert task.cancelled()
+        assert restart is task
+        connect.assert_not_awaited()
+        nc.close.assert_awaited_once_with()
+        assert coordinator.nc is None
+
     async def test_closed_client_restarts(self) -> None:
         """Drop a client nats-py closed for good and connect again in the background.
 

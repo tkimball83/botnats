@@ -410,7 +410,8 @@ class DeletableKV(FakeKV):
         """Delete a key, checking only a positive last revision, as nats-py does.
 
         A mismatch raises a bare BadRequestError. JetStream holds a missing
-        key at revision 0, so any positive revision mismatches it.
+        key at revision 0, so any positive revision mismatches it. A delete
+        writes a marker, so it consumes a stream sequence.
         """
         await asyncio.sleep(0)
         check_key(key)
@@ -418,6 +419,8 @@ class DeletableKV(FakeKV):
         if last and last > 0 and revision != last:
             raise BadRequestError(code=400, err_code=10071)
 
+        # The delete marker takes the next stream sequence.
+        self.sequence += 1
         self.entries.pop(key, None)
         return True
 
