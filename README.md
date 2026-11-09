@@ -184,5 +184,5 @@ Install the pre-commit hook with `make hooks`. Build the amd64 image with:
 docker build --platform linux/amd64 -t botnats .
 ```
 
-The container workflow publishes `ghcr.io/tkimball83/botnats`. `latest` follows
-the default branch; release tags publish matching image tags.
+The container workflow publishes `ghcr.io/tkimball83/botnats` from release tags.
+Each release tag publishes one image as its version and as `latest`.

@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 90
 
   container:
-    if: github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     permissions:
       contents: read
@@ -57,10 +57,7 @@ jobs:
         id: metadata
         with:
           images: ghcr.io/${{ github.repository_owner }}/botnats
-          flavor: latest=false
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}}
+          tags: type=semver,pattern=v{{version}}
       - uses: docker/build-push-action@v7.4.0
         with:
           context: .
