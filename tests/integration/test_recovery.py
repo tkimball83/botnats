@@ -1,47 +1,53 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Verify recovery from a ban, a kick, and a full channel, and a session restart."""
+"""Verify recovery from a ban, a kick, a full or invite-only channel, and a restart."""
 
 import asyncio
-import base64
-import os
-import time
 from typing import TYPE_CHECKING
 
-from botnats.auth import totp
 from tests.integration.test_mesh import (
     CHANNELS,
     COMMAND_TIMEOUT,
-    STARTUP_TIMEOUT,
     IRCSession,
     connect,
+    join_as_operator,
     names,
     private_message,
     wait_for_bots,
+    wait_for_modes,
     wait_for_names,
-    wait_for_operators,
     wait_for_reply,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+# The restarted bot's STATUS reply queues behind its registration, WHO, and
+# rejoin of both present channels (each JOIN, WHO, MODE, MODE +b, then MODE
+# and enforced modes once opped): 18 lines, sent within 28 seconds of
+# connecting under flood pacing.
 RESTART_TIMEOUT = 90.0
+# A reply later than one poll is read by the next; this only paces resends.
 STATUS_POLL_WAIT = 3.0
 
 
-async def wait_for_authorized_status(session: IRCSession, bot: str) -> str:
-    """Poll STATUS until the bot answers; unauthorized senders get no reply."""
+async def wait_for_authorized_status(session: IRCSession) -> str:
+    """Poll alpha's STATUS until it answers.
+
+    Alpha ignores the owner until it holds the owner's session and has seen
+    the owner in a channel again. Only a silent poll is retried: a closed
+    connection fails at once.
+    """
     async with asyncio.timeout(RESTART_TIMEOUT):
         while True:
-            await session.send("PRIVMSG", bot, trailing="STATUS")
+            await session.send("PRIVMSG", "alpha", trailing="STATUS")
             try:
                 reply = await session.read_until(
-                    private_message(bot),
+                    private_message("alpha"),
                     wait_seconds=STATUS_POLL_WAIT,
                 )
-            except AssertionError:
+            except TimeoutError:
                 continue
 
             return reply.params[-1]
@@ -49,12 +55,8 @@ async def wait_for_authorized_status(session: IRCSession, bot: str) -> str:
 
 async def rejoin_after_ban(session: IRCSession) -> None:
     """Ban and kick a bot; the mesh must get it back in and lift the ban."""
-    channel, key = CHANNELS[1]
-    await session.send("JOIN", channel, key)
-    await wait_for_reply(
-        session, "alpha", f"OP {channel} owner", f"Opped owner on {channel}"
-    )
-    await wait_for_operators(session, channel, present=frozenset({"owner"}))
+    channel, _ = CHANNELS[1]
+    await join_as_operator(session)
 
     await session.send("MODE", channel, "+b", "gamma!*@*")
     await session.send("KICK", channel, "gamma", trailing="recovery test")
@@ -92,34 +94,39 @@ async def rejoin_full_channel(session: IRCSession) -> None:
     await session.send("MODE", channel, "-l")
 
 
+async def rejoin_invite_only(session: IRCSession) -> None:
+    """Kick a bot from an invite-only channel; a peer must invite it back."""
+    channel, _ = CHANNELS[1]
+    await session.send("MODE", channel, "+i")
+    await wait_for_modes(session, channel, present="i")
+    await session.send("KICK", channel, "gamma", trailing="invite test")
+
+    # gamma's JOIN is refused as invite-only until a peer invites it.
+    await wait_for_names(session, channel, present=frozenset({"gamma"}))
+    await session.send("MODE", channel, "-i")
+
+
 async def session_survives_restart(
     session: IRCSession,
     restart: Callable[[str], Awaitable[None]],
 ) -> None:
     """Restart a bot; its admin session must replay from JetStream, not reset."""
     await restart("alpha")
-    reply = await wait_for_authorized_status(session, "alpha")
+    reply = await wait_for_authorized_status(session)
     assert reply.startswith("bot id=alpha"), reply
 
 
 async def run(restart: Callable[[str], Awaitable[None]]) -> None:
     """Authenticate once, then exercise every recovery path on one connection."""
-    secret = base64.b32decode(os.environ["BOTNATS_TEST_TOTP_SECRET"])
-    session = await connect(os.environ["BOTNATS_TEST_IRC_ADDRESS"])
+    session = await connect()
     try:
         await wait_for_bots(session)
-        # The next window's code: the mesh test already claimed this window's.
-        code = totp(secret, int(time.time() // 30) + 1)
-        await session.send("PRIVMSG", "alpha", trailing=f"AUTH {code}")
-        await session.read_until(
-            private_message("alpha", "Authorized"),
-            wait_seconds=COMMAND_TIMEOUT,
-        )
-
+        # Authenticates once the owner shares a channel with alpha.
         await rejoin_after_ban(session)
         await rejoin_full_channel(session)
+        await rejoin_invite_only(session)
         # Keep this connection open across the restart: closing it would QUIT
         # and revoke the very session under test.
         await session_survives_restart(session, restart)
     finally:
-        await asyncio.wait_for(session.close(), timeout=STARTUP_TIMEOUT)
+        await session.close()

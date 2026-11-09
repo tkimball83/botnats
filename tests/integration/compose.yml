@@ -9,11 +9,12 @@ x-bot: &bot
       condition: service_healthy
     nats-3:
       condition: service_healthy
+  # tests/integration/run.py owns these values and exports them for compose.
   environment:
-    BOTNATS_COORDINATION_SECRET: coordination-secret-used-only-for-tests
+    BOTNATS_COORDINATION_SECRET: ${BOTNATS_TEST_COORDINATION_SECRET:?run via tests/integration/run.py}
     BOTNATS_LOG_LEVEL: DEBUG
-    BOTNATS_NATS_TOKEN: integration-token
-    BOTNATS_TOTP_SECRET: GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ
+    BOTNATS_NATS_TOKEN: ${BOTNATS_TEST_NATS_TOKEN:?run via tests/integration/run.py}
+    BOTNATS_TOTP_SECRET: ${BOTNATS_TEST_TOTP_SECRET:?run via tests/integration/run.py}
   healthcheck:
     interval: 2s
     retries: 60
@@ -33,7 +34,7 @@ x-nats: &nats
         wget -qO- 'http://127.0.0.1:8222/healthz?js-enabled-only=true'
         | grep -q '"status":"ok"'
     timeout: 1s
-  image: nats:2.14.4-alpine
+  image: nats:2.15.2-alpine
   volumes:
     - /data
 
@@ -56,9 +57,6 @@ services:
       - ./config/gamma.json:/etc/botnats/bot.json:ro
 
   irc:
-    entrypoint:
-      - /bin/sh
-      - /test/run-ergo.sh
     healthcheck:
       interval: 5s
       retries: 30
@@ -66,17 +64,15 @@ services:
         - CMD-SHELL
         - nc -z 127.0.0.1 6667
       timeout: 1s
-    image: ghcr.io/ergochat/ergo:v2.19.0
+    image: ghcr.io/ergochat/ergo:v2.19.1
     ports:
       - 127.0.0.1::6667
-    volumes:
-      - ./run-ergo.sh:/test/run-ergo.sh:ro
 
   nats-1:
     <<: *nats
     command:
       - --auth
-      - integration-token
+      - ${BOTNATS_TEST_NATS_TOKEN:?run via tests/integration/run.py}
       - --cluster
       - nats://0.0.0.0:6222
       - --cluster_name
@@ -97,7 +93,7 @@ services:
     <<: *nats
     command:
       - --auth
-      - integration-token
+      - ${BOTNATS_TEST_NATS_TOKEN:?run via tests/integration/run.py}
       - --cluster
       - nats://0.0.0.0:6222
       - --cluster_name
@@ -118,7 +114,7 @@ services:
     <<: *nats
     command:
       - --auth
-      - integration-token
+      - ${BOTNATS_TEST_NATS_TOKEN:?run via tests/integration/run.py}
       - --cluster
       - nats://0.0.0.0:6222
       - --cluster_name

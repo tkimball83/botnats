@@ -5,15 +5,15 @@ description: Run Docker integration tests.
 
 # integration
 
-Full Docker mesh: three NATS nodes, one IRC server, three bots.
+Docker mesh: three NATS nodes, one IRC server, and three bots, one of them over `ircs://`.
 
 ```sh
 make integration
 ```
 
-Requires Docker. `tests/integration/run.py` starts the compose mesh, runs each
-named phase in order (live coordinator, NATS failover and restart, mesh, recovery,
-serial bot replacement), dumps compose logs on failure, and always tears down.
+`tests/integration/run.py` owns the test secrets and runs each phase in order under a timeout:
+live coordinator, three-bot mesh, NATS node failover, full NATS restart, presence TTL change,
+recovery, and serial bot replacement. It dumps compose logs on failure and always tears down.
 
 ## Dependencies
 

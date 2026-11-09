@@ -1,46 +1,143 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Shared fakes and factories for bot-level tests."""
+"""Shared fakes, factories, and waits for unit tests."""
 
 import asyncio
-import time
-from typing import TYPE_CHECKING, Any
+import base64
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import MagicMock, create_autospec
 
 from nats.errors import Error as NatsError
+from nats.js.errors import (
+    BadRequestError,
+    InvalidKeyError,
+    KeyNotFoundError,
+    KeyWrongLastSequenceError,
+)
+from nats.js.kv import VALID_KEY_RE
 
 from botnats.bot import Bot
-from botnats.channel import ChannelRuntime
+from botnats.channel import ChannelRecord, JoinState
 from botnats.config import BotConfig
 from botnats.irc.client import IRCServer
-from botnats.irc.protocol import IRCMessage, Prefix, casefold, format_message
+from botnats.irc.protocol import (
+    IRCMessage,
+    ISupportState,
+    Prefix,
+    format_message,
+)
 from botnats.nats.status import NATSStatus
-from botnats.nats.store import ATTEMPT_LIMIT, ATTEMPT_WINDOW, session_signature
+from botnats.nats.store import (
+    AttemptStore,
+    ChannelStore,
+    ClaimStore,
+    Session,
+    SessionStore,
+    StoreUnavailableError,
+    parse_session_record,
+    session_signature,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from nats.js.kv import KeyValue
+
     from botnats.irc.protocol import IRCProtocol
     from botnats.nats.coordinator import CoordinatorProtocol
+    from botnats.validators import ChannelFields
 
-AUTH_SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
-COORDINATION_KEY = b"coordination-secret-used-only-for-tests"
+AUTH_KEY = b"12345678901234567890"
 COORDINATION_KEY_TEXT = "coordination-secret-used-only-for-tests"
+COORDINATION_KEY = COORDINATION_KEY_TEXT.encode()
 NATS_CREDENTIAL = "nats-token"
 OWNER = Prefix("owner", "user", "real.host")
+
+# Every value differs from its default, so a field the loader drops or
+# misroutes cannot pass as its default.
+CONFIG = b"""{
+  "bot": {
+    "health_port": 9080,
+    "id": "botnats-1",
+    "network": "libera",
+    "nickname": "botnick"
+  },
+  "coordination": {
+    "maintenance_interval_seconds": 2,
+    "presence_ttl_seconds": 10
+  },
+  "irc": {
+    "channel_modes": "+nt-s",
+    "connect_timeout_seconds": 45,
+    "servers": ["ircs://irc.example.test:6697", "irc://irc2.example.test:6668"],
+    "verify_tls": false
+  },
+  "nats": {
+    "jetstream_replicas": 3,
+    "monitor_port": 9222,
+    "servers": ["nats://nats.internal:4222", "nats://nats2.internal:4223"]
+  }
+}
+"""
+SECRETS = {
+    "BOTNATS_COORDINATION_SECRET": COORDINATION_KEY_TEXT,
+    "BOTNATS_NATS_TOKEN": NATS_CREDENTIAL,
+    "BOTNATS_TOTP_SECRET": base64.b32encode(AUTH_KEY).decode(),
+}
+
+
+async def bounded[T](awaitable: Awaitable[T]) -> T:
+    """Await a call that takes a lock, failing instead of hanging."""
+    async with asyncio.timeout(5):
+        return await awaitable
 
 
 async def drain_session_writes(bot: Bot) -> None:
     """Wait for durable session writes that IRC handlers run in background."""
-    await asyncio.gather(
-        *(task for task in tuple(bot.tasks) if task.get_name() == "session-sync"),
-    )
+    async with asyncio.timeout(5):
+        await asyncio.gather(
+            *(task for task in tuple(bot.tasks) if task.get_name() == "session-sync"),
+        )
+
+
+async def hang(*arguments: object) -> None:
+    """Block like a live task or watch until cancelled."""
+    del arguments
+    await asyncio.Event().wait()
+
+
+def join_test_channel(bot: Bot, prefix: Prefix) -> None:
+    """Show a user joining #test, so the bot hears its commands once desired.
+
+    A server shows other users' JOINs only once this bot is in the channel.
+    """
+    runtime = bot.channel_mgr.runtime("#test")
+    if runtime is not None:
+        runtime.join = JoinState.JOINED
+
+    bot.events.on_irc_message(IRCMessage("JOIN", ("#test",), prefix))
 
 
 async def send_command(bot: Bot, prefix: Prefix, text: str) -> None:
-    """Queue a private-message command as IRC delivers it and wait for it."""
-    await bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
-    await asyncio.gather(
-        *(task for task in tuple(bot.tasks) if task.get_name() == "admin-command"),
-    )
+    """Queue a command from a member of #test as IRC delivers it; wait for it."""
+    join_test_channel(bot, prefix)
+    bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha", text), prefix))
+    async with asyncio.timeout(5):
+        await asyncio.gather(
+            *(task for task in tuple(bot.tasks) if task.get_name() == "admin-command"),
+        )
+
+
+async def settle(bot: Bot) -> None:
+    """Wait for background tasks, including any the finished ones spawned."""
+    async with asyncio.timeout(5):
+        while bot.tasks:
+            await asyncio.gather(*bot.tasks)
+            # Gathering done tasks never yields to their pending done
+            # callbacks, which stop tracking them.
+            await asyncio.sleep(0)
 
 
 def session_record(
@@ -61,33 +158,48 @@ def session_record(
     return record
 
 
+def session_value(expires_at: float) -> Session:
+    """Build a validated session for owner!user@host."""
+    session = parse_session_record(
+        COORDINATION_KEY,
+        "efnet",
+        session_record(expires_at),
+    )
+    assert session is not None
+    return session
+
+
 def bot_with_channel(
     *,
     irc: IRCProtocol | None = None,
     coordinator: CoordinatorProtocol | None = None,
 ) -> Bot:
     """Create a bot with a single test channel registered."""
+    bot = make_bot(irc=irc, coordinator=coordinator)
+    record = ChannelRecord.new("#test", None, present=True)
+    bot.channel_mgr.apply_record(record)
+    return bot
+
+
+def make_bot(
+    *,
+    irc: IRCProtocol | None = None,
+    coordinator: CoordinatorProtocol | None = None,
+) -> Bot:
+    """Create a bot whose fake IRC client folds names with the bot's own caps."""
     bot = Bot(config(), irc=irc, coordinator=coordinator)
-    folded = casefold("#test")
-    record = bot.channel_mgr.new_record(
-        "#test",
-        None,
-        present=True,
-    )
-    bot.channel_mgr.channel_records[folded] = record
-    bot.channel_mgr.source_records[casefold(record.channel, "ascii")] = record
-    bot.channel_mgr.channels[folded] = ChannelRuntime(channel="#test")
+    if isinstance(irc, FakeIRC):
+        irc.caps = bot.caps
+
     return bot
 
 
 def bot_with_coordinator(
     coordinator: FakeCoordinator | None = None,
-    *,
-    irc: FakeIRC | None = None,
 ) -> tuple[Bot, FakeIRC, FakeCoordinator]:
     """Create a bot wired to a fake IRC client and fake coordinator."""
     coordinator = coordinator or FakeCoordinator()
-    fake_irc = irc or FakeIRC()
+    fake_irc = FakeIRC()
     return (
         bot_with_channel(irc=fake_irc, coordinator=coordinator),
         fake_irc,
@@ -95,26 +207,22 @@ def bot_with_coordinator(
     )
 
 
-def bot_with_irc(
-    irc: FakeIRC | None = None,
-    *,
-    coordinator: CoordinatorProtocol | None = None,
-) -> tuple[Bot, FakeIRC]:
+def bot_with_irc() -> tuple[Bot, FakeIRC]:
     """Create a bot wired to a fake IRC client."""
-    fake_irc = irc or FakeIRC()
-    return bot_with_channel(irc=fake_irc, coordinator=coordinator), fake_irc
+    fake_irc = FakeIRC()
+    return bot_with_channel(irc=fake_irc), fake_irc
 
 
 def config() -> BotConfig:
     """Build a default test configuration."""
     return BotConfig(
-        auth_session_ttl=3600,
-        bot_id="alpha",
+        bot_id="alpha-id",
         channel_modes="+npst",
-        coordination_secret=COORDINATION_KEY_TEXT,
+        coordination_secret=COORDINATION_KEY,
+        enforced_modes=(frozenset("npst"), frozenset()),
         health_port=8080,
         irc_connect_timeout=30,
-        irc_servers=(IRCServer("irc.example.test", 6697, tls=True),),
+        irc_servers=(IRCServer("irc.example.test", 6667, tls=False),),
         irc_verify_tls=True,
         jetstream_replicas=1,
         maintenance_interval=3,
@@ -123,61 +231,87 @@ def config() -> BotConfig:
         nats_token=NATS_CREDENTIAL,
         network="efnet",
         nickname="alpha",
-        presence_ttl=15,
-        totp_secret=AUTH_SEED,
+        # Long enough that peers stay present through any stall.
+        presence_ttl=3600,
+        totp_secret=AUTH_KEY,
     )
 
 
+def mock_writer() -> MagicMock:
+    """Create a mock open StreamWriter that returns what the real one does."""
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.is_closing.return_value = False
+    writer.write.return_value = None
+    writer.drain.return_value = None
+    writer.close.return_value = None
+    writer.wait_closed.return_value = None
+    writer.transport.abort.return_value = None
+    return writer
+
+
 class FakeIRC:
-    """In-memory IRC client stub that records sent commands."""
+    """In-memory IRC client stub that records sent commands.
+
+    It delivers every command at once, so unlike IRCClient its outbound queue
+    never fills. It does not parse server lines either: tests set current_nick
+    and registered_with_server where IRCClient would track them from 001 and
+    NICK.
+    """
 
     def __init__(self) -> None:
         """Initialize empty recording buffers."""
-        self.casemapping = "rfc1459"
+        # Replaced with the bot's own capabilities when wired to a bot.
+        self.caps = ISupportState()
         self.connected = True
         self.current_nick = "alpha"
-        self.desired_nick = "alpha"
         self.modes: list[tuple[str, str, tuple[str, ...]]] = []
-        self.nickname_length = 9
         self.privmsgs: list[tuple[str, str]] = []
+        # Its queue delivers at once; a test sets a backlog for IRCClient's.
+        self.queue_delay = 0.0
         self.reconnects = 0
+        self.registered_with_server = False
         self.sent: list[tuple[str, tuple[str, ...]]] = []
 
     async def close(self) -> None:
-        """No-op close."""
-        return
+        """Close the connection, as IRCClient.close does."""
+        self.connected = False
 
     def is_self(self, nickname: str) -> bool:
         """Return whether a nickname identifies this client."""
-        return casefold(nickname, self.casemapping) == casefold(
-            self.current_nick,
-            self.casemapping,
-        )
+        return self.caps.fold(nickname) == self.caps.fold(self.current_nick)
 
-    async def reconnect(self) -> None:
-        """Increment the reconnect counter."""
+    def reconnect(self) -> None:
+        """Drop the connection, as IRCClient.reconnect does, and count it."""
+        self.connected = False
         self.reconnects += 1
 
-    def reset_caps(self) -> None:
-        """Reset server-advertised capabilities."""
-        self.nickname_length = 9
-
     async def run_forever(self) -> None:
-        """No-op run loop."""
-        return
+        """Block until cancelled, as IRCClient.run_forever never returns."""
+        await hang()
 
-    async def send(
+    def send(
         self,
         command: str,
         *params: str,
         trailing: str | None = None,
-    ) -> None:
-        """Validate and record a raw command, failing when disconnected."""
+        unless_waiting: bool = False,
+        check: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Validate and record a raw command, failing when disconnected.
+
+        A command whose check fails is queued but never recorded, as IRCClient
+        drops it when its turn comes, which here is at once.
+        """
+        # Each command is delivered at once, so no copy waits to be skipped.
+        del unless_waiting
+        format_message(command, params, trailing)
         if not self.connected:
             msg = "IRC is not connected"
             raise ConnectionError(msg)
 
-        format_message(command, params, trailing)
+        if check is not None and not check():
+            return True
+
         if command == "MODE" and params[1:]:
             self.modes.append((params[0], params[1], params[2:]))
 
@@ -186,28 +320,7 @@ class FakeIRC:
         else:
             self.sent.append((command, params))
 
-    def set_casemapping(self, casemapping: str) -> None:
-        """Update the casemapping setting."""
-        self.casemapping = casemapping
-
-    def set_nickname_length(self, length: int) -> None:
-        """Update the nickname length limit."""
-        self.nickname_length = length
-
-
-class FailingIRC(FakeIRC):
-    """IRC stub that raises ConnectionError on send."""
-
-    async def send(
-        self,
-        command: str,
-        *params: str,
-        trailing: str | None = None,
-    ) -> None:
-        """Raise ConnectionError to simulate a disconnect."""
-        del command, params, trailing
-        msg = "IRC disconnected"
-        raise ConnectionError(msg)
+        return True
 
 
 class FailingPartIRC(FakeIRC):
@@ -218,121 +331,199 @@ class FailingPartIRC(FakeIRC):
         super().__init__()
         self.failing = True
 
-    async def send(
+    def send(
         self,
         command: str,
         *params: str,
         trailing: str | None = None,
-    ) -> None:
+        unless_waiting: bool = False,
+        check: Callable[[], bool] | None = None,
+    ) -> bool:
         """Raise ConnectionError for PART commands while failing."""
         if self.failing and command == "PART":
             msg = "IRC outbound queue is full"
             raise ConnectionError(msg)
 
-        await super().send(command, *params, trailing=trailing)
+        return super().send(
+            command,
+            *params,
+            trailing=trailing,
+            unless_waiting=unless_waiting,
+            check=check,
+        )
+
+
+class FakeKV:
+    """In-memory JetStream KV bucket with the key and revision checks of nats-py.
+
+    Each call suspends, as a network round trip does, so a test's timeout can
+    interrupt a loop of store calls.
+    """
+
+    def __init__(self) -> None:
+        """Start with an empty bucket."""
+        self.entries: dict[str, tuple[int, bytes]] = {}
+        self.sequence = 0
+
+    async def create(self, key: str, value: bytes) -> int:
+        """Store a new key, or fail as JetStream does when it already exists."""
+        await asyncio.sleep(0)
+        check_key(key)
+        if key in self.entries:
+            raise KeyWrongLastSequenceError
+
+        return self.store(key, value)
+
+    async def get(self, key: str) -> SimpleNamespace:
+        """Return the stored entry, or fail as JetStream does when it is absent.
+
+        As in nats-py, an empty value reads back as None.
+        """
+        await asyncio.sleep(0)
+        check_key(key)
+        if key not in self.entries:
+            raise KeyNotFoundError
+
+        revision, value = self.entries[key]
+        return SimpleNamespace(key=key, revision=revision, value=value or None)
+
+    def store(self, key: str, value: bytes) -> int:
+        """Write a value under the next stream sequence and return it."""
+        self.sequence += 1
+        self.entries[key] = (self.sequence, value)
+        return self.sequence
+
+    async def update(self, key: str, value: bytes, last: int) -> int:
+        """Replace a key only while its revision is still last."""
+        await asyncio.sleep(0)
+        check_key(key)
+        if key not in self.entries or self.entries[key][0] != last:
+            raise KeyWrongLastSequenceError
+
+        return self.store(key, value)
+
+
+class DeletableKV(FakeKV):
+    """In-memory bucket whose delete checks the last revision as nats-py does."""
+
+    async def delete(self, key: str, last: int | None = None) -> bool:
+        """Delete a key, checking only a positive last revision, as nats-py does.
+
+        A mismatch raises a bare BadRequestError. JetStream holds a missing
+        key at revision 0, so any positive revision mismatches it. A delete
+        writes a marker, so it consumes a stream sequence.
+        """
+        await asyncio.sleep(0)
+        check_key(key)
+        revision = self.entries[key][0] if key in self.entries else 0
+        if last and last > 0 and revision != last:
+            raise BadRequestError(code=400, err_code=10071)
+
+        # The delete marker takes the next stream sequence.
+        self.sequence += 1
+        self.entries.pop(key, None)
+        return True
+
+
+def check_key(key: str) -> None:
+    """Reject a key that nats-py rejects before it reaches the bucket."""
+    if not key or key[0] == "." or key[-1] == "." or not VALID_KEY_RE.match(key):
+        raise InvalidKeyError
 
 
 class FakeCoordinator:
-    """In-memory coordinator stub that records KV puts and help requests."""
+    """In-memory coordinator over the real stores, recording writes and requests.
 
-    def __init__(self, *, claim_result: bool = False) -> None:
-        """Initialize empty recording buffers."""
-        self.auth_slots: dict[str, list[float]] = {}
-        self.bot_id = "alpha"
-        self.channel_expected: list[str | None] = []
-        self.channel_puts: list[tuple[str, dict[str, Any]]] = []
+    Channel, session, attempt, and claim writes go through the production
+    stores on in-memory buckets, so they sign, validate, order, and dedupe
+    exactly as they would against JetStream. A channel or session write
+    suspends first, as its round trip does, so a test's timeout can interrupt
+    a loop of refused writes.
+    """
+
+    def __init__(self) -> None:
+        """Open every store on an empty in-memory bucket."""
+        self.attempts = AttemptStore("efnet", 1, COORDINATION_KEY)
+        self.channels = ChannelStore("efnet", 1, COORDINATION_KEY)
+        self.claims = ClaimStore("efnet", 1, COORDINATION_KEY)
+        self.sessions = SessionStore("efnet", 1, COORDINATION_KEY)
+        for store in (self.attempts, self.channels, self.claims, self.sessions):
+            store.kv = cast("KeyValue", FakeKV())
+
+        self.channel_after: list[str | None] = []
+        self.channel_puts: list[dict[str, Any]] = []
         self.claim_requests: list[int] = []
-        self.claim_result = claim_result
         self.connected = True
+        self.duplicate = False
         self.help_requests: list[tuple[str, dict[str, object]]] = []
-        self.owns_presence = True
         self.presence_puts: list[dict[str, Any]] = []
-        self.session_puts: list[tuple[str, dict[str, Any]]] = []
-        self.synced = True
-        self.unique = True
+        self.session_puts: list[Session] = []
 
-    def require_unique(self) -> None:
-        """Mirror the real duplicate-ID write gate."""
-        if not self.unique or not self.owns_presence:
-            msg = f"duplicate bot ID: {self.bot_id}"
-            raise RuntimeError(msg)
+    def require_writable(self) -> None:
+        """Mirror the real write gate: this process must own its bot ID."""
+        if self.duplicate or not self.connected:
+            msg = "bot ID alpha-id does not own its presence key"
+            raise StoreUnavailableError(msg)
 
     async def close(self) -> None:
-        """No-op close."""
-        return
+        """Disconnect, as the real close leaves this bot unready and unwritable."""
+        self.connected = False
 
     async def put_channel(
         self,
-        channel: str,
         record: dict[str, Any],
         *,
-        expected: str | None,
-    ) -> dict[str, Any]:
-        """Record a channel KV put and the revision it was written after."""
-        self.require_unique()
-        self.channel_puts.append((channel, record))
-        self.channel_expected.append(expected)
-        return record
+        after: str | None,
+    ) -> ChannelFields:
+        """Record a channel write and store it as ChannelStore would."""
+        self.require_writable()
+        await asyncio.sleep(0)
+        self.channel_puts.append(record)
+        self.channel_after.append(after)
+        return await self.channels.put(record, after=after)
 
     async def put_presence(self, presence: dict[str, Any]) -> None:
-        """Record a presence KV put."""
-        if presence.get("bot_id") != self.bot_id:
-            msg = "presence does not match coordinator bot ID"
-            raise ValueError(msg)
+        """Record a presence write, refused while disconnected.
 
-        self.require_unique()
-        self.presence_puts.append(presence)
+        Disconnected, the real presence store has no open bucket and raises. A
+        duplicate writes nothing but is not refused: the real claim yields to
+        the live instance's signed record and returns, and the next heartbeat
+        tries again.
+        """
+        if not self.connected:
+            msg = "JetStream is unavailable"
+            raise StoreUnavailableError(msg)
 
-    async def put_session(
-        self,
-        identity: str,
-        session: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Record a session KV put."""
-        self.require_unique()
-        self.session_puts.append((identity, session))
-        return session
+        if not self.duplicate:
+            self.presence_puts.append(presence)
+
+    async def put_session(self, session: Session) -> Session:
+        """Record a session write and store it as SessionStore would."""
+        self.require_writable()
+        await asyncio.sleep(0)
+        self.session_puts.append(session)
+        return await self.sessions.put(session)
 
     @property
     def ready(self) -> bool:
-        """Mirror real readiness: connection, replay, presence, uniqueness."""
-        return self.connected and self.unique and self.synced and self.owns_presence
+        """Mirror real readiness: connected and owning this bot ID."""
+        return self.connected and not self.duplicate
 
     async def request_auth(self, identity: str) -> bool:
-        """Claim one attempt slot per identity, matching real slot-based store."""
-        if not self.ready:
-            return False
-
-        now = time.monotonic()
-        cutoff = now - ATTEMPT_WINDOW
-        slots = self.auth_slots.setdefault(identity, [])
-        for idx, ts in enumerate(slots):
-            if ts <= cutoff:
-                slots[idx] = now
-                return True
-
-        if len(slots) < ATTEMPT_LIMIT:
-            slots.append(now)
-            return True
-
-        return False
+        """Reserve an attempt slot through the real AttemptStore."""
+        return self.ready and await self.attempts.allow(identity)
 
     async def request_claim(self, counter: int) -> bool:
-        """Allow or deny claims, failing closed when not ready."""
+        """Claim a TOTP counter once through the real ClaimStore."""
         if not self.ready:
             return False
 
         self.claim_requests.append(counter)
-        return self.claim_result
+        return await self.claims.claim(counter)
 
     async def request_help(self, kind: str, payload: dict[str, object]) -> None:
-        """Record a help request, dropping it when not ready or misowned."""
-        presence = payload.get("presence")
-        if (
-            self.ready
-            and isinstance(presence, dict)
-            and presence.get("bot_id") == self.bot_id
-        ):
+        """Record a help request, dropping it when not ready."""
+        if self.ready:
             self.help_requests.append((kind, payload))
 
     async def start(self) -> None:
@@ -340,7 +531,7 @@ class FakeCoordinator:
         return
 
     async def status(self) -> NATSStatus:
-        """Return a healthy fake NATS cluster status."""
+        """Return a healthy status, or the one collect reports while disconnected."""
         return NATSStatus(
             connection=self.connected,
             jetstream="up" if self.connected else "unknown",
@@ -353,36 +544,41 @@ class FakeCoordinator:
         )
 
 
-class FailingPublishCoordinator(FakeCoordinator):
-    """Coordinator stub whose KV writes raise NatsError until it recovers."""
+class FailingWriteCoordinator(FakeCoordinator):
+    """Coordinator stub whose channel and session writes fail until it recovers.
 
-    def __init__(self, *, claim_result: bool = False) -> None:
-        """Start failing every KV write."""
-        super().__init__(claim_result=claim_result)
+    It models JetStream refusing writes while NATS stays connected: it stays
+    ready, and each write raises NatsError. A disconnect would instead drop
+    readiness, and writes would raise StoreUnavailableError. A failing write
+    checks the write gate and then suspends, as FakeCoordinator's do.
+    """
+
+    def __init__(self) -> None:
+        """Start failing channel and session writes."""
+        super().__init__()
         self.failing = True
 
     async def put_channel(
         self,
-        channel: str,
         record: dict[str, Any],
         *,
-        expected: str | None,
-    ) -> dict[str, Any]:
-        """Raise NatsError while failing, to simulate a NATS disconnect."""
+        after: str | None,
+    ) -> ChannelFields:
+        """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
-            msg = f"NATS disconnected: channel {channel} with {len(record)} fields"
+            self.require_writable()
+            await asyncio.sleep(0)
+            msg = f"JetStream write failed: channel {record['channel']}"
             raise NatsError(msg)
 
-        return await super().put_channel(channel, record, expected=expected)
+        return await super().put_channel(record, after=after)
 
-    async def put_session(
-        self,
-        identity: str,
-        session: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Raise NatsError while failing, to simulate a NATS disconnect."""
+    async def put_session(self, session: Session) -> Session:
+        """Raise NatsError while failing, as a JetStream write fails while connected."""
         if self.failing:
-            msg = f"NATS disconnected: session {identity} with {len(session)} fields"
+            self.require_writable()
+            await asyncio.sleep(0)
+            msg = f"JetStream write failed: session {session.prefix}"
             raise NatsError(msg)
 
-        return await super().put_session(identity, session)
+        return await super().put_session(session)

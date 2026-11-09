@@ -1,33 +1,46 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Tests for command parsing, input validation, and rate limiting."""
+"""Tests for admin command parsing, dispatch, replies, and rate limiting."""
 
+import asyncio
+import math
 import unittest
 from collections import deque
-from dataclasses import asdict
-from unittest.mock import AsyncMock, call, patch
+from dataclasses import asdict, replace
+from typing import TYPE_CHECKING, Any, Literal
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
-from botnats.channel import ChannelRuntime, JoinState
-from botnats.commands import RateLimiter, parse_command
-from botnats.irc.protocol import Prefix, casefold
+from botnats.channel import ChannelRecord, ChannelRuntime, JoinState
+from botnats.commands import RELAY_SOURCE_BYTES, RateLimiter, parse_command
+from botnats.irc.protocol import MAX_IRC_MESSAGE_BYTES, IRCMessage, Prefix, casefold
+from botnats.nats.store import StoreUnavailableError
 from botnats.presence import BotPresence
-from botnats.validators import (
-    validate_channel,
-    validate_join,
-    validate_key,
-    validate_target,
-)
 from tests.unit.helpers import (
     OWNER,
-    FailingIRC,
+    FailingWriteCoordinator,
+    FakeCoordinator,
+    FakeIRC,
     bot_with_coordinator,
     bot_with_irc,
+    bounded,
+    drain_session_writes,
+    join_test_channel,
+    make_bot,
+    send_command,
+    settle,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from botnats.bot import Bot
+    from botnats.nats.status import NATSStatus
+    from botnats.validators import ChannelFields
 
 
 class CommandTests(unittest.TestCase):
-    """Tests for command parsing, channel validation, and key validation."""
+    """Tests for command parsing."""
 
     def test_parse_preserves_backslash(self) -> None:
         """Verify backslashes in arguments are preserved, not shell-escaped."""
@@ -35,59 +48,6 @@ class CommandTests(unittest.TestCase):
 
         assert name == "DEOP"
         assert arguments == ("#chan", "Evil\\dude")
-
-    def test_validate_channel(self) -> None:
-        """Verify channel name validation accepts and rejects correctly."""
-        assert validate_channel("#general") == "#general"
-        for invalid in (
-            "general",
-            "#bad channel",
-            "#bad\tchannel",
-            "#bad,channel",
-            "#bad\x07channel",
-        ):
-            with (
-                self.subTest(invalid=invalid),
-                self.assertRaisesRegex(ValueError, "channel"),
-            ):
-                validate_channel(invalid)
-
-    def test_validate_key(self) -> None:
-        """Verify channel key validation accepts and rejects correctly."""
-        assert validate_key("safe-key") == "safe-key"
-        for invalid in (
-            "",
-            ":key",
-            "two words",
-            "one,two",
-            "safe\r\nOPER root pass",
-        ):
-            with (
-                self.subTest(invalid=invalid),
-                self.assertRaisesRegex(ValueError, "channel key"),
-            ):
-                validate_key(invalid)
-
-    def test_validate_join_message_size_and_encoding(self) -> None:
-        """Reject JOIN parameters that cannot fit in an IRC message."""
-        invalid = (
-            ("#" + "a" * 510, None),
-            ("#test", "k" * 510),
-            ("#" + chr(0xD800), None),
-        )
-        for channel, key in invalid:
-            with self.subTest(channel=channel), self.assertRaises(ValueError):
-                validate_join(channel, key)
-
-    def test_validate_target(self) -> None:
-        """Verify command target and ban-mask validation."""
-        assert validate_target("*!*@evil.example") == "*!*@evil.example"
-        for invalid in ("", ":nick", "*!*@ evil", "mask\twith\ttabs", "nul\x00"):
-            with (
-                self.subTest(invalid=invalid),
-                self.assertRaisesRegex(ValueError, "target"),
-            ):
-                validate_target(invalid)
 
 
 class RateLimitTests(unittest.IsolatedAsyncioTestCase):
@@ -116,7 +76,8 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_evict_stale_boundary(self) -> None:
         """Treat a bucket whose newest entry sits exactly at the cutoff as stale."""
         limiter = RateLimiter()
-        limiter.buckets["old"] = deque([5.0])
+        # Only the newest entry decides: the older one is past either cutoff.
+        limiter.buckets["old"] = deque([1.0, 5.0])
 
         assert not limiter.evict_stale(4.9)
         assert "old" in limiter.buckets
@@ -130,118 +91,713 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         assert limiter.check("bob")
         assert not limiter.check("alice")
 
-    async def test_window_expiry(self) -> None:
-        """Verify rate limit resets after window expires."""
-        limiter = RateLimiter(limit=1, window=0.0)
-        assert limiter.check("user")
-        assert limiter.check("user")
+    async def test_command_window(self) -> None:
+        """Verify the command limiter counts commands for 10 seconds, then forgets."""
+        limiter = make_bot().commands.command_limiter
+        now = 100.0
+        # A full budget spent exactly one window ago no longer counts.
+        limiter.buckets["host.example"] = deque([now - 10] * 8)
+        # One spent a second inside the window still does.
+        limiter.buckets["other.example"] = deque([now - 9] * 8)
 
-    async def test_within_limit(self) -> None:
-        """Verify requests within limit are allowed and excess is denied."""
-        limiter = RateLimiter(limit=3, window=60)
-        for _ in range(3):
+        # Judged at exactly now, however long the test takes.
+        with patch("botnats.commands.time") as clock:
+            clock.monotonic.return_value = now
+            assert limiter.check("host.example")
+            assert not limiter.check("other.example")
+
+    async def test_refusals_do_not_extend_the_window(self) -> None:
+        """Allow a flooding sender again once its allowed events leave the window.
+
+        Counted too, refusals would keep a sender who never pauses limited.
+        """
+        limiter = RateLimiter(limit=2, window=10)
+        with patch("botnats.commands.time") as clock:
+            clock.monotonic.return_value = 100.0
+            assert limiter.check("user")
+            assert limiter.check("user")
+            for second in range(101, 110):
+                clock.monotonic.return_value = float(second)
+                assert not limiter.check("user")
+
+            clock.monotonic.return_value = 110.0
             assert limiter.check("user")
 
-        assert not limiter.check("user")
+    async def test_window_forgets_only_expired_events(self) -> None:
+        """Forget the events that left the window and keep counting the rest."""
+        limiter = RateLimiter(limit=3, window=10)
+        # By 11.5 only the event at 1 has left the window.
+        limiter.buckets["user"] = deque([1.0, 5.0, 9.0])
+        with patch("botnats.commands.time") as clock:
+            clock.monotonic.return_value = 11.5
+            assert limiter.check("user")
+            clock.monotonic.return_value = 12.0
+            assert not limiter.check("user")
+
+    async def test_rate_limiting_ignores_nick_and_user_change(self) -> None:
+        """Verify the limiter keys on host, so nick or user cycling cannot bypass it."""
+        fake_irc = FakeIRC()
+        # Ready, with no channel desired, so every sender is heard.
+        bot = make_bot(irc=fake_irc, coordinator=FakeCoordinator())
+        # No command leaves the window, however long the test takes.
+        bot.commands.command_limiter.window = math.inf
+
+        for index in range(20):
+            prefix = Prefix(f"nick{index}", f"user{index}", "host.example")
+            bot.authorizer.grant(prefix.render())
+            await send_command(bot, prefix, "BOGUS")
+
+        assert len(fake_irc.privmsgs) == 8
+        assert all(text == "Unknown command" for _, text in fake_irc.privmsgs)
 
 
 class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
-    """Tests for admin ban, op, deop, invite, and status commands."""
+    """Tests for admin commands, their replies, and their failures."""
 
     async def test_admin_ban(self) -> None:
         """Verify BAN command sets a channel mode when bot is opped."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host")
+        await send_command(bot, OWNER, "BAN #test *!*@bad.host")
 
         assert fake_irc.modes == [("#test", "+b", ("*!*@bad.host",))]
         assert fake_irc.privmsgs == [
             ("owner", "Banned *!*@bad.host on #test"),
         ]
 
-    async def test_admin_ban_not_opped(self) -> None:
-        """Verify BAN command reports when bot is not opped."""
-        bot, fake_irc, _ = bot_with_coordinator()
+    async def test_join_part_nats_failure(self) -> None:
+        """Verify join and part commands report NATS write failures."""
+        bot, fake_irc, _ = bot_with_coordinator(FailingWriteCoordinator())
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host")
+        await send_command(bot, OWNER, "JOIN #new")
+        await send_command(bot, OWNER, "PART #test")
+
+        assert casefold("#new", "rfc1459") not in bot.channel_mgr.channels
+        assert casefold("#test", "rfc1459") in bot.channel_mgr.channels
+        # Each reply is the write's own error, so each command attempted one.
+        assert fake_irc.privmsgs == [
+            ("owner", "JetStream write failed: channel #new"),
+            ("owner", "JetStream write failed: channel #test"),
+        ]
+
+    async def test_failure_without_message_gets_generic_reply(self) -> None:
+        """Reply "Command failed" when the error a command raised has no text."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+
+        async def put_timed_out(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            del record, after
+            raise TimeoutError
+
+        with patch.object(coordinator, "put_channel", put_timed_out):
+            await send_command(bot, OWNER, "JOIN #new")
+
+        assert fake_irc.privmsgs == [("owner", "Command failed")]
+
+    async def test_failure_reply_needs_unbroken_connection(self) -> None:
+        """Send no write error once IRC reconnected while the write was in flight.
+
+        This bot saw no QUIT or NICK meanwhile, so another user may hold the
+        admin's nick by the time the write fails.
+        """
+        coordinator = FailingWriteCoordinator()
+        bot, fake_irc, _ = bot_with_coordinator(coordinator)
+        bot.authorizer.grant(OWNER.render())
+        put_channel = coordinator.put_channel
+        attempted: list[str] = []
+
+        async def put_across_reconnect(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            attempted.append(record["channel"])
+            bot.events.on_irc_disconnect()
+            return await put_channel(record, after=after)
+
+        with patch.object(coordinator, "put_channel", put_across_reconnect):
+            await send_command(bot, OWNER, "JOIN #new")
+
+        # The write was attempted, and failed, after the reconnect.
+        assert attempted == ["#new"]
+        assert bot.authorizer.authorized(OWNER.render())
+        assert fake_irc.privmsgs == []
+
+    async def test_join_reports_superseded_update(self) -> None:
+        """Tell the admin when another bot's newer record wins the write."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        # Stored by a peer, but not yet watched here.
+        winner = ChannelRecord.new("#new", None, present=False)
+        await bounded(coordinator.channels.put(asdict(winner), after=None))
+
+        await send_command(bot, OWNER, "JOIN #new")
+
+        assert fake_irc.privmsgs == [("owner", "Update superseded for #new")]
+
+    async def test_superseded_reply_needs_unbroken_connection(self) -> None:
+        """Send no superseded reply once IRC reconnected during the write."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        winner = ChannelRecord.new("#new", None, present=False)
+        await bounded(coordinator.channels.put(asdict(winner), after=None))
+        put_channel = coordinator.put_channel
+        attempted: list[str] = []
+
+        async def put_across_reconnect(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            attempted.append(record["channel"])
+            bot.events.on_irc_disconnect()
+            return await put_channel(record, after=after)
+
+        with patch.object(coordinator, "put_channel", put_across_reconnect):
+            await send_command(bot, OWNER, "JOIN #new")
+
+        # The write was attempted, and lost to the peer's record.
+        assert attempted == ["#new"]
+        assert bot.channel_mgr.channel_records[casefold("#new", "rfc1459")] == winner
+        assert fake_irc.privmsgs == []
+
+    async def test_part_reports_parting(self) -> None:
+        """Tell the admin a PART whose write won is under way."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].key = "live-key"
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "PART #test")
+
+        assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        # Unlike a JOIN's record, the PART's keeps no live key.
+        assert coordinator.channel_puts[-1]["key"] is None
+
+    async def test_part_waits_for_a_key_write_in_flight(self) -> None:
+        """Part once this bot's own key write, stored but unanswered, returns.
+
+        Written against the record before it, the PART would lose to that
+        write's compare-and-set.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        bot.authorizer.grant(OWNER.render())
+        put_channel = coordinator.put_channel
+        stored = asyncio.Event()
+        release = asyncio.Event()
+        lock = bot.channel_mgr.write_lock
+        acquire = lock.acquire
+        blocked = asyncio.Event()
+
+        async def blocking_acquire() -> Literal[True]:
+            if lock.locked():
+                blocked.set()
+
+            return await acquire()
+
+        async def unanswered_key_write(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            fields = await put_channel(record, after=after)
+            if record["key"] == "k":
+                stored.set()
+                await release.wait()
+
+            return fields
+
+        with (
+            patch.object(coordinator, "put_channel", unanswered_key_write),
+            patch.object(lock, "acquire", blocking_acquire),
+        ):
+            bot.events.on_irc_message(
+                IRCMessage("MODE", ("#test", "+k", "k"), Prefix("op", "~op", "h")),
+            )
+            await bounded(stored.wait())
+            join_test_channel(bot, OWNER)
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", "PART #test"), OWNER),
+            )
+            # Release the key write only once the PART waits for its turn.
+            await bounded(blocked.wait())
+            release.set()
+            await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        assert fake_irc.sent == [("PART", ("#test",))]
+
+    async def test_join_keeps_the_key_written_before_it(self) -> None:
+        """Store an admin JOIN with the key this bot's own key writes left.
+
+        Read before its turn, the key would be one that a key write ahead of
+        the JOIN replaced, and the JOIN would put it back.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        mgr = bot.channel_mgr
+        mgr.apply_record(ChannelRecord.new("#other", "old", present=True))
+        for runtime in mgr.channels.values():
+            runtime.join = JoinState.JOINED
+
+        bot.authorizer.grant(OWNER.render())
+        op = Prefix("op", "~op", "h")
+        put_channel = coordinator.put_channel
+        stored = asyncio.Event()
+        release = asyncio.Event()
+        lock = mgr.write_lock
+        acquire = lock.acquire
+        blocked = asyncio.Event()
+
+        async def blocking_acquire() -> Literal[True]:
+            if lock.locked():
+                blocked.set()
+
+            return await acquire()
+
+        async def unanswered_test_write(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            fields = await put_channel(record, after=after)
+            if record["channel"] == "#test":
+                stored.set()
+                await release.wait()
+
+            return fields
+
+        with (
+            patch.object(coordinator, "put_channel", unanswered_test_write),
+            patch.object(lock, "acquire", blocking_acquire),
+        ):
+            # One turn writes the keys pending in #test, then in #other.
+            bot.events.on_irc_message(IRCMessage("MODE", ("#test", "+k", "k"), op))
+            await bounded(stored.wait())
+            join_test_channel(bot, OWNER)
+            bot.events.on_irc_message(
+                IRCMessage("PRIVMSG", ("alpha", "JOIN #other"), OWNER),
+            )
+            # Change the key only once the JOIN waits for its turn.
+            await bounded(blocked.wait())
+            bot.events.on_irc_message(IRCMessage("MODE", ("#other", "+k", "new"), op))
+            release.set()
+            await settle(bot)
+
+        assert fake_irc.privmsgs == [("owner", "Joining #other")]
+        assert mgr.channel_records[casefold("#other", "rfc1459")].key == "new"
+
+    async def test_update_needs_a_session_that_outlasts_its_turn(self) -> None:
+        """Write no channel record for a sender who quit while it waited.
+
+        A quit revokes the session, so the sender must authenticate again
+        before its commands change the mesh's channels.
+        """
+
+        async def quit_while_waiting(command: str) -> None:
+            bot, fake_irc, coordinator = bot_with_coordinator()
+            bot.authorizer.grant(OWNER.render())
+            lock = bot.channel_mgr.write_lock
+            acquire = lock.acquire
+            blocked = asyncio.Event()
+
+            async def blocking_acquire() -> Literal[True]:
+                if lock.locked():
+                    blocked.set()
+
+                return await acquire()
+
+            # Stands in for one of this bot's key writes in flight.
+            await bounded(acquire())
+            with patch.object(lock, "acquire", blocking_acquire):
+                join_test_channel(bot, OWNER)
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", command), OWNER),
+                )
+                await bounded(blocked.wait())
+                bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+                lock.release()
+                await settle(bot)
+
+            assert coordinator.channel_puts == []
+            assert fake_irc.privmsgs == []
+
+        for command in ("JOIN #new", "PART #test"):
+            with self.subTest(command=command):
+                await quit_while_waiting(command)
+
+    async def test_replies_need_unbroken_connection(self) -> None:
+        """Answer no command received before IRC reconnected.
+
+        This bot saw no QUIT or NICK meanwhile, so another user may hold the
+        admin's nick, and must not learn the channel key from a GETMODES
+        queued behind a JOIN whose write spanned the reconnect.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.key = "hunter2"
+        bot.authorizer.grant(OWNER.render())
+        put_channel = coordinator.put_channel
+
+        async def put_across_reconnect(
+            record: dict[str, Any],
+            *,
+            after: str | None,
+        ) -> ChannelFields:
+            bot.events.on_irc_disconnect()
+            # Back in the channel, whose modes show the key again.
+            runtime.modes = "+ntk"
+            return await put_channel(record, after=after)
+
+        join_test_channel(bot, OWNER)
+        with patch.object(coordinator, "put_channel", put_across_reconnect):
+            for text in ("JOIN #new", "GETMODES #test", "   "):
+                bot.events.on_irc_message(
+                    IRCMessage("PRIVMSG", ("alpha", text), OWNER),
+                )
+
+            await settle(bot)
+
+        assert casefold("#new", "rfc1459") in bot.channel_mgr.channels
+        assert fake_irc.privmsgs == []
+        # The session stands: a command received since gets its reply.
+        await send_command(bot, OWNER, "GETMODES #test")
+        assert fake_irc.privmsgs == [("owner", "#test +ntk hunter2")]
+
+    async def test_replies_need_live_session_when_sent(self) -> None:
+        """Bind each reply to the session, checked again when its turn comes.
+
+        Flood pacing can hold a reply for minutes: the admin may quit
+        meanwhile, and another user take the nick and learn the channel key.
+        """
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.modes = "+ntk"
+        runtime.key = "hunter2"
+        bot.authorizer.grant(OWNER.render())
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            await send_command(bot, OWNER, "GETMODES #test")
+            await send_command(bot, OWNER, "GETMODES")
+
+        assert send.call_args_list == [
+            call("PRIVMSG", "owner", trailing="#test +ntk hunter2", check=ANY),
+            call("PRIVMSG", "owner", trailing="GETMODES <channel>", check=ANY),
+        ]
+        checks = [entry.kwargs["check"] for entry in send.call_args_list]
+        assert [check() for check in checks] == [True, True]
+
+        # The unconnected coordinator refuses the revocation's write at once;
+        # once only, so a drain that keeps retrying fails instead of hanging.
+        refused = StoreUnavailableError("bot ID alpha-id does not own its presence key")
+        with patch.object(
+            bot.coordinator, "put_session", AsyncMock(side_effect=[refused])
+        ):
+            bot.events.on_irc_message(IRCMessage("QUIT", ("Quit",), OWNER))
+            await drain_session_writes(bot)
+
+        assert [check() for check in checks] == [False, False]
+
+    async def test_parse_error_reaches_authenticated_admin(self) -> None:
+        """Explain an unparseable command to a sender who is authenticated."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "   ")
+
+        assert fake_irc.privmsgs == [("owner", "empty command")]
+
+    async def test_list_commands_report_unknown_channel(self) -> None:
+        """Answer list commands for an untracked channel with no record."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+
+        for command in ("GETBANS", "GETMODES", "GETUSERS"):
+            await send_command(bot, OWNER, f"{command} #missing")
+
+        assert fake_irc.privmsgs == [("owner", "No record for #missing")] * 3
+
+    async def test_admin_commands_not_opped(self) -> None:
+        """Refuse BAN, DEOP, OP, and UNBAN on a channel where the bot is not opped."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        # Each command would act here if the bot were opped.
+        runtime.member("Chanop").modes.add("o")
+        runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
+        runtime.add_ban("*!*@bad.host")
+        bot.authorizer.grant(OWNER.render())
+
+        for text in (
+            "BAN #test *!*@bad.host",
+            "DEOP #test Chanop",
+            "OP #test Target",
+            "UNBAN #test *!*@bad.host",
+        ):
+            with self.subTest(text=text):
+                fake_irc.privmsgs.clear()
+
+                await send_command(bot, OWNER, text)
+
+                assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
         assert fake_irc.modes == []
-        assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
     async def test_admin_getbans(self) -> None:
         """Verify GETBANS command lists tracked channel bans."""
         bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "GETBANS #test")
+        await send_command(bot, OWNER, "GETBANS #test")
         assert fake_irc.privmsgs == [("owner", "No bans tracked for #test")]
 
         fake_irc.privmsgs.clear()
-        for _mask in ("*!*@bad.host", "*!*@evil.host"):
-            runtime.add_ban(_mask)
+        for mask in ("*!*@evil.host", "*!*@bad.host"):
+            runtime.add_ban(mask)
 
-        await bot.commands.dispatch(OWNER, "GETBANS #test")
-        assert fake_irc.privmsgs == [
-            ("owner", "#test +b *!*@bad.host"),
-            ("owner", "#test +b *!*@evil.host"),
-        ]
+        await send_command(bot, OWNER, "GETBANS #test")
+        assert fake_irc.privmsgs == [("owner", "#test +b *!*@bad.host *!*@evil.host")]
 
-    async def test_admin_getmodes(self) -> None:
-        """Verify GETMODES command reports tracked channel modes."""
+    async def test_reply_list_drops_items_too_long_to_relay(self) -> None:
+        """Drop an item too long to relay whole, never sending a bare header."""
         bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        bot.authorizer.grant(OWNER.render())
+        # The shortest mask fits a relayed line alone, but not after the
+        # header; the next fits the line the bot sends, but not the line the
+        # server relays with the bot's source in front. The last is short in
+        # characters, but each "é" encodes to two bytes.
+        for mask in (
+            "*!*@" + "h" * 356,
+            "*!*@" + "h" * 400,
+            "*!*@" + "h" * 495,
+            "*!*@" + "é" * 200,
+        ):
+            with self.subTest(length=len(mask)):
+                fake_irc.privmsgs.clear()
+                with self.assertLogs("botnats.commands", level="WARNING"):
+                    bot.commands.reply_list(OWNER, "#test +b", [mask, "ok"])
+                    bot.commands.reply_list(OWNER, "#test +b", [mask])
+
+                assert fake_irc.privmsgs == [("owner", "#test +b ok")]
+
+    async def test_reply_list_packs_by_encoded_bytes(self) -> None:
+        """Pack multibyte items by their encoded size, not their characters."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        # Each "é" encodes to two bytes: packed by characters, a line would
+        # hold nearly twice as many items and overflow 512 bytes.
+        items = [f"{number:02d}" + "é" * 20 for number in range(30)]
+
+        bot.commands.reply_list(OWNER, "#test +b", items)
+
+        listed = [word for _, text in fake_irc.privmsgs for word in text.split()[2:]]
+        assert listed == items
+        for _, text in fake_irc.privmsgs:
+            line = f"PRIVMSG owner :{text}\r\n".encode()
+            assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
+
+    async def test_reply_list_fills_lines_to_the_byte(self) -> None:
+        """Pack a line up to exactly 512 relayed bytes, and not one byte more."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        # Under the largest relay source, a line to "owner" holds 367 bytes:
+        # "y" would take the first line one byte over 512, while the last
+        # item fills the second line exactly.
+        first = "é" * 178 + "x"
+        last = "é" * 178
+
+        bot.commands.reply_list(OWNER, "#test +b", [first, "y", last])
+
+        assert fake_irc.privmsgs == [
+            ("owner", f"#test +b {first}"),
+            ("owner", f"#test +b y {last}"),
+        ]
+        line = f"PRIVMSG owner :#test +b y {last}\r\n".encode()
+        assert RELAY_SOURCE_BYTES + len(line) == MAX_IRC_MESSAGE_BYTES
+
+    async def test_reply_list_keeps_an_item_that_fills_a_line(self) -> None:
+        """Keep an item that fills a relayed line exactly; drop one byte more."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        # Under the largest relay source, a line to "owner" holds 367 bytes.
+        fits = "x" * 358
+        over = "x" * 359
+
+        with self.assertLogs("botnats.commands", level="WARNING"):
+            bot.commands.reply_list(OWNER, "#test +b", [fits, over])
+
+        assert fake_irc.privmsgs == [("owner", f"#test +b {fits}")]
+        line = f"PRIVMSG owner :#test +b {fits}\r\n".encode()
+        assert RELAY_SOURCE_BYTES + len(line) == MAX_IRC_MESSAGE_BYTES
+
+    async def test_reply_list_caps_lines(self) -> None:
+        """Send at most 10 lines, the last saying how many items are left out."""
+        bot, fake_irc = bot_with_irc()
+        bot.authorizer.grant(OWNER.render())
+        # Ten of these 35-byte items fill a line after "#test" for "owner".
+        items = [f"{number:03d}" + "x" * 32 for number in range(250)]
+
+        bot.commands.reply_list(OWNER, "#test", items[:100])
+
+        assert len(fake_irc.privmsgs) == 10
+        listed = [word for _, text in fake_irc.privmsgs for word in text.split()[1:]]
+        assert listed == items[:100]
+
+        fake_irc.privmsgs.clear()
+        bot.commands.reply_list(OWNER, "#test", items)
+
+        assert len(fake_irc.privmsgs) == 10
+        *packed, last = fake_irc.privmsgs
+        listed = [word for _, text in packed for word in text.split()[1:]]
+        assert listed == items[:90]
+        assert last == ("owner", "#test ... and 160 more")
+
+        # One line past the cap is enough to cut the list short.
+        fake_irc.privmsgs.clear()
+        bot.commands.reply_list(OWNER, "#test", items[:110])
+
+        assert len(fake_irc.privmsgs) == 10
+        *packed, last = fake_irc.privmsgs
+        listed = [word for _, text in packed for word in text.split()[1:]]
+        assert listed == items[:90]
+        assert last == ("owner", "#test ... and 20 more")
+
+    async def test_reply_list_packs_for_the_sender_nick(self) -> None:
+        """Pack lines for the relay to the sender's own nick, however long."""
+        bot, fake_irc = bot_with_irc()
+        admin = Prefix("n" * 30, "user", "real.host")
+        bot.authorizer.grant(admin.render())
+        # Ten of these 35-byte items fill a line after "#test" for "owner",
+        # but a 30-character nick leaves room for only nine.
+        items = [f"{number:03d}" + "x" * 32 for number in range(30)]
+
+        bot.commands.reply_list(admin, "#test", items)
+
+        listed = [word for _, text in fake_irc.privmsgs for word in text.split()[1:]]
+        assert listed == items
+        for target, text in fake_irc.privmsgs:
+            assert target == admin.nick
+            line = f"PRIVMSG {target} :{text}\r\n".encode()
+            assert RELAY_SOURCE_BYTES + len(line) <= MAX_IRC_MESSAGE_BYTES
+
+    async def test_reply_drops_unsendable_line(self) -> None:
+        """Log and drop a reply too long to send instead of raising."""
+        bot, fake_irc = bot_with_irc()
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        with self.assertLogs("botnats.commands", level="WARNING") as logs:
+            bot.commands.reply(OWNER, "x" * MAX_IRC_MESSAGE_BYTES)
+
+        assert fake_irc.privmsgs == []
+        assert len(logs.output) == 1
+        assert "dropped PRIVMSG to owner: IRC message exceeds" in logs.output[0]
+
+    async def test_admin_getmodes(self) -> None:
+        """Verify GETMODES reports tracked modes, with "*" for unknown values."""
+        bot, fake_irc = bot_with_irc()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "GETMODES #test")
         assert fake_irc.privmsgs == [("owner", "No modes tracked for #test")]
 
         fake_irc.privmsgs.clear()
         runtime.modes = "+nst"
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        await send_command(bot, OWNER, "GETMODES #test")
         assert fake_irc.privmsgs == [("owner", "#test +nst")]
 
         fake_irc.privmsgs.clear()
         runtime.modes = "+nstlk"
         runtime.key = "secret"
         runtime.limit = 5
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        await send_command(bot, OWNER, "GETMODES #test")
         assert fake_irc.privmsgs == [("owner", "#test +nstlk 5 secret")]
 
         fake_irc.privmsgs.clear()
         runtime.modes = "+nstkl"
-        await bot.commands.dispatch(OWNER, "GETMODES #test")
+        await send_command(bot, OWNER, "GETMODES #test")
         assert fake_irc.privmsgs == [("owner", "#test +nstkl secret 5")]
+
+        fake_irc.privmsgs.clear()
+        # As tracked from RPL_CHANNELMODEIS "+ntkl * 10": the server hid the key.
+        runtime.modes = "+ntkl"
+        runtime.key = None
+        runtime.limit = 10
+        await send_command(bot, OWNER, "GETMODES #test")
+        assert fake_irc.privmsgs == [("owner", "#test +ntkl * 10")]
+
+        fake_irc.privmsgs.clear()
+        runtime.key = "secret"
+        runtime.limit = None
+        await send_command(bot, OWNER, "GETMODES #test")
+        assert fake_irc.privmsgs == [("owner", "#test +ntkl secret *")]
+
+    async def test_getmodes_holds_places_for_untracked_arguments(self) -> None:
+        """Pair each value with its letter past argument modes not tracked."""
+        bot, fake_irc = bot_with_irc()
+        bot.caps.apply("CHANMODES", "beI,fkL,lFH,cdimnprstzCDGKMNOPQRSTVZ")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        bot.authorizer.grant(OWNER.render())
+        # As tracked from UnrealIRCd's RPL_CHANNELMODEIS "+fnkl [5j]:10 secret
+        # 50": the +f flood setting is an argument this bot does not keep.
+        runtime.modes = "+fnkl"
+        runtime.key = "secret"
+        runtime.limit = 50
+
+        await send_command(bot, OWNER, "GETMODES #test")
+
+        assert fake_irc.privmsgs == [("owner", "#test +fnkl * secret 50")]
 
     async def test_admin_getusers(self) -> None:
         """Verify GETUSERS command lists channel members with op prefixes."""
         bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        bot.channel_mgr.apply_record(ChannelRecord.new("#other", None, present=True))
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "GETUSERS #test")
-        assert fake_irc.privmsgs == [("owner", "No users tracked for #test")]
+        await send_command(bot, OWNER, "GETUSERS #other")
+        assert fake_irc.privmsgs == [("owner", "No users tracked for #other")]
 
         fake_irc.privmsgs.clear()
         runtime.member("alpha").modes.add("o")
         runtime.member("beta")
+        runtime.member("Delta")
         runtime.member("gamma").modes.add("o")
-        await bot.commands.dispatch(OWNER, "GETUSERS #test")
+        await send_command(bot, OWNER, "GETUSERS #test")
         assert fake_irc.privmsgs == [
-            ("owner", "#test @alpha beta @gamma"),
+            ("owner", "#test @alpha beta Delta @gamma owner"),
+        ]
+
+    async def test_getusers_marks_ranks_above_op(self) -> None:
+        """Mark a member ranked above op with "@", even without +o itself."""
+        bot, fake_irc = bot_with_irc()
+        bot.caps.apply("PREFIX", "(qaohv)~&@%+")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        bot.authorizer.grant(OWNER.render())
+        runtime.member("alpha").modes.add("q")
+        runtime.member("beta").modes.add("a")
+        runtime.member("gamma").modes.add("h")
+
+        await send_command(bot, OWNER, "GETUSERS #test")
+
+        assert fake_irc.privmsgs == [
+            ("owner", "#test @alpha @beta gamma owner"),
         ]
 
     async def test_admin_getchans(self) -> None:
         """List tracked channels, marking opped ones @ and those not joined -."""
-        bot, fake_irc = bot_with_irc()
+        bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
         bot.channel_mgr.channels.clear()
 
-        await bot.commands.dispatch(OWNER, "GETCHANS")
+        await send_command(bot, OWNER, "GETCHANS")
         assert fake_irc.privmsgs == [("owner", "No channels tracked")]
 
         for name, state in (
@@ -250,107 +806,133 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ("#beta", JoinState.JOINING),
             ("#gamma", JoinState.IDLE),
         ):
-            runtime = ChannelRuntime(channel=name, join=state)
-            bot.channel_mgr.channels[casefold(name)] = runtime
+            runtime = ChannelRuntime(bot.caps, channel=name, join=state)
+            bot.channel_mgr.channels[casefold(name, "rfc1459")] = runtime
 
-        bot.channel_mgr.channels[casefold("#alpha")].member("alpha").modes.add("o")
+        alpha = bot.channel_mgr.channels[casefold("#alpha", "rfc1459")]
+        alpha.member("alpha").modes.add("o")
+        # Now that channels are desired, the admin must be seen in one.
+        alpha.member("owner").prefix = OWNER
         fake_irc.privmsgs.clear()
-        await bot.commands.dispatch(OWNER, "GETCHANS")
+        await send_command(bot, OWNER, "GETCHANS")
         assert fake_irc.privmsgs == [("owner", "Channels @#alpha -#beta -#gamma #Zeta")]
 
-    async def test_admin_getusers_chunked(self) -> None:
-        """Verify GETUSERS splits long nick lists across multiple messages."""
-        bot, fake_irc = bot_with_irc()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
-        bot.authorizer.grant(OWNER.render())
-
-        for i in range(80):
-            runtime.member(f"longernickname{i:03d}")
-
-        await bot.commands.dispatch(OWNER, "GETUSERS #test")
-        assert len(fake_irc.privmsgs) > 1
-        for _, text in fake_irc.privmsgs:
-            assert text.startswith("#test ")
-
-        all_nicks = []
-        for _, text in fake_irc.privmsgs:
-            all_nicks.extend(text.split()[1:])
-
-        assert len(all_nicks) == 80
-
     async def test_admin_commands_with_disconnected_irc(self) -> None:
-        """Verify admin commands degrade gracefully when IRC is disconnected."""
-        bot, _, _ = bot_with_coordinator(irc=FailingIRC())
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        """Report a command's failed send, and swallow the undeliverable reply."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         bot.authorizer.grant(OWNER.render())
+        fake_irc.connected = False
 
-        await bot.commands.dispatch(OWNER, "BAN #test *!*@bad.host")
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            await send_command(bot, OWNER, "BAN #test *!*@bad.host")
 
-        peer = BotPresence("beta", "beta.host", "one", "beta", "~beta")
-        bot.presence.update(peer)
-        action = {"channel": "#test", "presence": asdict(peer)}
-        await bot.channel_mgr.invite_peer(action)
-        runtime.member("beta").prefix = Prefix("beta", "~beta", "beta.host")
-        runtime.add_ban("*!~beta@beta.host")
-        await bot.channel_mgr.unban_peer(action)
+        assert send.call_args_list == [
+            call("MODE", "#test", "+b", "*!*@bad.host"),
+            call("PRIVMSG", "owner", trailing="IRC is not connected", check=ANY),
+        ]
 
-        assert "*!~beta@beta.host" in runtime.bans.values()
+    async def test_admin_commands_always_queue(self) -> None:
+        """Ask IRC to queue every admin command, even a copy of one waiting.
 
-        await bot.channel_mgr.op_peer(action)
-        assert "o" not in runtime.member("beta").modes
+        A skipped copy could leave a ban, unban, and ban again unbanned.
+        """
+        bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
+        runtime.add_ban("*!*@bad.host")
+        bot.authorizer.grant(OWNER.render())
+
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            for text in (
+                "BAN #test *!*@bad.host",
+                "UNBAN #test *!*@bad.host",
+                "OP #test Target",
+                "INVITE #test guest",
+            ):
+                await send_command(bot, OWNER, text)
+
+        commands = [
+            entry for entry in send.call_args_list if entry.args[0] != "PRIVMSG"
+        ]
+        assert commands == [
+            call("MODE", "#test", "+b", "*!*@bad.host"),
+            call("MODE", "#test", "-b", "*!*@bad.host"),
+            call("MODE", "#test", "+o", "Target", check=ANY),
+            call("INVITE", "guest", "#test"),
+        ]
 
     async def test_admin_deop(self) -> None:
         """Verify DEOP command removes operator mode directly."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
         runtime.member("Target").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "DEOP #test Target")
+        await send_command(bot, OWNER, "DEOP #test Target")
 
         assert fake_irc.modes == [("#test", "-o", ("Target",))]
+        assert fake_irc.privmsgs == [("owner", "Deopped Target on #test")]
 
     async def test_admin_deop_removes_hidden_lower_modes(self) -> None:
         """Verify DEOP removes lower operator modes hidden by the highest one."""
         bot, fake_irc, _ = bot_with_coordinator()
         bot.caps.parse_prefix("(qao)~&@")
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.member("Target").modes.add("q")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "DEOP #test Target")
+        await send_command(bot, OWNER, "DEOP #test Target")
+
+        assert fake_irc.modes == [("#test", "-qao", ("Target", "Target", "Target"))]
+
+    async def test_admin_deop_sends_at_most_three_modes_per_line(self) -> None:
+        """Verify DEOP splits more than three operator ranks across MODE lines."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.caps.parse_prefix("(Yqaohv)!~&@%+")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        runtime.member("Target").modes.add("Y")
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "DEOP #test Target")
 
         assert fake_irc.modes == [
-            ("#test", "-q", ("Target",)),
-            ("#test", "-a", ("Target",)),
+            ("#test", "-Yqa", ("Target", "Target", "Target")),
             ("#test", "-o", ("Target",)),
         ]
 
     async def test_admin_deop_not_opped_target(self) -> None:
         """Verify DEOP reports when target is not opped."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "DEOP #test Target")
+        await send_command(bot, OWNER, "DEOP #test Target")
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [("owner", "Target is not opped on #test")]
 
     async def test_admin_invite(self) -> None:
-        """Verify INVITE command sends IRC INVITE directly."""
+        """Send IRC INVITE directly, only while opped in the channel."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
-        runtime.member("alpha").modes.add("o")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "INVITE #test guest")
+        await send_command(bot, OWNER, "INVITE #test guest")
+        assert fake_irc.sent == []
+        assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
+
+        runtime.member("alpha").modes.add("o")
+        fake_irc.privmsgs.clear()
+        await send_command(bot, OWNER, "INVITE #test guest")
 
         assert fake_irc.sent == [("INVITE", ("guest", "#test"))]
         assert fake_irc.privmsgs == [("owner", "Invited guest to #test")]
@@ -358,24 +940,24 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_kick(self) -> None:
         """Kick a member, with or without a reason, only while opped."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("Target")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "KICK #test target")
+        await send_command(bot, OWNER, "KICK #test target")
         assert fake_irc.privmsgs == [("owner", "Not opped on #test")]
 
         runtime.member("alpha").modes.add("o")
         fake_irc.privmsgs.clear()
-        with patch.object(fake_irc, "send", AsyncMock(wraps=fake_irc.send)) as send:
-            await bot.commands.dispatch(OWNER, "KICK #test ghost")
-            await bot.commands.dispatch(OWNER, "KICK #test target")
-            await bot.commands.dispatch(OWNER, "KICK #test target go  away")
+        with patch.object(fake_irc, "send", MagicMock(wraps=fake_irc.send)) as send:
+            await send_command(bot, OWNER, "KICK #test ghost")
+            await send_command(bot, OWNER, "KICK #test TARGET")
+            await send_command(bot, OWNER, "KICK #test TARGET go  away")
 
-        kicks = [c for c in send.await_args_list if c.args[0] == "KICK"]
+        kicks = [c for c in send.call_args_list if c.args[0] == "KICK"]
         assert kicks == [
-            call("KICK", "#test", "Target", trailing=None),
-            call("KICK", "#test", "Target", trailing="go away"),
+            call("KICK", "#test", "Target", trailing=None, check=ANY),
+            call("KICK", "#test", "Target", trailing="go away", check=ANY),
         ]
         assert fake_irc.privmsgs == [
             ("owner", "ghost not found on #test"),
@@ -383,28 +965,166 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ("owner", "Kicked Target from #test"),
         ]
 
+    async def test_target_lines_need_the_same_member_when_sent(self) -> None:
+        """Bind each OP, KICK, and DEOP line to its target, checked again when sent.
+
+        Flood pacing can hold a line for minutes: the target may quit or
+        rename meanwhile, and another user take its nick and join, or an
+        admin PART on any bot drop the channel.
+        """
+        target = Prefix("Target", "user", "real.host")
+
+        def part(bot: Bot) -> None:
+            """Part #test, as an admin PART on any bot reaches this one's watch."""
+            mgr = bot.channel_mgr
+            current = mgr.channel_records[casefold("#test", "rfc1459")]
+            mgr.apply_record(
+                ChannelRecord.new("#test", None, present=False, after=current.revision)
+            )
+
+        departures: dict[str, Callable[[Bot], None]] = {
+            "quit": lambda bot: bot.events.on_irc_message(
+                IRCMessage("QUIT", ("Quit",), target)
+            ),
+            "rename": lambda bot: bot.events.on_irc_message(
+                IRCMessage("NICK", ("Moved",), target)
+            ),
+            "part": part,
+        }
+        for text, flags in (
+            ("OP #test Target", "H"),
+            ("KICK #test Target", "H"),
+            ("DEOP #test Target", "H@"),
+        ):
+            for label, departure in departures.items():
+                with self.subTest(text=text, departure=label):
+                    bot, fake_irc, _ = bot_with_coordinator()
+                    runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                    runtime.join = JoinState.JOINED
+                    runtime.member("alpha").modes.add("o")
+                    bot.authorizer.grant(OWNER.render())
+                    who = IRCMessage(
+                        "352",
+                        (
+                            "alpha",
+                            "#test",
+                            "user",
+                            "real.host",
+                            "srv",
+                            "Target",
+                            flags,
+                            "0 r",
+                        ),
+                    )
+                    bot.events.on_irc_message(who)
+
+                    with patch.object(
+                        fake_irc, "send", MagicMock(wraps=fake_irc.send)
+                    ) as send:
+                        await send_command(bot, OWNER, text)
+
+                    checks = [
+                        entry.kwargs.get("check")
+                        for entry in send.call_args_list
+                        if entry.args[0] != "PRIVMSG"
+                    ]
+                    assert len(checks) == 1
+                    check = checks[0]
+                    assert check is not None
+                    # WHO reports the same user again: the line still goes out.
+                    bot.events.on_irc_message(who)
+                    assert check()
+
+                    departure(bot)
+                    join_test_channel(bot, Prefix("Target", "other", "other.host"))
+
+                    assert not check()
+
+    async def test_target_lines_tell_names_only_members_apart(self) -> None:
+        """Bind each line to its target member, even one alike in every field.
+
+        Known only from NAMES, the target and the user who takes its nick
+        share nick, modes, and a missing prefix: only the member itself tells
+        them apart.
+        """
+        for text, status in (
+            ("OP #test Target", ""),
+            ("KICK #test Target", ""),
+            ("DEOP #test Target", "@"),
+        ):
+            with self.subTest(text=text):
+                bot, fake_irc, _ = bot_with_coordinator()
+                runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+                runtime.join = JoinState.JOINED
+                runtime.member("alpha").modes.add("o")
+                bot.authorizer.grant(OWNER.render())
+                bot.events.on_irc_message(
+                    IRCMessage(
+                        "353",
+                        ("alpha", "=", "#test", f"{status}Target {status}Other"),
+                    ),
+                )
+
+                with patch.object(
+                    fake_irc, "send", MagicMock(wraps=fake_irc.send)
+                ) as send:
+                    await send_command(bot, OWNER, text)
+
+                checks = [
+                    entry.kwargs.get("check")
+                    for entry in send.call_args_list
+                    if entry.args[0] != "PRIVMSG"
+                ]
+                assert len(checks) == 1
+                check = checks[0]
+                assert check is not None
+                assert check()
+
+                bot.events.on_irc_message(
+                    IRCMessage("QUIT", ("Quit",), Prefix("Target", "user", "host")),
+                )
+                bot.events.on_irc_message(
+                    IRCMessage("NICK", ("Target",), Prefix("Other")),
+                )
+
+                assert not check()
+
     async def test_admin_op(self) -> None:
         """Verify OP command grants operator mode directly."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "OP #test Target")
+        await send_command(bot, OWNER, "OP #test Target")
 
         assert fake_irc.modes == [("#test", "+o", ("Target",))]
+        assert fake_irc.privmsgs == [("owner", "Opped Target on #test")]
+
+    async def test_admin_op_uses_the_advertised_op_mode(self) -> None:
+        """Op with the mode letter the server's PREFIX maps to "@"."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        bot.caps.parse_prefix("(yov)@%+")
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("y")
+        runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "OP #test Target")
+
+        assert fake_irc.modes == [("#test", "+y", ("Target",))]
 
     async def test_admin_op_already_opped(self) -> None:
         """Verify OP reports when target is already opped."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.member("Target").prefix = Prefix("Target", "user", "real.host")
         runtime.member("Target").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "OP #test Target")
+        await send_command(bot, OWNER, "OP #test Target")
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [
@@ -414,39 +1134,59 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_op_unknown_target(self) -> None:
         """Verify OP reports when target is not found on channel."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "OP #test ghost")
+        await send_command(bot, OWNER, "OP #test ghost")
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [("owner", "ghost not found on #test")]
 
-    async def test_admin_unban(self) -> None:
-        """Verify UNBAN command removes a ban mode directly."""
+    async def test_admin_op_member_before_who(self) -> None:
+        """Op a member whose full nick!user@host WHO has not yet reported."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
-        runtime.add_ban("*!*@bad.host")
+        runtime.member("Listed")
+        runtime.member("Partial").prefix = Prefix("Partial", "user")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@bad.host")
+        await send_command(bot, OWNER, "OP #test Listed")
+        await send_command(bot, OWNER, "OP #test Partial")
 
-        assert fake_irc.modes == [("#test", "-b", ("*!*@bad.host",))]
-        assert fake_irc.privmsgs == [
-            ("owner", "Unbanned *!*@bad.host on #test"),
+        assert fake_irc.modes == [
+            ("#test", "+o", ("Listed",)),
+            ("#test", "+o", ("Partial",)),
         ]
+        assert fake_irc.privmsgs == [
+            ("owner", "Opped Listed on #test"),
+            ("owner", "Opped Partial on #test"),
+        ]
+
+    async def test_unauthenticated_commands_are_ignored(self) -> None:
+        """Drop commands from a sender without a session, without replying."""
+        bot, fake_irc, _ = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.authorizer.grant("other!user@real.host")
+
+        for text in ("BAN #test *!*@bad.host", "XYZZY", "   "):
+            await send_command(bot, OWNER, text)
+
+        assert fake_irc.modes == []
+        assert fake_irc.privmsgs == []
+        assert fake_irc.sent == []
 
     async def test_admin_unban_case_insensitive(self) -> None:
         """Verify UNBAN matches ban masks case-insensitively."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         runtime.add_ban("*!*@Bad.Host")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@bad.host")
+        await send_command(bot, OWNER, "UNBAN #test *!*@BAD.host")
 
         assert fake_irc.modes == [("#test", "-b", ("*!*@Bad.Host",))]
         assert fake_irc.privmsgs == [
@@ -456,11 +1196,11 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_unban_unknown_mask(self) -> None:
         """Verify UNBAN reports when mask is not in the ban list."""
         bot, fake_irc, _ = bot_with_coordinator()
-        runtime = bot.channel_mgr.channels[casefold("#test")]
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
         runtime.member("alpha").modes.add("o")
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "UNBAN #test *!*@unknown.host")
+        await send_command(bot, OWNER, "UNBAN #test *!*@unknown.host")
 
         assert fake_irc.modes == []
         assert fake_irc.privmsgs == [
@@ -470,18 +1210,26 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_cmd_status(self) -> None:
         """Verify STATUS command returns bot identity and channel count."""
         bot, fake_irc, _ = bot_with_coordinator()
+        # Registered under a fallback nick, unlike the configured one.
+        fake_irc.current_nick = "alpha_"
         bot.authorizer.grant(OWNER.render())
-        bot.channel_mgr.channels[casefold("#test")].join = JoinState.JOINED
-        bot.presence.update(
-            BotPresence("Alpha", "host.example", "inst", "alpha", "~alpha"),
+        bot.channel_mgr.channels[casefold("#test", "rfc1459")].join = JoinState.JOINED
+        # A channel still joining is desired but not counted.
+        bot.channel_mgr.channels[casefold("#other", "rfc1459")] = ChannelRuntime(
+            bot.caps, channel="#other", join=JoinState.JOINING
         )
         bot.presence.update(
-            BotPresence("beta", "peer.example", "inst2", "beta", "~beta"),
+            BotPresence("Alpha-ID", "host.example", "inst", "alpha_", "~alpha")
+        )
+        bot.presence.update(
+            BotPresence("beta-id", "peer.example", "inst2", "beta", "~beta")
         )
 
-        await bot.commands.dispatch(OWNER, "STATUS")
+        join_test_channel(bot, OWNER)
+        bot.events.on_irc_message(IRCMessage("PRIVMSG", ("alpha_", "STATUS"), OWNER))
+        await settle(bot)
         assert fake_irc.privmsgs == [
-            ("owner", "bot id=alpha nick=alpha peers=1 channels=1"),
+            ("owner", "bot id=alpha-id nick=alpha_ peers=1 channels=1"),
             (
                 "owner",
                 (
@@ -491,11 +1239,258 @@ class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
         ]
 
+    async def test_status_reply_needs_unbroken_connection(self) -> None:
+        """Send no NATS status once IRC reconnected while it was read.
+
+        This bot saw no QUIT or NICK meanwhile, so another user may hold the
+        admin's nick by the time NATS answers.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        status = coordinator.status
+
+        async def status_across_reconnect() -> NATSStatus:
+            bot.events.on_irc_disconnect()
+            return await status()
+
+        with patch.object(coordinator, "status", status_across_reconnect):
+            await send_command(bot, OWNER, "STATUS")
+
+        assert bot.authorizer.authorized(OWNER.render())
+        # Only the line sent before the await reached the admin.
+        assert fake_irc.privmsgs == [
+            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=1"),
+        ]
+
+    async def test_cmd_status_with_nats_down(self) -> None:
+        """Answer STATUS while the coordinator is not ready.
+
+        The NATS line renders whatever status the coordinator reports.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        coordinator.connected = False
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "STATUS")
+
+        assert fake_irc.privmsgs == [
+            ("owner", "bot id=alpha-id nick=alpha peers=0 channels=1"),
+            (
+                "owner",
+                (
+                    "nats connection=down routes=? jetstream=unknown leader=? "
+                    "replicas=?/1 lag=?"
+                ),
+            ),
+        ]
+
     async def test_unknown_command(self) -> None:
         """Verify an unrecognized command sends an error to the user."""
         bot, fake_irc, _ = bot_with_coordinator()
         bot.authorizer.grant(OWNER.render())
 
-        await bot.commands.dispatch(OWNER, "XYZZY")
+        await send_command(bot, OWNER, "XYZZY")
 
         assert fake_irc.privmsgs == [("owner", "Unknown command")]
+
+    async def test_bad_admin_input_gets_reply(self) -> None:
+        """Answer malformed or inapplicable admin commands instead of crashing."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.authorizer.grant(OWNER.render())
+        replies = {
+            "BAN #test": "BAN <channel> <mask>",
+            "KICK #test": "KICK <channel> <nick> [reason]",
+            "JOIN": "JOIN <channel> [key]",
+            "DEOP #test ghost": "ghost is not opped on #test",
+            "BAN #missing *!*@x": "Not opped on #missing",
+            "DEOP #missing ghost": "Not opped on #missing",
+            "OP #missing ghost": "Not opped on #missing",
+            "UNBAN #missing *!*@x": "Not opped on #missing",
+        }
+
+        for text, reply in replies.items():
+            with self.subTest(text=text):
+                fake_irc.privmsgs.clear()
+
+                await send_command(bot, OWNER, text)
+
+                assert fake_irc.privmsgs == [("owner", reply)]
+
+        assert fake_irc.modes == []
+        assert coordinator.channel_puts == []
+
+    async def test_extra_argument_gets_usage_reply(self) -> None:
+        """Reject an argument past a command's last with its usage reply."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.member("alpha").modes.add("o")
+        bot.authorizer.grant(OWNER.render())
+        replies = {
+            "BAN #test *!*@x extra": "BAN <channel> <mask>",
+            "DEOP #test alpha extra": "DEOP <channel> <nick>",
+            "GETBANS #test extra": "GETBANS <channel>",
+            "GETCHANS extra": "GETCHANS takes no arguments",
+            "GETMODES #test extra": "GETMODES <channel>",
+            "GETUSERS #test extra": "GETUSERS <channel>",
+            "INVITE #test ghost extra": "INVITE <channel> <nick>",
+            "JOIN #new key extra": "JOIN <channel> [key]",
+            "OP #test alpha extra": "OP <channel> <nick>",
+            "PART #test extra": "PART <channel>",
+            "STATUS extra": "STATUS takes no arguments",
+            "UNBAN #test *!*@x extra": "UNBAN <channel> <mask>",
+        }
+        # More commands at once than one host may send in a window.
+        bot.commands.command_limiter.limit = len(replies)
+
+        for text, reply in replies.items():
+            with self.subTest(text=text):
+                fake_irc.privmsgs.clear()
+
+                await send_command(bot, OWNER, text)
+
+                assert fake_irc.privmsgs == [("owner", reply)]
+
+        assert fake_irc.modes == []
+        assert coordinator.channel_puts == []
+
+    async def test_channel_update_rejects_oversized_mode_command(self) -> None:
+        """Reject a channel update before storing an unusable mode command."""
+        bot, _, coordinator = bot_with_coordinator()
+        bot.config = replace(bot.config, channel_modes="+" + "n" * 499)
+
+        with self.assertRaisesRegex(ValueError, "exceeds 512 bytes"):
+            await bounded(
+                bot.commands.channel_update(OWNER, "#test", None, present=True)
+            )
+
+        assert coordinator.channel_puts == []
+
+    async def test_part_ignores_oversized_mode_command(self) -> None:
+        """Part a channel even when the enforced mode command could not fit it."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.config = replace(bot.config, channel_modes="+" + "n" * 499)
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "PART #test")
+
+        assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        assert coordinator.channel_puts[-1]["present"] is False
+
+    async def test_join_accepts_name_at_server_channellen(self) -> None:
+        """Store a JOIN of a channel name exactly as long as the server allows."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.caps.apply("CHANNELLEN", "50")
+        bot.authorizer.grant(OWNER.render())
+        channel = "#" + "a" * 49
+
+        await send_command(bot, OWNER, f"JOIN {channel}")
+
+        assert fake_irc.privmsgs == [("owner", f"Joining {channel}")]
+        assert coordinator.channel_puts[-1]["channel"] == channel
+
+    async def test_join_refuses_name_over_server_channellen(self) -> None:
+        """Refuse, before storing it, a JOIN of a name the server would not take.
+
+        A server that truncates it would put this bot in another channel.
+        """
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.caps.apply("CHANNELLEN", "50")
+        bot.authorizer.grant(OWNER.render())
+        # 50 characters, but 51 bytes in UTF-8.
+        channel = "#" + "a" * 48 + "é"
+
+        await send_command(bot, OWNER, f"JOIN {channel}")
+
+        assert fake_irc.privmsgs == [
+            ("owner", "channel name exceeds the server limit of 50 bytes"),
+        ]
+        assert coordinator.channel_puts == []
+
+    async def test_part_ignores_server_channellen(self) -> None:
+        """Part a channel whose stored name is longer than the server allows."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.caps.apply("CHANNELLEN", "4")
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "PART #test")
+
+        assert fake_irc.privmsgs == [("owner", "Parting #test")]
+        assert coordinator.channel_puts[-1]["channel"] == "#test"
+        assert coordinator.channel_puts[-1]["present"] is False
+
+    async def test_join_without_channellen_takes_long_name(self) -> None:
+        """Store a long JOIN when the server advertises no CHANNELLEN."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+        # Longer than the 200 that RFC 1459 allowed.
+        channel = "#" + "a" * 300
+
+        await send_command(bot, OWNER, f"JOIN {channel}")
+
+        assert fake_irc.privmsgs == [("owner", f"Joining {channel}")]
+        assert coordinator.channel_puts[-1]["channel"] == channel
+
+    async def test_join_without_enforced_modes(self) -> None:
+        """Join under the default config, which enforces no channel modes."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.config = replace(
+            bot.config,
+            channel_modes="",
+            enforced_modes=(frozenset(), frozenset()),
+        )
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "JOIN #new")
+
+        assert fake_irc.privmsgs == [("owner", "Joining #new")]
+        assert coordinator.channel_puts[-1]["channel"] == "#new"
+
+    async def test_join_preserves_live_key(self) -> None:
+        """Verify a repeated keyless JOIN retains a key learned from IRC."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        runtime = bot.channel_mgr.channels[casefold("#test", "rfc1459")]
+        runtime.key = "live-key"
+        base = bot.channel_mgr.channel_records[casefold("#test", "rfc1459")].revision
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "JOIN #test")
+
+        assert fake_irc.privmsgs == [("owner", "Joining #test")]
+        payload = coordinator.channel_puts[-1]
+        assert payload["key"] == "live-key"
+        assert runtime.key == "live-key"
+        # Written against the record it replaces, so a concurrent write wins cleanly.
+        assert coordinator.channel_after == [base]
+
+    async def test_join_stores_key(self) -> None:
+        """Store a JOIN's key so every bot can join the keyed channel."""
+        bot, fake_irc, coordinator = bot_with_coordinator()
+        bot.authorizer.grant(OWNER.render())
+
+        await send_command(bot, OWNER, "JOIN #new hunter2")
+
+        assert fake_irc.privmsgs == [("owner", "Joining #new")]
+        payload = coordinator.channel_puts[-1]
+        assert payload["channel"] == "#new"
+        assert payload["key"] == "hunter2"
+
+    async def test_join_key_replaces_tracked_key(self) -> None:
+        """Store a JOIN's key in place of the key a tracked channel holds.
+
+        A key changed while every bot was outside locks them all out; only
+        the admin's key lets them back in.
+        """
+        folded = casefold("#test", "rfc1459")
+        for tracked in ("old-key", None):
+            with self.subTest(tracked=tracked):
+                bot, fake_irc, coordinator = bot_with_coordinator()
+                bot.channel_mgr.channels[folded].key = tracked
+                bot.authorizer.grant(OWNER.render())
+
+                await send_command(bot, OWNER, "JOIN #test new-key")
+
+                assert fake_irc.privmsgs == [("owner", "Joining #test")]
+                assert coordinator.channel_puts[-1]["key"] == "new-key"
+                assert bot.channel_mgr.channel_records[folded].key == "new-key"

@@ -5,22 +5,14 @@ description: Bump the Python version across all project files.
 
 # python-version
 
-Update every file that pins the Python version:
+Update every Python pin; `{{ patch }}` is `N` in the newest `python:{{ version }}.N-alpine` tag on
+Docker Hub.
 
-| File                          | Pattern                                        |
-| ----------------------------- | ---------------------------------------------- |
-| `.python-version`             | `{{ version }}`                                |
-| `Makefile`                    | `PYTHON ?= python{{ version }}`                |
-| `pyproject.toml`              | `requires-python = ">={{ version }}"`          |
-| `pyproject.toml`              | `target-version = "py{{ major }}{{ minor }}"`  |
-| `Dockerfile`                  | `FROM python:{{ version }}-alpine`             |
+| File              | Pattern                                        |
+| ----------------- | ---------------------------------------------- |
+| `.python-version` | `{{ version }}`                                |
+| `pyproject.toml`  | `requires-python = ">={{ version }}"`          |
+| `Dockerfile`      | `FROM python:{{ version }}.{{ patch }}-alpine` |
 
-Then clean and rebuild:
-
-```sh
-make clean
-make test
-```
-
-The new ruff target version may enable new rules or auto-fix syntax changes.
-Verify correctness before accepting.
+Then run `make clean` and `make test`. Ruff's target follows `requires-python`; review any new
+findings or fixes it brings.

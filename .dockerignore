@@ -2,7 +2,5 @@
 !LICENSE
 !pyproject.toml
 !src/
-!src/**/
-!src/**/*.py
 **/*.egg-info/
 **/__pycache__/

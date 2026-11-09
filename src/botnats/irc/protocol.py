@@ -7,8 +7,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
+STRICT_RFC1459_TABLE = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\",
+    "abcdefghijklmnopqrstuvwxyz{}|",
+)
 CASEMAP_TABLES = {
     "ascii": str.maketrans(
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -18,15 +22,14 @@ CASEMAP_TABLES = {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\^",
         "abcdefghijklmnopqrstuvwxyz{}|~",
     ),
-    "strict-rfc1459": str.maketrans(
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ[]\\",
-        "abcdefghijklmnopqrstuvwxyz{}|",
-    ),
+    # The modern ISUPPORT spelling, which Ergo advertises.
+    "rfc1459-strict": STRICT_RFC1459_TABLE,
+    "strict-rfc1459": STRICT_RFC1459_TABLE,
 }
-CASEMAPPINGS = frozenset(CASEMAP_TABLES)
 DEFAULT_CASEMAPPING = "rfc1459"
 DEFAULT_CHANMODES = ("beI", "k", "l", "imnst")
 DEFAULT_MEMBERSHIP_MODES = "qaohv"
+DEFAULT_OP_MODE = "o"
 DEFAULT_MEMBER_PREFIXES = {
     "%": "h",
     "&": "a",
@@ -48,11 +51,39 @@ class IRCMessage:
     prefix: Prefix | None = None
 
 
-class IRCProtocol(Protocol):
-    """Interface for IRC client implementations."""
+class IRCSender(Protocol):
+    """Sends commands as this bot's current nick, reconnecting on demand."""
 
     current_nick: str
-    desired_nick: str
+
+    def reconnect(self) -> None:
+        """Force a reconnection."""
+        ...
+
+    def send(
+        self,
+        command: str,
+        *params: str,
+        trailing: str | None = None,
+        unless_waiting: bool = False,
+        check: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Enqueue an IRC command, unless asked to skip a copy still waiting.
+
+        Return whether it was queued. A line with a check is written only if
+        the check still passes when its turn comes, and dropped otherwise.
+        """
+        ...
+
+
+class IRCProtocol(IRCSender, Protocol):
+    """Interface for IRC client implementations."""
+
+    # About how long the lines queued now take to go out.
+    queue_delay: float
+    # Whether the current connection has registered (001); cleared when it
+    # ends.
+    registered_with_server: bool
 
     async def close(self) -> None:
         """Close the connection."""
@@ -67,54 +98,71 @@ class IRCProtocol(Protocol):
         """Return whether a nickname identifies this client."""
         ...
 
-    async def reconnect(self) -> None:
-        """Force a reconnection."""
-        ...
-
-    def reset_caps(self) -> None:
-        """Reset server capabilities."""
-        ...
-
     async def run_forever(self) -> None:
         """Maintain a persistent connection."""
-        ...
-
-    async def send(
-        self,
-        command: str,
-        *params: str,
-        trailing: str | None = None,
-    ) -> None:
-        """Enqueue an IRC command."""
-        ...
-
-    def set_casemapping(self, casemapping: str) -> None:
-        """Apply a casemapping."""
-        ...
-
-    def set_nickname_length(self, length: int) -> None:
-        """Record the nickname length limit."""
         ...
 
 
 @dataclass(slots=True)
 class ISupportState:
-    """Tracks server capabilities advertised via ISUPPORT tokens."""
+    """Tracks server capabilities advertised via ISUPPORT or acknowledged via CAP."""
 
     casemapping: str = DEFAULT_CASEMAPPING
     chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES
+    # The longest channel name a client may join, or None for no known limit.
+    channellen: int | None = None
     member_prefixes: dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_MEMBER_PREFIXES),
     )
     membership_modes: str = DEFAULT_MEMBERSHIP_MODES
     monitor: bool = False
-    op_mode: str = "o"
+    # Whether the server acknowledged multi-prefix: NAMES and WHO then show
+    # every rank a member holds, not only its highest.
+    multi_prefix: bool = False
+
+    @property
+    def op_mode(self) -> str:
+        """Return the channel operator mode: the one PREFIX maps to "@".
+
+        Without "@" the default "o" stays the operator mode: a PREFIX that
+        lacks it too, such as "(qv)~+", counts no rank as opped.
+        """
+        return self.member_prefixes.get("@", DEFAULT_OP_MODE)
 
     @property
     def operator_modes(self) -> str:
         """Return membership modes with at least channel operator privileges."""
         op_index = self.membership_modes.find(self.op_mode)
-        return self.membership_modes[: op_index + 1] if op_index >= 0 else self.op_mode
+        return self.membership_modes[: op_index + 1]
+
+    def apply(self, name: str, value: str) -> None:
+        """Apply one advertised ISUPPORT token other than CASEMAPPING."""
+        match name:
+            case "CHANMODES":
+                self.parse_chanmodes(value)
+            case "CHANNELLEN":
+                # An empty value means no limit, and a malformed one leaves none known.
+                limit = int(value) if value.isascii() and value.isdigit() else 0
+                self.channellen = limit or None
+            case "MONITOR":
+                # The value is only a target limit, and this bot monitors one.
+                self.monitor = True
+            case "PREFIX":
+                self.parse_prefix(value)
+
+    def forget(self, name: str) -> None:
+        """Restore the default for one withdrawn ISUPPORT token."""
+        default = ISupportState()
+        match name:
+            case "CHANMODES":
+                self.chanmodes = default.chanmodes
+            case "CHANNELLEN":
+                self.channellen = default.channellen
+            case "MONITOR":
+                self.monitor = default.monitor
+            case "PREFIX":
+                self.member_prefixes = default.member_prefixes
+                self.membership_modes = default.membership_modes
 
     def fold(self, value: str) -> str:
         """Normalize a string using the server's casemapping rules."""
@@ -122,11 +170,7 @@ class ISupportState:
 
     def fold_identity(self, prefix: str) -> str:
         """Normalize a nick!user@host identity for case-insensitive comparison."""
-        nick, bang, rest = prefix.partition("!")
-        if not bang:
-            return self.fold(nick)
-
-        return self.fold(nick) + "!" + casefold(rest, "ascii")
+        return casefold_identity(prefix, self.casemapping)
 
     def is_opped(self, modes: set[str]) -> bool:
         """Return whether the given mode set includes channel operator status."""
@@ -140,26 +184,20 @@ class ISupportState:
 
     def parse_prefix(self, value: str) -> None:
         """Map membership symbols to modes from an ISUPPORT PREFIX value."""
-        if value in {"", "()"}:
+        if not value:
             self.member_prefixes = {}
             self.membership_modes = ""
-            self.op_mode = "o"
             return
 
         if not value.startswith("(") or ")" not in value:
             return
 
         modes, symbols = value[1:].split(")", 1)
-        if not modes or len(modes) != len(symbols):
+        if len(modes) != len(symbols):
             return
 
         self.member_prefixes = dict(zip(symbols, modes, strict=True))
         self.membership_modes = modes
-        # Without "@" fall back through the conventional operator tiers; a
-        # PREFIX advertising only sub-operator modes (e.g. "(v)+") must not
-        # count its highest rank as opped.
-        fallback = next((mode for mode in ("o", "a", "q") if mode in modes), "o")
-        self.op_mode = self.member_prefixes.get("@", fallback)
 
     def reset(self) -> None:
         """Reset capabilities learned from the previous server connection."""
@@ -179,19 +217,13 @@ class Prefix:
         """Return whether nick, user, and host are all present."""
         return self.user is not None and self.host is not None
 
-    def matches(self, other: Prefix, casemapping: str = DEFAULT_CASEMAPPING) -> bool:
+    def matches(self, other: Prefix, casemapping: str) -> bool:
         """Check whether two complete prefixes identify the same user."""
-        s_user = self.user
-        s_host = self.host
-        o_user = other.user
-        o_host = other.host
-        if s_user is None or s_host is None or o_user is None or o_host is None:
+        if not self.complete or not other.complete:
             return False
 
-        return (
-            casefold(self.nick, casemapping) == casefold(other.nick, casemapping)
-            and casefold(s_user, "ascii") == casefold(o_user, "ascii")
-            and casefold(s_host, "ascii") == casefold(o_host, "ascii")
+        return casefold_identity(self.render(), casemapping) == casefold_identity(
+            other.render(), casemapping
         )
 
     @classmethod
@@ -199,28 +231,26 @@ class Prefix:
         """Construct a Prefix from a nick!user@host string."""
         nick, bang, remainder = value.partition("!")
         if not bang:
-            nick, at, host = value.partition("@")
-            return cls(nick=nick, host=(host or None) if at else None)
+            nick, _, host = value.partition("@")
+            return cls(nick=nick, host=host or None)
 
-        user, at, host = remainder.partition("@")
-        return cls(nick=nick, user=user or None, host=(host or None) if at else None)
+        user, _, host = remainder.partition("@")
+        return cls(nick=nick, user=user or None, host=host or None)
 
     def render(self) -> str:
-        """Format the prefix as a nick!user@host string."""
-        if not self.complete:
-            return self.nick
-
+        """Format a complete prefix as a nick!user@host string."""
         return f"{self.nick}!{self.user}@{self.host}"
 
 
-def casefold(value: str, casemapping: str = DEFAULT_CASEMAPPING) -> str:
+def casefold(value: str, casemapping: str) -> str:
     """Fold an IRC identifier using a server-advertised casemapping."""
-    table = CASEMAP_TABLES.get(casemapping)
-    if table is None:
-        msg = f"unsupported casemapping: {casemapping!r}"
-        raise ValueError(msg)
+    return value.translate(CASEMAP_TABLES[casemapping])
 
-    return value.translate(table)
+
+def casefold_identity(prefix: str, casemapping: str) -> str:
+    """Fold a nick!user@host identity: the nick by casemapping, user@host as ascii."""
+    nick, _, rest = prefix.partition("!")
+    return casefold(nick, casemapping) + "!" + casefold(rest, "ascii")
 
 
 def format_message(
@@ -229,10 +259,6 @@ def format_message(
     trailing: str | None,
 ) -> bytes:
     """Encode an IRC command, parameters, and trailing text into bytes."""
-    if not command or not command.isascii() or not command.isalnum():
-        msg = "IRC command contains unsupported characters"
-        raise ValueError(msg)
-
     for param in params:
         if not param or param[0] == ":" or not ILLEGAL_PARAM_CHARS.isdisjoint(param):
             msg = "IRC parameter contains unsupported characters"
@@ -261,16 +287,18 @@ def _glob_matches(pattern: str, value: str) -> bool:
     star_index = -1
     star_value_index = 0
     while value_index < len(value):
-        if pattern_index < len(pattern) and pattern[pattern_index] in (
+        # A wildcard is tried first, so a literal "*" in the value cannot
+        # consume it as a plain character and lose the backtrack point.
+        if pattern_index < len(pattern) and pattern[pattern_index] == "*":
+            star_index = pattern_index
+            star_value_index = value_index
+            pattern_index += 1
+        elif pattern_index < len(pattern) and pattern[pattern_index] in (
             value[value_index],
             "?",
         ):
             pattern_index += 1
             value_index += 1
-        elif pattern_index < len(pattern) and pattern[pattern_index] == "*":
-            star_index = pattern_index
-            star_value_index = value_index
-            pattern_index += 1
         elif star_index >= 0:
             pattern_index = star_index + 1
             star_value_index += 1
@@ -287,8 +315,8 @@ def _glob_matches(pattern: str, value: str) -> bool:
 def iter_mode_changes(
     modes: str,
     arguments: tuple[str, ...],
-    chanmodes: tuple[str, str, str, str] = DEFAULT_CHANMODES,
-    membership: str = DEFAULT_MEMBERSHIP_MODES,
+    chanmodes: tuple[str, str, str, str],
+    membership: str,
 ) -> Iterator[tuple[bool, str, str | None]]:
     """Yield channel mode changes with their consumed arguments."""
     adding = True
@@ -318,7 +346,7 @@ def iter_mode_changes(
     # arguments paired with their modes.
     if sum(consumes) == len(arguments) + 1:
         for position, (adding, mode) in enumerate(changes):
-            if mode == "k" and not adding and consumes[position]:
+            if mode == "k" and not adding:
                 consumes[position] = False
                 break
 
@@ -348,7 +376,7 @@ def mode_requires_argument(
 def mask_matches(
     mask: str,
     prefix: Prefix,
-    casemapping: str = DEFAULT_CASEMAPPING,
+    casemapping: str,
 ) -> bool:
     """Match a standard IRC nick!user@host mask using only * and ? wildcards."""
     mask_prefix = Prefix.parse(mask)
@@ -375,17 +403,10 @@ def parse_message(line: str) -> IRCMessage:
     prefix: Prefix | None = None
 
     if rest.startswith("@"):
-        _, separator, rest = rest.partition(" ")
-        if not separator:
-            msg = "IRC tags were not followed by a command"
-            raise ValueError(msg)
+        rest = rest.partition(" ")[2].lstrip(" ")
 
     if rest.startswith(":"):
-        raw_prefix, separator, rest = rest[1:].partition(" ")
-        if not separator:
-            msg = "IRC prefix was not followed by a command"
-            raise ValueError(msg)
-
+        raw_prefix, _, rest = rest[1:].partition(" ")
         prefix = Prefix.parse(raw_prefix)
 
     middle, separator, trailing = rest.partition(" :")

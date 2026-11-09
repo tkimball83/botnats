@@ -58,12 +58,7 @@ class Envelope:
             msg = "NATS envelope exceeds the size limit"
             raise ValueError(msg)
 
-        try:
-            envelope = json.loads(value)
-        except RecursionError as error:
-            msg = "NATS envelope is too deeply nested"
-            raise ValueError(msg) from error
-
+        envelope = json.loads(value)
         if not isinstance(envelope, dict):
             msg = "NATS envelope is not an object"
             raise TypeError(msg)
@@ -78,11 +73,9 @@ class Envelope:
             or NONCE_RE.fullmatch(nonce) is None
             or not isinstance(payload, dict)
             or not isinstance(sender, str)
-            or not sender
             or not isinstance(signature, str)
             or SIGNATURE_RE.fullmatch(signature) is None
             or not isinstance(timestamp, int)
-            or isinstance(timestamp, bool)
         ):
             msg = "NATS envelope is malformed"
             raise ValueError(msg)
@@ -106,25 +99,16 @@ class Envelope:
             msg = "NATS envelope signature is invalid"
             raise ValueError(msg)
 
-        bound_subject = payload.get(SUBJECT_FIELD)
-        if bound_subject is None:
-            msg = "NATS envelope is not bound to a subject"
+        if payload.get(SUBJECT_FIELD) != subject:
+            msg = "NATS envelope is not bound to its subject"
             raise ValueError(msg)
 
-        if bound_subject != subject:
-            msg = "NATS envelope subject is invalid"
-            raise ValueError(msg)
-
-        payload.pop(SUBJECT_FIELD, None)
+        del payload[SUBJECT_FIELD]
         self.seen_nonces[nonce] = now + NONCE_TTL
         return sender, payload
 
     def encode(self, subject: str, payload: dict[str, Any]) -> bytes:
         """Wrap a payload in a signed, nonce-protected envelope."""
-        if SUBJECT_FIELD in payload:
-            msg = f"payload field {SUBJECT_FIELD!r} is reserved"
-            raise ValueError(msg)
-
         signed_payload = {**payload, SUBJECT_FIELD: subject}
         nonce = secrets.token_hex(16)
         timestamp = int(time.time())
@@ -134,7 +118,7 @@ class Envelope:
             self.bot_id,
             timestamp,
         )
-        encoded = json.dumps(
+        return json.dumps(
             {
                 "nonce": nonce,
                 "payload": signed_payload,
@@ -145,26 +129,20 @@ class Envelope:
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-        if len(encoded) > MAX_ENVELOPE_BYTES:
-            msg = "NATS envelope exceeds the size limit"
-            raise ValueError(msg)
-
-        return encoded
 
     def mac(self, value: bytes) -> str:
         """Return the hexadecimal HMAC for canonical envelope bytes."""
         return hmac.digest(self.coordination_key, value, "sha256").hex()
 
-    def prune_nonces(self, now: float | None = None) -> None:
+    def prune_nonces(self, now: float) -> None:
         """Remove expired nonces from the replay-detection cache."""
         # Entries are inserted in expiry order, so expired nonces sit at the
         # front. OrderedDict's linked list keeps front peek-and-delete O(1);
         # plain-dict iteration would rescan tombstoned slots on every call.
         # Clock regressions only delay pruning, never drop live nonces.
-        current = time.time() if now is None else now
         while self.seen_nonces:
             nonce, expiry = next(iter(self.seen_nonces.items()))
-            if expiry > current:
+            if expiry > now:
                 break
 
             del self.seen_nonces[nonce]

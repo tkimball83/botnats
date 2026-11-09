@@ -3,10 +3,13 @@
 
 """Tests for bot configuration loading."""
 
+import base64
 import json
 import os
 import tempfile
+import traceback
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,110 +17,223 @@ from botnats.config import (
     BotConfig,
     mode_string,
     nats_urls,
+    nickname,
     port,
     positive_float,
     replica_count,
 )
 from botnats.irc.client import IRCServer
-
-CONFIG = b"""{
-  "authorization": {
-    "session_ttl_seconds": 600
-  },
-  "bot": {
-    "id": "botnats",
-    "network": "efnet",
-    "nickname": "botnats"
-  },
-  "coordination": {
-    "maintenance_interval_seconds": 2,
-    "presence_ttl_seconds": 10
-  },
-  "irc": {
-    "servers": ["ircs://irc.example.test:6697"],
-    "verify_tls": false
-  },
-  "nats": {
-    "jetstream_replicas": 3,
-    "servers": ["nats://nats.internal:4222"]
-  }
-}
-"""
-SECRETS = {
-    "BOTNATS_COORDINATION_SECRET": "coordination-secret-used-only-for-tests",
-    "BOTNATS_NATS_TOKEN": "nats-token",
-    "BOTNATS_TOTP_SECRET": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
-}
+from tests.unit.helpers import (
+    AUTH_KEY,
+    CONFIG,
+    COORDINATION_KEY,
+    NATS_CREDENTIAL,
+    SECRETS,
+)
 
 
-EXPECTED_COORDINATION_KEY = "coordination-secret-used-only-for-tests"
-EXPECTED_NATS_CREDENTIAL = "nats-token"
+def load_config(document: object, **environment: str) -> BotConfig:
+    """Load a JSON document from a file, with SECRETS and overrides set."""
+    with (
+        tempfile.TemporaryDirectory() as directory,
+        patch.dict(os.environ, {**SECRETS, **environment}),
+    ):
+        path = Path(directory, "bot.json")
+        path.write_text(json.dumps(document))
+        return BotConfig.load(path)
 
 
 class ConfigTests(unittest.TestCase):
     """Tests for JSON configuration file loading."""
 
     def test_config_loading(self) -> None:
-        """Verify configuration loads from JSON with environment overrides."""
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_bytes(CONFIG)
-            with patch.dict(os.environ, SECRETS):
-                config = BotConfig.load(path)
+        """Load every field from the JSON file and secrets from the environment."""
+        config = load_config(json.loads(CONFIG))
 
-        assert config.bot_id == "botnats"
-        assert config.coordination_secret == EXPECTED_COORDINATION_KEY
-        assert config.nickname == "botnats"
-        assert not config.irc_verify_tls
-        assert config.nats_token == EXPECTED_NATS_CREDENTIAL
-        assert config.nats_monitor_port == 8222
-        assert config.jetstream_replicas == 3
-        assert config.health_port == 8080
-        assert config.irc_servers == (IRCServer("irc.example.test", 6697, tls=True),)
+        assert config == BotConfig(
+            bot_id="botnats-1",
+            channel_modes="+nt-s",
+            coordination_secret=COORDINATION_KEY,
+            enforced_modes=(frozenset("nt"), frozenset("s")),
+            health_port=9080,
+            irc_connect_timeout=45,
+            irc_servers=(
+                IRCServer("irc.example.test", 6697, tls=True),
+                IRCServer("irc2.example.test", 6668, tls=False),
+            ),
+            irc_verify_tls=False,
+            jetstream_replicas=3,
+            maintenance_interval=2,
+            nats_monitor_port=9222,
+            nats_servers=("nats://nats.internal:4222", "nats://nats2.internal:4223"),
+            nats_token=NATS_CREDENTIAL,
+            network="libera",
+            nickname="botnick",
+            presence_ttl=10,
+            totp_secret=AUTH_KEY,
+        )
 
-    def test_optional_tables_may_be_omitted(self) -> None:
-        """Load defaults for tables whose keys are all optional."""
+    def test_repr_hides_secrets(self) -> None:
+        """Leave every secret out of the configuration's repr, which logs may show."""
+        rendered = repr(load_config(json.loads(CONFIG)))
+
+        for secret in (AUTH_KEY.decode(), COORDINATION_KEY.decode(), NATS_CREDENTIAL):
+            with self.subTest(secret=secret):
+                assert secret not in rendered
+
+    def test_secret_validation(self) -> None:
+        """Reject a missing, malformed, too-short, or non-UTF-8 secret."""
+        # One byte short of the 20-byte minimum that AUTH_KEY meets.
+        short_totp = base64.b32encode(AUTH_KEY[:19]).decode()
+        for variable, value, message in (
+            ("BOTNATS_TOTP_SECRET", "", "BOTNATS_TOTP_SECRET is required"),
+            ("BOTNATS_TOTP_SECRET", "not base32!", "valid base32"),
+            ("BOTNATS_TOTP_SECRET", short_totp, "at least 160 bits"),
+            ("BOTNATS_NATS_TOKEN", "", "BOTNATS_NATS_TOKEN is required"),
+            ("BOTNATS_COORDINATION_SECRET", "x" * 31, "at least 32 bytes"),
+        ):
+            with (
+                self.subTest(variable=variable, value=value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                load_config(json.loads(CONFIG), **{variable: value})
+
+        # The minimum counts encoded bytes, not characters.
+        for secret in ("x" * 32, "é" * 16):
+            with self.subTest(secret=secret):
+                config = load_config(
+                    json.loads(CONFIG),
+                    BOTNATS_COORDINATION_SECRET=secret,
+                )
+                assert config.coordination_secret == secret.encode()
+
+        # Bytes that are not UTF-8 reach os.environ as lone surrogates. The
+        # ASCII part alone exceeds the minimum, so only the UTF-8 check can
+        # reject the value, and the single surrogate is one that a chained
+        # UnicodeEncodeError would quote.
+        secret = "canary-" * 5 + "\udcff"
+        for variable in ("BOTNATS_COORDINATION_SECRET", "BOTNATS_NATS_TOKEN"):
+            with (
+                self.subTest(variable=variable),
+                self.assertRaisesRegex(
+                    ValueError,
+                    f"^{variable} must be valid UTF-8$",
+                ) as raised,
+            ):
+                load_config(json.loads(CONFIG), **{variable: secret})
+
+            rendered = "".join(traceback.format_exception(raised.exception))
+            for fragment in ("canary", "udcff"):
+                with self.subTest(variable=variable, fragment=fragment):
+                    assert fragment not in rendered
+
+        # A non-ASCII TOTP secret fails inside an ASCII encode whose error
+        # holds the whole value, so the chain to it must be dropped.
+        for secret in ("canary base32!", "canaryé" * 5):
+            with (
+                self.subTest(secret=secret),
+                self.assertRaisesRegex(ValueError, "valid base32") as raised,
+            ):
+                load_config(json.loads(CONFIG), BOTNATS_TOTP_SECRET=secret)
+
+            assert raised.exception.__cause__ is None
+            assert raised.exception.__suppress_context__
+            assert "canary" not in str(raised.exception).lower()
+
+    def test_totp_secret_normalization(self) -> None:
+        """Decode a TOTP secret written in lowercase groups split by whitespace."""
+        encoded = base64.b32encode(AUTH_KEY).decode().lower()
+        grouped = " ".join(encoded[i : i + 4] for i in range(0, len(encoded), 4))
+
+        config = load_config(
+            json.loads(CONFIG),
+            BOTNATS_TOTP_SECRET=f"\t{grouped}\n",
+        )
+
+        assert config.totp_secret == AUTH_KEY
+
+    def test_totp_secret_without_padding(self) -> None:
+        """Decode a base32 TOTP secret written without its trailing padding."""
+        key = AUTH_KEY + b"1"
+        encoded = base64.b32encode(key).decode()
+        assert encoded.endswith("=")
+
+        config = load_config(
+            json.loads(CONFIG),
+            BOTNATS_TOTP_SECRET=encoded.rstrip("="),
+        )
+
+        assert config.totp_secret == key
+
+    def test_nickname_fits_rfc1459_length(self) -> None:
+        """Accept a nickname of RFC 1459's nine characters, but not a longer one."""
+        assert nickname({"nickname": "n" * 9}) == "n" * 9
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^bot\.nickname must not exceed 9 characters$",
+        ):
+            nickname({"nickname": "n" * 10})
+
+    def test_nickname_rejects_invalid_characters(self) -> None:
+        """Reject a nickname with an invalid later character, or a hyphen first.
+
+        A hyphen is valid only after the first character.
+        """
+        for value in ("bad.nick", "-nick"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    r"^bot\.nickname is not a valid IRC nickname$",
+                ),
+            ):
+                nickname({"nickname": value})
+
+    def test_optional_settings_default(self) -> None:
+        """Load defaults for omitted optional keys and tables."""
         raw = json.loads(CONFIG)
-        del raw["authorization"]
         del raw["coordination"]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_text(json.dumps(raw))
-            with patch.dict(os.environ, SECRETS):
-                config = BotConfig.load(path)
+        del raw["bot"]["health_port"]
+        for key in ("channel_modes", "connect_timeout_seconds", "verify_tls"):
+            del raw["irc"][key]
 
-        assert config.auth_session_ttl == 3600
-        assert config.presence_ttl == 15
+        for key in ("jetstream_replicas", "monitor_port"):
+            del raw["nats"][key]
 
-    def test_session_ttl_has_no_maximum(self) -> None:
-        """Accept a session lifetime longer than a day."""
-        raw = json.loads(CONFIG)
-        raw["authorization"]["session_ttl_seconds"] = 172800
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_text(json.dumps(raw))
-            with patch.dict(os.environ, SECRETS):
-                config = BotConfig.load(path)
+        # CONFIG sets every optional key away from its default.
+        assert load_config(raw) == replace(
+            load_config(json.loads(CONFIG)),
+            channel_modes="",
+            enforced_modes=(frozenset(), frozenset()),
+            health_port=8080,
+            irc_connect_timeout=30,
+            irc_verify_tls=True,
+            jetstream_replicas=1,
+            maintenance_interval=3,
+            nats_monitor_port=8222,
+            presence_ttl=15,
+        )
 
-        assert config.auth_session_ttl == 172800
-
-    def test_session_ttl_must_expire(self) -> None:
-        """Reject a session lifetime of zero or less: sessions always expire."""
-        for ttl in (0, -1):
-            with self.subTest(ttl=ttl):
+    def test_durations_must_be_numbers(self) -> None:
+        """Reject a timeout or interval written as a string or a boolean."""
+        durations = (
+            ("coordination", "maintenance_interval_seconds"),
+            ("coordination", "presence_ttl_seconds"),
+            ("irc", "connect_timeout_seconds"),
+        )
+        for section, key in durations:
+            # Each would read as a valid duration if converted to float.
+            for value in ("30", True):
                 raw = json.loads(CONFIG)
-                raw["authorization"]["session_ttl_seconds"] = ttl
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory, "bot.json")
-                    path.write_text(json.dumps(raw))
-                    with (
-                        patch.dict(os.environ, SECRETS),
-                        self.assertRaisesRegex(
-                            ValueError,
-                            r"authorization\.session_ttl_seconds must be a positive",
-                        ),
-                    ):
-                        BotConfig.load(path)
+                raw[section][key] = value
+                with (
+                    self.subTest(key=key, value=value),
+                    self.assertRaisesRegex(
+                        TypeError,
+                        rf"^{section}\.{key} must be a positive number$",
+                    ),
+                ):
+                    load_config(raw)
 
     def test_required_key_errors_name_their_section(self) -> None:
         """Qualify required-key errors with their configuration table."""
@@ -127,18 +243,24 @@ class ConfigTests(unittest.TestCase):
             ("nats", r"nats\.servers must be a list of non-empty strings"),
         )
         for section, message in cases:
-            with self.subTest(section=section):
-                raw = json.loads(CONFIG)
-                del raw[section]
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory, "bot.json")
-                    path.write_text(json.dumps(raw))
-                    with self.assertRaisesRegex(ValueError, message):
-                        BotConfig.load(path)
+            raw = json.loads(CONFIG)
+            del raw[section]
+            with (
+                self.subTest(section=section),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                load_config(raw)
 
     def test_invalid_value_errors_name_their_section(self) -> None:
         """Qualify invalid-value errors with their configuration table."""
         cases = (
+            ("bot", "id", "botnats.1", r"bot\.id contains unsupported characters"),
+            (
+                "bot",
+                "network",
+                "libera*",
+                r"bot\.network contains unsupported characters",
+            ),
             ("bot", "nickname", "1bad", r"bot\.nickname is not a valid IRC nickname"),
             ("bot", "health_port", 0, r"bot\.health_port must be an integer"),
             ("irc", "verify_tls", "yes", r"irc\.verify_tls must be a boolean"),
@@ -157,57 +279,72 @@ class ConfigTests(unittest.TestCase):
             ),
         )
         for section, key, value, message in cases:
-            with self.subTest(key=key):
-                raw = json.loads(CONFIG)
-                raw.setdefault(section, {})[key] = value
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory, "bot.json")
-                    path.write_text(json.dumps(raw))
-                    with (
-                        patch.dict(os.environ, SECRETS),
-                        self.assertRaisesRegex((TypeError, ValueError), message),
-                    ):
-                        BotConfig.load(path)
+            raw = json.loads(CONFIG)
+            raw[section][key] = value
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex((TypeError, ValueError), message),
+            ):
+                load_config(raw)
 
     def test_non_table_section_is_rejected(self) -> None:
         """Reject a section that is present but not an object."""
         raw = json.loads(CONFIG)
-        raw["authorization"] = []
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_text(json.dumps(raw))
-            with self.assertRaisesRegex(
-                TypeError, "authorization must be a JSON object"
-            ):
-                BotConfig.load(path)
+        raw["coordination"] = []
+        with self.assertRaisesRegex(TypeError, "coordination must be a JSON object"):
+            load_config(raw)
 
     def test_config_requires_object(self) -> None:
         """Verify a non-object JSON document produces a clear config error."""
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_text("[]")
-            with self.assertRaisesRegex(TypeError, "configuration must be an object"):
-                BotConfig.load(path)
+        with self.assertRaisesRegex(TypeError, "configuration must be an object"):
+            load_config([])
+
+    def test_channel_modes_intent(self) -> None:
+        """Return the mode string with the modes it requires and forbids."""
+        assert mode_string({"channel_modes": "-s+nt"}) == (
+            "-s+nt",
+            (frozenset("nt"), frozenset("s")),
+        )
+        # Unsetting a limit takes no argument, though setting one does.
+        assert mode_string({"channel_modes": "-l"}) == (
+            "-l",
+            (frozenset(), frozenset("l")),
+        )
 
     def test_channel_modes_reject_contradictions(self) -> None:
         """Reject modes configured as both required and forbidden."""
-        with self.assertRaisesRegex(ValueError, "require and forbid"):
-            mode_string({"channel_modes": "+n-n"}, "channel_modes", "irc", "")
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^irc\.channel_modes cannot require and forbid the same mode$",
+        ):
+            mode_string({"channel_modes": "+n-n"})
 
     def test_channel_modes_reject_oversized_message(self) -> None:
         """Reject channel modes that cannot fit in an IRC MODE command."""
         with self.assertRaisesRegex(ValueError, "512 bytes"):
-            mode_string({"channel_modes": "+" + "n" * 510}, "channel_modes", "irc", "")
+            mode_string({"channel_modes": "+" + "n" * 510})
 
     def test_channel_modes_reject_unusable_syntax(self) -> None:
         """Reject unsigned, empty, and argument-consuming channel modes."""
-        for value in ("nt", "+", "+k", "-b", "+o"):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                mode_string({"channel_modes": value}, "channel_modes", "irc", "")
+        for value, message in (
+            ("nt", "contains unsupported characters"),
+            ("+", "contains unsupported characters"),
+            ("+nt1", "contains unsupported characters"),
+            ("+k", "contains a mode that requires an argument"),
+            ("+l", "contains a mode that requires an argument"),
+            ("-b", "contains a mode that requires an argument"),
+            ("+o", "contains a mode that requires an argument"),
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                mode_string({"channel_modes": value})
 
     def test_port_validation(self) -> None:
         """Verify monitoring ports default and stay in the TCP port range."""
         assert port({}, "monitor_port", "nats", 8222) == 8222
+        assert port({"monitor_port": 65535}, "monitor_port", "nats", 8222) == 65535
         for bad in (True, 0, 65536, 8222.0, "8222"):
             with self.assertRaisesRegex(ValueError, "integer between 1 and 65535"):
                 port({"monitor_port": bad}, "monitor_port", "nats", 8222)
@@ -229,73 +366,83 @@ class ConfigTests(unittest.TestCase):
 
     def test_presence_ttl_exceeds_maintenance_interval(self) -> None:
         """Reject presence expiry that is no longer than its heartbeat interval."""
-        raw = json.loads(CONFIG)
-        raw["coordination"]["presence_ttl_seconds"] = 2
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_text(json.dumps(raw))
+        # Each expiry exceeds the default interval, so only the configured
+        # interval can reject it.
+        for ttl in (10, 20):
+            raw = json.loads(CONFIG)
+            raw["coordination"] = {
+                "maintenance_interval_seconds": 20,
+                "presence_ttl_seconds": ttl,
+            }
             with (
-                patch.dict(os.environ, SECRETS),
-                self.assertRaisesRegex(
-                    ValueError,
-                    "presence_ttl_seconds must exceed",
-                ),
+                self.subTest(ttl=ttl),
+                self.assertRaisesRegex(ValueError, "presence_ttl_seconds must exceed"),
             ):
-                BotConfig.load(path)
+                load_config(raw)
 
     def test_replica_count_validation(self) -> None:
         """Verify JetStream replicas default to one and stay in range."""
         assert replica_count({}) == 1
+        assert replica_count({"jetstream_replicas": 5}) == 5
         for bad in (True, 0, 6, 1.0, "3"):
             with self.assertRaisesRegex(ValueError, "integer between 1 and 5"):
                 replica_count({"jetstream_replicas": bad})
 
-    def test_server_url_validation(self) -> None:
-        """Verify IRC and NATS URLs reject unsupported components and ports."""
-        invalid_nats = (
-            "nats://host:bad",
-            "nats://host:0",
-            "nats://host:70000",
-            "nats://host/stream",
-            "nats://token@host:4222",
-            "nats://ho\x1bst:4222",
-            "nats://" + chr(0xD800) + ":4222",
-        )
-        invalid_irc = (
-            "irc://host:bad",
-            "irc://host:0",
-            "irc://host:70000",
-            "irc://host/channel",
-            "irc://user@host:6667",
-            "irc://ho\x7fst:6667",
-            "irc://" + chr(0xD800) + ":6667",
-        )
-        for value in invalid_nats:
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "invalid NATS server URL",
-                ) as raised:
-                    nats_urls({"servers": [value]})
+    def test_nats_urls_reject_other_schemes(self) -> None:
+        """Reject a NATS server URL with a scheme other than nats."""
+        # nats-py ignores a tls:// scheme and uses TLS only when the server
+        # asks, so accepting tls:// would promise encryption it never enforces.
+        for value in ("irc://host:4222", "tls://host:4222"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "^invalid NATS server URL$"),
+            ):
+                nats_urls({"servers": [value]})
 
-                assert value not in str(raised.exception)
+    def test_nats_urls_reject_hostname_nats_refuses(self) -> None:
+        """Reject a NATS hostname nats-py refuses once instead of retrying."""
+        for value in ("nats://none:4222", "nats://NONE:4222"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "^invalid NATS server URL$"),
+            ):
+                nats_urls({"servers": [value]})
 
-        for value in invalid_irc:
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "invalid IRC server URL",
-                ) as raised:
-                    IRCServer.parse(value)
-
-                assert value not in str(raised.exception)
+    def test_server_lists_must_hold_urls(self) -> None:
+        """Reject an empty server list or one with a non-string or empty entry."""
+        for section in ("irc", "nats"):
+            for servers, message in (
+                ([], "must not be empty"),
+                ([1], "must be a list of non-empty strings"),
+                ([""], "must be a list of non-empty strings"),
+            ):
+                raw = json.loads(CONFIG)
+                raw[section]["servers"] = servers
+                with (
+                    self.subTest(section=section, servers=servers),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        rf"^{section}\.servers {message}$",
+                    ),
+                ):
+                    load_config(raw)
 
     def test_unknown_keys(self) -> None:
         """Verify configuration typos fail instead of selecting defaults."""
-        raw = json.loads(CONFIG)
-        raw["nats"]["jetsteam_replicas"] = 3
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "bot.json")
-            path.write_text(json.dumps(raw))
-            with self.assertRaisesRegex(ValueError, "jetsteam_replicas"):
-                BotConfig.load(path)
+        nested = json.loads(CONFIG)
+        nested["nats"]["jetsteam_replicas"] = 3
+        top = json.loads(CONFIG)
+        top["coordinaton"] = top.pop("coordination")
+        # The session lifetime is fixed; a config that still sets it fails.
+        removed = json.loads(CONFIG)
+        removed["authorization"] = {"session_ttl_seconds": 3600}
+        for raw, message in (
+            (nested, r"unsupported nats configuration key\(s\): jetsteam_replicas$"),
+            (top, r"unsupported root configuration key\(s\): coordinaton$"),
+            (removed, r"unsupported root configuration key\(s\): authorization$"),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                load_config(raw)

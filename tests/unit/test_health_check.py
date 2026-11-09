@@ -4,10 +4,27 @@
 """Tests for HTTP health check endpoint."""
 
 import asyncio
+import ipaddress
 import socket
 import unittest
+from unittest.mock import patch
 
-from botnats.health_check import HealthCheck
+from botnats.health_check import RESPONSE_NOT_FOUND, HealthCheck
+from tests.unit.helpers import bounded, mock_writer
+
+
+def ipv6_binds() -> bool:
+    """Return whether this host can listen on IPv6."""
+    if not socket.has_ipv6:
+        return False
+
+    try:
+        with socket.socket(socket.AF_INET6) as sock:
+            sock.bind(("::", 0))
+    except OSError:
+        return False
+
+    return True
 
 
 class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
@@ -15,7 +32,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
 
     async def request(self, health_check: HealthCheck, path: str) -> bytes:
         """Request one health path and return its response."""
-        await health_check.start()
+        await bounded(health_check.start())
         try:
             assert health_check.server is not None
             port = next(
@@ -23,25 +40,143 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
                 for sock in health_check.server.sockets
                 if sock.family == socket.AF_INET
             )
-            reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            writer.write(f"GET {path} HTTP/1.0\r\n\r\n".encode())
-            await writer.drain()
-            response = await reader.read()
-            writer.close()
-            await writer.wait_closed()
+            async with asyncio.timeout(5):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(f"GET {path} HTTP/1.0\r\n\r\n".encode())
+                await writer.drain()
+                response = await reader.read()
+                writer.close()
+                await writer.wait_closed()
+
             return response
         finally:
-            await health_check.close()
+            # wait_closed also waits on a handler that never closes its
+            # connection, so the shutdown needs its own bound.
+            async with asyncio.timeout(5):
+                await health_check.close()
 
     async def test_close_is_idempotent(self) -> None:
-        """Verify repeated shutdown releases the listening server."""
+        """Verify repeated shutdown stops and releases the listening server."""
         health_check = HealthCheck(ready=lambda: True, port=0)
-        await health_check.start()
+        await bounded(health_check.start())
+        server = health_check.server
+        assert server is not None
+        self.addAsyncCleanup(bounded, server.wait_closed())
+        self.addCleanup(server.close)
+        assert server.is_serving()
 
-        await health_check.close()
-        await health_check.close()
+        async with asyncio.timeout(5):
+            await health_check.close()
+            await health_check.close()
 
         assert health_check.server is None
+        assert not server.is_serving()
+
+    async def test_close_drops_idle_connection(self) -> None:
+        """Close without waiting out a connection that sends nothing."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        handling = asyncio.Event()
+        handle = health_check.handle
+
+        async def tracked(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            handling.set()
+            await handle(reader, writer)
+
+        with patch.object(health_check, "handle", tracked):
+            await bounded(health_check.start())
+
+        server = health_check.server
+        assert server is not None
+        self.addAsyncCleanup(bounded, server.wait_closed())
+        self.addCleanup(server.close_clients)
+        self.addCleanup(server.close)
+        port = next(
+            sock.getsockname()[1]
+            for sock in server.sockets
+            if sock.family == socket.AF_INET
+        )
+        real_timeout = asyncio.timeout
+        delays: list[float | None] = []
+
+        def no_timeout(delay: float | None) -> asyncio.Timeout:
+            delays.append(delay)
+            return real_timeout(None)
+
+        # Without its request timeout the handler never ends on its own, so only
+        # close can end it before the test's bound.
+        async with real_timeout(5):
+            with patch("asyncio.timeout", no_timeout):
+                _, writer = await asyncio.open_connection("127.0.0.1", port)
+                self.addCleanup(writer.close)
+                await handling.wait()
+
+        assert delays == [5.0]
+        await bounded(health_check.close())
+
+    async def test_listens_on_every_interface(self) -> None:
+        """Listen on every interface, so probes from other hosts reach it."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        await bounded(health_check.start())
+        self.addAsyncCleanup(bounded, health_check.close())
+        assert health_check.server is not None
+
+        hosts = [sock.getsockname()[0] for sock in health_check.server.sockets]
+
+        assert hosts
+        assert all(ipaddress.ip_address(host).is_unspecified for host in hosts)
+        # Probes may come over IPv6 alone, which an IPv4 wildcard misses.
+        if ipv6_binds():
+            families = {sock.family for sock in health_check.server.sockets}
+            assert socket.AF_INET6 in families
+
+    async def test_request_timeout_closes_connection(self) -> None:
+        """Close a connection that sends no request line within the timeout."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        writer = mock_writer()
+        real_timeout = asyncio.timeout
+        delays: list[float | None] = []
+
+        def short_timeout(delay: float | None) -> asyncio.Timeout:
+            delays.append(delay)
+            return real_timeout(0)
+
+        async with real_timeout(5):
+            with patch("asyncio.timeout", short_timeout):
+                await health_check.handle(asyncio.StreamReader(), writer)
+
+        assert delays == [5.0]
+        writer.write.assert_not_called()
+        writer.close.assert_called_once_with()
+
+    async def test_overlong_request_line_closes_connection(self) -> None:
+        """Close a connection whose request line overflows the reader limit."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        writer = mock_writer()
+        reader = asyncio.StreamReader(limit=64)
+        reader.feed_data(b"GET /" + b"x" * 128 + b" HTTP/1.0\r\n\r\n")
+        reader.feed_eof()
+
+        async with asyncio.timeout(5):
+            await health_check.handle(reader, writer)
+
+        writer.write.assert_not_called()
+        writer.close.assert_called_once_with()
+
+    async def test_empty_request_line_is_not_found(self) -> None:
+        """Answer a TCP probe that connects and closes without a request."""
+        health_check = HealthCheck(ready=lambda: True, port=0)
+        writer = mock_writer()
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+
+        async with asyncio.timeout(5):
+            await health_check.handle(reader, writer)
+
+        writer.write.assert_called_once_with(RESPONSE_NOT_FOUND)
+        writer.close.assert_called_once_with()
 
     async def test_liveness_ignores_dependencies(self) -> None:
         """Verify dependency loss does not fail the liveness endpoint."""

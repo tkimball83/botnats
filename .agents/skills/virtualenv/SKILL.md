@@ -5,16 +5,12 @@ description: Set up the project virtualenv.
 
 # virtualenv
 
-All tooling runs from `venv/`, pinned to the Python in `.python-version`.
+All tooling runs from the git-ignored `venv/`, built with the Python in `.python-version`.
 
-```sh
-make venv
-```
+- `make venv`: create the venv.
+- `make install`: add the dev dependencies.
+- `make hooks`: install the pre-commit hooks.
+- `make clean`: remove the venv and build artifacts.
 
-- `make venv` — create the venv.
-- `make install` — venv + dev dependencies.
-- `make hooks` — pre-commit hooks.
-- `make clean` — remove venv and build artifacts.
-
-Validation targets install their own dependencies. Run `make install` directly only when an
-interactive tool is missing or outdated. `venv/` is git-ignored.
+Validation targets install what they need; run `make install` yourself only for interactive
+tools.

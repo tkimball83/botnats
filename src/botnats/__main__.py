@@ -10,6 +10,7 @@ import os
 import signal
 from contextlib import suppress
 
+from botnats import error_label
 from botnats.bot import Bot
 from botnats.config import BotConfig
 
@@ -31,7 +32,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=levels[level],
     )
-    config = BotConfig.load(arguments.config)
+    try:
+        config = BotConfig.load(arguments.config)
+    except (OSError, TypeError, ValueError) as error:
+        parser.error(f"invalid configuration: {error_label(error)}")
 
     with suppress(KeyboardInterrupt, asyncio.CancelledError):
         asyncio.run(run(config))
@@ -42,11 +46,7 @@ async def run(config: BotConfig) -> None:
     bot = Bot(config)
     task = asyncio.current_task()
     if task is not None:
-        with suppress(NotImplementedError):
-            asyncio.get_running_loop().add_signal_handler(
-                signal.SIGTERM,
-                task.cancel,
-            )
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
 
     await bot.run()
 

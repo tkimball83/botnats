@@ -1,25 +1,17 @@
 # Copyright (C) 2026 Taylor Kimball
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""TOTP authentication, signed sessions, and their mesh-wide synchronization."""
+"""TOTP authentication, sessions, and their mesh-wide synchronization."""
 
 import asyncio
-import base64
-import binascii
 import hmac
 import time
-from dataclasses import asdict
-from typing import TYPE_CHECKING, Any
+from dataclasses import replace
+from functools import partial
+from typing import TYPE_CHECKING
 
-from botnats.config import MIN_COORDINATION_KEY_BYTES
 from botnats.irc.protocol import casefold
-from botnats.nats.store import (
-    PUBLISH_ERRORS,
-    SESSION_EXPIRY_GRACE,
-    Session,
-    parse_session_record,
-    session_signature,
-)
+from botnats.nats.store import PUBLISH_ERRORS, SESSION_TTL, Session
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -27,9 +19,8 @@ if TYPE_CHECKING:
     from botnats import Tasks
     from botnats.bot import Bot
     from botnats.irc.protocol import Prefix
-    from botnats.nats.coordinator import CoordinatorProtocol
+    from botnats.nats.coordinator import SessionWriter
 
-MIN_TOTP_SECRET_BYTES = 20
 TOTP_CODE_LENGTH = 6
 TOTP_PERIOD = 30
 TOTP_WINDOW = 1
@@ -43,53 +34,91 @@ class AuthFlow:
 
     async def authenticate(self, prefix: Prefix, arguments: tuple[str, ...]) -> None:
         """Validate a TOTP code and establish an authorized session."""
-        if not prefix.complete:
-            return
-
         bot = self.bot
         coordinator = bot.coordinator
-        if len(arguments) != 1:
-            await bot.commands.reply(prefix.nick, "AUTH <totp-code>")
-            return
-
         rendered = prefix.render()
         identity = limit_identity(prefix)
+        # Over the attempt limit, or without NATS to enforce it, AUTH stays
+        # silent, even malformed: a reply would only tell a guesser that the
+        # bot is listening.
         if not await coordinator.request_auth(identity):
             return
 
+        # The usage and failure replies carry nothing private, and go to a
+        # sender who holds no session: they are sent unchecked.
+        if len(arguments) != 1:
+            bot.commands.reply(prefix, "AUTH <totp-code>", checked=False)
+            return
+
         counter = bot.authorizer.match(arguments[0])
-        # A wrong code still performs the claim round trip so response
-        # timing cannot distinguish it from a valid-but-replayed code.
-        claimed = await coordinator.request_claim(
-            counter if counter is not None else -1,
-        )
+        claimed = counter is not None and await coordinator.request_claim(counter)
         # AUTH runs off the IRC read loop, so the user may QUIT or change
         # identity while it waits; a grant after that would authorize an
         # identity that is already gone.
-        if counter is not None and claimed and bot.sessions.watched_valid(rendered):
+        if claimed and bot.sessions.watched_valid(rendered):
             session = bot.authorizer.grant(rendered)
+            # A held revocation that outranks the grant blocks it. Writing the
+            # grant anyway could land it where the store no longer holds that
+            # revocation, as after a delete the watch has yet to report.
+            if not bot.authorizer.authorized(rendered):
+                bot.commands.reply(prefix, "Authorization failed", checked=False)
+                return
+
+            try:
+                synced = await bot.sessions.sync(session)
+            except asyncio.CancelledError:
+                # Shutdown cancels AUTH mid-write, before the check below can
+                # deny it, and its final flush would write the grant still
+                # queued. The cancelled write may already have landed, so
+                # only a revocation supersedes it. Shutdown reports the IRC
+                # disconnect first, so the identity no longer holds: the
+                # revocation escalates over a newer grant like a change's own.
+                revoked = bot.authorizer.revoke(session)
+                if revoked is not None:
+                    bot.sessions.queue(revoked)
+
+                raise
+
             # The identity must still hold after the write: IRC may have
             # disconnected while it waited on JetStream.
             if (
-                not await bot.sessions.sync(rendered, asdict(session))
+                not synced
                 or not bot.authorizer.authorized(rendered)
                 or not bot.sessions.watched_valid(rendered)
             ):
-                revoked = bot.authorizer.revoke(rendered)
+                # While the identity holds, the revocation cancels only this
+                # grant and yields to a newer one: the user may authenticate
+                # on a peer meanwhile. Once gone, it revokes whatever is held,
+                # or this grant if nothing is, and escalates like the change's
+                # own.
+                holds = bot.sessions.watched_valid(rendered)
+                revoked = (
+                    bot.authorizer.withdraw(session)
+                    if holds
+                    else bot.authorizer.revoke(session)
+                )
                 if revoked is not None:
-                    await bot.sessions.sync(revoked.prefix, asdict(revoked))
+                    # Queued before waiting on the lock: shutdown may cancel
+                    # the wait, and its final flush writes only what is queued.
+                    bot.sessions.queue(revoked, yielding=holds)
+                    await bot.sessions.retry()
 
-                await bot.commands.reply(prefix.nick, "Authorization failed")
+                bot.commands.reply(prefix, "Authorization failed", checked=False)
                 return
 
-            await bot.commands.reply(prefix.nick, "Authorized")
-            bot.tasks.spawn(self.auto_op(prefix), "admin-auto-op")
+            bot.commands.reply(prefix, "Authorized")
+            self.auto_op(prefix)
         else:
-            await bot.commands.reply(prefix.nick, "Authorization failed")
+            bot.commands.reply(prefix, "Authorization failed", checked=False)
 
-    async def auto_op(self, prefix: Prefix) -> None:
-        """Grant operator status on all channels where this bot is opped."""
+    def auto_op(self, prefix: Prefix) -> None:
+        """Grant operator status on all channels where this bot is opped.
+
+        Each MODE goes out only if the session still holds when its turn in
+        the send queue comes, as for a reply.
+        """
         bot = self.bot
+        check = partial(bot.authorizer.authorized, prefix.render())
         for runtime in tuple(bot.channel_mgr.channels.values()):
             channel = runtime.channel
             if not bot.channel_mgr.is_self_opped(runtime):
@@ -105,11 +134,12 @@ class AuthFlow:
                 continue
 
             try:
-                await bot.irc.send(
+                bot.irc.send(
                     "MODE",
                     channel,
                     f"+{bot.caps.op_mode}",
                     member.nick,
+                    check=check,
                 )
             except ConnectionError:
                 continue
@@ -121,7 +151,8 @@ class SessionSync:
     Writes: IRC handlers apply a revocation locally at once and queue its
     durable write, which a background drain performs, so the IRC read loop
     never waits on JetStream. AUTH awaits sync() because it replies with the
-    outcome. A drain stops at the first failed write; the next retry resumes.
+    outcome. A drain stops at the first write JetStream fails; the next retry
+    resumes.
 
     Watched records: the coordinator reports validated records by KV key.
     A delete carries only the key, so the prefix each key holds is kept here
@@ -131,13 +162,17 @@ class SessionSync:
     def __init__(
         self,
         authorizer: TotpAuthorizer,
-        coordinator: CoordinatorProtocol,
+        coordinator: SessionWriter,
         tasks: Tasks,
     ) -> None:
         self.authorizer = authorizer
         self.coordinator = coordinator
         self.lock = asyncio.Lock()
-        self.pending: dict[str, dict[str, object]] = {}
+        self.pending: dict[str, Session] = {}
+        # Identity -> queued record that is not a new mutation, so a newer
+        # grant supersedes it unrevoked: a held record written back over a
+        # rollback, or AUTH's revocation of its own grant.
+        self.yielding: dict[str, Session] = {}
         # KV key -> (prefix, expiry) for each unexpired watched session.
         self.watched: dict[str, tuple[str, float]] = {}
         # ASCII-folded identity -> (commands in flight, invalidated since the
@@ -161,7 +196,7 @@ class SessionSync:
         reconnecting as the same prefix meanwhile fails closed until then.
         """
         key = casefold(identity, "ascii")
-        count, invalidated = self.watched_identities.pop(key, (1, True))
+        count, invalidated = self.watched_identities.pop(key)
         if count > 1:
             self.watched_identities[key] = (count - 1, invalidated)
 
@@ -172,11 +207,36 @@ class SessionSync:
         return watched is not None and not watched[1]
 
     def invalidate(self, identity: str) -> None:
-        """Mark an identity that quit or changed as invalid for pending commands."""
-        key = casefold(identity, "ascii")
-        if key in self.watched_identities:
-            count, _ = self.watched_identities[key]
-            self.watched_identities[key] = (count, True)
+        """Mark an identity that quit or changed as invalid for pending commands.
+
+        A command may spell the identity another way the casemapping folds
+        together; every casemapping folds an ASCII-folded key alike.
+        """
+        fold = self.authorizer.identity_fold
+        self.watched_identities = {
+            key: (count, invalidated or fold(key) == fold(identity))
+            for key, (count, invalidated) in self.watched_identities.items()
+        }
+
+    def invalidate_nick(self, nick: str) -> None:
+        """Invalidate every identity of a nick for pending commands and queued writes.
+
+        For a departure member state could not complete, which names only the
+        nick. Its identities are gone, so whatever is queued for them
+        escalates over a newer grant, as revoke() does for one identity. A
+        command or record may spell the nick another way the casemapping
+        folds together.
+        """
+        fold = self.authorizer.identity_fold
+        self.watched_identities = {
+            key: (count, invalidated or fold(key.partition("!")[0]) == fold(nick))
+            for key, (count, invalidated) in self.watched_identities.items()
+        }
+        self.yielding = {
+            key: held
+            for key, held in self.yielding.items()
+            if fold(held.prefix.partition("!")[0]) != fold(nick)
+        }
 
     def invalidate_all(self) -> None:
         """Invalidate every pending command's identity after IRC disconnects.
@@ -188,122 +248,214 @@ class SessionSync:
             key: (count, True) for key, (count, _) in self.watched_identities.items()
         }
 
-    def observe(
-        self,
-        key: str,
-        record: dict[str, Any],
-        *,
-        replaying: bool,
-    ) -> None:
-        """Apply a validated watched record: import it, or drop it if expired."""
-        now = time.time()
-        if not replaying:
-            self.prune(now)
+    def observe(self, key: str, session: Session) -> None:
+        """Apply a validated watched record: keep it, or forget its key if expired.
 
-        expiry = float(record["expires_at"])
-        if expiry > now:
-            self.watched[key] = (record["prefix"], expiry)
-            self.authorizer.import_session(record)
+        A record below the one held for its key was rolled back, as when a
+        NATS writer without the coordination secret re-puts the grant a
+        revocation replaced. Bots that start later replay only that record,
+        so the held one is written again unless a mutation for its identity
+        is already queued. The record may instead be a late echo of this
+        bot's own write, so the write-back never escalates over a newer grant.
+        """
+        now = time.time()
+        if session.expires_at > now:
+            self.watched[key] = (session.prefix, session.expires_at)
+            held = self.keep(session)
+            if held is not None:
+                self.restore(held)
         else:
             self.forget(key)
 
+    def keep(self, session: Session) -> Session | None:
+        """Keep a record locally, as TotpAuthorizer.keep, unless an escalation waits.
+
+        A grant is held back while a revocation queued for its identity
+        escalates: that identity is gone, and once written the escalation
+        revokes whatever grant the key holds. The identity is the record's
+        prefix ASCII-folded, as the queue keys it: an IRC-equivalent spelling
+        has its own key, which the escalation never meets. A held-back grant
+        returns None, as its identity's queued mutation leaves nothing to
+        write back.
+        """
+        identity = casefold(session.prefix, "ascii")
+        queued = self.pending.get(identity)
+        if (
+            not session.revoked
+            and queued is not None
+            and queued.revoked
+            and self.yielding.get(identity) is not queued
+        ):
+            return None
+
+        return self.authorizer.keep(session)
+
     def forget(self, key: str) -> None:
-        """Drop the local session a deleted or expired KV key held."""
+        """Drop the local session a deleted, unauthentic, or expired KV key held.
+
+        A held unexpired revocation is written back, as over a rollback: bots
+        that start later would otherwise accept the revoked grant if re-put.
+        A key whose mapping expired held a record that is already gone: the
+        identity's record, if any, is newer, as a grant this bot has yet to
+        write, and stays.
+        """
         mapped = self.watched.pop(key, None)
-        if mapped is not None:
-            self.authorizer.drop_session(mapped[0])
+        if mapped is not None and mapped[1] > time.time():
+            held = self.authorizer.drop_session(mapped[0])
+            if held is not None:
+                self.restore(held)
 
     def replayed(self, keys: set[str]) -> None:
-        """Drop sessions a completed watch replay no longer contains."""
-        self.prune()
+        """Forget the keys a completed watch replay held no valid record for."""
         for key in self.watched.keys() - keys:
             self.forget(key)
 
-    def prune(self, now: float | None = None) -> None:
-        """Discard expired key mappings, which receive no TTL delete event."""
-        current = time.time() if now is None else now
-        self.watched = {
-            key: mapped for key, mapped in self.watched.items() if mapped[1] > current
-        }
+    def restore(self, held: Session) -> None:
+        """Queue a held record to write back unless its identity has a mutation."""
+        identity = casefold(held.prefix, "ascii")
+        if identity not in self.pending:
+            self.pending[identity] = self.yielding[identity] = held
+            self.tasks.spawn(self.retry(), "session-sync")
 
-    def queue(self, identity: str, session: dict[str, object]) -> str:
-        """Queue a mutation unless an unwritten one for the identity outranks it.
+    def prune(self) -> None:
+        """Discard expired key mappings, which receive no TTL delete event."""
+        cutoff = time.time()
+        for key in [k for k, mapped in self.watched.items() if mapped[1] <= cutoff]:
+            del self.watched[key]
+
+    def queue(self, session: Session, *, yielding: bool = False) -> str:
+        """Queue a mutation unless an unwritten one for its identity outranks it.
 
         AUTH grants before it waits for the lock, so a revocation queued
-        meanwhile by a QUIT must not be replaced by the older grant.
+        meanwhile by a QUIT must not be replaced by the older grant. The
+        identity is the session's own prefix, which the store keys it by.
+        A yielding revocation only cancels this bot's own grant: a newer
+        grant it meets, as when the user authenticates on a peer, stands.
         """
-        key = casefold(identity, "ascii")
-        now = time.time()
-        incoming = self.authorizer.parse(session, now)
-        queued = self.authorizer.parse(self.pending.get(key), now)
-        if queued is None or (incoming is not None and incoming.order > queued.order):
+        key = casefold(session.prefix, "ascii")
+        queued = self.pending.get(key)
+        if queued is None or session.order > queued.order:
             self.pending[key] = session
+            if yielding:
+                self.yielding[key] = session
 
         return key
 
-    async def sync(self, identity: str, session: dict[str, object]) -> bool:
-        """Queue and write one mutation now; report whether it was written."""
+    async def sync(self, session: Session) -> bool:
+        """Queue and write one mutation now.
+
+        Returns whether nothing remained unwritten for its identity once its
+        write finished; a queued revocation that outranks the session drops it.
+        """
         async with self.lock:
-            key = self.queue(identity, session)
-            await self.drain()
-            return key not in self.pending
+            return await self.drain(self.queue(session))
 
     async def retry(self) -> None:
         """Retry queued writes that failed while JetStream was unavailable."""
         async with self.lock:
             await self.drain()
 
+    async def flush(self) -> None:
+        """Write everything queued at shutdown, escalations included.
+
+        A drain leaves an escalated revocation to a background retry, which
+        shutdown cancels instead of awaiting, so drain again until the queue
+        is empty or a pass changes nothing, as when JetStream fails or the
+        store refuses the rest.
+        """
+        async with self.lock:
+            while self.pending:
+                queued = dict(self.pending)
+                await self.drain()
+                if self.pending == queued:
+                    return
+
     def revoke(self, prefix: Prefix) -> None:
-        """Revoke a session locally now and write the revocation in background."""
+        """Revoke sessions locally now and write the revocations in background.
+
+        The identity is gone, so whatever is queued for it escalates over a
+        newer grant, even when its record is already revoked. Its sessions,
+        like its queued records, may spell the identity any way the
+        casemapping folds together; each is revoked under its own key.
+        """
         identity = prefix.render()
         self.invalidate(identity)
-        revoked = self.authorizer.revoke(identity)
-        if revoked is not None:
-            # File it under the session's own prefix: the observed prefix can
-            # differ in IRC-case-equivalent characters, and the store keys and
-            # validates sessions by their own prefix.
-            self.queue(revoked.prefix, asdict(revoked))
+        fold = self.authorizer.identity_fold
+        self.yielding = {
+            key: held
+            for key, held in self.yielding.items()
+            if fold(held.prefix) != fold(identity)
+        }
+        revocations = self.authorizer.revoke_all(identity)
+        for revoked in revocations:
+            self.queue(revoked)
+
+        if revocations:
             self.tasks.spawn(self.retry(), "session-sync")
 
-    async def drain(self) -> None:
-        """Write queued mutations in order while holding the lock."""
-        for identity, session in tuple(self.pending.items()):
-            if not await self.write(identity, session):
-                return
+    async def drain(self, key: str | None = None) -> bool:
+        """Write queued mutations in order while holding the lock.
 
-    async def write(self, identity: str, session: dict[str, object]) -> bool:
-        """Write one queued mutation; re-queue a revocation that met a newer grant."""
+        Each entry is read when its turn comes: revoke() may replace one
+        during an earlier write, and the superseded one must not be written.
+        Returns whether key's write left nothing queued for it, checked
+        before later writes: the watch may meanwhile deliver an older record
+        for key and queue the record just written to write back.
+        """
+        settled = False
+        for identity in tuple(self.pending):
+            if not await self.write(identity, self.pending[identity]):
+                break
+
+            if identity == key:
+                settled = key not in self.pending
+
+        return settled
+
+    async def write(self, identity: str, session: Session) -> bool:
+        """Write one queued mutation; re-queue a revocation that met a newer grant.
+
+        Returns False only when JetStream fails, which stops the drain. A
+        record the store refuses as expiring past its horizon, after the wall
+        clock stepped back or as a revocation from a peer whose clock runs
+        ahead, stays queued until the clock catches up without holding later
+        writes.
+        """
         try:
-            stored = await self.coordinator.put_session(identity, session)
+            stored = await self.coordinator.put_session(session)
         except PUBLISH_ERRORS:
             return False
+        except ValueError:
+            return True
 
-        self.authorizer.import_session(stored)
+        # The store returns a validated record; an expired one is no winner.
+        winner = stored if stored.expires_at > time.time() else None
+        if winner is not None:
+            self.keep(winner)
+
         # revoke() queues without the lock, so a newer mutation for
         # this identity may have replaced this entry during the write; it is
         # still unwritten and must stay queued for its own drain.
         if self.pending.get(identity) is not session:
             return True
 
-        if session.get("revoked") is True:
-            winner = self.authorizer.parse(stored, time.time())
-            if winner is not None and not winner.revoked:
-                replacement = asdict(
-                    self.authorizer.create(
-                        winner.prefix,
-                        winner.expires_at,
-                        winner.issuer,
-                        winner.version + 1,
-                        revoked=True,
-                    ),
-                )
-                # The write succeeded; the replacement waits for the next
-                # retry so later identities are not held behind it.
-                self.authorizer.import_session(replacement)
-                self.pending[identity] = replacement
-                return True
+        if (
+            session.revoked
+            and winner is not None
+            and not winner.revoked
+            and self.yielding.get(identity) is not session
+        ):
+            replacement = replace(winner, revoked=True, version=winner.version + 1)
+            # The write succeeded; a retry writes the replacement once this
+            # drain releases the lock, so later identities are not held
+            # behind it.
+            self.authorizer.keep(replacement)
+            self.pending[identity] = replacement
+            self.tasks.spawn(self.retry(), "session-sync")
+            return True
 
         del self.pending[identity]
+        self.yielding.pop(identity, None)
         return True
 
 
@@ -312,140 +464,129 @@ class TotpAuthorizer:
 
     def __init__(
         self,
-        secret: str,
+        secret: bytes,
         *,
-        coordination_secret: bytes,
         identity_fold: Callable[[str], str],
-        scope: tuple[str, str],
-        session_ttl: float,
+        issuer: str,
     ) -> None:
-        normalized = "".join(secret.split()).upper()
-        try:
-            padding = "=" * (-len(normalized) % 8)
-            decoded = base64.b32decode(normalized + padding, casefold=True)
-        except (binascii.Error, ValueError) as error:
-            msg = "TOTP secret must be valid base32"
-            raise ValueError(msg) from error
-
-        if len(decoded) < MIN_TOTP_SECRET_BYTES:
-            msg = "TOTP secret must contain at least 160 bits"
-            raise ValueError(msg)
-
-        if len(coordination_secret) < MIN_COORDINATION_KEY_BYTES:
-            msg = "coordination secret must contain at least 32 bytes"
-            raise ValueError(msg)
-
-        issuer, network = scope
-        if not issuer:
-            msg = "authorization issuer must not be empty"
-            raise ValueError(msg)
-
-        if not network:
-            msg = "authorization network must not be empty"
-            raise ValueError(msg)
-
-        self.coordination_key = coordination_secret
         self.identity_fold = identity_fold
         self.issuer = issuer
-        self.network = network
-        self.secret = decoded
-        # The highest-ranked session or revocation per identity.
+        self.secret = secret
+        # Under the IRC fold, each identity's highest-ranked session or
+        # revocation, except that a grant replaces a held live session
+        # whatever its rank. Each durable identity's own record, under the
+        # ASCII fold that keys the store, is what a new fold regroups.
         self.records: dict[str, Session] = {}
-        self.session_ttl = session_ttl
+        self.source_records: dict[str, Session] = {}
 
-    def authorized(self, prefix: str, *, now: float | None = None) -> bool:
+    def authorized(self, prefix: str) -> bool:
         """Return whether the prefix has a valid, unexpired session."""
-        return self.get(prefix, now) is not None
+        record = self.records.get(self.identity_fold(prefix))
+        current = time.time()
+        return record is not None and record.expires_at > current and not record.revoked
 
-    def create(
-        self,
-        prefix: str,
-        expires_at: float,
-        issuer: str,
-        version: int = 0,
-        *,
-        revoked: bool = False,
-    ) -> Session:
-        """Create a signed session value."""
-        record: dict[str, object] = {
-            "expires_at": expires_at,
-            "issuer": issuer,
-            "prefix": prefix,
-            "revoked": revoked,
-            "version": version,
-        }
-        return Session(
-            expires_at=expires_at,
-            issuer=issuer,
-            prefix=prefix,
-            revoked=revoked,
-            version=version,
-            signature=session_signature(self.coordination_key, self.network, record),
-        )
+    def drop_session(self, prefix: str) -> Session | None:
+        """Remove a cached session whose durable record was deleted.
 
-    def drop_session(self, prefix: str) -> None:
-        """Remove a cached session whose durable record was deleted."""
-        key = self.identity_fold(prefix)
-        record = self.records.get(key)
-        if (
-            record is not None
-            and not record.revoked
-            and casefold(record.prefix, "ascii") == casefold(prefix, "ascii")
-        ):
-            del self.records[key]
-
-    def get(self, prefix: str, now: float | None = None) -> Session | None:
-        """Return an active session, pruning the record when expired."""
-        key = self.identity_fold(prefix)
-        record = self.records.get(key)
-        current = time.time() if now is None else now
-        if record is None or record.expires_at <= current:
-            self.records.pop(key, None)
+        A revocation is kept, and returned while unexpired. An IRC-equivalent
+        identity's record, which has its own durable key, stays; the highest
+        of those takes a removed session's place, as a replay would leave it.
+        """
+        identity = casefold(prefix, "ascii")
+        record = self.source_records.get(identity)
+        if record is None:
             return None
 
-        return None if record.revoked else record
+        if record.revoked:
+            return record if record.expires_at > time.time() else None
 
-    def grant(
-        self,
-        prefix: str,
-        *,
-        now: float | None = None,
-    ) -> Session:
+        del self.source_records[identity]
+        key = self.identity_fold(prefix)
+        if self.records.get(key) is record:
+            del self.records[key]
+            for source in [
+                s
+                for s in self.source_records.values()
+                if self.identity_fold(s.prefix) == key
+            ]:
+                self.keep(source)
+
+        return None
+
+    def grant(self, prefix: str) -> Session:
         """Create an authenticated session for the given IRC prefix."""
-        current = time.time() if now is None else now
-        expires_at = current + self.session_ttl
-        session = self.create(prefix, expires_at, self.issuer)
+        current = time.time()
+        session = Session(
+            expires_at=current + SESSION_TTL,
+            issuer=self.issuer,
+            prefix=prefix,
+            revoked=False,
+            version=0,
+        )
         key = self.identity_fold(prefix)
         existing = self.records.get(key)
-        # Only a revocation that outranks the new session blocks it.
+        # Only a revocation that outranks the new session blocks it. AUTH runs
+        # under the server's casemapping, so every spelling the grant folds
+        # with is this user's, and the grant supersedes their records, even a
+        # higher live session: kept apart, one could outrank the grant's
+        # revocation, as when AUTH fails, once a rekey regroups them.
         if existing is None or not existing.revoked or session.order > existing.order:
-            self.records[key] = session
+            for identity in [
+                i
+                for i, r in self.source_records.items()
+                if self.identity_fold(r.prefix) == key
+            ]:
+                del self.source_records[identity]
+
+            self.records[key] = self.source_records[casefold(prefix, "ascii")] = session
 
         return session
 
-    def import_session(self, value: object, *, now: float | None = None) -> None:
-        """Import a single session from a KV watch update into local cache."""
-        if not isinstance(value, dict):
-            return
+    def keep(self, incoming: Session) -> Session | None:
+        """Keep a session or revocation if it outranks the identity's record.
 
-        current = time.time() if now is None else now
-        incoming = self.parse(value, current)
-        if incoming is not None:
-            self.keep(incoming)
-
-    def keep(self, incoming: Session) -> None:
-        """Keep a session or revocation if it outranks the identity's record."""
+        Returns the record held under incoming's own durable key instead when
+        that outranks incoming. A record outranked only by an IRC-equivalent
+        identity's is still kept as its own durable identity's, for a new
+        fold to regroup.
+        """
+        identity = casefold(incoming.prefix, "ascii")
         key = self.identity_fold(incoming.prefix)
         existing = self.records.get(key)
         if existing is None or incoming.order > existing.order:
-            self.records[key] = incoming
+            self.records[key] = self.source_records[identity] = incoming
+            return None
 
-    def match(self, code: str, *, now: float | None = None) -> int | None:
+        source = self.source_records.get(identity)
+        if source is None or incoming.order > source.order:
+            self.source_records[identity] = incoming
+            return None
+
+        return source if source.order > incoming.order else None
+
+    def live_prefixes(self, nick: str) -> list[str]:
+        """Return the prefixes of the unexpired, unrevoked sessions a nick holds.
+
+        A session is the nick's when the nick, with the session's own user
+        and host, folds to the session's identity. One a higher record of an
+        IRC-equivalent identity outranks is the nick's too.
+        """
+        now = time.time()
+        return [
+            record.prefix
+            for record in self.source_records.values()
+            if not record.revoked
+            and record.expires_at > now
+            and self.identity_fold(f"{nick}!{record.prefix.partition('!')[2]}")
+            == self.identity_fold(record.prefix)
+        ]
+
+    def match(self, code: str) -> int | None:
         """Return the TOTP counter that produced the code, or None."""
         if not code.isascii() or len(code) != TOTP_CODE_LENGTH or not code.isdigit():
             return None
 
-        current_counter = int((time.time() if now is None else now) // TOTP_PERIOD)
+        current_counter = int(time.time() // TOTP_PERIOD)
         for offset in (
             0,
             *range(-1, -TOTP_WINDOW - 1, -1),
@@ -457,54 +598,77 @@ class TotpAuthorizer:
 
         return None
 
-    def parse(self, value: object, current: float) -> Session | None:
-        """Validate and parse a remotely supplied authorization session."""
-        if not isinstance(value, dict):
-            return None
-
-        parsed = parse_session_record(self.coordination_key, self.network, value)
-        if parsed is None or not (
-            current
-            < parsed.expires_at
-            <= current + self.session_ttl + SESSION_EXPIRY_GRACE
-        ):
-            return None
-
-        return parsed
-
-    def prune(self, current: float | None = None) -> None:
+    def prune(self) -> None:
         """Remove expired sessions and revocations."""
-        cutoff = time.time() if current is None else current
-        self.records = {k: r for k, r in self.records.items() if r.expires_at > cutoff}
+        cutoff = time.time()
+        for records in (self.records, self.source_records):
+            for key in [k for k, r in records.items() if r.expires_at <= cutoff]:
+                del records[key]
 
-    def rekey(self, *, now: float | None = None) -> None:
-        """Collapse records onto a new identity fold, keeping the highest rank."""
-        self.prune(now)
-        records, self.records = self.records, {}
-        for record in records.values():
+    def rekey(self) -> None:
+        """Regroup records under a new identity fold, keeping the highest rank.
+
+        They regroup from each durable identity's own record: a fold that
+        merged two identities, as the default casemapping does until
+        ISUPPORT, must lose neither once a fold that parts them returns.
+        """
+        self.records = {}
+        for record in self.source_records.values():
             self.keep(record)
 
-    def revoke(self, prefix: str) -> Session | None:
-        """Destroy the session associated with the given prefix."""
-        key = self.identity_fold(prefix)
-        record = self.records.get(key)
-        if record is None or record.revoked:
+    def revoke(self, session: Session) -> Session | None:
+        """Replace the record under a session's own key with a revocation.
+
+        Returns the revocation, or None if that record is already revoked.
+        With no record held, as when a delete dropped it during the session's
+        write, the session itself is revoked, which outranks it where it is
+        still queued. An IRC-equivalent identity's session, which may outrank
+        it under the fold, has its own key and stays.
+        """
+        record = self.source_records.get(casefold(session.prefix, "ascii"), session)
+        if record.revoked:
             return None
 
-        revoked = self.create(
-            record.prefix,
-            record.expires_at,
-            record.issuer,
-            record.version + 1,
-            revoked=True,
-        )
-        self.records[key] = revoked
+        revoked = replace(record, revoked=True, version=record.version + 1)
+        self.keep(revoked)
         return revoked
+
+    def revoke_all(self, prefix: str) -> list[Session]:
+        """Revoke every session the prefix folds with; return the revocations.
+
+        Under the casemapping in force each spelling is the same user, though
+        each has its own durable key: one left live would authorize the
+        departed identity again under a mapping that parts them.
+        """
+        key = self.identity_fold(prefix)
+        revocations = [
+            replace(record, revoked=True, version=record.version + 1)
+            for record in self.source_records.values()
+            if not record.revoked and self.identity_fold(record.prefix) == key
+        ]
+        for revoked in revocations:
+            self.keep(revoked)
+
+        return revocations
+
+    def withdraw(self, session: Session) -> Session | None:
+        """Revoke a grant only while it, or no record, is under its own key.
+
+        Returns the revocation, as revoke does. A record that replaced the
+        grant stands, as a peer's newer grant for the same identity. With none
+        held, as when a delete dropped it during the grant's write, the grant
+        itself is revoked: it failed, and must not land from the queue.
+        """
+        key = casefold(session.prefix, "ascii")
+        if self.source_records.get(key, session) != session:
+            return None
+
+        return self.revoke(session)
 
 
 def limit_identity(prefix: Prefix) -> str:
-    """Return the rate-limit key for a prefix, shared by both limiters."""
-    return casefold(prefix.host or prefix.render(), "ascii")
+    """Return the rate-limit key for a complete prefix, shared by both limiters."""
+    return casefold(prefix.host or "", "ascii")
 
 
 def totp(secret: bytes, counter: int) -> str:

@@ -56,6 +56,7 @@ class HealthCheck:
         self.server = None
         if server is not None:
             server.close()
+            server.close_clients()
             await server.wait_closed()
 
     async def handle(
@@ -67,6 +68,7 @@ class HealthCheck:
         try:
             async with asyncio.timeout(5.0):
                 request = await reader.readline()
+
             target = request.split(maxsplit=2)[1:2]
             path = target[0].partition(b"?")[0] if target else b""
             if path == b"/":

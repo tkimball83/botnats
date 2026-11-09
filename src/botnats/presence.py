@@ -10,12 +10,12 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING
 
-from botnats.irc.protocol import DEFAULT_CASEMAPPING, Prefix
+from botnats.irc.protocol import Prefix
 from botnats.nats.store import PUBLISH_ERRORS
 
 if TYPE_CHECKING:
-    from botnats.irc.protocol import IRCProtocol
-    from botnats.nats.coordinator import CoordinatorProtocol
+    from botnats.irc.protocol import IRCSender
+    from botnats.nats.coordinator import PresenceWriter
 
 IDENTITY_RETRY_ATTEMPTS = 5
 IDENTITY_RETRY_DELAY = 5.0
@@ -50,10 +50,6 @@ class BotPresence:
 
         return cls(*values)
 
-    def matches(self, prefix: Prefix, casemapping: str = DEFAULT_CASEMAPPING) -> bool:
-        """Check whether this presence corresponds to the given IRC prefix."""
-        return self.to_prefix().matches(prefix, casemapping)
-
     def to_prefix(self) -> Prefix:
         """Convert to an IRC prefix for mask matching."""
         return Prefix(self.nick, self.user, self.host)
@@ -66,59 +62,55 @@ class PresenceRegistry:
     ttl: float
     entries: dict[str, tuple[BotPresence, float]] = field(default_factory=dict)
 
-    def active(self, *, now: float | None = None) -> tuple[BotPresence, ...]:
+    def active(self) -> tuple[BotPresence, ...]:
         """Return all presences whose heartbeats have not expired."""
-        self.prune(now=now)
-        return tuple(entry[0] for entry in self.entries.values())
+        current = time.monotonic()
+        return tuple(
+            presence
+            for presence, deadline in self.entries.values()
+            if deadline > current
+        )
 
-    def has(self, presence: BotPresence, *, now: float | None = None) -> bool:
+    def has(self, presence: BotPresence) -> bool:
         """Return whether the exact presence is active."""
-        self.prune(now=now)
+        current = time.monotonic()
         entry = self.entries.get(presence.bot_id.casefold())
-        return entry is not None and entry[0] == presence
+        return entry is not None and entry[1] > current and entry[0] == presence
 
-    def prune(self, *, now: float | None = None) -> None:
-        """Remove entries whose heartbeat deadline has passed."""
-        current = time.monotonic() if now is None else now
-        self.entries = {k: v for k, v in self.entries.items() if v[1] > current}
+    def peers(self, bot_id: str) -> tuple[BotPresence, ...]:
+        """Return the active presences of every bot other than bot_id."""
+        own = bot_id.casefold()
+        return tuple(peer for peer in self.active() if peer.bot_id.casefold() != own)
 
     def remove(self, bot_id: str) -> None:
         """Remove a bot presence by stable ID."""
         self.entries.pop(bot_id.casefold(), None)
 
-    def update(
-        self,
-        presence: BotPresence,
-        *,
-        now: float | None = None,
-    ) -> None:
+    def update(self, presence: BotPresence) -> None:
         """Record or refresh a heartbeat for the given bot presence."""
-        current = time.monotonic() if now is None else now
+        current = time.monotonic()
         self.entries[presence.bot_id.casefold()] = (presence, current + self.ttl)
 
 
 class SelfIdentity:
-    """Own this bot's resolved IRC identity and its registration state."""
+    """Own this bot's resolved IRC identity."""
 
     def __init__(
         self,
         *,
         bot_id: str,
-        coordinator: CoordinatorProtocol,
+        coordinator: PresenceWriter,
         instance_id: str,
-        irc: IRCProtocol,
-        registry: PresenceRegistry,
+        irc: IRCSender,
     ) -> None:
         self.bot_id = bot_id
         self.coordinator = coordinator
         self.current: BotPresence | None = None
-        # Bumped on every registration and disconnect, so a discovery started
-        # for an older connection stops instead of acting on this one.
+        # Bumped on every disconnect, so a discovery started for an older
+        # connection stops instead of acting on this one.
         self.generation = 0
         self.instance_id = instance_id
         self.irc = irc
-        self.registered = False
-        self.registry = registry
 
     async def announce(self) -> None:
         """Write this bot's presence; the next heartbeat retries a failure."""
@@ -133,9 +125,10 @@ class SelfIdentity:
                 return
 
             try:
-                # USERHOST alone: its one-line reply carries exactly the user
-                # and visible host peers match against.
-                await self.irc.send("USERHOST", self.irc.current_nick)
+                # WHO, not USERHOST: about oneself, USERHOST shows the real
+                # host on most servers, not the visible one peers see and
+                # match bans against.
+                self.irc.send("WHO", self.irc.current_nick)
             except ConnectionError:
                 return
 
@@ -143,19 +136,12 @@ class SelfIdentity:
 
         if generation == self.generation and self.current is None:
             LOGGER.warning("IRC identity discovery failed; reconnecting")
-            await self.irc.reconnect()
-
-    def on_registered(self) -> None:
-        """Start a new registration, whose identity is not yet known."""
-        self.reset()
-        self.registered = True
-        LOGGER.info("registered on IRC as %s", self.irc.current_nick)
+            self.irc.reconnect()
 
     def reset(self) -> None:
         """Forget the identity of a connection that ended or restarted."""
         self.current = None
         self.generation += 1
-        self.registered = False
 
     def set(self, prefix: Prefix) -> bool:
         """Record a resolved identity; return whether it changed."""
@@ -169,7 +155,6 @@ class SelfIdentity:
             nick=self.irc.current_nick,
             user=prefix.user or "",
         )
-        self.registry.update(identity)
         if identity == self.current:
             return False
 

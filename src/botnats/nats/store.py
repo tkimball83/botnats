@@ -9,7 +9,8 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from nats.errors import Error as NatsError
@@ -18,13 +19,14 @@ from nats.js.errors import (
     BadRequestError,
     KeyNotFoundError,
     KeyWrongLastSequenceError,
+    NotFoundError,
 )
 from nats.js.kv import KV_DEL, KV_PURGE
 
 from botnats import error_label
 from botnats.irc.protocol import casefold
 from botnats.nats.envelope import SIGNATURE_RE
-from botnats.validators import parse_channel_record
+from botnats.validators import IDENTIFIER_RE, parse_channel_record
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -32,29 +34,38 @@ if TYPE_CHECKING:
     from nats.js.client import JetStreamContext
     from nats.js.kv import KeyValue
 
+    from botnats.validators import ChannelFields
+
 LOGGER = logging.getLogger(__name__)
 
-# Transport failures, and the RuntimeError family a store or presence claim
-# raises when a write cannot proceed (unavailable store, duplicate bot ID).
+
+class StoreUnavailableError(Exception):
+    """A durable write cannot proceed yet, though nothing is wrong with it.
+
+    JetStream handles are reset or replaced while Core NATS reconnects, and a
+    process writes only while it owns its bot ID's presence key.
+    """
+
+
+# Transport failures, and the error a store or presence claim raises when a
+# write cannot proceed yet (store reconnecting, presence key not owned).
 CONNECT_ERRORS = (NatsError, OSError)
-PUBLISH_ERRORS = (*CONNECT_ERRORS, RuntimeError)
+PUBLISH_ERRORS = (*CONNECT_ERRORS, StoreUnavailableError)
+DECODE_ERRORS = (RecursionError, TypeError, ValueError)
 
 ATTEMPT_LIMIT = 3
-ATTEMPT_TTL = 120.0
-ATTEMPT_WINDOW = 60
+ATTEMPT_WINDOW = 3600
+# A slot expiring inside the window would free it early; the margin covers
+# clock skew between the bots that stamp attempts and the server that expires them.
+ATTEMPT_TTL = 2.0 * ATTEMPT_WINDOW
 CAS_ATTEMPT_LIMIT = 8
 CLAIM_TTL = 300.0
+DUPLICATE_WINDOW = 120.0
 PRESENCE_DRIFT = 30.0
 SESSION_EXPIRY_GRACE = 60.0
-
-
-class StoreUnavailableError(RuntimeError):
-    """JetStream handles are reset or replaced while Core NATS reconnects.
-
-    A RuntimeError subclass so every PUBLISH_ERRORS handler treats it as
-    transient, while watches can distinguish it from a genuine RuntimeError
-    programming failure.
-    """
+# The same on every bot: a bot skips grants that expire past its own horizon,
+# so it could never revoke a grant from a peer with a longer lifetime.
+SESSION_TTL = 3600.0
 
 
 class KVStore:
@@ -73,6 +84,7 @@ class KVStore:
         async with self.lock:
             if js is not None and js is not self.js:
                 self.js = js
+                # Startup's retry can open it on an older context mid-reconnect.
                 self.kv = None
 
             if self.kv is not None:
@@ -92,9 +104,13 @@ class KVStore:
             )
             try:
                 kv = await context.create_key_value(config)
-            except BadRequestError:
+            except BadRequestError as error:
                 # An earlier configuration may have created it with another TTL.
-                kv = await self.retune(context, config)
+                try:
+                    kv = await self.retune(context, config)
+                except NotFoundError:
+                    # No bucket to retune: report why creating it failed.
+                    raise error from None
 
             if self.js is not context:
                 msg = "JetStream changed while opening a bucket"
@@ -114,10 +130,13 @@ class KVStore:
         difference, such as the replica count, fails as it did the first time.
         """
         stream = (await context.stream_info(f"KV_{self.bucket}")).config
-        if stream.max_age != self.ttl:
+        # Compare in the whole nanoseconds nats-py truncates the TTL to; it
+        # reads back None for a missing max_age and sends None as 0.
+        if round((stream.max_age or 0) * 1e9) != int(self.ttl * 1e9):
             # create_key_value's duplicate window, so creating again matches.
+            window = min(DUPLICATE_WINDOW, self.ttl or DUPLICATE_WINDOW)
             await context.update_stream(
-                stream.evolve(max_age=self.ttl, duplicate_window=min(120, self.ttl)),
+                stream.evolve(max_age=self.ttl, duplicate_window=window),
             )
             LOGGER.info("updated %s bucket TTL to %s seconds", self.bucket, self.ttl)
 
@@ -133,17 +152,20 @@ class KVStore:
         self.js = None
         self.kv = None
 
-    async def put_newer(
+    async def put_newer[T](
         self,
         key: str,
         data: dict[str, Any],
-        newer: Callable[[dict[str, Any]], bool],
-    ) -> dict[str, Any]:
-        """Atomically store JSON and return the authoritative value.
+        written: T,
+        standing: Callable[[dict[str, Any]], T | None],
+    ) -> T:
+        """Atomically store JSON unless the stored record stands; return the winner.
 
-        Bounded like reclaim: repeatedly losing the CAS race against a
-        handful of peers is transient, so exhaustion raises for the caller's
-        retry path instead of spinning against the bucket.
+        standing parses the stored record and returns it when it outranks
+        the write, or None when the write may replace it. Bounded like
+        reclaim: repeatedly losing the CAS race against a handful of peers is
+        transient, so exhaustion raises for the caller's retry path instead of
+        spinning against the bucket.
         """
         kv = await self.open()
         encoded = json.dumps(data).encode()
@@ -156,22 +178,19 @@ class KVStore:
                 except KeyWrongLastSequenceError:
                     continue
 
-                return data
+                return written
 
-            try:
-                current = json.loads(entry.value) if entry.value is not None else None
-            except RecursionError, ValueError:
-                current = None
-
-            if isinstance(current, dict) and not newer(current):
-                return current
+            current = decode_record(entry.value)
+            winner = standing(current) if current is not None else None
+            if winner is not None:
+                return winner
 
             try:
                 await kv.update(key, encoded, last=entry.revision)
             except KeyWrongLastSequenceError:
                 continue
 
-            return data
+            return written
 
         msg = "durable write lost repeated update races"
         raise NatsError(msg)
@@ -184,14 +203,11 @@ class AttemptStore(KVStore):
         super().__init__(f"botnats_v1_{network}_auth_attempts", replicas, ATTEMPT_TTL)
         self.secret = secret
 
-    async def allow(self, identity: str, *, now: float | None = None) -> bool:
+    async def allow(self, identity: str) -> bool:
         """Claim one attempt slot, failing closed when KV is unavailable."""
-        if self.kv is None and self.js is None:
-            return False
-
-        current = time.time() if now is None else now
+        current = time.time()
         cutoff = current - ATTEMPT_WINDOW
-        encoded = float(current).hex().encode()
+        encoded = current.hex().encode()
         try:
             kv = await self.open()
             for slot in range(ATTEMPT_LIMIT):
@@ -211,7 +227,7 @@ class AttemptStore(KVStore):
 
                 try:
                     timestamp = float.fromhex(entry.value.decode())
-                except UnicodeDecodeError, ValueError:
+                except OverflowError, ValueError:
                     continue
 
                 if not math.isfinite(timestamp) or timestamp > cutoff:
@@ -223,7 +239,7 @@ class AttemptStore(KVStore):
                     continue
 
                 return True
-        except (NatsError, OSError, RuntimeError) as error:
+        except PUBLISH_ERRORS as error:
             # Keep the handle: this attempt fails closed, and the next one
             # retries it. A Core NATS disconnect resets handles properly, and
             # dropping it here would leave the store unready with nothing
@@ -253,9 +269,9 @@ class ChannelStore(KVStore):
         folded = casefold(channel, "ascii")
         return _sign_fields(self.secret, "botnats-channel-v1", folded)
 
-    def sign(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Return a canonical, signed copy of a valid channel record."""
-        channel, channel_key, present, revision = parse_channel_record(data)
+    def sign(self, fields: ChannelFields) -> dict[str, Any]:
+        """Return the canonical, signed record of validated channel fields."""
+        channel, channel_key, present, revision = fields
         record: dict[str, Any] = {
             "channel": channel,
             "key": channel_key,
@@ -265,68 +281,61 @@ class ChannelStore(KVStore):
         record["signature"] = channel_signature(self.secret, self.network, record)
         return record
 
-    def order(self, key: str, record: dict[str, Any]) -> str | None:
-        """Validate a signed, key-bound channel record and return its revision.
+    def parse(self, key: str, record: dict[str, Any]) -> ChannelFields | None:
+        """Validate a signed, key-bound channel record and return its fields.
 
         Unsigned or wrong-signature records are untrusted and treated as
-        replaceable (revision ignored), like sessions and presence: honoring an
-        unsigned record's revision would let a coordination-secret-less writer
-        plant a high revision and wedge legitimate writes.
+        replaceable, like sessions and presence: honoring one would let a
+        writer without the coordination secret have put() return its forged
+        record as the winner.
         """
         try:
-            channel, channel_key, present, revision = parse_channel_record(record)
+            fields = parse_channel_record(record)
         except TypeError, ValueError:
             return None
 
         signature = record.get("signature")
         if (
-            self.key(channel) != key
+            self.key(fields[0]) != key
             or not isinstance(signature, str)
             or SIGNATURE_RE.fullmatch(signature) is None
         ):
             return None
 
-        expected = channel_signature(
-            self.secret,
-            self.network,
-            {
-                "channel": channel,
-                "key": channel_key,
-                "present": present,
-                "revision": revision,
-            },
-        )
+        expected = channel_signature(self.secret, self.network, record)
         if not hmac.compare_digest(expected, signature):
             return None
 
-        return revision
+        return fields
 
     async def put(
         self,
-        channel: str,
         data: dict[str, Any],
         *,
-        expected: str | None,
-    ) -> dict[str, Any]:
-        """Store a signed channel record and return the authoritative record.
+        after: str | None,
+    ) -> ChannelFields:
+        """Store a signed channel record and return the authoritative fields.
 
-        expected is the revision the record was written after (None when no
-        record was known). The write lands only while that is still the
-        stored record, so a concurrent write from another bot wins cleanly
-        instead of by the random revision suffix.
+        after is the revision the record was written after (None when no
+        record was known). The write lands only while the stored record is
+        no newer than that, so a concurrent write from another bot wins
+        cleanly instead of by the random revision suffix. An older stored
+        record was rolled back, as when a NATS writer without the
+        coordination secret replays a signed one; honoring it would supersede
+        every later write.
         """
-        signed = self.sign(data)
-        key = self.key(channel)
-        revision = self.order(key, signed)
-        if revision is None:
-            msg = "channel record is invalid"
-            raise ValueError(msg)
+        fields = parse_channel_record(data)
+        key = self.key(fields[0])
 
-        def newer(current: dict[str, Any]) -> bool:
-            current_revision = self.order(key, current)
-            return current_revision is None or current_revision == expected
+        def standing(current: dict[str, Any]) -> ChannelFields | None:
+            stored = self.parse(key, current)
+            # Revisions are fixed-width, so string order is revision order.
+            if stored is None or (after is not None and stored[3] <= after):
+                return None
 
-        return await self.put_newer(key, signed, newer)
+            return stored
+
+        return await self.put_newer(key, self.sign(fields), fields, standing)
 
 
 class ClaimStore(KVStore):
@@ -338,15 +347,12 @@ class ClaimStore(KVStore):
 
     async def claim(self, counter: int) -> bool:
         """Claim a counter once, failing closed when KV is unavailable."""
-        if self.kv is None and self.js is None:
-            return False
-
         try:
             kv = await self.open()
             await kv.create(self.key(counter), b"1")
         except KeyWrongLastSequenceError:
             return False
-        except (NatsError, OSError, RuntimeError) as error:
+        except PUBLISH_ERRORS as error:
             # Keep the handle, as in AttemptStore.allow.
             LOGGER.warning(
                 "TOTP claim failed; denying: %s",
@@ -375,18 +381,38 @@ class PresenceStore(KVStore):
         self.network = network
         self.secret = secret
 
+    def key(self, bot_id: str) -> str:
+        """Return the presence key of a bot ID, which is case-insensitive."""
+        return bot_id.casefold()
+
     async def create(self, bot_id: str, data: dict[str, Any]) -> int | None:
         """Atomically create a signed presence key and return its revision."""
         kv = await self.open()
         try:
-            return await kv.create(bot_id.casefold(), self.sign(data))
+            return await kv.create(self.key(bot_id), self.sign(data))
         except KeyWrongLastSequenceError:
             return None
 
-    async def delete(self, bot_id: str, revision: int) -> None:
-        """Delete the presence key only while its owned revision still matches."""
+    async def delete(self, bot_id: str, revision: int | None, instance_id: str) -> None:
+        """Delete the presence key at its owned revision, if still this instance's.
+
+        A heartbeat cancelled after its write reached the server leaves the
+        owned revision stale, and a claim cancelled after its write reached
+        the server leaves none (None). nats-py reports a stale delete's
+        revision mismatch as a bare BadRequestError; either way, the record is
+        then deleted at its current revision if it is still this instance's.
+        """
         kv = await self.open()
-        await kv.delete(bot_id.casefold(), last=revision)
+        key = self.key(bot_id)
+        if revision is not None:
+            with suppress(BadRequestError):
+                await kv.delete(key, last=revision)
+                return
+
+        entry = await kv.get(key)
+        record = decode_record(entry.value)
+        if record and record.get("instance_id") == instance_id:
+            await kv.delete(key, last=entry.revision)
 
     async def reclaim(
         self,
@@ -394,15 +420,18 @@ class PresenceStore(KVStore):
         data: dict[str, Any],
         instance_id: str,
     ) -> int | None:
-        """Reclaim an occupied presence key from a single read.
+        """Reclaim an occupied presence key, re-reading after a lost race.
 
-        Returns the current revision when this instance's own signed record
-        still holds the key; overwrites an unsigned or forged clobber (written
-        by a party without the coordination secret) to reclaim it; and returns
-        None only when a validly signed record from another instance holds the
-        key, which is a genuine duplicate this process must yield to. Repeated
-        lost races prove nothing about ownership, so exhaustion raises for the
-        caller's transient retry path instead of reporting a duplicate.
+        Overwrites the occupant at its revision and returns the new one: this
+        instance's own signed record, left unowned by a reset or by a
+        heartbeat that landed after it timed out, is refreshed like any
+        heartbeat; an unsigned, forged, or misplaced clobber (written by a
+        party without the coordination secret, or copied from another bot's
+        key) is replaced. Returns None only when a validly signed record of
+        this bot ID from another instance holds the key, which is a genuine
+        duplicate this process must yield to. Repeated lost races prove
+        nothing about ownership, so exhaustion raises for the caller's
+        transient retry path instead of reporting a duplicate.
         """
         kv = await self.open()
         # Deliberately tighter than CAS_ATTEMPT_LIMIT: one create race plus
@@ -410,7 +439,7 @@ class PresenceStore(KVStore):
         # heartbeat retries far sooner than eight rounds would resolve.
         for _ in range(2):
             try:
-                entry = await kv.get(bot_id.casefold())
+                entry = await kv.get(self.key(bot_id))
             except KeyNotFoundError:
                 # The occupant expired between the failed create and this
                 # read; the key is unowned, so claim it. On a lost create
@@ -422,21 +451,17 @@ class PresenceStore(KVStore):
 
                 continue
 
-            try:
-                current = json.loads(entry.value) if entry.value is not None else None
-            except RecursionError, TypeError, ValueError:
-                current = None
-
-            if isinstance(current, dict) and self.valid(current):
-                return (
-                    entry.revision
-                    if current.get("instance_id") == instance_id
-                    else None
-                )
+            current = decode_record(entry.value)
+            if (
+                current is not None
+                and self.valid(self.key(bot_id), current)
+                and current.get("instance_id") != instance_id
+            ):
+                return None
 
             try:
                 return await kv.update(
-                    bot_id.casefold(), self.sign(data), last=entry.revision
+                    self.key(bot_id), self.sign(data), last=entry.revision
                 )
             except KeyWrongLastSequenceError:
                 # Lost the overwrite race; re-read to evaluate the racing
@@ -447,10 +472,9 @@ class PresenceStore(KVStore):
         msg = "presence reclaim lost repeated update races"
         raise NatsError(msg)
 
-    def sign(self, data: dict[str, Any], now: float | None = None) -> bytes:
+    def sign(self, data: dict[str, Any]) -> bytes:
         """Serialize a freshly timestamped, signed presence record."""
-        current = time.time() if now is None else now
-        stamped = {**data, "timestamp": int(current)}
+        stamped = {**data, "timestamp": int(time.time())}
         stamped["signature"] = presence_signature(self.secret, self.network, stamped)
         return json.dumps(stamped).encode()
 
@@ -463,23 +487,32 @@ class PresenceStore(KVStore):
         """Refresh presence only while its last owned revision still matches."""
         kv = await self.open()
         try:
-            return await kv.update(bot_id.casefold(), self.sign(data), last=revision)
+            return await kv.update(self.key(bot_id), self.sign(data), last=revision)
         except KeyWrongLastSequenceError:
             return None
 
-    def valid(self, data: dict[str, Any], now: float | None = None) -> bool:
-        """Return whether a presence record is fresh and correctly signed."""
+    def valid(self, key: str, data: dict[str, Any]) -> bool:
+        """Return whether a presence record is fresh, signed, and bound to its key.
+
+        The signature does not cover the KV key, so a record copied from
+        another bot's key is valid only there.
+        """
+        bot_id = data.get("bot_id")
         signature = data.get("signature")
         timestamp = data.get("timestamp")
         if (
-            not isinstance(signature, str)
+            not isinstance(bot_id, str)
+            or IDENTIFIER_RE.fullmatch(bot_id) is None
+            or self.key(bot_id) != key
+            or not isinstance(signature, str)
             or SIGNATURE_RE.fullmatch(signature) is None
             or not isinstance(timestamp, int)
-            or isinstance(timestamp, bool)
         ):
             return False
 
-        current = time.time() if now is None else now
+        current = time.time()
+        # Compared without arithmetic on the unchecked timestamp: an int too
+        # large for a float would raise.
         if (
             not current - self.ttl - PRESENCE_DRIFT
             <= timestamp
@@ -498,8 +531,8 @@ class PresenceStore(KVStore):
 class SessionStore(KVStore):
     """Auth sessions in JetStream KV with TTL-based expiry."""
 
-    def __init__(self, network: str, replicas: int, secret: bytes, ttl: float) -> None:
-        super().__init__(f"botnats_v1_{network}_sessions", replicas, ttl)
+    def __init__(self, network: str, replicas: int, secret: bytes) -> None:
+        super().__init__(f"botnats_v1_{network}_sessions", replicas, SESSION_TTL)
         self.network = network
         self.secret = secret
 
@@ -508,44 +541,61 @@ class SessionStore(KVStore):
         folded = casefold(identity, "ascii")
         return _sign_fields(self.secret, "botnats-session-v1", folded)
 
-    def order(
-        self,
-        identity: str,
-        record: dict[str, Any],
-    ) -> tuple[float, int, bool] | None:
-        """Validate a signed session record and return its durable order."""
-        parsed = parse_session_record(self.secret, self.network, record)
-        if parsed is None or casefold(parsed.prefix, "ascii") != casefold(
-            identity,
-            "ascii",
-        ):
+    def parse(self, key: str, record: dict[str, Any]) -> Session | None:
+        """Validate a signed session record held under a KV key, if it stands."""
+        session = self.verify(key, record)
+        if session is None or not self.stands(session):
             return None
 
-        return parsed.order
+        return session
 
-    async def put(self, identity: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Store a session or revocation and return the authoritative record.
+    def verify(self, key: str, record: dict[str, Any]) -> Session | None:
+        """Validate a signed session record bound to its KV key, at any expiry."""
+        session = parse_session_record(self.secret, self.network, record)
+        if session is None or self.key(session.prefix) != key:
+            return None
+
+        return session
+
+    async def put(self, session: Session) -> Session:
+        """Sign and store a session or revocation; return the authoritative one.
 
         Only the future horizon is bounded: an already-expired record must
         stay writable so a near-expiry revocation is not rejected under
         clock skew, and consumers treat expired records as deletions.
         """
-        order = self.order(identity, data)
-        if order is None or order[0] > time.time() + self.ttl + SESSION_EXPIRY_GRACE:
-            msg = "session record is invalid"
+        if not self.within_horizon(session):
+            msg = "session record expires past this bot's horizon"
             raise ValueError(msg)
 
-        def newer(current: dict[str, Any]) -> bool:
-            current_order = self.order(identity, current)
-            now = time.time()
-            return (
-                current_order is None
-                or current_order[0] <= now
-                or current_order[0] > now + self.ttl + SESSION_EXPIRY_GRACE
-                or current_order < order
-            )
+        key = self.key(session.prefix)
 
-        return await self.put_newer(self.key(identity), data, newer)
+        def standing(current: dict[str, Any]) -> Session | None:
+            stored = self.parse(key, current)
+            if stored is None or stored.order < session.order:
+                return None
+
+            return stored
+
+        return await self.put_newer(key, self.sign(session), session, standing)
+
+    def sign(self, session: Session) -> dict[str, Any]:
+        """Return the canonical, signed record of a session."""
+        record = asdict(session)
+        record["signature"] = session_signature(self.secret, self.network, record)
+        return record
+
+    def stands(self, session: Session) -> bool:
+        """Return whether a verified record applies to local authorization.
+
+        Only a grant must expire within this bot's horizon: a revocation past
+        it, as from a peer whose clock runs ahead, only denies, so it stands.
+        """
+        return session.revoked or self.within_horizon(session)
+
+    def within_horizon(self, session: Session) -> bool:
+        """Return whether a session expires no later than one TTL plus grace away."""
+        return session.expires_at <= time.time() + self.ttl + SESSION_EXPIRY_GRACE
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,7 +607,6 @@ class Session:
     prefix: str
     revoked: bool
     version: int
-    signature: str
 
     @property
     def order(self) -> tuple[float, int, bool]:
@@ -616,8 +665,17 @@ def parse_session_record(
         prefix=prefix,
         revoked=revoked,
         version=version,
-        signature=signature,
     )
+
+
+def decode_record(value: bytes | None) -> dict[str, Any] | None:
+    """Decode a stored JSON object, or None when it is missing or malformed."""
+    try:
+        data = json.loads(value) if value is not None else None
+    except DECODE_ERRORS:
+        return None
+
+    return data if isinstance(data, dict) else None
 
 
 def _sign_fields(secret: bytes, *fields: str) -> str:

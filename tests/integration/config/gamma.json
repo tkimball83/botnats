@@ -1,7 +1,4 @@
 {
-  "authorization": {
-    "session_ttl_seconds": 300
-  },
   "bot": {
     "id": "gamma",
     "network": "integration",
@@ -15,7 +12,7 @@
     "channel_modes": "+mnt",
     "connect_timeout_seconds": 5,
     "servers": [
-      "irc://irc:6667"
+      "ircs://irc:6697"
     ],
     "verify_tls": false
   },

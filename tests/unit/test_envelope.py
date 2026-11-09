@@ -4,26 +4,24 @@
 """Tests for the signed NATS message envelope."""
 
 import json
-import time
 import unittest
+from unittest.mock import patch
 
 from botnats.nats.envelope import Envelope
 from tests.unit.helpers import COORDINATION_KEY
 
-JSON_NESTING_DEPTH = 100_000
+NOW = 1_000_000
 OVERSIZED_TIMESTAMP = 10**400
 SUBJECT = "botnats.v1.efnet.channel"
 
 
 class EnvelopeTests(unittest.TestCase):
-    """Tests for envelope decoding safety."""
+    """Tests for envelope signing, replay protection, and decoding safety."""
 
-    def test_decode_rejects_deeply_nested_json(self) -> None:
-        """Verify deeply nested JSON is rejected as a value error, not a crash."""
-        envelope = Envelope("alpha", COORDINATION_KEY)
-
-        with self.assertRaises(ValueError):
-            envelope.decode(SUBJECT, b"[" * JSON_NESTING_DEPTH)
+    def setUp(self) -> None:
+        """Pin the envelope clock, so no test races the drift window."""
+        self.clock = self.enterContext(patch("botnats.nats.envelope.time"))
+        self.clock.time.return_value = float(NOW)
 
     def test_decode_rejects_large_payload(self) -> None:
         """Verify oversized envelopes are rejected before JSON parsing."""
@@ -41,6 +39,55 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
+    def test_decode_rejects_non_hex_signature(self) -> None:
+        """Reject a non-hex signature as malformed before comparing it."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        # compare_digest returns False for the first and raises TypeError for
+        # the non-ASCII second.
+        for signature in ("z" * 64, "é" * 64):
+            encoded = json.loads(envelope.encode(SUBJECT, {}))
+            encoded["signature"] = signature
+
+            with (
+                self.subTest(signature=signature),
+                self.assertRaisesRegex(ValueError, "malformed"),
+            ):
+                envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
+    def test_decode_rejects_float_timestamp(self) -> None:
+        """Reject a correctly signed timestamp that is not an integer."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        encoded = json.loads(envelope.encode(SUBJECT, {}))
+        encoded["timestamp"] = float(encoded["timestamp"])
+        encoded["signature"] = envelope.mac(
+            envelope.body(
+                encoded["nonce"],
+                encoded["payload"],
+                encoded["sender"],
+                encoded["timestamp"],
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
+    def test_decode_rejects_non_string_sender(self) -> None:
+        """Reject a correctly signed sender that is not a string."""
+        envelope = Envelope("alpha", COORDINATION_KEY)
+        encoded = json.loads(envelope.encode(SUBJECT, {}))
+        encoded["sender"] = 1
+        encoded["signature"] = envelope.mac(
+            envelope.body(
+                encoded["nonce"],
+                encoded["payload"],
+                encoded["sender"],
+                encoded["timestamp"],
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            envelope.decode(SUBJECT, json.dumps(encoded).encode())
+
     def test_decode_rejects_oversized_timestamp(self) -> None:
         """Reject an integer timestamp too large for float arithmetic."""
         envelope = Envelope("alpha", COORDINATION_KEY)
@@ -50,20 +97,24 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allowed window"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
-    def test_decode_rejects_stale_timestamp(self) -> None:
-        """Reject an envelope with a plausible but expired timestamp."""
+    def test_decode_rejects_boolean_timestamp(self) -> None:
+        """Reject a boolean timestamp, an int the drift window refuses."""
         envelope = Envelope("alpha", COORDINATION_KEY)
-        encoded = json.loads(envelope.encode(SUBJECT, {}))
-        encoded["timestamp"] = int(time.time()) - 60
+        for timestamp in (True, False):
+            encoded = json.loads(envelope.encode(SUBJECT, {}))
+            encoded["timestamp"] = timestamp
 
-        with self.assertRaisesRegex(ValueError, "allowed window"):
-            envelope.decode(SUBJECT, json.dumps(encoded).encode())
+            with (
+                self.subTest(timestamp=timestamp),
+                self.assertRaisesRegex(ValueError, "allowed window"),
+            ):
+                envelope.decode(SUBJECT, json.dumps(encoded).encode())
 
     def test_decode_rejects_future_timestamp(self) -> None:
         """Reject an envelope with a timestamp too far in the future."""
         envelope = Envelope("alpha", COORDINATION_KEY)
         encoded = json.loads(envelope.encode(SUBJECT, {}))
-        encoded["timestamp"] = int(time.time()) + 60
+        encoded["timestamp"] = NOW + 60
 
         with self.assertRaisesRegex(ValueError, "allowed window"):
             envelope.decode(SUBJECT, json.dumps(encoded).encode())
@@ -73,7 +124,7 @@ class EnvelopeTests(unittest.TestCase):
         sender = Envelope("alpha", COORDINATION_KEY)
         nonce = "a" * 32
         payload: dict[str, object] = {}
-        timestamp = int(time.time())
+        timestamp = NOW
         encoded = json.dumps(
             {
                 "nonce": nonce,
@@ -89,16 +140,93 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not bound"):
             Envelope("beta", COORDINATION_KEY).decode(SUBJECT, encoded)
 
-    def test_encode_rejects_large_payload(self) -> None:
-        """Verify encoding a payload that exceeds the size limit raises."""
-        envelope = Envelope("alpha", COORDINATION_KEY)
+    def test_envelope_security(self) -> None:
+        """Verify envelope signing, replay rejection, and malformed envelopes."""
+        key = COORDINATION_KEY
+        sender = Envelope("alpha", key)
+        receiver = Envelope("beta", key)
 
-        with self.assertRaisesRegex(ValueError, "size limit"):
-            envelope.encode(SUBJECT, {"big": "x" * 262_144})
+        encoded = sender.encode(SUBJECT, {"channel": "#test"})
+        assert receiver.decode(SUBJECT, encoded) == (
+            "alpha",
+            {"channel": "#test"},
+        )
+        with self.assertRaisesRegex(ValueError, "replayed"):
+            receiver.decode(SUBJECT, encoded)
 
-    def test_encode_rejects_reserved_field(self) -> None:
-        """Verify encoding rejects payloads containing the reserved subject field."""
-        envelope = Envelope("alpha", COORDINATION_KEY)
+        forged = json.dumps({"payload": {"channel": "#owned"}}).encode()
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            receiver.decode(SUBJECT, forged)
 
-        with self.assertRaisesRegex(ValueError, "reserved"):
-            envelope.encode(SUBJECT, {"_botnats_subject": "spoofed"})
+        with self.assertRaisesRegex(TypeError, "not an object"):
+            receiver.decode(SUBJECT, b"[]")
+
+    def test_signature_covers_every_field(self) -> None:
+        """Reject an envelope with any one signed field changed and not re-signed.
+
+        A client holding the NATS token but not the coordination secret could
+        otherwise replay a captured envelope under a fresh nonce or timestamp.
+        """
+        sender = Envelope("alpha", COORDINATION_KEY)
+        receiver = Envelope("beta", COORDINATION_KEY)
+        for field in ("nonce", "payload", "sender", "timestamp"):
+            # Never decoded, so its nonce is not yet a replay.
+            tampered = json.loads(sender.encode(SUBJECT, {"channel": "#test"}))
+            tampered[field] = {
+                "nonce": "f" * 32,
+                "payload": {**tampered["payload"], "channel": "#owned"},
+                "sender": "gamma",
+                # Still inside the drift window.
+                "timestamp": tampered["timestamp"] - 1,
+            }[field]
+
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "signature"),
+            ):
+                receiver.decode(SUBJECT, json.dumps(tampered).encode())
+
+        # Only authentic envelopes may grow the replay cache.
+        assert not receiver.seen_nonces
+
+    def test_decode_prunes_expired_nonces(self) -> None:
+        """Prune expired nonces on decode, which keeps the replay cache bounded."""
+        receiver = Envelope("beta", COORDINATION_KEY)
+        receiver.seen_nonces["a" * 32] = 1.0
+        receiver.seen_nonces["b" * 32] = 2.0
+        receiver.seen_nonces["c" * 32] = NOW + 60
+        encoded = Envelope("alpha", COORDINATION_KEY).encode(SUBJECT, {})
+
+        receiver.decode(SUBJECT, encoded)
+
+        assert list(receiver.seen_nonces) == ["c" * 32, json.loads(encoded)["nonce"]]
+
+    def test_nonce_outlives_drift_window(self) -> None:
+        """Reject a replay for as long as the 30-second drift window accepts it."""
+        sender = Envelope("alpha", COORDINATION_KEY)
+        receiver = Envelope("beta", COORDINATION_KEY)
+        encoded = sender.encode(SUBJECT, {})
+
+        # First seen at the window's future edge and replayed at its past
+        # edge, so the nonce must outlive both halves of the window.
+        self.clock.time.return_value = NOW - 30.0
+        assert receiver.decode(SUBJECT, encoded) == ("alpha", {})
+        self.clock.time.return_value = NOW + 30.0
+        with self.assertRaisesRegex(ValueError, "replayed"):
+            receiver.decode(SUBJECT, encoded)
+
+        self.clock.time.return_value = NOW + 31.0
+        with self.assertRaisesRegex(ValueError, "allowed window"):
+            receiver.decode(SUBJECT, encoded)
+
+    def test_subject_substitution(self) -> None:
+        """Verify a signed message cannot be moved to another NATS subject."""
+        key = COORDINATION_KEY
+        sender = Envelope("alpha", key)
+        receiver = Envelope("beta", key)
+        encoded = sender.encode(SUBJECT, {"channel": "#test"})
+
+        with self.assertRaisesRegex(ValueError, "not bound"):
+            receiver.decode("botnats.v1.efnet.auth.session", encoded)
+
+        assert json.loads(encoded)["nonce"] not in receiver.seen_nonces

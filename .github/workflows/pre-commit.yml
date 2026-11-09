@@ -8,6 +8,7 @@
       - .yamllint
       - '**/*.yaml'
       - '**/*.yml'
+      - pyproject.toml
   pull_request:
     paths: *paths
 
@@ -20,13 +21,15 @@ concurrency:
 
 jobs:
   pre-commit:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
         with:
+          cache: pip
+          cache-dependency-path: pyproject.toml
           python-version-file: .python-version
-      - uses: pre-commit/action@v3.0.1
-        with:
-          extra_args: yamllint --all-files
+      - run: make install
+      - run: venv/bin/pre-commit run yamllint --all-files
+    timeout-minutes: 10
 ...
