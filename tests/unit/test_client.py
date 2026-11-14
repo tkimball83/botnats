@@ -433,15 +433,16 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(client, "run_connection", failing_connection),
             patch("asyncio.sleep", record_sleep),
-            # The largest jitter, so its scale is pinned too.
-            patch("secrets.randbelow", return_value=999),
+            # The last server first and the largest jitter, so the start and
+            # the jitter's scale are pinned too.
+            patch("secrets.randbelow", side_effect=lambda bound: bound - 1),
             self.assertLogs("botnats.irc.client", level="WARNING"),
             self.assertRaises(asyncio.CancelledError),
         ):
             async with asyncio.timeout(5):
                 await client.run_forever()
 
-        assert ports == [6667, 6668] * 5 + [6667]
+        assert ports == [6668, 6667] * 5 + [6668]
         # The backoff grows to its cap of 8 steps and then stays there.
         assert delays == [1.5 ** min(attempt, 8) + 0.999 for attempt in range(1, 11)]
 

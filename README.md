@@ -85,7 +85,7 @@ Example `bot.json`:
 | `coordination.presence_ttl_seconds`         | Must exceed the maintenance interval; 15 seconds by default               |
 | `irc.channel_modes`                         | Required (`+`) and forbidden (`-`) modes; empty by default                |
 | `irc.connect_timeout_seconds`               | Per-server connection timeout; 30 seconds by default                      |
-| `irc.servers`                               | Ordered failover endpoints for the configured network; required           |
+| `irc.servers`                               | Failover endpoints, tried in turn from a random start; required           |
 | `irc.verify_tls`                            | Applies only to `ircs://` connections; `true` by default                  |
 | `nats.jetstream_replicas`                   | Use `3` only when three JetStream storage peers are present; 1 by default |
 | `nats.monitor_port`                         | Connected-server monitoring port used by `STATUS`; 8222 by default        |
