@@ -223,6 +223,7 @@ def config() -> BotConfig:
         health_port=8080,
         irc_connect_timeout=30,
         irc_servers=(IRCServer("irc.example.test", 6667, tls=False),),
+        irc_username="alphaid",
         irc_verify_tls=True,
         jetstream_replicas=1,
         maintenance_interval=3,

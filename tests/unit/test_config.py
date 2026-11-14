@@ -61,6 +61,7 @@ class ConfigTests(unittest.TestCase):
                 IRCServer("irc.example.test", 6697, tls=True),
                 IRCServer("irc2.example.test", 6668, tls=False),
             ),
+            irc_username="botnats1",
             irc_verify_tls=False,
             jetstream_replicas=3,
             maintenance_interval=2,
@@ -255,6 +256,7 @@ class ConfigTests(unittest.TestCase):
         """Qualify invalid-value errors with their configuration table."""
         cases = (
             ("bot", "id", "botnats.1", r"bot\.id contains unsupported characters"),
+            ("bot", "id", "_-", r"bot\.id must contain a letter or digit"),
             (
                 "bot",
                 "network",
@@ -286,6 +288,20 @@ class ConfigTests(unittest.TestCase):
                 self.assertRaisesRegex((TypeError, ValueError), message),
             ):
                 load_config(raw)
+
+    def test_irc_username_keeps_only_letters_and_digits_of_bot_id(self) -> None:
+        """Derive a username that starts alphanumeric, as some servers require."""
+        raw = json.loads(CONFIG)
+        raw["bot"]["id"] = "_-Bot_1-a"
+
+        assert load_config(raw).irc_username == "Bot1a"
+
+    def test_irc_username_is_bounded(self) -> None:
+        """Truncate the username as servers do, so USER fits any bot ID."""
+        raw = json.loads(CONFIG)
+        raw["bot"]["id"] = "a" * 512
+
+        assert load_config(raw).irc_username == "a" * 10
 
     def test_non_table_section_is_rejected(self) -> None:
         """Reject a section that is present but not an object."""

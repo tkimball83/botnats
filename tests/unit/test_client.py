@@ -149,6 +149,7 @@ def irc_client(
             connect_timeout=1,
             nickname="alpha",
             servers=tuple(IRCServer("127.0.0.1", port, tls=tls) for port in ports),
+            username="alphaid",
             verify_tls=verify_tls,
         ),
         on_disconnect=lambda: None,
@@ -286,6 +287,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
                 connect_timeout=1,
                 nickname="alpha",
                 servers=servers,
+                username="alphaid",
                 verify_tls=True,
             ),
             on_disconnect=lambda: None,
@@ -303,12 +305,8 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         contexts = [call.kwargs["ssl"] for call in connect.await_args_list]
         assert contexts == [client.tls_context, None]
 
-    async def test_establish_registers_a_fixed_username(self) -> None:
-        """Register any valid nick under a username every server accepts.
-
-        Without identd the server takes the username from USER, and hybrid,
-        solanum, and charybdis refuse one that does not start alphanumeric.
-        """
+    async def test_establish_registers_the_configured_username(self) -> None:
+        """Register under the configured username, whatever the nick."""
         client = irc_client()
         client.config = replace(client.config, nickname="_bot")
         connect = AsyncMock(return_value=(asyncio.StreamReader(), mock_writer()))
@@ -324,7 +322,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert lines == [
             (b"CAP LS 302\r\n", None),
             (b"NICK _bot\r\n", None),
-            (b"USER botnats 0 * :_bot\r\n", None),
+            (b"USER alphaid 0 * :_bot\r\n", None),
         ]
 
     async def test_establish_gives_up_after_connect_timeout(self) -> None:
@@ -719,7 +717,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             2.0,
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
-            b"USER botnats 0 * :alpha\r\n",
+            b"USER alphaid 0 * :alpha\r\n",
             op,
         ]
 
@@ -753,7 +751,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
             *burst,
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
-            b"USER botnats 0 * :alpha\r\n",
+            b"USER alphaid 0 * :alpha\r\n",
         ]
 
     async def test_registration_nick_rejections_retry(self) -> None:
@@ -1542,7 +1540,7 @@ class IRCClientTests(unittest.IsolatedAsyncioTestCase):
         assert sessions[1] == [
             b"CAP LS 302\r\n",
             b"NICK alpha\r\n",
-            b"USER botnats 0 * :alpha\r\n",
+            b"USER alphaid 0 * :alpha\r\n",
             b"CAP REQ :chghost\r\n",
             b"CAP REQ :chghost\r\n",
             b"CAP END\r\n",

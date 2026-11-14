@@ -23,6 +23,8 @@ MODE_STRING_RE = re.compile(r"(?:[+-][A-Za-z]+)+")
 # RFC 1459's NICKLEN, which every server family accepts: some truncate a
 # longer NICK and others refuse it, so the bot could never hold its nick.
 MAX_NICKNAME_LENGTH = 9
+# The USERLEN of ircu, hybrid, and solanum, which truncate longer usernames.
+MAX_USERNAME_LENGTH = 10
 MIN_COORDINATION_KEY_BYTES = 32
 MIN_TOTP_SECRET_BYTES = 20
 NATS_SCHEMES = frozenset({"nats"})
@@ -41,6 +43,7 @@ class BotConfig:
     health_port: int
     irc_connect_timeout: float
     irc_servers: tuple[IRCServer, ...]
+    irc_username: str
     irc_verify_tls: bool
     jetstream_replicas: int
     maintenance_interval: float
@@ -124,6 +127,7 @@ class BotConfig:
                 30,
             ),
             irc_servers=servers,
+            irc_username=irc_username(bot_id),
             irc_verify_tls=verify_tls(irc),
             jetstream_replicas=replica_count(nats_section),
             maintenance_interval=maintenance_interval,
@@ -165,6 +169,20 @@ def irc_servers(section: dict[str, Any]) -> tuple[IRCServer, ...]:
         raise ValueError(msg)
 
     return servers
+
+
+def irc_username(bot_id: str) -> str:
+    """Derive the IRC username from the bot ID's first letters and digits.
+
+    Without identd a server takes the username from USER, and hybrid, solanum,
+    and charybdis refuse one that does not start alphanumeric.
+    """
+    username = re.sub(r"[^A-Za-z0-9]", "", bot_id)[:MAX_USERNAME_LENGTH]
+    if not username:
+        msg = "bot.id must contain a letter or digit"
+        raise ValueError(msg)
+
+    return username
 
 
 def load_secrets() -> tuple[bytes, str, bytes]:
