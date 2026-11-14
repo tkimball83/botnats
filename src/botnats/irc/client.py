@@ -331,7 +331,9 @@ class IRCClient:
 
     async def run_forever(self) -> None:
         """Maintain a persistent connection with automatic reconnection."""
-        index = 0
+        # A random first server spreads bots sharing one server list, so a
+        # netsplit does not cut every bot off at once.
+        index = secrets.randbelow(len(self.config.servers))
         backoff = 0
         loop = asyncio.get_running_loop()
         while True:
