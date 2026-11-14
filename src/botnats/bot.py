@@ -80,6 +80,7 @@ class Bot:
                 connect_timeout=config.irc_connect_timeout,
                 nickname=config.nickname,
                 servers=config.irc_servers,
+                username=config.irc_username,
                 verify_tls=config.irc_verify_tls,
             ),
             on_disconnect=self.events.on_irc_disconnect,

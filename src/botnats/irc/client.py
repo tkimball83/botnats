@@ -48,10 +48,6 @@ REGISTRATION_TIMEOUT = 60.0
 # seconds ahead of the clock; send_cost prices each line.
 SEND_CREDIT = 10.0
 STABLE_SESSION_SECONDS = 60.0
-# Without identd a server takes the username from USER, and hybrid, solanum,
-# and charybdis refuse one that does not start alphanumeric, as a valid
-# nickname need not; WHO, not USER, tells the bot its identity.
-USERNAME = "botnats"
 WRITE_TIMEOUT = 30.0
 
 # A line waiting to be written, and the check, if any, it must pass then.
@@ -84,6 +80,7 @@ class IRCClientConfig:
     connect_timeout: float
     nickname: str
     servers: tuple[IRCServer, ...]
+    username: str
     verify_tls: bool
 
 
@@ -219,7 +216,7 @@ class IRCClient:
         LOGGER.info("connected to IRC server %s:%s", server.host, server.port)
         self.send("CAP", "LS", "302")
         self.send("NICK", self.current_nick)
-        self.send("USER", USERNAME, "0", "*", trailing=self.config.nickname)
+        self.send("USER", self.config.username, "0", "*", trailing=self.config.nickname)
         return reader, writer
 
     def handle_cap(self, message: IRCMessage) -> None:

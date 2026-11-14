@@ -79,6 +79,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                     connect_timeout=45,
                     nickname="alpha",
                     servers=(server,),
+                    username="alphaid",
                     verify_tls=verify,
                 )
                 assert bot.irc.caps is bot.caps
